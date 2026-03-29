@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(SAM3_METAL "Enable Metal backend" OFF)
 option(SAM3_CPU   "Enable CPU backend"   ON)
 option(SAM3_TESTS "Build tests"          ON)
+option(SAM3_PROFILE "Enable profiler"     OFF)
 
 # Auto-detect Metal on macOS
 if(APPLE AND NOT DEFINED SAM3_METAL)
@@ -29,6 +30,10 @@ add_compile_options(
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 	add_compile_options(-fsanitize=address,undefined)
 	add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(SAM3_PROFILE)
+	add_definitions(-DSAM3_HAS_PROFILE)
 endif()
 
 # Include paths
