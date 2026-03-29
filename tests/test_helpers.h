@@ -22,27 +22,25 @@
 static int tests_run = 0;
 static int tests_failed = 0;
 
-#define ASSERT(cond) do {						\
-	tests_run++;							\
-	if (!(cond)) {							\
-		fprintf(stderr, "FAIL %s:%d: %s\n",			\
-			__FILE__, __LINE__, #cond);			\
-		tests_failed++;						\
-	}								\
+#define ASSERT(cond) do { \
+    tests_run++; \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+        tests_failed++; \
+    } \
 } while (0)
 
-#define ASSERT_EQ(a, b) do {						\
-	tests_run++;							\
-	if ((a) != (b)) {						\
-		fprintf(stderr, "FAIL %s:%d: %s != %s\n",		\
-			__FILE__, __LINE__, #a, #b);			\
-		tests_failed++;						\
-	}								\
+#define ASSERT_EQ(a, b) do { \
+    tests_run++; \
+    if ((a) != (b)) { \
+        fprintf(stderr, "FAIL %s:%d: %s != %s\n", __FILE__, __LINE__, #a, #b); \
+        tests_failed++; \
+    } \
 } while (0)
 
-#define TEST_REPORT() do {						\
-	printf("%d tests, %d failures\n", tests_run, tests_failed);	\
-	return tests_failed ? 1 : 0;					\
+#define TEST_REPORT() do { \
+    printf("%d tests, %d failures\n", tests_run, tests_failed); \
+    return tests_failed ? 1 : 0; \
 } while (0)
 
 #endif /* SAM3_TEST_HELPERS_H */
