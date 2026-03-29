@@ -164,6 +164,58 @@ static void test_report_no_crash(void)
 	sam3_profiler_free(p);
 }
 
+/* Task 8: Full round-trip integration test */
+
+static void test_full_round_trip(void)
+{
+	struct sam3_profiler *p = sam3_profiler_create();
+	sam3_profiler_enable(p);
+
+	/* Simulate a mini inference run */
+	sam3_prof_stage_begin(p, "image_encoder");
+
+	sam3_prof_mem_arena(p);
+	sam3_prof_mem_alloc(p, 1024 * 1024);  /* 1MB */
+
+	sam3_prof_op_begin(p, SAM3_OP_CONV2D);
+	volatile int x = 0;
+	for (int i = 0; i < 50000; i++)
+		x += i;
+	(void)x;
+	sam3_prof_op_end(p, SAM3_OP_CONV2D);
+
+	sam3_prof_op_begin(p, SAM3_OP_MATMUL);
+	for (int i = 0; i < 50000; i++)
+		x += i;
+	(void)x;
+	sam3_prof_op_end(p, SAM3_OP_MATMUL);
+
+	sam3_prof_stage_end(p, "image_encoder");
+
+	sam3_prof_stage_begin(p, "mask_decoder");
+	sam3_prof_op_begin(p, SAM3_OP_SOFTMAX);
+	for (int i = 0; i < 10000; i++)
+		x += i;
+	(void)x;
+	sam3_prof_op_end(p, SAM3_OP_SOFTMAX);
+	sam3_prof_stage_end(p, "mask_decoder");
+
+	/* Verify data collected */
+	ASSERT_EQ(p->n_stages, 2);
+	ASSERT(p->stages[0].total_ns > 0);
+	ASSERT(p->stages[1].total_ns > 0);
+	ASSERT_EQ(p->op_stats[SAM3_OP_CONV2D].calls, 1);
+	ASSERT_EQ(p->op_stats[SAM3_OP_MATMUL].calls, 1);
+	ASSERT_EQ(p->op_stats[SAM3_OP_SOFTMAX].calls, 1);
+	ASSERT_EQ(p->mem.alloc_count, 1);
+	ASSERT_EQ((int)p->mem.peak_bytes, 1024 * 1024);
+
+	/* Print report */
+	sam3_profiler_report(p);
+
+	sam3_profiler_free(p);
+}
+
 int main(void)
 {
 	/* Task 2: Lifecycle */
@@ -180,6 +232,9 @@ int main(void)
 	test_op_timing();
 	test_mem_tracking();
 	test_report_no_crash();
+
+	/* Task 8: Integration */
+	test_full_round_trip();
 
 	TEST_REPORT();
 }
