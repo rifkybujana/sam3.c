@@ -85,4 +85,39 @@ void sam3_result_free(struct sam3_result *result);
  */
 const char *sam3_version(void);
 
+
+/* --- Profiling API --- */
+
+/*
+ * sam3_profile_enable - Enable profiling on this context.
+ *
+ * @ctx: Initialized context.
+ *
+ * Allocates profiler state if not already present. Profiling data
+ * accumulates until reset or context is freed.
+ * Requires SAM3_HAS_PROFILE at compile time; otherwise a no-op.
+ */
+enum sam3_error sam3_profile_enable(sam3_ctx *ctx);
+
+/*
+ * sam3_profile_disable - Disable profiling (data is preserved).
+ *
+ * @ctx: Initialized context.
+ */
+void sam3_profile_disable(sam3_ctx *ctx);
+
+/*
+ * sam3_profile_report - Print profiling report to stderr.
+ *
+ * @ctx: Initialized context.
+ */
+void sam3_profile_report(sam3_ctx *ctx);
+
+/*
+ * sam3_profile_reset - Clear all collected profiling data.
+ *
+ * @ctx: Initialized context.
+ */
+void sam3_profile_reset(sam3_ctx *ctx);
+
 #endif /* SAM3_H */

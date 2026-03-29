@@ -17,11 +17,17 @@
 #include <stdlib.h>
 
 #include "sam3/sam3.h"
+#ifdef SAM3_HAS_PROFILE
+#include "util/profile.h"
+#endif
 
 /* Internal context definition. */
 struct sam3_ctx {
 	struct sam3_model_config config;
 	int loaded;
+#ifdef SAM3_HAS_PROFILE
+	struct sam3_profiler *profiler;
+#endif
 };
 
 const char *sam3_version(void)
@@ -37,6 +43,11 @@ sam3_ctx *sam3_init(void)
 
 void sam3_free(sam3_ctx *ctx)
 {
+	if (!ctx)
+		return;
+#ifdef SAM3_HAS_PROFILE
+	sam3_profiler_free(ctx->profiler);
+#endif
 	free(ctx);
 }
 
@@ -76,4 +87,52 @@ void sam3_result_free(struct sam3_result *result)
 	result->masks      = NULL;
 	result->iou_scores = NULL;
 	result->n_masks    = 0;
+}
+
+enum sam3_error sam3_profile_enable(sam3_ctx *ctx)
+{
+#ifdef SAM3_HAS_PROFILE
+	if (!ctx)
+		return SAM3_EINVAL;
+	if (!ctx->profiler) {
+		ctx->profiler = sam3_profiler_create();
+		if (!ctx->profiler)
+			return SAM3_ENOMEM;
+	}
+	sam3_profiler_enable(ctx->profiler);
+	return SAM3_OK;
+#else
+	(void)ctx;
+	return SAM3_OK;
+#endif
+}
+
+void sam3_profile_disable(sam3_ctx *ctx)
+{
+#ifdef SAM3_HAS_PROFILE
+	if (ctx && ctx->profiler)
+		sam3_profiler_disable(ctx->profiler);
+#else
+	(void)ctx;
+#endif
+}
+
+void sam3_profile_report(sam3_ctx *ctx)
+{
+#ifdef SAM3_HAS_PROFILE
+	if (ctx && ctx->profiler)
+		sam3_profiler_report(ctx->profiler);
+#else
+	(void)ctx;
+#endif
+}
+
+void sam3_profile_reset(sam3_ctx *ctx)
+{
+#ifdef SAM3_HAS_PROFILE
+	if (ctx && ctx->profiler)
+		sam3_profiler_reset(ctx->profiler);
+#else
+	(void)ctx;
+#endif
 }
