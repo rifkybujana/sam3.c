@@ -1,0 +1,88 @@
+/*
+ * include/sam3/sam3.h - Main public API for sam3 inference
+ *
+ * This is the only header users need to include. Provides functions to
+ * load a SAM3 model, run segmentation inference with point/box/mask
+ * prompts, and free resources. All functions are thread-safe with
+ * respect to different sam3_ctx instances.
+ *
+ * Key types:  sam3_ctx (opaque handle)
+ * Depends on: sam3_types.h
+ * Used by:    tools/sam3_main.c, user applications
+ *
+ * Copyright (c) 2026
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef SAM3_H
+#define SAM3_H
+
+#include "sam3_types.h"
+
+/*
+ * sam3_init - Create and initialize a sam3 context.
+ *
+ * Initializes the compute backend and prepares for model loading.
+ * Returns NULL on failure. Call sam3_free() when done.
+ */
+sam3_ctx *sam3_init(void);
+
+/*
+ * sam3_free - Release all resources held by a sam3 context.
+ *
+ * @ctx: Context to free (may be NULL).
+ */
+void sam3_free(sam3_ctx *ctx);
+
+/*
+ * sam3_load_model - Load SAM3 model weights from a file.
+ *
+ * @ctx:  Initialized context
+ * @path: Path to model weights file
+ *
+ * Returns SAM3_OK on success. The context takes ownership of the
+ * loaded weights and frees them in sam3_free().
+ */
+enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path);
+
+/*
+ * sam3_set_image - Set the input image for segmentation.
+ *
+ * @ctx:    Initialized context with loaded model
+ * @pixels: RGB pixel data (H * W * 3 uint8_t values)
+ * @width:  Image width in pixels
+ * @height: Image height in pixels
+ *
+ * Runs the image encoder. Subsequent sam3_segment() calls reuse the
+ * encoded image until a new image is set.
+ */
+enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
+			       int width, int height);
+
+/*
+ * sam3_segment - Run segmentation with the given prompts.
+ *
+ * @ctx:      Context with image already set
+ * @prompts:  Array of prompts (points, boxes, or masks)
+ * @n_prompts: Number of prompts
+ * @result:   Output result (caller must call sam3_result_free)
+ *
+ * Returns SAM3_OK on success. The result contains one or more predicted
+ * masks with IoU confidence scores.
+ */
+enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
+			     int n_prompts, struct sam3_result *result);
+
+/*
+ * sam3_result_free - Free memory allocated in a sam3_result.
+ *
+ * @result: Result struct to free (fields set to NULL/0 after).
+ */
+void sam3_result_free(struct sam3_result *result);
+
+/*
+ * sam3_version - Return the sam3 version string.
+ */
+const char *sam3_version(void);
+
+#endif /* SAM3_H */
