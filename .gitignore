@@ -1,0 +1,24 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+
+# Models / weights
+models/*.bin
+models/*.safetensors
+models/*.pt
+models/*.onnx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Generated
+compile_commands.json
