@@ -1,0 +1,41 @@
+/*
+ * src/core/alloc.h - Arena memory allocator
+ *
+ * Provides a simple bump allocator for inference-time memory. All
+ * tensor data is allocated from an arena, which is freed in one shot
+ * when inference completes. This avoids per-tensor malloc/free overhead
+ * and prevents memory fragmentation.
+ *
+ * Key types:  sam3_arena
+ * Depends on: <stddef.h>
+ * Used by:    tensor.c, graph.c, model/ files
+ *
+ * Copyright (c) 2026
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef SAM3_CORE_ALLOC_H
+#define SAM3_CORE_ALLOC_H
+
+#include <stddef.h>
+#include "sam3/sam3_types.h"
+
+struct sam3_arena {
+	void   *base;      /* Start of allocated region */
+	size_t  size;      /* Total capacity in bytes */
+	size_t  offset;    /* Current allocation offset */
+};
+
+/* Create an arena with the given capacity. Returns SAM3_OK or SAM3_ENOMEM. */
+enum sam3_error sam3_arena_init(struct sam3_arena *arena, size_t capacity);
+
+/* Allocate nbytes from the arena (16-byte aligned). Returns NULL if full. */
+void *sam3_arena_alloc(struct sam3_arena *arena, size_t nbytes);
+
+/* Reset the arena (frees all allocations but keeps the backing memory). */
+void sam3_arena_reset(struct sam3_arena *arena);
+
+/* Free the arena and its backing memory. */
+void sam3_arena_free(struct sam3_arena *arena);
+
+#endif /* SAM3_CORE_ALLOC_H */
