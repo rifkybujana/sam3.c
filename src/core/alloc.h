@@ -38,4 +38,10 @@ void sam3_arena_reset(struct sam3_arena *arena);
 /* Free the arena and its backing memory. */
 void sam3_arena_free(struct sam3_arena *arena);
 
+
+struct sam3_profiler;
+
+/* Set the active profiler for memory tracking. NULL to disable. */
+void sam3_arena_set_profiler(struct sam3_profiler *p);
+
 #endif /* SAM3_CORE_ALLOC_H */
