@@ -45,6 +45,11 @@ file(GLOB_RECURSE SAM3_CORE_SOURCES   "src/core/*.c")
 file(GLOB_RECURSE SAM3_MODEL_SOURCES  "src/model/*.c")
 file(GLOB_RECURSE SAM3_UTIL_SOURCES   "src/util/*.c")
 
+# Suppress warnings for vendored code
+file(GLOB_RECURSE SAM3_VENDORED_SOURCES "src/core/json/*.c")
+set_source_files_properties(${SAM3_VENDORED_SOURCES} PROPERTIES
+    COMPILE_FLAGS "-Wno-strict-prototypes -Wno-missing-prototypes -Wno-unused-function -Wno-deprecated-declarations")
+
 set(SAM3_SOURCES
 	src/sam3.c
 	${SAM3_CORE_SOURCES}
