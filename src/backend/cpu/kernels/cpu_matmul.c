@@ -66,7 +66,6 @@ static void matmul_f32_neon(const float *a, const float *b, float *c,
 		int imax = (i0 + TILE_M < M) ? i0 + TILE_M : M;
 		for (int j0 = 0; j0 < N; j0 += TILE_N) {
 			int jmax = (j0 + TILE_N < N) ? j0 + TILE_N : N;
-			int jlen = jmax - j0;
 			for (int k0 = 0; k0 < K; k0 += TILE_K) {
 				int kmax = (k0 + TILE_K < K) ? k0 + TILE_K : K;
 				for (int i = i0; i < imax; i++) {
@@ -85,7 +84,6 @@ static void matmul_f32_neon(const float *a, const float *b, float *c,
 					}
 				}
 			}
-			(void)jlen;
 		}
 	}
 }
@@ -172,6 +170,12 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node)
 
 	if (K_a != K_b) {
 		sam3_log_error("matmul: K mismatch %d != %d", K_a, K_b);
+		return SAM3_EINVAL;
+	}
+
+	if (sam3_tensor_nelems(c) != M * N) {
+		sam3_log_error("matmul: output size mismatch %d != %d",
+			       sam3_tensor_nelems(c), M * N);
 		return SAM3_EINVAL;
 	}
 
