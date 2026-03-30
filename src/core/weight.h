@@ -9,7 +9,7 @@
  * Key types:  sam3_weight_file, sam3_weight_header, sam3_weight_tensor_desc,
  *             weight_reader, weight_reader_ops
  * Depends on: sam3/sam3_types.h, core/tensor.h
- * Used by:    sam3.c, weight.c, weight_safetensors.c, weight_convert.c
+ * Used by:    sam3.c, weight.c, weight_safetensors.c
  *
  * Copyright (c) 2026
  * SPDX-License-Identifier: MIT
@@ -30,7 +30,7 @@
 #define SAM3_WEIGHT_DATA_ALIGN 64   /* per-tensor alignment in data blob */
 #define SAM3_WEIGHT_PAGE_ALIGN 4096 /* data blob start alignment */
 
-/* ── On-disk structures (packed, little-endian) ─────────────────────── */
+/* ── On-disk structures (little-endian) ─────────────────────────────── */
 
 /*
  * File header: 48 bytes.
@@ -62,6 +62,11 @@ struct sam3_weight_tensor_desc {
 	uint64_t data_size;    /* total bytes */
 	uint64_t reserved;
 };
+
+_Static_assert(sizeof(struct sam3_weight_header) == 48,
+	       "header must be exactly 48 bytes on disk");
+_Static_assert(sizeof(struct sam3_weight_tensor_desc) == 112,
+	       "tensor desc must be exactly 112 bytes on disk");
 
 /* ── Runtime loader ─────────────────────────────────────────────────── */
 

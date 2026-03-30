@@ -196,6 +196,8 @@ cleanup:
 	if (fp)
 		fclose(fp);
 	free(descs);
+	if (err != SAM3_OK && output_path)
+		remove(output_path);
 	return err;
 }
 
@@ -327,24 +329,52 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 	}
 
 	/* Populate the handle */
+	enum sam3_error err;
+	size_t data_start = align_up(table_end, SAM3_WEIGHT_PAGE_ALIGN);
+
+	if (data_start > file_size) {
+		sam3_log_error("data section start (%zu) exceeds file size (%zu)",
+			       data_start, file_size);
+		err = SAM3_EMODEL;
+		goto fail;
+	}
+
 	wf->mapped      = mapped;
 	wf->mapped_size = file_size;
 	wf->header      = hdr;
 	wf->tensors     = (const struct sam3_weight_tensor_desc *)
 			  ((const char *)mapped +
 			   sizeof(struct sam3_weight_header));
-	wf->data_base   = (const char *)mapped +
-			  align_up(table_end, SAM3_WEIGHT_PAGE_ALIGN);
+	wf->data_base   = (const char *)mapped + data_start;
+
+	/* Validate all tensor data ranges fit in file */
+	uint32_t n = hdr->n_tensors;
+	size_t data_section_size = file_size - data_start;
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint64_t end = wf->tensors[i].data_offset +
+			       wf->tensors[i].data_size;
+		if (end > data_section_size) {
+			sam3_log_error("tensor %u data extends past file end",
+				       i);
+			err = SAM3_EMODEL;
+			goto fail;
+		}
+	}
 
 	if (build_hash_table(wf) < 0) {
 		sam3_log_error("weight_open: hash table alloc failed");
-		munmap(mapped, file_size);
-		memset(wf, 0, sizeof(*wf));
-		return SAM3_ENOMEM;
+		err = SAM3_ENOMEM;
+		goto fail;
 	}
 
 	sam3_log_info("opened %s: %u tensors", path, hdr->n_tensors);
 	return SAM3_OK;
+
+fail:
+	munmap(mapped, file_size);
+	memset(wf, 0, sizeof(*wf));
+	return err;
 }
 
 void sam3_weight_close(struct sam3_weight_file *wf)

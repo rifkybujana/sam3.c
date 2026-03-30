@@ -68,6 +68,7 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 	struct st_reader_state *s = NULL;
 	struct st_tensor_entry *entries = NULL;
 	size_t file_size = 0;
+	enum sam3_error err = SAM3_EIO;
 
 	if (!r || !path) {
 		sam3_log_error("st_open: NULL argument");
@@ -192,9 +193,10 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 			goto fail;
 		}
 		e->n_dims = cJSON_GetArraySize(shape);
-		if (e->n_dims > SAM3_MAX_DIMS) {
-			sam3_log_error("st_open: too many dims for %s",
-				       item->string);
+		if (e->n_dims < 1 || e->n_dims > SAM3_MAX_DIMS) {
+			sam3_log_error("unsupported ndims %d for tensor %s",
+				       e->n_dims, item->string);
+			err = SAM3_EMODEL;
 			goto fail;
 		}
 		for (int d = 0; d < e->n_dims; d++) {
@@ -227,7 +229,22 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 		}
 		e->data_start = (size_t)off_start->valuedouble;
 		e->data_end   = (size_t)off_end->valuedouble;
-		e->nbytes     = e->data_end - e->data_start;
+		if (e->data_end < e->data_start) {
+			sam3_log_error("data_end < data_start for tensor %s",
+				       e->name);
+			err = SAM3_EMODEL;
+			goto fail;
+		}
+		e->nbytes = e->data_end - e->data_start;
+
+		size_t data_section_size = file_size - 8 -
+					   (size_t)header_size;
+		if (e->data_end > data_section_size) {
+			sam3_log_error("data_offsets exceed file "
+				       "for tensor %s", e->name);
+			err = SAM3_EMODEL;
+			goto fail;
+		}
 
 		sam3_log_debug("st tensor[%d] \"%s\": %zu bytes "
 			       "[%zu, %zu)", idx, e->name, e->nbytes,
@@ -261,7 +278,7 @@ fail:
 	free(entries);
 	if (mapped != MAP_FAILED)
 		munmap(mapped, file_size);
-	return SAM3_EIO;
+	return err;
 }
 
 static int st_n_tensors(struct weight_reader *r)
