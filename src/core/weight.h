@@ -24,9 +24,9 @@
 
 /* .sam3 file magic: ASCII "SAM3" = 0x53414D33 (little-endian: 0x334D4153) */
 #define SAM3_WEIGHT_MAGIC   0x334D4153
-#define SAM3_WEIGHT_VERSION 1
+#define SAM3_WEIGHT_VERSION 2
 
-#define SAM3_WEIGHT_NAME_MAX   64
+#define SAM3_WEIGHT_NAME_MAX   128
 #define SAM3_WEIGHT_DATA_ALIGN 64   /* per-tensor alignment in data blob */
 #define SAM3_WEIGHT_PAGE_ALIGN 4096 /* data blob start alignment */
 
@@ -65,8 +65,8 @@ struct sam3_weight_tensor_desc {
 
 _Static_assert(sizeof(struct sam3_weight_header) == 48,
 	       "header must be exactly 48 bytes on disk");
-_Static_assert(sizeof(struct sam3_weight_tensor_desc) == 112,
-	       "tensor desc must be exactly 112 bytes on disk");
+_Static_assert(sizeof(struct sam3_weight_tensor_desc) == 176,
+	       "tensor desc must be exactly 176 bytes on disk");
 
 /* ── Runtime loader ─────────────────────────────────────────────────── */
 
