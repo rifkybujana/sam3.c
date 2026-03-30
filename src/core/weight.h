@@ -75,8 +75,8 @@ _Static_assert(sizeof(struct sam3_weight_tensor_desc) == 176,
  * Tensor data pointers are valid until sam3_weight_close().
  */
 struct sam3_weight_file {
-	void                                *mapped;
-	size_t                               mapped_size;
+	void                                 *mapped;
+	size_t                                mapped_size;
 	const struct sam3_weight_header      *header;
 	const struct sam3_weight_tensor_desc *tensors;
 	const void                           *data_base;
