@@ -1,4 +1,5 @@
 # Build
+.cache/
 build/
 cmake-build-*/
 *.o
@@ -11,6 +12,7 @@ models/*.bin
 models/*.safetensors
 models/*.pt
 models/*.onnx
+models/*.sam3
 
 # IDE
 .vscode/
@@ -19,6 +21,7 @@ models/*.onnx
 *.swo
 *~
 .DS_Store
+docs/plans
 
 # Generated
 compile_commands.json
