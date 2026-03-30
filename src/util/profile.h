@@ -52,9 +52,9 @@ struct sam3_prof_mem {
 
 /* Profiler instance. */
 struct sam3_profiler {
-	int                       enabled;
+	int                        enabled;
 	struct sam3_prof_stage     stages[SAM3_PROF_MAX_STAGES];
-	int                       n_stages;
+	int                        n_stages;
 	struct sam3_prof_op_stats  op_stats[SAM3_OP_COUNT];
 	struct sam3_prof_mem       mem;
 };
@@ -103,12 +103,12 @@ void sam3_profiler_report(const struct sam3_profiler *p);
 
 #else /* !SAM3_HAS_PROFILE */
 
-#define SAM3_PROF_BEGIN(prof, name)           ((void)0)
-#define SAM3_PROF_END(prof, name)             ((void)0)
-#define SAM3_PROF_OP_BEGIN(prof, op)          ((void)0)
-#define SAM3_PROF_OP_END(prof, op)            ((void)0)
-#define SAM3_PROF_MEM(prof, nbytes)           ((void)0)
-#define SAM3_PROF_MEM_ARENA(prof)             ((void)0)
+#define SAM3_PROF_BEGIN(prof, name)            ((void)0)
+#define SAM3_PROF_END(prof, name)              ((void)0)
+#define SAM3_PROF_OP_BEGIN(prof, op)           ((void)0)
+#define SAM3_PROF_OP_END(prof, op)             ((void)0)
+#define SAM3_PROF_MEM(prof, nbytes)            ((void)0)
+#define SAM3_PROF_MEM_ARENA(prof)              ((void)0)
 #define SAM3_PROF_MEM_ARENA_RESET(prof, freed) ((void)0)
 
 #endif /* SAM3_HAS_PROFILE */
