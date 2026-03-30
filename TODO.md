@@ -4,21 +4,20 @@
 
 ### Priority 1 — Blocking
 
-- [ ] **CPU compute kernels** (`src/backend/cpu/kernels/`)
-  - [ ] `matmul` — matrix multiplication (hot path, optimize first)
-  - [ ] `conv2d` — 2D convolution
-  - [ ] `softmax`
-  - [ ] `layernorm`
-  - [ ] `gelu`
-  - [ ] `relu`
-  - [ ] `add` — elementwise
-  - [ ] `mul` — elementwise
-  - [ ] `reshape` — view operation (zero-copy)
-  - [ ] `transpose` — view or copy depending on layout
+- [x] **CPU compute kernels** (`src/backend/cpu/kernels/`)
+  - [x] `matmul` — tiled 8×8×64, NEON vfmaq_f32
+  - [x] `conv2d` — im2col + matmul, scratch arena
+  - [x] `softmax` — row-wise, numerically stable
+  - [x] `layernorm` — optional gamma/beta, eps=1e-5
+  - [x] `gelu` — fast tanh approximation
+  - [x] `relu`
+  - [x] `add` — with [M,N]+[N] broadcasting
+  - [x] `mul` — with [M,N]+[N] broadcasting
+  - [x] `reshape` — zero-copy data aliasing
+  - [x] `transpose` — 4×4 NEON block transpose
 
-- [ ] **Backend graph evaluator** (`src/backend/cpu/cpu_backend.c`)
-  - `cpu_graph_eval()` — iterate nodes, dispatch to kernel functions
-  - Topological order traversal
+- [x] **Backend graph evaluator** (`src/backend/cpu/cpu_backend.c`)
+  - `cpu_graph_eval()` — dispatch switch over all ops
   - Error propagation from kernel failures
 
 ### Priority 2 — Important
@@ -76,3 +75,5 @@ Depends on all Priority 1 ground systems.
 - [x] SafeTensors reader (`src/core/weight_safetensors.c`)
 - [x] `sam3_convert` CLI (`tools/sam3_convert.c`)
 - [x] Backend tensor allocation (`src/backend/cpu/cpu_backend.c`)
+- [x] CPU compute kernels with NEON SIMD (`src/backend/cpu/kernels/`)
+- [x] Backend graph evaluator (`src/backend/cpu/cpu_backend.c`)
