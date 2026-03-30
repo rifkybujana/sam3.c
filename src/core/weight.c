@@ -13,4 +13,399 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "weight.h"
+#include "util/log.h"
+
+/* ── Helpers ───────────────────────────────────────────────────────── */
+
+static size_t align_up(size_t val, size_t align)
+{
+	return (val + align - 1) & ~(align - 1);
+}
+
+/* ── Writer ────────────────────────────────────────────────────────── */
+
+enum sam3_error sam3_weight_write(const char *output_path,
+				  const struct sam3_model_config *config,
+				  struct weight_reader *reader)
+{
+	FILE *fp = NULL;
+	struct sam3_weight_tensor_desc *descs = NULL;
+	void *buf = NULL;
+	enum sam3_error err = SAM3_OK;
+	int n;
+
+	if (!output_path || !config || !reader) {
+		sam3_log_error("weight_write: NULL argument");
+		return SAM3_EINVAL;
+	}
+
+	n = reader->ops->n_tensors(reader);
+	if (n <= 0) {
+		sam3_log_error("weight_write: no tensors in reader");
+		return SAM3_EINVAL;
+	}
+
+	/* Build header */
+	struct sam3_weight_header hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic            = SAM3_WEIGHT_MAGIC;
+	hdr.version          = SAM3_WEIGHT_VERSION;
+	hdr.flags            = 0;
+	hdr.n_tensors        = (uint32_t)n;
+	hdr.image_size       = config->image_size;
+	hdr.encoder_dim      = config->encoder_dim;
+	hdr.decoder_dim      = config->decoder_dim;
+	hdr.n_encoder_layers = config->n_encoder_layers;
+	hdr.n_decoder_layers = config->n_decoder_layers;
+
+	/* Build tensor descriptors */
+	descs = calloc((size_t)n, sizeof(*descs));
+	if (!descs) {
+		err = SAM3_ENOMEM;
+		goto cleanup;
+	}
+
+	size_t data_offset = 0;
+
+	for (int i = 0; i < n; i++) {
+		struct weight_tensor_info info;
+		err = reader->ops->get_tensor_info(reader, i, &info);
+		if (err != SAM3_OK)
+			goto cleanup;
+
+		/* Copy name, truncating if necessary */
+		size_t name_len = strlen(info.name);
+		if (name_len >= SAM3_WEIGHT_NAME_MAX) {
+			sam3_log_warn("tensor name truncated: %s", info.name);
+			name_len = SAM3_WEIGHT_NAME_MAX - 1;
+		}
+		memcpy(descs[i].name, info.name, name_len);
+		descs[i].name[name_len] = '\0';
+
+		descs[i].dtype       = (uint32_t)info.dtype;
+		descs[i].n_dims      = (uint32_t)info.n_dims;
+		for (int d = 0; d < SAM3_MAX_DIMS; d++)
+			descs[i].dims[d] = info.dims[d];
+		descs[i].data_offset = data_offset;
+		descs[i].data_size   = info.nbytes;
+		descs[i].reserved    = 0;
+
+		sam3_log_debug("tensor[%d] \"%s\": %zu bytes @ offset %zu",
+			       i, descs[i].name,
+			       (size_t)descs[i].data_size,
+			       (size_t)descs[i].data_offset);
+
+		data_offset = align_up(data_offset + info.nbytes,
+				       SAM3_WEIGHT_DATA_ALIGN);
+	}
+
+	/* Open output file */
+	fp = fopen(output_path, "wb");
+	if (!fp) {
+		sam3_log_error("weight_write: cannot open %s", output_path);
+		err = SAM3_EIO;
+		goto cleanup;
+	}
+
+	/* Write header */
+	if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
+		err = SAM3_EIO;
+		goto cleanup;
+	}
+
+	/* Write tensor descriptors */
+	if (fwrite(descs, sizeof(*descs), (size_t)n, fp) != (size_t)n) {
+		err = SAM3_EIO;
+		goto cleanup;
+	}
+
+	/* Pad to page boundary before data blob */
+	size_t table_end = sizeof(hdr) + (size_t)n * sizeof(*descs);
+	size_t data_start = align_up(table_end, SAM3_WEIGHT_PAGE_ALIGN);
+	size_t pad_bytes = data_start - table_end;
+
+	if (pad_bytes > 0) {
+		void *zeros = calloc(1, pad_bytes);
+		if (!zeros) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		size_t written = fwrite(zeros, 1, pad_bytes, fp);
+		free(zeros);
+		if (written != pad_bytes) {
+			err = SAM3_EIO;
+			goto cleanup;
+		}
+	}
+
+	/* Write tensor data with 64-byte alignment padding */
+	for (int i = 0; i < n; i++) {
+		size_t nbytes = (size_t)descs[i].data_size;
+
+		/* Allocate buffer for this tensor's data */
+		buf = malloc(nbytes);
+		if (!buf) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+
+		err = reader->ops->read_tensor_data(reader, i, buf, nbytes);
+		if (err != SAM3_OK) {
+			free(buf);
+			buf = NULL;
+			goto cleanup;
+		}
+
+		if (fwrite(buf, 1, nbytes, fp) != nbytes) {
+			free(buf);
+			buf = NULL;
+			err = SAM3_EIO;
+			goto cleanup;
+		}
+
+		free(buf);
+		buf = NULL;
+
+		/* Pad to 64-byte alignment (except after the last tensor) */
+		if (i < n - 1) {
+			size_t aligned = align_up(nbytes, SAM3_WEIGHT_DATA_ALIGN);
+			size_t tensor_pad = aligned - nbytes;
+			if (tensor_pad > 0) {
+				uint8_t pad[SAM3_WEIGHT_DATA_ALIGN];
+				memset(pad, 0, sizeof(pad));
+				if (fwrite(pad, 1, tensor_pad, fp) != tensor_pad) {
+					err = SAM3_EIO;
+					goto cleanup;
+				}
+			}
+		}
+	}
+
+	sam3_log_info("wrote %d tensors to %s", n, output_path);
+
+cleanup:
+	if (fp)
+		fclose(fp);
+	free(descs);
+	return err;
+}
+
+/* ── Loader ────────────────────────────────────────────────────────── */
+
+static uint32_t fnv1a(const char *s)
+{
+	uint32_t h = 0x811c9dc5;
+
+	while (*s) {
+		h ^= (uint8_t)*s++;
+		h *= 0x01000193;
+	}
+	return h;
+}
+
+static uint32_t next_pow2(uint32_t v)
+{
+	v--;
+	v |= v >> 1;
+	v |= v >> 2;
+	v |= v >> 4;
+	v |= v >> 8;
+	v |= v >> 16;
+	v++;
+	return v;
+}
+
+static int build_hash_table(struct sam3_weight_file *wf)
+{
+	uint32_t n = wf->header->n_tensors;
+	uint32_t min_cap = n * 2;
+
+	if (min_cap < 8)
+		min_cap = 8;
+	uint32_t cap = next_pow2(min_cap);
+
+	wf->hash_table = malloc(cap * sizeof(uint32_t));
+	if (!wf->hash_table)
+		return -1;
+
+	wf->hash_capacity = cap;
+
+	for (uint32_t i = 0; i < cap; i++)
+		wf->hash_table[i] = SAM3_WEIGHT_HASH_EMPTY;
+
+	uint32_t mask = cap - 1;
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t slot = fnv1a(wf->tensors[i].name) & mask;
+		while (wf->hash_table[slot] != SAM3_WEIGHT_HASH_EMPTY)
+			slot = (slot + 1) & mask;
+		wf->hash_table[slot] = i;
+	}
+
+	return 0;
+}
+
+enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
+				 const char *path)
+{
+	int fd = -1;
+	void *mapped = MAP_FAILED;
+	size_t file_size = 0;
+
+	if (!wf || !path) {
+		sam3_log_error("weight_open: NULL argument");
+		return SAM3_EINVAL;
+	}
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		sam3_log_error("weight_open: cannot open %s", path);
+		return SAM3_EIO;
+	}
+
+	struct stat st;
+	if (fstat(fd, &st) < 0) {
+		sam3_log_error("weight_open: fstat failed for %s", path);
+		close(fd);
+		return SAM3_EIO;
+	}
+
+	file_size = (size_t)st.st_size;
+	if (file_size < sizeof(struct sam3_weight_header)) {
+		sam3_log_error("weight_open: file too small: %s", path);
+		close(fd);
+		return SAM3_EMODEL;
+	}
+
+	mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+
+	if (mapped == MAP_FAILED) {
+		sam3_log_error("weight_open: mmap failed for %s", path);
+		return SAM3_EIO;
+	}
+
+	/* Validate header */
+	const struct sam3_weight_header *hdr = mapped;
+
+	if (hdr->magic != SAM3_WEIGHT_MAGIC) {
+		sam3_log_error("weight_open: bad magic 0x%08x in %s",
+			       hdr->magic, path);
+		munmap(mapped, file_size);
+		memset(wf, 0, sizeof(*wf));
+		return SAM3_EMODEL;
+	}
+
+	if (hdr->version != SAM3_WEIGHT_VERSION) {
+		sam3_log_error("weight_open: unsupported version %u in %s",
+			       hdr->version, path);
+		munmap(mapped, file_size);
+		memset(wf, 0, sizeof(*wf));
+		return SAM3_EMODEL;
+	}
+
+	/* Validate tensor table fits in file */
+	size_t table_size = (size_t)hdr->n_tensors *
+			    sizeof(struct sam3_weight_tensor_desc);
+	size_t table_end = sizeof(struct sam3_weight_header) + table_size;
+
+	if (table_end > file_size) {
+		sam3_log_error("weight_open: tensor table exceeds file: %s",
+			       path);
+		munmap(mapped, file_size);
+		memset(wf, 0, sizeof(*wf));
+		return SAM3_EMODEL;
+	}
+
+	/* Populate the handle */
+	wf->mapped      = mapped;
+	wf->mapped_size = file_size;
+	wf->header      = hdr;
+	wf->tensors     = (const struct sam3_weight_tensor_desc *)
+			  ((const char *)mapped +
+			   sizeof(struct sam3_weight_header));
+	wf->data_base   = (const char *)mapped +
+			  align_up(table_end, SAM3_WEIGHT_PAGE_ALIGN);
+
+	if (build_hash_table(wf) < 0) {
+		sam3_log_error("weight_open: hash table alloc failed");
+		munmap(mapped, file_size);
+		memset(wf, 0, sizeof(*wf));
+		return SAM3_ENOMEM;
+	}
+
+	sam3_log_info("opened %s: %u tensors", path, hdr->n_tensors);
+	return SAM3_OK;
+}
+
+void sam3_weight_close(struct sam3_weight_file *wf)
+{
+	if (!wf)
+		return;
+
+	if (wf->mapped && wf->mapped_size > 0)
+		munmap(wf->mapped, wf->mapped_size);
+
+	free(wf->hash_table);
+	memset(wf, 0, sizeof(*wf));
+}
+
+const struct sam3_weight_tensor_desc *sam3_weight_find(
+	const struct sam3_weight_file *wf, const char *name)
+{
+	if (!wf || !name || !wf->hash_table)
+		return NULL;
+
+	uint32_t mask = wf->hash_capacity - 1;
+	uint32_t slot = fnv1a(name) & mask;
+
+	while (wf->hash_table[slot] != SAM3_WEIGHT_HASH_EMPTY) {
+		uint32_t idx = wf->hash_table[slot];
+		if (strcmp(wf->tensors[idx].name, name) == 0)
+			return &wf->tensors[idx];
+		slot = (slot + 1) & mask;
+	}
+
+	return NULL;
+}
+
+const void *sam3_weight_tensor_data(
+	const struct sam3_weight_file *wf,
+	const struct sam3_weight_tensor_desc *desc)
+{
+	if (!wf || !desc)
+		return NULL;
+
+	return (const char *)wf->data_base + desc->data_offset;
+}
+
+enum sam3_error sam3_weight_to_tensor(
+	const struct sam3_weight_file *wf,
+	const struct sam3_weight_tensor_desc *desc,
+	struct sam3_tensor *out)
+{
+	if (!wf || !desc || !out)
+		return SAM3_EINVAL;
+
+	out->dtype  = (enum sam3_dtype)desc->dtype;
+	out->n_dims = (int)desc->n_dims;
+
+	for (int i = 0; i < SAM3_MAX_DIMS; i++)
+		out->dims[i] = desc->dims[i];
+
+	out->data   = (void *)sam3_weight_tensor_data(wf, desc);
+	out->nbytes = (size_t)desc->data_size;
+
+	sam3_tensor_compute_strides(out);
+
+	return SAM3_OK;
+}
