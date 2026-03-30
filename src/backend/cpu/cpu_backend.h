@@ -23,9 +23,13 @@
 /* Default arena capacity: 256 MiB — enough for SAM3 inference. */
 #define SAM3_CPU_ARENA_DEFAULT_CAPACITY (256UL * 1024 * 1024)
 
+/* Default scratch arena: 64 MiB for conv2d im2col temp buffers. */
+#define SAM3_CPU_SCRATCH_DEFAULT_CAPACITY (64UL * 1024 * 1024)
+
 struct sam3_cpu_backend {
 	struct sam3_backend base;           /* Must be first member */
 	struct sam3_arena   arena;          /* Tensor data arena */
+	struct sam3_arena   scratch;        /* Scratch arena for temp buffers */
 	size_t              arena_capacity; /* 0 = use default */
 };
 

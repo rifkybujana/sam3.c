@@ -43,6 +43,7 @@ struct sam3_node {
 	struct sam3_tensor  *inputs[SAM3_NODE_MAX_INPUTS];
 	int                  n_inputs;
 	struct sam3_tensor  *output;
+	int                  params[4]; /* Op-specific (e.g. conv2d stride/padding) */
 };
 
 /* A compute graph: ordered list of nodes. */

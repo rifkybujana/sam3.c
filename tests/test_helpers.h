@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -36,6 +37,16 @@ static int tests_failed = 0;
 	if ((a) != (b)) {                                               \
 		fprintf(stderr, "FAIL %s:%d: %s != %s\n",                   \
 			__FILE__, __LINE__, #a, #b);                            \
+		tests_failed++;                                             \
+	}                                                               \
+} while (0)
+
+#define ASSERT_NEAR(a, b, eps) do {                                  \
+	tests_run++;                                                    \
+	if (fabs((double)(a) - (double)(b)) > (double)(eps)) {          \
+		fprintf(stderr, "FAIL %s:%d: %s=%g != %s=%g (eps=%g)\n",    \
+			__FILE__, __LINE__, #a, (double)(a),                    \
+			#b, (double)(b), (double)(eps));                         \
 		tests_failed++;                                             \
 	}                                                               \
 } while (0)

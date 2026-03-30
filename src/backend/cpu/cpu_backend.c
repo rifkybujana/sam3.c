@@ -15,6 +15,7 @@
  */
 
 #include "cpu_backend.h"
+#include "kernels/cpu_kernels.h"
 #include "core/tensor.h"
 #include "util/log.h"
 
@@ -34,6 +35,14 @@ static enum sam3_error cpu_init(struct sam3_backend *be)
 		return err;
 	}
 
+	err = sam3_arena_init(&cpu->scratch,
+			      SAM3_CPU_SCRATCH_DEFAULT_CAPACITY);
+	if (err != SAM3_OK) {
+		sam3_arena_free(&cpu->arena);
+		sam3_log_error("CPU backend: scratch arena init failed");
+		return err;
+	}
+
 	sam3_log_info("CPU backend initialized (arena: %zu bytes)", capacity);
 	return SAM3_OK;
 }
@@ -42,6 +51,7 @@ static void cpu_free(struct sam3_backend *be)
 {
 	struct sam3_cpu_backend *cpu = (struct sam3_cpu_backend *)be;
 
+	sam3_arena_free(&cpu->scratch);
 	sam3_arena_free(&cpu->arena);
 	sam3_log_debug("CPU backend freed");
 }
@@ -97,9 +107,60 @@ static enum sam3_error cpu_alloc_tensor(struct sam3_backend *be,
 static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 				     struct sam3_graph *g)
 {
-	(void)be;
-	(void)g;
-	/* TODO: iterate nodes, dispatch to CPU kernels */
+	struct sam3_cpu_backend *cpu = (struct sam3_cpu_backend *)be;
+	enum sam3_error err;
+
+	for (int i = 0; i < g->n_nodes; i++) {
+		struct sam3_node *node = &g->nodes[i];
+
+		switch (node->op) {
+		case SAM3_OP_MATMUL:
+			err = cpu_kernel_matmul(node);
+			break;
+		case SAM3_OP_ADD:
+			err = cpu_kernel_add(node);
+			break;
+		case SAM3_OP_MUL:
+			err = cpu_kernel_mul(node);
+			break;
+		case SAM3_OP_SOFTMAX:
+			err = cpu_kernel_softmax(node);
+			break;
+		case SAM3_OP_RELU:
+			err = cpu_kernel_relu(node);
+			break;
+		case SAM3_OP_GELU:
+			err = cpu_kernel_gelu(node);
+			break;
+		case SAM3_OP_LAYERNORM:
+			err = cpu_kernel_layernorm(node);
+			break;
+		case SAM3_OP_CONV2D:
+			err = cpu_kernel_conv2d(node, &cpu->scratch);
+			break;
+		case SAM3_OP_RESHAPE:
+			err = cpu_kernel_reshape(node);
+			break;
+		case SAM3_OP_TRANSPOSE:
+			err = cpu_kernel_transpose(node);
+			break;
+		case SAM3_OP_NONE:
+			err = SAM3_OK;
+			break;
+		default:
+			sam3_log_error("cpu_graph_eval: unknown op %d",
+				       node->op);
+			err = SAM3_EINVAL;
+			break;
+		}
+
+		if (err != SAM3_OK) {
+			sam3_log_error("cpu_graph_eval: node %d (op=%d) failed",
+				       i, node->op);
+			return err;
+		}
+	}
+
 	return SAM3_OK;
 }
 
