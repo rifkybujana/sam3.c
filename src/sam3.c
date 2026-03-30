@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "sam3/sam3.h"
+#include "core/weight.h"
 #ifdef SAM3_HAS_PROFILE
 #include "util/profile.h"
 #endif
@@ -24,6 +25,7 @@
 /* Internal context definition. */
 struct sam3_ctx {
 	struct sam3_model_config config;
+	struct sam3_weight_file weights;
 	int loaded;
 #ifdef SAM3_HAS_PROFILE
 	struct sam3_profiler *profiler;
@@ -45,6 +47,8 @@ void sam3_free(sam3_ctx *ctx)
 {
 	if (!ctx)
 		return;
+	if (ctx->loaded)
+		sam3_weight_close(&ctx->weights);
 #ifdef SAM3_HAS_PROFILE
 	sam3_profiler_free(ctx->profiler);
 #endif
@@ -53,9 +57,27 @@ void sam3_free(sam3_ctx *ctx)
 
 enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 {
-	(void)ctx;
-	(void)path;
-	return SAM3_EMODEL; /* Not yet implemented */
+	if (!ctx || !path)
+		return SAM3_EINVAL;
+	if (ctx->loaded) {
+		sam3_weight_close(&ctx->weights);
+		ctx->loaded = 0;
+	}
+
+	enum sam3_error err = sam3_weight_open(&ctx->weights, path);
+	if (err)
+		return err;
+
+	/* Copy model config from weight file header */
+	const struct sam3_weight_header *h = ctx->weights.header;
+	ctx->config.image_size       = h->image_size;
+	ctx->config.encoder_dim      = h->encoder_dim;
+	ctx->config.decoder_dim      = h->decoder_dim;
+	ctx->config.n_encoder_layers = h->n_encoder_layers;
+	ctx->config.n_decoder_layers = h->n_decoder_layers;
+
+	ctx->loaded = 1;
+	return SAM3_OK;
 }
 
 enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
