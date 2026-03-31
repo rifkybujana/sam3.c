@@ -27,7 +27,7 @@
   - RGB uint8 output matching `sam3_set_image()` interface
   - Image resize/normalize for model input
 
-- [ ] **Thread pool** (`src/util/threadpool.h/.c`)
+- [x] **Thread pool** (`src/util/threadpool.h/.c`)
   - Fixed-size worker pool
   - Task queue for parallel kernel execution
   - Used by CPU backend for matmul/conv2d parallelism
