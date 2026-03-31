@@ -75,6 +75,10 @@ endif()
 # Static library
 add_library(sam3 STATIC ${SAM3_SOURCES})
 
+# Link pthreads
+find_package(Threads REQUIRED)
+target_link_libraries(sam3 Threads::Threads)
+
 if(SAM3_METAL)
 	target_link_libraries(sam3 ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
 endif()
