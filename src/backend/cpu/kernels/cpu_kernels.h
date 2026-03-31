@@ -46,7 +46,8 @@ enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node);
 
 /* Conv2D via im2col + matmul. scratch arena for temp buffers. */
 enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
-				  struct sam3_arena *scratch);
+				  struct sam3_arena *scratch,
+				  struct sam3_threadpool *pool);
 
 /* Reshape: zero-copy, sets output->data = input->data */
 enum sam3_error cpu_kernel_reshape(const struct sam3_node *node);

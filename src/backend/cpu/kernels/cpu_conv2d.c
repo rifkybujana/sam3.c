@@ -21,6 +21,7 @@
 #include "core/tensor.h"
 #include "core/alloc.h"
 #include "util/log.h"
+#include "util/threadpool.h"
 
 #include <string.h>
 
@@ -61,26 +62,40 @@ static void im2col_f32(const float *in, float *col,
 	(void)col_rows;
 }
 
-/*
- * Simple matmul for conv2d: C = A @ B
- * A: [M, K], B: [K, N], C: [M, N]
- */
-static void conv2d_matmul_f32(const float *a, const float *b, float *c,
-			      int M, int K, int N)
-{
-	memset(c, 0, (size_t)M * N * sizeof(float));
+struct conv2d_matmul_ctx {
+	const float *a;
+	const float *b;
+	float       *c;
+	int          M;
+	int          K;
+	int          N;
+};
 
-	for (int i = 0; i < M; i++) {
-		for (int k = 0; k < K; k++) {
-			float aik = a[i * K + k];
-			for (int j = 0; j < N; j++)
-				c[i * N + j] += aik * b[k * N + j];
+static void conv2d_matmul_parallel_fn(void *arg, int task_id, int n_tasks)
+{
+	struct conv2d_matmul_ctx *ctx = (struct conv2d_matmul_ctx *)arg;
+	int chunk = ctx->M / n_tasks;
+	int m_start = task_id * chunk;
+	int m_end = (task_id == n_tasks - 1) ? ctx->M : m_start + chunk;
+
+	if (m_start >= m_end)
+		return;
+
+	memset(ctx->c + (size_t)m_start * ctx->N, 0,
+	       (size_t)(m_end - m_start) * ctx->N * sizeof(float));
+
+	for (int i = m_start; i < m_end; i++) {
+		for (int k = 0; k < ctx->K; k++) {
+			float aik = ctx->a[i * ctx->K + k];
+			for (int j = 0; j < ctx->N; j++)
+				ctx->c[i * ctx->N + j] += aik * ctx->b[k * ctx->N + j];
 		}
 	}
 }
 
 enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
-				  struct sam3_arena *scratch)
+				  struct sam3_arena *scratch,
+				  struct sam3_threadpool *pool)
 {
 	if (node->n_inputs < 2 || !node->inputs[0] || !node->inputs[1] ||
 	    !node->output) {
@@ -150,9 +165,16 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 
 		im2col_f32(in_n, col, C, H, W, KH, KW, stride, pad, OH, OW);
 
-		/* weight [OC, C*KH*KW] @ col [C*KH*KW, OH*OW] -> out [OC, OH*OW] */
-		conv2d_matmul_f32(w_data, col, out_n,
-				  OC, C * KH * KW, OH * OW);
+		/* Parallel matmul: weight [OC, C*KH*KW] @ col -> out [OC, OH*OW] */
+		struct conv2d_matmul_ctx mctx = {
+			.a = w_data, .b = col, .c = out_n,
+			.M = OC, .K = C * KH * KW, .N = OH * OW,
+		};
+		int n_tasks = sam3_threadpool_n_threads(pool);
+		if (n_tasks < 1)
+			n_tasks = 1;
+		sam3_threadpool_parallel_for(pool, conv2d_matmul_parallel_fn,
+					     &mctx, n_tasks);
 	}
 
 	/* Restore scratch offset — frees the im2col buffer */

@@ -154,7 +154,7 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 			err = cpu_kernel_layernorm(node);
 			break;
 		case SAM3_OP_CONV2D:
-			err = cpu_kernel_conv2d(node, &cpu->scratch);
+			err = cpu_kernel_conv2d(node, &cpu->scratch, cpu->pool);
 			break;
 		case SAM3_OP_RESHAPE:
 			err = cpu_kernel_reshape(node);
