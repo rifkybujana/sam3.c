@@ -6,7 +6,7 @@
  * Always copies data (no lazy stride swap).
  *
  * Key types:  sam3_node, sam3_tensor
- * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h
+ * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h, util/threadpool.h
  * Used by:    cpu_backend.c (dispatch)
  *
  * Copyright (c) 2026
@@ -17,15 +17,17 @@
 #include "cpu_simd.h"
 #include "core/tensor.h"
 #include "util/log.h"
+#include "util/threadpool.h"
 
 /* --- Scalar path (when no SIMD available) --- */
 
 #if !SAM3_HAS_NEON && !SAM3_HAS_AVX2
 
 static void transpose_f32_scalar(const float *in, float *out,
-				 int rows, int cols)
+				 int rows, int cols,
+				 int row_start, int row_end)
 {
-	for (int i = 0; i < rows; i++)
+	for (int i = row_start; i < row_end; i++)
 		for (int j = 0; j < cols; j++)
 			out[j * rows + i] = in[i * cols + j];
 }
@@ -58,12 +60,13 @@ static void transpose_4x4_neon(const float *in, float *out,
 }
 
 static void transpose_f32_neon(const float *in, float *out,
-			       int rows, int cols)
+			       int rows, int cols,
+			       int row_start, int row_end)
 {
-	int i = 0;
+	int i = row_start;
 
 	/* Process 4x4 blocks */
-	for (; i + 4 <= rows; i += 4) {
+	for (; i + 4 <= row_end; i += 4) {
 		int j = 0;
 		for (; j + 4 <= cols; j += 4)
 			transpose_4x4_neon(in + i * cols + j,
@@ -76,7 +79,7 @@ static void transpose_f32_neon(const float *in, float *out,
 	}
 
 	/* Remainder rows */
-	for (; i < rows; i++)
+	for (; i < row_end; i++)
 		for (int j = 0; j < cols; j++)
 			out[j * rows + i] = in[i * cols + j];
 }
@@ -88,12 +91,13 @@ static void transpose_f32_neon(const float *in, float *out,
 #if SAM3_HAS_AVX2
 
 static void transpose_f32_avx2(const float *in, float *out,
-			       int rows, int cols)
+			       int rows, int cols,
+			       int row_start, int row_end)
 {
 	/* Use 8x8 blocks for AVX2 */
-	int i = 0;
+	int i = row_start;
 
-	for (; i + 8 <= rows; i += 8) {
+	for (; i + 8 <= row_end; i += 8) {
 		int j = 0;
 		for (; j + 8 <= cols; j += 8) {
 			/* Load 8 rows of 8 floats */
@@ -148,17 +152,47 @@ static void transpose_f32_avx2(const float *in, float *out,
 				out[j * rows + ii] = in[ii * cols + j];
 	}
 
-	for (; i < rows; i++)
+	for (; i < row_end; i++)
 		for (int j = 0; j < cols; j++)
 			out[j * rows + i] = in[i * cols + j];
 }
 
 #endif /* SAM3_HAS_AVX2 */
 
+/* --- Parallel dispatch --- */
+
+struct transpose_par_ctx {
+	const float *in;
+	float       *out;
+	int          rows;
+	int          cols;
+};
+
+static void transpose_parallel_fn(void *arg, int task_id, int n_tasks)
+{
+	struct transpose_par_ctx *ctx = (struct transpose_par_ctx *)arg;
+	int chunk = ctx->rows / n_tasks;
+	int row_start = task_id * chunk;
+	int row_end = (task_id == n_tasks - 1) ? ctx->rows : row_start + chunk;
+
+	if (row_start >= row_end)
+		return;
+
+#if SAM3_HAS_NEON
+	transpose_f32_neon(ctx->in, ctx->out, ctx->rows, ctx->cols,
+			   row_start, row_end);
+#elif SAM3_HAS_AVX2
+	transpose_f32_avx2(ctx->in, ctx->out, ctx->rows, ctx->cols,
+			   row_start, row_end);
+#else
+	transpose_f32_scalar(ctx->in, ctx->out, ctx->rows, ctx->cols,
+			     row_start, row_end);
+#endif
+}
+
 enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
 				     struct sam3_threadpool *pool)
 {
-	(void)pool;
 	if (!node->inputs[0] || !node->output) {
 		sam3_log_error("transpose: NULL tensor");
 		return SAM3_EINVAL;
@@ -178,19 +212,19 @@ enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	int rows = in->dims[0];
-	int cols = in->dims[1];
+	struct transpose_par_ctx ctx = {
+		.in   = (const float *)in->data,
+		.out  = (float *)out->data,
+		.rows = in->dims[0],
+		.cols = in->dims[1],
+	};
 
-#if SAM3_HAS_NEON
-	transpose_f32_neon((const float *)in->data, (float *)out->data,
-			   rows, cols);
-#elif SAM3_HAS_AVX2
-	transpose_f32_avx2((const float *)in->data, (float *)out->data,
-			   rows, cols);
-#else
-	transpose_f32_scalar((const float *)in->data, (float *)out->data,
-			     rows, cols);
-#endif
+	int n_tasks = sam3_threadpool_n_threads(pool);
+	if (n_tasks < 1)
+		n_tasks = 1;
+
+	sam3_threadpool_parallel_for(pool, transpose_parallel_fn, &ctx,
+				     n_tasks);
 
 	return SAM3_OK;
 }
