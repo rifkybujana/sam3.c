@@ -55,7 +55,6 @@ static void test_threadpool_free_null(void)
 /* --- Helper for serial/parallel tests --- */
 struct task_result {
 	int values[64];
-	int count;
 };
 
 static void write_task_id(void *ctx, int task_id, int n_tasks)

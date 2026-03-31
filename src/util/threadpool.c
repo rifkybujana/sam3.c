@@ -43,7 +43,7 @@ struct sam3_threadpool {
 	int              n_active;      /* min(n_tasks, n_threads) */
 
 	/* Coordination counters (protected by mutex) */
-	int              generation;    /* incremented each parallel_for */
+	unsigned int     generation;    /* incremented each parallel_for */
 	int              task_counter;  /* next task_id to claim */
 	int              done_counter;  /* tasks completed by workers */
 	int              shutdown;
@@ -76,7 +76,7 @@ static int detect_n_threads(void)
 static void *worker_main(void *arg)
 {
 	struct sam3_threadpool *pool = arg;
-	int my_gen = 0;
+	unsigned int my_gen = 0;
 
 	for (;;) {
 		sam3_parallel_fn fn = NULL;
@@ -246,6 +246,12 @@ void sam3_threadpool_parallel_for(struct sam3_threadpool *pool,
 	if (!pool || pool->n_threads <= 1) {
 		for (int i = 0; i < n_tasks; i++)
 			fn(ctx, i, n_tasks);
+		return;
+	}
+
+	/* Single task: no need to wake workers */
+	if (n_tasks == 1) {
+		fn(ctx, 0, 1);
 		return;
 	}
 

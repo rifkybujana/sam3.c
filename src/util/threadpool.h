@@ -7,7 +7,7 @@
  * backend matmul/conv2d row-splitting.
  *
  * Key types:  sam3_threadpool, sam3_parallel_fn
- * Depends on: sam3/sam3_types.h
+ * Depends on: (none)
  * Used by:    cpu_backend.c, cpu_matmul.c, cpu_conv2d.c
  *
  * Copyright (c) 2026
@@ -16,8 +16,6 @@
 
 #ifndef SAM3_UTIL_THREADPOOL_H
 #define SAM3_UTIL_THREADPOOL_H
-
-#include "sam3/sam3_types.h"
 
 struct sam3_threadpool;
 
