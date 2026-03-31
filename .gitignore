@@ -23,5 +23,8 @@ models/*.sam3
 .DS_Store
 docs/plans
 
+# Worktrees
+.worktrees/
+
 # Generated
 compile_commands.json
