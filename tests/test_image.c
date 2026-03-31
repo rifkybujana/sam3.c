@@ -54,6 +54,10 @@ static void write_test_bmp(const char *path, int w, int h,
 	header[37] = (pixel_size >> 24) & 0xFF;
 
 	FILE *f = fopen(path, "wb");
+	if (!f) {
+		fprintf(stderr, "FAIL: cannot create test BMP '%s'\n", path);
+		abort();
+	}
 	fwrite(header, 1, 54, f);
 
 	uint8_t *row = calloc(1, row_bytes);

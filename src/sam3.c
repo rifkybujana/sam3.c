@@ -18,6 +18,7 @@
 
 #include "sam3/sam3.h"
 #include "core/weight.h"
+#include "util/image.h"
 #ifdef SAM3_HAS_PROFILE
 #include "util/profile.h"
 #endif
@@ -88,6 +89,32 @@ enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
 	(void)width;
 	(void)height;
 	return SAM3_EINVAL; /* Not yet implemented */
+}
+
+enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
+{
+	if (!ctx || !path)
+		return SAM3_EINVAL;
+
+	struct sam3_image raw = {0};
+	enum sam3_error err = sam3_image_load(path, &raw);
+	if (err)
+		return err;
+
+	int target = ctx->config.image_size;
+	if (target <= 0)
+		target = 1024;
+
+	struct sam3_image letterboxed = {0};
+	err = sam3_image_letterbox(&raw, &letterboxed, target);
+	sam3_image_free(&raw);
+	if (err)
+		return err;
+
+	err = sam3_set_image(ctx, letterboxed.pixels,
+			     letterboxed.width, letterboxed.height);
+	sam3_image_free(&letterboxed);
+	return err;
 }
 
 enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,

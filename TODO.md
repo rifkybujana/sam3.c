@@ -22,7 +22,7 @@
 
 ### Priority 2 — Important
 
-- [ ] **Image I/O** (`src/util/image.h/.c`)
+- [x] **Image I/O** (`src/util/image.h/.c`)
   - Vendor `stb_image.h` for PNG/JPEG decoding
   - RGB uint8 output matching `sam3_set_image()` interface
   - Image resize/normalize for model input

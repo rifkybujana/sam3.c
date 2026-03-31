@@ -60,6 +60,18 @@ enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
 			       int width, int height);
 
 /*
+ * sam3_set_image_file - Load an image file and set it for segmentation.
+ *
+ * @ctx:  Initialized context with loaded model
+ * @path: Path to PNG, JPEG, or BMP image file
+ *
+ * Convenience function: loads the image, resizes/letterboxes to model
+ * input size, then calls sam3_set_image(). Equivalent to loading and
+ * resizing manually.
+ */
+enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path);
+
+/*
  * sam3_segment - Run segmentation with the given prompts.
  *
  * @ctx:      Context with image already set

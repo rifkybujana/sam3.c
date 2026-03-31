@@ -107,10 +107,10 @@ enum sam3_error sam3_image_letterbox(const struct sam3_image *src,
 	int sw, sh;
 	if (src->width >= src->height) {
 		sw = target_size;
-		sh = (src->height * target_size + src->width / 2) / src->width;
+		sh = (int)(((size_t)src->height * target_size + src->width / 2) / src->width);
 	} else {
 		sh = target_size;
-		sw = (src->width * target_size + src->height / 2) / src->height;
+		sw = (int)(((size_t)src->width * target_size + src->height / 2) / src->height);
 	}
 
 	/* Resize to scaled dimensions */
