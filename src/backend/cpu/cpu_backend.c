@@ -18,6 +18,7 @@
 #include "kernels/cpu_kernels.h"
 #include "core/tensor.h"
 #include "util/log.h"
+#include "util/profile.h"
 
 static enum sam3_error cpu_init(struct sam3_backend *be)
 {
@@ -110,8 +111,14 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 	struct sam3_cpu_backend *cpu = (struct sam3_cpu_backend *)be;
 	enum sam3_error err;
 
+#ifdef SAM3_HAS_PROFILE
+	struct sam3_profiler *prof = cpu->profiler;
+#endif
+
 	for (int i = 0; i < g->n_nodes; i++) {
 		struct sam3_node *node = &g->nodes[i];
+
+		SAM3_PROF_OP_BEGIN(prof, node->op);
 
 		switch (node->op) {
 		case SAM3_OP_MATMUL:
@@ -153,6 +160,8 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 			err = SAM3_EINVAL;
 			break;
 		}
+
+		SAM3_PROF_OP_END(prof, node->op);
 
 		if (err != SAM3_OK) {
 			sam3_log_error("cpu_graph_eval: node %d (op=%d) failed",

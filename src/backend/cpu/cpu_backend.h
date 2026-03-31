@@ -26,11 +26,16 @@
 /* Default scratch arena: 64 MiB for conv2d im2col temp buffers. */
 #define SAM3_CPU_SCRATCH_DEFAULT_CAPACITY (64UL * 1024 * 1024)
 
+struct sam3_profiler; /* Forward declaration */
+
 struct sam3_cpu_backend {
 	struct sam3_backend base;           /* Must be first member */
 	struct sam3_arena   arena;          /* Tensor data arena */
 	struct sam3_arena   scratch;        /* Scratch arena for temp buffers */
 	size_t              arena_capacity; /* 0 = use default */
+#ifdef SAM3_HAS_PROFILE
+	struct sam3_profiler *profiler;     /* NULL when profiling disabled */
+#endif
 };
 
 /* Get the CPU backend ops vtable. */

@@ -18,6 +18,9 @@
 #include "backend/backend.h"
 #include "core/graph.h"
 #include "core/tensor.h"
+#ifdef SAM3_HAS_PROFILE
+#include "util/profile.h"
+#endif
 
 #include <string.h>
 
@@ -861,6 +864,455 @@ static void test_error_dtype(void)
 	ASSERT(g_cpu.base.ops->graph_eval(&g_cpu.base, &g) != SAM3_OK);
 }
 
+/* --- Mul SIMD test --- */
+
+static void test_mul_large(void)
+{
+	int dims[] = {256};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *b = make_tensor(1, dims);
+	struct sam3_tensor *c = make_tensor(1, dims);
+
+	float *ad = (float *)a->data;
+	float *bd = (float *)b->data;
+	for (int i = 0; i < 256; i++) {
+		ad[i] = (float)(i + 1);
+		bd[i] = 2.0f;
+	}
+
+	struct sam3_tensor *inputs[] = {a, b};
+	struct sam3_node node = make_node(SAM3_OP_MUL, inputs, 2, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	float *out = (float *)c->data;
+	for (int i = 0; i < 256; i++)
+		ASSERT_NEAR(out[i], (float)((i + 1) * 2), EPS);
+}
+
+/* --- ReLU SIMD test --- */
+
+static void test_relu_large(void)
+{
+	int dims[] = {256};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *c = make_tensor(1, dims);
+
+	float *ad = (float *)a->data;
+	for (int i = 0; i < 256; i++)
+		ad[i] = (float)(i - 128);
+
+	struct sam3_tensor *inputs[] = {a};
+	struct sam3_node node = make_node(SAM3_OP_RELU, inputs, 1, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	float *out = (float *)c->data;
+	for (int i = 0; i < 256; i++) {
+		float expected = (float)(i - 128);
+		if (expected < 0.0f)
+			expected = 0.0f;
+		ASSERT_NEAR(out[i], expected, EPS);
+	}
+}
+
+/* --- GELU SIMD test --- */
+
+static float ref_gelu(float x)
+{
+	/* GELU(x) = 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))) */
+	float c = 0.7978845608f; /* sqrt(2/pi) */
+	return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
+}
+
+static void test_gelu_large(void)
+{
+	int dims[] = {256};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *c = make_tensor(1, dims);
+
+	float *ad = (float *)a->data;
+	for (int i = 0; i < 256; i++)
+		ad[i] = (float)(i - 128) * 0.05f;
+
+	struct sam3_tensor *inputs[] = {a};
+	struct sam3_node node = make_node(SAM3_OP_GELU, inputs, 1, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	float *out = (float *)c->data;
+	for (int i = 0; i < 256; i++)
+		ASSERT_NEAR(out[i], ref_gelu(ad[i]), 1e-3f);
+}
+
+/* --- Softmax edge cases --- */
+
+static void test_softmax_large_logits(void)
+{
+	int dims[] = {3};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *c = make_tensor(1, dims);
+
+	float a_data[] = {1000.0f, 1001.0f, 1002.0f};
+	fill_data(a, a_data);
+
+	struct sam3_tensor *inputs[] = {a};
+	struct sam3_node node = make_node(SAM3_OP_SOFTMAX, inputs, 1, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	float *out = (float *)c->data;
+
+	/* Sum must be 1.0 even with large logits (numerical stability) */
+	float sum = out[0] + out[1] + out[2];
+	ASSERT_NEAR(sum, 1.0f, EPS);
+
+	/* Values should still be ordered */
+	ASSERT(out[0] < out[1]);
+	ASSERT(out[1] < out[2]);
+
+	/* No NaN or Inf */
+	for (int i = 0; i < 3; i++) {
+		ASSERT(out[i] == out[i]); /* NaN check */
+		ASSERT(out[i] < 1.0f / 0.0f); /* Inf check */
+	}
+}
+
+static void test_softmax_single(void)
+{
+	int dims[] = {1};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *c = make_tensor(1, dims);
+
+	float a_data[] = {42.0f};
+	fill_data(a, a_data);
+
+	struct sam3_tensor *inputs[] = {a};
+	struct sam3_node node = make_node(SAM3_OP_SOFTMAX, inputs, 1, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	ASSERT_NEAR(((float *)c->data)[0], 1.0f, EPS);
+}
+
+/* --- LayerNorm gamma-only test --- */
+
+static void test_layernorm_gamma_only(void)
+{
+	int dims[] = {4};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *gamma = make_tensor(1, dims);
+	struct sam3_tensor *c = make_tensor(1, dims);
+
+	float a_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+	float g_data[] = {2.0f, 2.0f, 2.0f, 2.0f};
+	fill_data(a, a_data);
+	fill_data(gamma, g_data);
+
+	/* n_inputs=2: gamma but no beta (inputs[2] = NULL) */
+	struct sam3_tensor *inputs[] = {a, gamma};
+	struct sam3_node node = make_node(SAM3_OP_LAYERNORM, inputs, 2, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	float *out = (float *)c->data;
+
+	/* Output = normalized * 2.0. Mean of normalized is 0, so mean of
+	 * output should be 0 * 2 = 0. Variance should be scaled by 4. */
+	float mean = 0.0f;
+	for (int i = 0; i < 4; i++)
+		mean += out[i];
+	mean /= 4.0f;
+	ASSERT_NEAR(mean, 0.0f, 1e-3f);
+
+	/* Each element should be 2x the no-affine result */
+	float var = 0.0f;
+	for (int i = 0; i < 4; i++)
+		var += out[i] * out[i];
+	var /= 4.0f;
+	/* Variance of 2*normalized = 4 * 1.0 = 4.0 */
+	ASSERT_NEAR(var, 4.0f, 1e-2f);
+}
+
+/* --- Matmul non-tile-aligned test --- */
+
+static void test_matmul_non_tile_aligned(void)
+{
+	int a_dims[] = {7, 13};
+	int b_dims[] = {13, 5};
+	int c_dims[] = {7, 5};
+	struct sam3_tensor *a = make_tensor(2, a_dims);
+	struct sam3_tensor *b = make_tensor(2, b_dims);
+	struct sam3_tensor *c = make_tensor(2, c_dims);
+
+	float *ad = (float *)a->data;
+	float *bd = (float *)b->data;
+	for (int i = 0; i < 7 * 13; i++)
+		ad[i] = (float)(i % 11) * 0.1f;
+	for (int i = 0; i < 13 * 5; i++)
+		bd[i] = (float)(i % 7) * 0.1f;
+
+	struct sam3_tensor *inputs[] = {a, b};
+	struct sam3_node node = make_node(SAM3_OP_MATMUL, inputs, 2, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	/* Verify all 7*5=35 elements against naive computation */
+	float *out = (float *)c->data;
+	for (int i = 0; i < 7; i++) {
+		for (int j = 0; j < 5; j++) {
+			float expected = 0.0f;
+			for (int k = 0; k < 13; k++)
+				expected += ad[i * 13 + k] * bd[k * 5 + j];
+			ASSERT_NEAR(out[i * 5 + j], expected, 1e-3f);
+		}
+	}
+}
+
+/* --- Matmul full verify test --- */
+
+static void test_matmul_full_verify(void)
+{
+	int a_dims[] = {16, 16};
+	int b_dims[] = {16, 16};
+	int c_dims[] = {16, 16};
+	struct sam3_tensor *a = make_tensor(2, a_dims);
+	struct sam3_tensor *b = make_tensor(2, b_dims);
+	struct sam3_tensor *c = make_tensor(2, c_dims);
+
+	float *ad = (float *)a->data;
+	float *bd = (float *)b->data;
+	for (int i = 0; i < 256; i++) {
+		ad[i] = (float)(i % 7) * 0.1f;
+		bd[i] = (float)(i % 5) * 0.1f;
+	}
+
+	struct sam3_tensor *inputs[] = {a, b};
+	struct sam3_node node = make_node(SAM3_OP_MATMUL, inputs, 2, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	/* Verify ALL 256 output elements */
+	float *out = (float *)c->data;
+	for (int i = 0; i < 16; i++) {
+		for (int j = 0; j < 16; j++) {
+			float expected = 0.0f;
+			for (int k = 0; k < 16; k++)
+				expected += ad[i * 16 + k] * bd[k * 16 + j];
+			ASSERT_NEAR(out[i * 16 + j], expected, 1e-3f);
+		}
+	}
+}
+
+/* --- Conv2D multi-channel test --- */
+
+static void test_conv2d_multi_channel(void)
+{
+	/* Input: [1,2,3,3], Weight: [2,2,2,2], stride=1, pad=0 -> [1,2,2,2] */
+	int in_dims[] = {1, 2, 3, 3};
+	int w_dims[] = {2, 2, 2, 2};
+	int out_dims[] = {1, 2, 2, 2};
+
+	struct sam3_tensor *input = make_tensor(4, in_dims);
+	struct sam3_tensor *weight = make_tensor(4, w_dims);
+	struct sam3_tensor *output = make_tensor(4, out_dims);
+
+	/* Fill input: channel 0 = all 1s, channel 1 = all 2s */
+	float in_data[18];
+	for (int i = 0; i < 9; i++)
+		in_data[i] = 1.0f;
+	for (int i = 9; i < 18; i++)
+		in_data[i] = 2.0f;
+	fill_data(input, in_data);
+
+	/* Weight: all ones — each output = sum of 2x2 patch across 2 channels */
+	float w_data[16];
+	for (int i = 0; i < 16; i++)
+		w_data[i] = 1.0f;
+	fill_data(weight, w_data);
+
+	struct sam3_tensor *inputs[] = {input, weight};
+	struct sam3_node node = make_node(SAM3_OP_CONV2D, inputs, 2, output);
+	node.params[0] = 1;
+	node.params[1] = 0;
+
+	struct sam3_graph g;
+	memset(&g, 0, sizeof(g));
+	g.nodes[0] = node;
+	g.n_nodes = 1;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base, &g), SAM3_OK);
+
+	float *out = (float *)output->data;
+	/* Each output filter sums 2x2 from C=2 channels:
+	 * ch0: 4 * 1.0 = 4, ch1: 4 * 2.0 = 8, total = 12 per position */
+	for (int i = 0; i < 4; i++)
+		ASSERT_NEAR(out[i], 12.0f, EPS);
+	for (int i = 4; i < 8; i++)
+		ASSERT_NEAR(out[i], 12.0f, EPS);
+}
+
+/* --- Conv2D multi-batch test --- */
+
+static void test_conv2d_multi_batch(void)
+{
+	/* Input: [2,1,3,3], Weight: [1,1,2,2], stride=1, pad=0 -> [2,1,2,2] */
+	int in_dims[] = {2, 1, 3, 3};
+	int w_dims[] = {1, 1, 2, 2};
+	int out_dims[] = {2, 1, 2, 2};
+
+	struct sam3_tensor *input = make_tensor(4, in_dims);
+	struct sam3_tensor *weight = make_tensor(4, w_dims);
+	struct sam3_tensor *output = make_tensor(4, out_dims);
+
+	/* Batch 0: all 1s, Batch 1: all 3s */
+	float in_data[18];
+	for (int i = 0; i < 9; i++)
+		in_data[i] = 1.0f;
+	for (int i = 9; i < 18; i++)
+		in_data[i] = 3.0f;
+	fill_data(input, in_data);
+
+	/* All-ones kernel */
+	float w_data[] = {1.0f, 1.0f, 1.0f, 1.0f};
+	fill_data(weight, w_data);
+
+	struct sam3_tensor *inputs[] = {input, weight};
+	struct sam3_node node = make_node(SAM3_OP_CONV2D, inputs, 2, output);
+	node.params[0] = 1;
+	node.params[1] = 0;
+
+	struct sam3_graph g;
+	memset(&g, 0, sizeof(g));
+	g.nodes[0] = node;
+	g.n_nodes = 1;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base, &g), SAM3_OK);
+
+	float *out = (float *)output->data;
+	/* Batch 0: each 2x2 sum of 1s = 4 */
+	for (int i = 0; i < 4; i++)
+		ASSERT_NEAR(out[i], 4.0f, EPS);
+	/* Batch 1: each 2x2 sum of 3s = 12 */
+	for (int i = 4; i < 8; i++)
+		ASSERT_NEAR(out[i], 12.0f, EPS);
+}
+
+/* --- Transpose non-square test --- */
+
+static void test_transpose_non_square(void)
+{
+	int in_dims[] = {5, 3};
+	int out_dims[] = {3, 5};
+	struct sam3_tensor *a = make_tensor(2, in_dims);
+	struct sam3_tensor *c = make_tensor(2, out_dims);
+
+	float a_data[15];
+	for (int i = 0; i < 15; i++)
+		a_data[i] = (float)(i + 1);
+	fill_data(a, a_data);
+
+	struct sam3_tensor *inputs[] = {a};
+	struct sam3_node node = make_node(SAM3_OP_TRANSPOSE, inputs, 1, c);
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}), SAM3_OK);
+
+	float *out = (float *)c->data;
+	for (int i = 0; i < 5; i++)
+		for (int j = 0; j < 3; j++)
+			ASSERT_NEAR(out[j * 5 + i], a_data[i * 3 + j], EPS);
+}
+
+/* --- Graph error mid-chain test --- */
+
+static void test_graph_error_mid_chain(void)
+{
+	/* 3-node graph: add -> relu -> relu
+	 * Middle node has wrong dtype to force an error. */
+	int dims[] = {4};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *b = make_tensor(1, dims);
+	struct sam3_tensor *sum = make_tensor(1, dims);
+	struct sam3_tensor *mid = make_tensor(1, dims);
+	struct sam3_tensor *out = make_tensor(1, dims);
+
+	float a_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+	float b_data[] = {1.0f, 1.0f, 1.0f, 1.0f};
+	fill_data(a, a_data);
+	fill_data(b, b_data);
+
+	struct sam3_graph g;
+	memset(&g, 0, sizeof(g));
+
+	/* Node 0: add (OK) */
+	struct sam3_tensor *add_inputs[] = {a, b};
+	g.nodes[0] = make_node(SAM3_OP_ADD, add_inputs, 2, sum);
+
+	/* Node 1: relu with wrong dtype input -> should fail */
+	sum->dtype = SAM3_DTYPE_I32; /* Force dtype error */
+	struct sam3_tensor *relu_inputs[] = {sum};
+	g.nodes[1] = make_node(SAM3_OP_RELU, relu_inputs, 1, mid);
+
+	/* Node 2: relu (should never run) */
+	struct sam3_tensor *relu2_inputs[] = {mid};
+	g.nodes[2] = make_node(SAM3_OP_RELU, relu2_inputs, 1, out);
+
+	g.n_nodes = 3;
+
+	/* Graph should fail at node 1 */
+	ASSERT(g_cpu.base.ops->graph_eval(&g_cpu.base, &g) != SAM3_OK);
+}
+
+/* --- Profiler op counting test --- */
+
+#ifdef SAM3_HAS_PROFILE
+static void test_profiler_op_counting(void)
+{
+	struct sam3_profiler *prof = sam3_profiler_create();
+	sam3_profiler_enable(prof);
+	g_cpu.profiler = prof;
+
+	int dims[] = {4};
+	struct sam3_tensor *a = make_tensor(1, dims);
+	struct sam3_tensor *b = make_tensor(1, dims);
+	struct sam3_tensor *sum = make_tensor(1, dims);
+	struct sam3_tensor *out = make_tensor(1, dims);
+
+	float a_data[] = {-3.0f, -1.0f, 1.0f, 3.0f};
+	float b_data[] = {1.0f, 1.0f, 1.0f, 1.0f};
+	fill_data(a, a_data);
+	fill_data(b, b_data);
+
+	struct sam3_graph g;
+	memset(&g, 0, sizeof(g));
+
+	struct sam3_tensor *add_inputs[] = {a, b};
+	g.nodes[0] = make_node(SAM3_OP_ADD, add_inputs, 2, sum);
+
+	struct sam3_tensor *relu_inputs[] = {sum};
+	g.nodes[1] = make_node(SAM3_OP_RELU, relu_inputs, 1, out);
+	g.n_nodes = 2;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base, &g), SAM3_OK);
+
+	ASSERT_EQ(prof->op_stats[SAM3_OP_ADD].calls, 1);
+	ASSERT_EQ(prof->op_stats[SAM3_OP_RELU].calls, 1);
+	ASSERT_EQ(prof->op_stats[SAM3_OP_MATMUL].calls, 0);
+
+	g_cpu.profiler = NULL;
+	sam3_profiler_free(prof);
+}
+#endif /* SAM3_HAS_PROFILE */
+
 /* --- Main --- */
 
 int main(void)
@@ -875,29 +1327,37 @@ int main(void)
 	/* Mul */
 	test_mul_basic();
 	test_mul_broadcast();
+	test_mul_large();
 
 	/* ReLU */
 	test_relu_basic();
 	test_relu_all_negative();
+	test_relu_large();
 
 	/* GELU */
 	test_gelu_basic();
 	test_gelu_zero();
+	test_gelu_large();
 
 	/* Softmax */
 	test_softmax_basic();
 	test_softmax_2d();
 	test_softmax_uniform();
+	test_softmax_large_logits();
+	test_softmax_single();
 
 	/* LayerNorm */
 	test_layernorm_no_affine();
 	test_layernorm_with_affine();
 	test_layernorm_2d();
+	test_layernorm_gamma_only();
 
 	/* Matmul */
 	test_matmul_2x3_3x2();
 	test_matmul_identity();
 	test_matmul_large();
+	test_matmul_non_tile_aligned();
+	test_matmul_full_verify();
 
 	/* Reshape */
 	test_reshape_basic();
@@ -908,11 +1368,14 @@ int main(void)
 	test_transpose_basic();
 	test_transpose_square();
 	test_transpose_large();
+	test_transpose_non_square();
 
 	/* Conv2D */
 	test_conv2d_basic();
 	test_conv2d_with_padding();
 	test_conv2d_stride2();
+	test_conv2d_multi_channel();
+	test_conv2d_multi_batch();
 
 	/* Multi-node graph */
 	test_graph_multi_node();
@@ -920,6 +1383,12 @@ int main(void)
 	/* Error handling */
 	test_error_null_tensor();
 	test_error_dtype();
+	test_graph_error_mid_chain();
+
+	/* Profiler */
+#ifdef SAM3_HAS_PROFILE
+	test_profiler_op_counting();
+#endif
 
 	teardown();
 
