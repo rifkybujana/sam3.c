@@ -181,12 +181,12 @@ static void test_image_letterbox_portrait(void)
 	ASSERT_EQ(dst.height, 100);
 
 	/* Left padding column should be zero */
-	int pad_left = 25;
 	ASSERT_EQ(dst.pixels[0], 0);
 	ASSERT_EQ(dst.pixels[1], 0);
 	ASSERT_EQ(dst.pixels[2], 0);
 
 	/* Image area starts at col 25 */
+	int pad_left = 25;
 	int idx = pad_left * 3;
 	ASSERT_EQ(dst.pixels[idx + 0], 128);
 	ASSERT_EQ(dst.pixels[idx + 1], 64);

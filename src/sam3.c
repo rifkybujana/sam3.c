@@ -111,6 +111,7 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
 	if (err)
 		return err;
 
+	/* sam3_set_image() is a stub until the image encoder is wired up */
 	err = sam3_set_image(ctx, letterboxed.pixels,
 			     letterboxed.width, letterboxed.height);
 	sam3_image_free(&letterboxed);

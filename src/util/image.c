@@ -86,9 +86,13 @@ enum sam3_error sam3_image_resize(const struct sam3_image *src,
 	if (!out)
 		return SAM3_ENOMEM;
 
-	stbir_resize_uint8_linear(src->pixels, src->width, src->height, 0,
-				  out, target_w, target_h, 0,
-				  STBIR_RGB);
+	uint8_t *result = stbir_resize_uint8_linear(
+		src->pixels, src->width, src->height, 0,
+		out, target_w, target_h, 0, STBIR_RGB);
+	if (!result) {
+		free(out);
+		return SAM3_EIO;
+	}
 
 	dst->pixels = out;
 	dst->width  = target_w;
