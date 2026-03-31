@@ -136,22 +136,22 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 			err = cpu_kernel_matmul(node, cpu->pool);
 			break;
 		case SAM3_OP_ADD:
-			err = cpu_kernel_add(node);
+			err = cpu_kernel_add(node, cpu->pool);
 			break;
 		case SAM3_OP_MUL:
-			err = cpu_kernel_mul(node);
+			err = cpu_kernel_mul(node, cpu->pool);
 			break;
 		case SAM3_OP_SOFTMAX:
-			err = cpu_kernel_softmax(node);
+			err = cpu_kernel_softmax(node, cpu->pool);
 			break;
 		case SAM3_OP_RELU:
-			err = cpu_kernel_relu(node);
+			err = cpu_kernel_relu(node, cpu->pool);
 			break;
 		case SAM3_OP_GELU:
-			err = cpu_kernel_gelu(node);
+			err = cpu_kernel_gelu(node, cpu->pool);
 			break;
 		case SAM3_OP_LAYERNORM:
-			err = cpu_kernel_layernorm(node);
+			err = cpu_kernel_layernorm(node, cpu->pool);
 			break;
 		case SAM3_OP_CONV2D:
 			err = cpu_kernel_conv2d(node, &cpu->scratch, cpu->pool);
@@ -160,7 +160,7 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 			err = cpu_kernel_reshape(node);
 			break;
 		case SAM3_OP_TRANSPOSE:
-			err = cpu_kernel_transpose(node);
+			err = cpu_kernel_transpose(node, cpu->pool);
 			break;
 		case SAM3_OP_NONE:
 			err = SAM3_OK;

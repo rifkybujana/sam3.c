@@ -168,8 +168,10 @@ static void layernorm_row_avx2(const float *in, float *out, int cols,
 
 #endif /* SAM3_HAS_AVX2 */
 
-enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node)
+enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node,
+				     struct sam3_threadpool *pool)
 {
+	(void)pool;
 	if (!node->inputs[0] || !node->output) {
 		sam3_log_error("layernorm: NULL tensor");
 		return SAM3_EINVAL;

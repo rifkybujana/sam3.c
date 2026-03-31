@@ -27,22 +27,28 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 				  struct sam3_threadpool *pool);
 
 /* Element-wise add with broadcasting: inputs[0] + inputs[1] -> output */
-enum sam3_error cpu_kernel_add(const struct sam3_node *node);
+enum sam3_error cpu_kernel_add(const struct sam3_node *node,
+			       struct sam3_threadpool *pool);
 
 /* Element-wise multiply with broadcasting: inputs[0] * inputs[1] -> output */
-enum sam3_error cpu_kernel_mul(const struct sam3_node *node);
+enum sam3_error cpu_kernel_mul(const struct sam3_node *node,
+			       struct sam3_threadpool *pool);
 
 /* Row-wise softmax along last dimension */
-enum sam3_error cpu_kernel_softmax(const struct sam3_node *node);
+enum sam3_error cpu_kernel_softmax(const struct sam3_node *node,
+				   struct sam3_threadpool *pool);
 
 /* Element-wise ReLU: max(0, x) */
-enum sam3_error cpu_kernel_relu(const struct sam3_node *node);
+enum sam3_error cpu_kernel_relu(const struct sam3_node *node,
+				struct sam3_threadpool *pool);
 
 /* Element-wise GELU: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))) */
-enum sam3_error cpu_kernel_gelu(const struct sam3_node *node);
+enum sam3_error cpu_kernel_gelu(const struct sam3_node *node,
+				struct sam3_threadpool *pool);
 
 /* Layer normalization with optional gamma/beta */
-enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node);
+enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
 
 /* Conv2D via im2col + matmul. scratch arena for temp buffers. */
 enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
@@ -53,6 +59,7 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 enum sam3_error cpu_kernel_reshape(const struct sam3_node *node);
 
 /* Transpose: 2D copy with optional SIMD block transpose */
-enum sam3_error cpu_kernel_transpose(const struct sam3_node *node);
+enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
 
 #endif /* SAM3_CPU_KERNELS_H */

@@ -118,8 +118,10 @@ static void gelu_f32_avx2(const float *in, float *out, int n)
 
 #endif /* SAM3_HAS_AVX2 */
 
-enum sam3_error cpu_kernel_gelu(const struct sam3_node *node)
+enum sam3_error cpu_kernel_gelu(const struct sam3_node *node,
+				struct sam3_threadpool *pool)
 {
+	(void)pool;
 	if (!node->inputs[0] || !node->output) {
 		sam3_log_error("gelu: NULL tensor");
 		return SAM3_EINVAL;

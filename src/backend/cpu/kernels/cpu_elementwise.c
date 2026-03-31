@@ -260,8 +260,10 @@ static enum sam3_error validate_binary_op(const struct sam3_node *node,
 	return SAM3_OK;
 }
 
-enum sam3_error cpu_kernel_add(const struct sam3_node *node)
+enum sam3_error cpu_kernel_add(const struct sam3_node *node,
+			       struct sam3_threadpool *pool)
 {
+	(void)pool;
 	int broadcast_n;
 	enum sam3_error err = validate_binary_op(node, &broadcast_n);
 	if (err != SAM3_OK)
@@ -283,8 +285,10 @@ enum sam3_error cpu_kernel_add(const struct sam3_node *node)
 	return SAM3_OK;
 }
 
-enum sam3_error cpu_kernel_mul(const struct sam3_node *node)
+enum sam3_error cpu_kernel_mul(const struct sam3_node *node,
+			       struct sam3_threadpool *pool)
 {
+	(void)pool;
 	int broadcast_n;
 	enum sam3_error err = validate_binary_op(node, &broadcast_n);
 	if (err != SAM3_OK)
@@ -306,8 +310,10 @@ enum sam3_error cpu_kernel_mul(const struct sam3_node *node)
 	return SAM3_OK;
 }
 
-enum sam3_error cpu_kernel_relu(const struct sam3_node *node)
+enum sam3_error cpu_kernel_relu(const struct sam3_node *node,
+				struct sam3_threadpool *pool)
 {
+	(void)pool;
 	if (!node->inputs[0] || !node->output) {
 		sam3_log_error("relu: NULL tensor");
 		return SAM3_EINVAL;
