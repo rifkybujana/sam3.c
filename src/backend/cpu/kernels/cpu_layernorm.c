@@ -7,7 +7,7 @@
  * eps is fixed at 1e-5.
  *
  * Key types:  sam3_node, sam3_tensor
- * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h
+ * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h, util/threadpool.h
  * Used by:    cpu_backend.c (dispatch)
  *
  * Copyright (c) 2026
@@ -18,6 +18,7 @@
 #include "cpu_simd.h"
 #include "core/tensor.h"
 #include "util/log.h"
+#include "util/threadpool.h"
 
 #include <math.h>
 
@@ -168,10 +169,47 @@ static void layernorm_row_avx2(const float *in, float *out, int cols,
 
 #endif /* SAM3_HAS_AVX2 */
 
+/* --- Parallel dispatch --- */
+
+struct layernorm_par_ctx {
+	const float *in;
+	float       *out;
+	int          cols;
+	int          rows;
+	const float *gamma;
+	const float *beta;
+};
+
+static void layernorm_parallel_fn(void *arg, int task_id, int n_tasks)
+{
+	struct layernorm_par_ctx *ctx = (struct layernorm_par_ctx *)arg;
+	int chunk = ctx->rows / n_tasks;
+	int r_start = task_id * chunk;
+	int r_end = (task_id == n_tasks - 1) ? ctx->rows : r_start + chunk;
+
+	if (r_start >= r_end)
+		return;
+
+	for (int r = r_start; r < r_end; r++) {
+#if SAM3_HAS_NEON
+		layernorm_row_neon(ctx->in + r * ctx->cols,
+				   ctx->out + r * ctx->cols,
+				   ctx->cols, ctx->gamma, ctx->beta);
+#elif SAM3_HAS_AVX2
+		layernorm_row_avx2(ctx->in + r * ctx->cols,
+				   ctx->out + r * ctx->cols,
+				   ctx->cols, ctx->gamma, ctx->beta);
+#else
+		layernorm_row_scalar(ctx->in + r * ctx->cols,
+				     ctx->out + r * ctx->cols,
+				     ctx->cols, ctx->gamma, ctx->beta);
+#endif
+	}
+}
+
 enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node,
 				     struct sam3_threadpool *pool)
 {
-	(void)pool;
 	if (!node->inputs[0] || !node->output) {
 		sam3_log_error("layernorm: NULL tensor");
 		return SAM3_EINVAL;
@@ -196,21 +234,21 @@ enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node,
 	if (node->n_inputs > 2 && node->inputs[2])
 		beta = (const float *)node->inputs[2]->data;
 
-	const float *in_data = (const float *)in->data;
-	float *out_data = (float *)out->data;
+	struct layernorm_par_ctx ctx = {
+		.in    = (const float *)in->data,
+		.out   = (float *)out->data,
+		.cols  = cols,
+		.rows  = rows,
+		.gamma = gamma,
+		.beta  = beta,
+	};
 
-	for (int r = 0; r < rows; r++) {
-#if SAM3_HAS_NEON
-		layernorm_row_neon(in_data + r * cols, out_data + r * cols,
-				   cols, gamma, beta);
-#elif SAM3_HAS_AVX2
-		layernorm_row_avx2(in_data + r * cols, out_data + r * cols,
-				   cols, gamma, beta);
-#else
-		layernorm_row_scalar(in_data + r * cols, out_data + r * cols,
-				     cols, gamma, beta);
-#endif
-	}
+	int n_tasks = sam3_threadpool_n_threads(pool);
+	if (n_tasks < 1)
+		n_tasks = 1;
+
+	sam3_threadpool_parallel_for(pool, layernorm_parallel_fn, &ctx,
+				     n_tasks);
 
 	return SAM3_OK;
 }
