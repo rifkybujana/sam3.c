@@ -20,8 +20,11 @@
 #include "core/alloc.h"
 #include "sam3/sam3_types.h"
 
+struct sam3_threadpool;
+
 /* Matrix multiply: inputs[0] @ inputs[1] -> output */
-enum sam3_error cpu_kernel_matmul(const struct sam3_node *node);
+enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
+				  struct sam3_threadpool *pool);
 
 /* Element-wise add with broadcasting: inputs[0] + inputs[1] -> output */
 enum sam3_error cpu_kernel_add(const struct sam3_node *node);

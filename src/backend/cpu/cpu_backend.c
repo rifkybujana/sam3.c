@@ -7,7 +7,8 @@
  * The arena is freed on cpu_free().
  *
  * Key types:  sam3_cpu_backend
- * Depends on: cpu_backend.h, core/tensor.h, util/log.h, util/profile.h
+ * Depends on: cpu_backend.h, core/tensor.h, util/log.h, util/profile.h,
+ *             util/threadpool.h
  * Used by:    backend.h (registered at init)
  *
  * Copyright (c) 2026
@@ -19,6 +20,7 @@
 #include "core/tensor.h"
 #include "util/log.h"
 #include "util/profile.h"
+#include "util/threadpool.h"
 
 static enum sam3_error cpu_init(struct sam3_backend *be)
 {
@@ -44,6 +46,14 @@ static enum sam3_error cpu_init(struct sam3_backend *be)
 		return err;
 	}
 
+	cpu->pool = sam3_threadpool_create(0);
+	if (!cpu->pool) {
+		sam3_arena_free(&cpu->scratch);
+		sam3_arena_free(&cpu->arena);
+		sam3_log_error("CPU backend: thread pool init failed");
+		return SAM3_ENOMEM;
+	}
+
 	sam3_log_info("CPU backend initialized (arena: %zu bytes)", capacity);
 	return SAM3_OK;
 }
@@ -52,6 +62,7 @@ static void cpu_free(struct sam3_backend *be)
 {
 	struct sam3_cpu_backend *cpu = (struct sam3_cpu_backend *)be;
 
+	sam3_threadpool_free(cpu->pool);
 	sam3_arena_free(&cpu->scratch);
 	sam3_arena_free(&cpu->arena);
 	sam3_log_debug("CPU backend freed");
@@ -122,7 +133,7 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 
 		switch (node->op) {
 		case SAM3_OP_MATMUL:
-			err = cpu_kernel_matmul(node);
+			err = cpu_kernel_matmul(node, cpu->pool);
 			break;
 		case SAM3_OP_ADD:
 			err = cpu_kernel_add(node);

@@ -6,7 +6,7 @@
  * vfmaq_f32 for fused multiply-add. Scalar path uses same tiling.
  *
  * Key types:  sam3_node, sam3_tensor
- * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h
+ * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h, util/threadpool.h
  * Used by:    cpu_backend.c (dispatch), cpu_conv2d.c (im2col reuse)
  *
  * Copyright (c) 2026
@@ -17,6 +17,7 @@
 #include "cpu_simd.h"
 #include "core/tensor.h"
 #include "util/log.h"
+#include "util/threadpool.h"
 
 #include <string.h>
 
@@ -29,12 +30,14 @@
 #if !SAM3_HAS_NEON && !SAM3_HAS_AVX2
 
 static void matmul_f32_scalar(const float *a, const float *b, float *c,
-			      int M, int K, int N)
+			      int M, int K, int N,
+			      int m_start, int m_end)
 {
-	memset(c, 0, (size_t)M * N * sizeof(float));
+	memset(c + (size_t)m_start * N, 0,
+	       (size_t)(m_end - m_start) * N * sizeof(float));
 
-	for (int i0 = 0; i0 < M; i0 += TILE_M) {
-		int imax = (i0 + TILE_M < M) ? i0 + TILE_M : M;
+	for (int i0 = m_start; i0 < m_end; i0 += TILE_M) {
+		int imax = (i0 + TILE_M < m_end) ? i0 + TILE_M : m_end;
 		for (int j0 = 0; j0 < N; j0 += TILE_N) {
 			int jmax = (j0 + TILE_N < N) ? j0 + TILE_N : N;
 			for (int k0 = 0; k0 < K; k0 += TILE_K) {
@@ -58,12 +61,14 @@ static void matmul_f32_scalar(const float *a, const float *b, float *c,
 #if SAM3_HAS_NEON
 
 static void matmul_f32_neon(const float *a, const float *b, float *c,
-			    int M, int K, int N)
+			    int M, int K, int N,
+			    int m_start, int m_end)
 {
-	memset(c, 0, (size_t)M * N * sizeof(float));
+	memset(c + (size_t)m_start * N, 0,
+	       (size_t)(m_end - m_start) * N * sizeof(float));
 
-	for (int i0 = 0; i0 < M; i0 += TILE_M) {
-		int imax = (i0 + TILE_M < M) ? i0 + TILE_M : M;
+	for (int i0 = m_start; i0 < m_end; i0 += TILE_M) {
+		int imax = (i0 + TILE_M < m_end) ? i0 + TILE_M : m_end;
 		for (int j0 = 0; j0 < N; j0 += TILE_N) {
 			int jmax = (j0 + TILE_N < N) ? j0 + TILE_N : N;
 			for (int k0 = 0; k0 < K; k0 += TILE_K) {
@@ -95,12 +100,14 @@ static void matmul_f32_neon(const float *a, const float *b, float *c,
 #if SAM3_HAS_AVX2
 
 static void matmul_f32_avx2(const float *a, const float *b, float *c,
-			    int M, int K, int N)
+			    int M, int K, int N,
+			    int m_start, int m_end)
 {
-	memset(c, 0, (size_t)M * N * sizeof(float));
+	memset(c + (size_t)m_start * N, 0,
+	       (size_t)(m_end - m_start) * N * sizeof(float));
 
-	for (int i0 = 0; i0 < M; i0 += TILE_M) {
-		int imax = (i0 + TILE_M < M) ? i0 + TILE_M : M;
+	for (int i0 = m_start; i0 < m_end; i0 += TILE_M) {
+		int imax = (i0 + TILE_M < m_end) ? i0 + TILE_M : m_end;
 		for (int j0 = 0; j0 < N; j0 += TILE_N) {
 			int jmax = (j0 + TILE_N < N) ? j0 + TILE_N : N;
 			for (int k0 = 0; k0 < K; k0 += TILE_K) {
@@ -127,7 +134,41 @@ static void matmul_f32_avx2(const float *a, const float *b, float *c,
 
 #endif /* SAM3_HAS_AVX2 */
 
-enum sam3_error cpu_kernel_matmul(const struct sam3_node *node)
+/* --- Parallel dispatch context --- */
+
+struct matmul_par_ctx {
+	const float *a;
+	const float *b;
+	float       *c;
+	int          M;
+	int          K;
+	int          N;
+};
+
+static void matmul_parallel_fn(void *arg, int task_id, int n_tasks)
+{
+	struct matmul_par_ctx *ctx = (struct matmul_par_ctx *)arg;
+	int chunk = ctx->M / n_tasks;
+	int m_start = task_id * chunk;
+	int m_end = (task_id == n_tasks - 1) ? ctx->M : m_start + chunk;
+
+	if (m_start >= m_end)
+		return;
+
+#if SAM3_HAS_NEON
+	matmul_f32_neon(ctx->a, ctx->b, ctx->c,
+			ctx->M, ctx->K, ctx->N, m_start, m_end);
+#elif SAM3_HAS_AVX2
+	matmul_f32_avx2(ctx->a, ctx->b, ctx->c,
+			ctx->M, ctx->K, ctx->N, m_start, m_end);
+#else
+	matmul_f32_scalar(ctx->a, ctx->b, ctx->c,
+			  ctx->M, ctx->K, ctx->N, m_start, m_end);
+#endif
+}
+
+enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
+				  struct sam3_threadpool *pool)
 {
 	if (node->n_inputs < 2 || !node->inputs[0] || !node->inputs[1] ||
 	    !node->output) {
@@ -179,16 +220,19 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node)
 		return SAM3_EINVAL;
 	}
 
-#if SAM3_HAS_NEON
-	matmul_f32_neon((const float *)a->data, (const float *)b->data,
-			(float *)c->data, M, K_a, N);
-#elif SAM3_HAS_AVX2
-	matmul_f32_avx2((const float *)a->data, (const float *)b->data,
-			(float *)c->data, M, K_a, N);
-#else
-	matmul_f32_scalar((const float *)a->data, (const float *)b->data,
-			  (float *)c->data, M, K_a, N);
-#endif
+	struct matmul_par_ctx ctx = {
+		.a = (const float *)a->data,
+		.b = (const float *)b->data,
+		.c = (float *)c->data,
+		.M = M, .K = K_a, .N = N,
+	};
+
+	int n_tasks = sam3_threadpool_n_threads(pool);
+	if (n_tasks < 1)
+		n_tasks = 1;
+
+	sam3_threadpool_parallel_for(pool, matmul_parallel_fn, &ctx,
+				     n_tasks);
 
 	return SAM3_OK;
 }
