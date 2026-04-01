@@ -335,7 +335,7 @@ static int write_mask_png(const char *path, const float *data,
 	}
 
 	for (size_t i = 0; i < npix; i++)
-		gray[i] = data[i] > threshold ? 255 : 0;
+		gray[i] = data[i] >= threshold ? 255 : 0;
 
 	int ok = stbi_write_png(path, w, h, 1, gray, w);
 	free(gray);
@@ -422,7 +422,7 @@ static int write_overlay(const char *path, const float *mask,
 		uint8_t g = img->pixels[i * 3 + 1];
 		uint8_t b = img->pixels[i * 3 + 2];
 
-		if (m[i] > threshold) {
+		if (m[i] >= threshold) {
 			/* Blend with (30, 144, 255) at 50% alpha */
 			out[i * 3 + 0] = (uint8_t)((r + 30) / 2);
 			out[i * 3 + 1] = (uint8_t)((g + 144) / 2);
@@ -493,7 +493,7 @@ static int write_cutout(const char *path, const float *mask,
 	}
 
 	for (size_t i = 0; i < npix; i++) {
-		if (m[i] > threshold) {
+		if (m[i] >= threshold) {
 			out[i * 4 + 0] = img->pixels[i * 3 + 0];
 			out[i * 4 + 1] = img->pixels[i * 3 + 1];
 			out[i * 4 + 2] = img->pixels[i * 3 + 2];
