@@ -62,6 +62,9 @@ set(SAM3_SOURCES
 	${SAM3_UTIL_SOURCES}
 )
 
+# Backend factory (always needed)
+list(APPEND SAM3_SOURCES src/backend/backend.c)
+
 # Backend sources
 if(SAM3_CPU)
 	file(GLOB_RECURSE SAM3_CPU_SOURCES "src/backend/cpu/*.c")
