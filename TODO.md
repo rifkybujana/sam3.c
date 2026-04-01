@@ -32,10 +32,10 @@
   - Task queue for parallel kernel execution
   - Used by CPU backend for matmul/conv2d parallelism
 
-- [ ] **Quantization support**
-  - F16/BF16 compute paths in CPU kernels
-  - INT8 quantized matmul
-  - Dequantize-on-load for weight format
+- [x] **Quantization support**
+  - [x] F16/BF16 compute paths in CPU kernels
+  - [x] INT8 quantized matmul (Q8_0: symmetric per-block, mixed F32 x Q8_0)
+  - [x] Dequantize-on-load for weight format (`sam3_convert --quantize q8_0`)
 
 ### Priority 3 — Before shipping
 
