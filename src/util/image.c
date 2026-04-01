@@ -1,12 +1,14 @@
 /*
  * src/util/image.c - Image loading and resizing implementation
  *
- * Implements image I/O using vendored stb_image.h for decoding and
- * stb_image_resize2.h for bilinear resize. The stb implementations are
- * compiled here via #define STB_*_IMPLEMENTATION includes.
+ * Implements image I/O using vendored stb_image.h for decoding,
+ * stb_image_resize2.h for bilinear resize, and stb_image_write.h for
+ * PNG/BMP/TGA/JPEG output. The stb implementations are compiled here
+ * via #define STB_*_IMPLEMENTATION includes.
  *
  * Key types:  sam3_image
- * Depends on: util/image.h, vendor/stb_image.h, vendor/stb_image_resize2.h
+ * Depends on: util/image.h, vendor/stb_image.h, vendor/stb_image_resize2.h,
+ *             vendor/stb_image_write.h
  * Used by:    src/sam3.c, tools/sam3_main.c
  *
  * Copyright (c) 2026
@@ -49,6 +51,9 @@
 
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include "vendor/stb_image_resize2.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "vendor/stb_image_write.h"
 
 #ifdef __clang__
 #pragma clang diagnostic pop
