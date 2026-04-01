@@ -122,6 +122,9 @@ if(SAM3_TESTS)
 	endif()
 endif()
 
-# Benchmark (not included in CTest)
+# Benchmarks (not included in CTest)
 add_executable(bench_dtype tests/bench_dtype.c)
 target_link_libraries(bench_dtype sam3)
+
+add_executable(bench_metal tests/bench_metal.c)
+target_link_libraries(bench_metal sam3)
