@@ -11,7 +11,7 @@
  * Depends on: core/trace.h, core/half.h, util/log.h
  * Used by:    backend/ files, tests/test_trace.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

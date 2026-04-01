@@ -11,7 +11,7 @@
  * Depends on: sam3/sam3.h, util/image.h, util/log.h, util/error.h
  * Used by:    end users
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

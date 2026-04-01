@@ -11,7 +11,7 @@
  * Depends on: sam3/sam3_types.h, core/tensor.h
  * Used by:    sam3.c, weight.c, weight_safetensors.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

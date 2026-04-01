@@ -9,7 +9,7 @@
  * Depends on: <stdint.h>, <stddef.h>
  * Used by:    cpu_matmul_q8.c, weight.c, sam3_convert.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

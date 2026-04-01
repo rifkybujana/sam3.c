@@ -9,7 +9,7 @@
  * Depends on: <stdint.h>, <stddef.h>
  * Used by:    sam3.h, all internal modules
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

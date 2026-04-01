@@ -9,7 +9,7 @@
  * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h, util/threadpool.h
  * Used by:    cpu_backend.c (dispatch), cpu_conv2d.c (im2col reuse)
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

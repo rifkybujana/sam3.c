@@ -9,7 +9,7 @@
  * Depends on: profile.h, util/time.h
  * Used by:    sam3.c, core/alloc.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

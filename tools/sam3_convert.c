@@ -11,7 +11,7 @@
  * Depends on: core/weight.h, util/log.h, util/error.h
  * Used by:    end users (pre-inference step)
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

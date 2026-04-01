@@ -10,7 +10,7 @@
  * Depends on: <stddef.h>
  * Used by:    tensor.c, graph.c, model/ files
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

@@ -10,7 +10,7 @@
  *             backend/cpu/kernels/cpu_kernels.h, util/threadpool.h
  * Used by:    manual benchmarking
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

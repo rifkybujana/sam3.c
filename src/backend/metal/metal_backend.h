@@ -10,7 +10,7 @@
  * Depends on: backend/backend.h
  * Used by:    backend.h (via sam3_backend_init)
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

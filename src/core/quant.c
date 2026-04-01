@@ -10,7 +10,7 @@
  * Depends on: core/quant.h
  * Used by:    cpu_matmul_q8.c, tools/sam3_convert.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

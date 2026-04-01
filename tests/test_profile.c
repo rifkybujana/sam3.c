@@ -8,7 +8,7 @@
  * Depends on: util/profile.h, test_helpers.h
  * Used by:    CTest
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

@@ -9,7 +9,7 @@
  * Depends on: <stdio.h>
  * Used by:    all modules
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

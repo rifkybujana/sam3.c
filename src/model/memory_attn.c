@@ -8,7 +8,7 @@
  * Depends on: memory_attn.h
  * Used by:    sam3.c (future video API)
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

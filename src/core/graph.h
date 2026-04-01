@@ -10,7 +10,7 @@
  * Depends on: tensor.h
  * Used by:    model/ files, backend/ files
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

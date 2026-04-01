@@ -11,7 +11,7 @@
  * Depends on: cpu_kernels.h, core/half.h, core/tensor.h, util/log.h
  * Used by:    cpu_dispatch.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

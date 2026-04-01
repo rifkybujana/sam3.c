@@ -10,7 +10,7 @@
  * Depends on: (none)
  * Used by:    cpu_backend.c, cpu_matmul.c, cpu_conv2d.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

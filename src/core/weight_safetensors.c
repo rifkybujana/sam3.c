@@ -10,7 +10,7 @@
  * Depends on: core/weight.h, core/json/cJSON.h, util/log.h
  * Used by:    tools/sam3_convert.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

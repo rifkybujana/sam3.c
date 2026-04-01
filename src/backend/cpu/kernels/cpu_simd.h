@@ -9,7 +9,7 @@
  * Depends on: <arm_neon.h> or <immintrin.h> (platform-dependent)
  * Used by:    all cpu_*.c kernel files
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

@@ -11,7 +11,7 @@
  * Depends on: <stdint.h>, <string.h>
  * Used by:    src/core/weight.h, src/backend/cpu/kernels.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

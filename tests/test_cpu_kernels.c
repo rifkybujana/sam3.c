@@ -9,7 +9,7 @@
  * Depends on: test_helpers.h, cpu_backend.h, core/graph.h
  * Used by:    CTest
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

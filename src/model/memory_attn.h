@@ -9,7 +9,7 @@
  * Depends on: core/tensor.h, core/graph.h
  * Used by:    sam3.h (future video API)
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

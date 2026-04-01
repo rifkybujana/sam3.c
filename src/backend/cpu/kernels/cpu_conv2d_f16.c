@@ -9,7 +9,7 @@
  * Depends on: cpu_kernels.h, cpu_simd_f16.h, core/half.h, core/tensor.h, core/alloc.h
  * Used by:    cpu_dispatch.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

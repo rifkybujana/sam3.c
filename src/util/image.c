@@ -11,7 +11,7 @@
  *             vendor/stb_image_write.h
  * Used by:    src/sam3.c, tools/sam3_main.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

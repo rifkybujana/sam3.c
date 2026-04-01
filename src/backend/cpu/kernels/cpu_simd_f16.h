@@ -9,7 +9,7 @@
  * Depends on: cpu_simd.h, <arm_neon.h>, <math.h>
  * Used by:    cpu_*_f16.c kernel files
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

@@ -8,7 +8,7 @@
  * Depends on: error.h
  * Used by:    tools/, user applications
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

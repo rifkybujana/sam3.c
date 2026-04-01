@@ -10,7 +10,7 @@
  * Depends on: sam3_types.h
  * Used by:    tools/sam3_main.c, user applications
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

@@ -9,7 +9,7 @@
  * Depends on: core/weight.h, util/log.h
  * Used by:    sam3.c, tools/sam3_convert.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

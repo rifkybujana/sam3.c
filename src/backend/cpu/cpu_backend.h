@@ -10,7 +10,7 @@
  * Depends on: backend/backend.h, core/alloc.h
  * Used by:    backend.h (via sam3_backend_init), tests, cpu_matmul.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

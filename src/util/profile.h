@@ -12,7 +12,7 @@
  * Depends on: util/time.h, core/graph.h
  * Used by:    sam3.c, core/alloc.c, backend/ files
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

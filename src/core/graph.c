@@ -9,7 +9,7 @@
  * Depends on: graph.h
  * Used by:    model/ files
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 

@@ -9,7 +9,7 @@
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h
  * Used by:    sam3.h (via sam3_set_image)
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
