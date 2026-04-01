@@ -19,6 +19,7 @@
 #include "backend/cpu/kernels/cpu_kernels.h"
 #include "util/threadpool.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -164,6 +165,50 @@ static void test_relu_f16(void)
 	sam3_threadpool_free(pool);
 }
 
+static void test_gelu_f16(void)
+{
+	/* Test GELU against f32 reference */
+	float in_f32[8] = {-2.0f, -1.0f, -0.5f, 0.0f,
+			   0.5f,  1.0f,  1.5f, 2.0f};
+	uint16_t in_f16[8], out_f16[8];
+
+	for (int i = 0; i < 8; i++)
+		in_f16[i] = f32_to_fp16(in_f32[i]);
+
+	/* Compute expected in f32 */
+	float expected[8];
+	for (int i = 0; i < 8; i++) {
+		float x = in_f32[i];
+		float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+		expected[i] = 0.5f * x * (1.0f + tanhf(inner));
+	}
+
+	struct sam3_tensor t_in, t_out;
+	make_f16_tensor(&t_in,  in_f16,  8);
+	make_f16_tensor(&t_out, out_f16, 8);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_GELU;
+	node.n_inputs  = 1;
+	node.inputs[0] = &t_in;
+	node.output    = &t_out;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_gelu_f16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	for (int i = 0; i < 8; i++) {
+		float result = fp16_to_f32(out_f16[i]);
+		/* fp16 GELU needs slightly wider tolerance */
+		ASSERT_NEAR(result, expected[i], 5e-3f);
+	}
+
+	sam3_threadpool_free(pool);
+}
+
 static void test_add_f16_dtype_reject(void)
 {
 	/* Passing F32 tensors to the F16 kernel must return SAM3_EINVAL */
@@ -209,6 +254,7 @@ int main(void)
 	test_add_f16();
 	test_mul_f16();
 	test_relu_f16();
+	test_gelu_f16();
 	test_add_f16_dtype_reject();
 
 	TEST_REPORT();

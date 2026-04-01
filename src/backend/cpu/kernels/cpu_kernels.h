@@ -70,5 +70,7 @@ enum sam3_error cpu_kernel_mul_f16(const struct sam3_node *node,
 				   struct sam3_threadpool *pool);
 enum sam3_error cpu_kernel_relu_f16(const struct sam3_node *node,
 				    struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_gelu_f16(const struct sam3_node *node,
+				    struct sam3_threadpool *pool);
 
 #endif /* SAM3_CPU_KERNELS_H */
