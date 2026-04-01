@@ -118,4 +118,8 @@ enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
 enum sam3_error cpu_kernel_cast(const struct sam3_node *node,
 				struct sam3_threadpool *pool);
 
+/* Q8_0 mixed-dtype matmul: A[F32] @ B[Q8_0] -> C[F32] */
+enum sam3_error cpu_kernel_matmul_q8(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */
