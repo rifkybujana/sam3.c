@@ -114,6 +114,30 @@ wrap_transpose(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_transpose(node, pool);
 }
 
+static enum sam3_error
+wrap_add_f16(const struct sam3_node *node, struct sam3_arena *scratch,
+	     struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_add_f16(node, pool);
+}
+
+static enum sam3_error
+wrap_mul_f16(const struct sam3_node *node, struct sam3_arena *scratch,
+	     struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_mul_f16(node, pool);
+}
+
+static enum sam3_error
+wrap_relu_f16(const struct sam3_node *node, struct sam3_arena *scratch,
+	      struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_relu_f16(node, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -128,15 +152,18 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_ADD] = {
 		[SAM3_DTYPE_F32]  = wrap_add,
+		[SAM3_DTYPE_F16]  = wrap_add_f16,
 	},
 	[SAM3_OP_MUL] = {
 		[SAM3_DTYPE_F32]  = wrap_mul,
+		[SAM3_DTYPE_F16]  = wrap_mul_f16,
 	},
 	[SAM3_OP_SOFTMAX] = {
 		[SAM3_DTYPE_F32]  = wrap_softmax,
 	},
 	[SAM3_OP_RELU] = {
 		[SAM3_DTYPE_F32]  = wrap_relu,
+		[SAM3_DTYPE_F16]  = wrap_relu_f16,
 	},
 	[SAM3_OP_GELU] = {
 		[SAM3_DTYPE_F32]  = wrap_gelu,

@@ -3,7 +3,8 @@
  *
  * Declares all CPU compute kernels. Each kernel validates its inputs,
  * selects scalar or SIMD path, and operates on the node's tensor data.
- * All kernels expect F32 tensors; other dtypes return SAM3_EINVAL.
+ * F32 kernels return SAM3_EINVAL for other dtypes; fp16 kernels handle
+ * SAM3_DTYPE_F16 tensors via NEON or scalar fallback.
  *
  * Key types:  (function declarations only)
  * Depends on: core/graph.h, core/alloc.h, sam3/sam3_types.h
@@ -61,5 +62,13 @@ enum sam3_error cpu_kernel_reshape(const struct sam3_node *node);
 /* Transpose: 2D copy with optional SIMD block transpose */
 enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
+
+/* FP16 elementwise kernels */
+enum sam3_error cpu_kernel_add_f16(const struct sam3_node *node,
+				   struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_mul_f16(const struct sam3_node *node,
+				   struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_relu_f16(const struct sam3_node *node,
+				    struct sam3_threadpool *pool);
 
 #endif /* SAM3_CPU_KERNELS_H */
