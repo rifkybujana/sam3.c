@@ -279,7 +279,7 @@ static void test_metal_reshape(void)
 	sam3_backend_free(metal);
 }
 
-/* ── Test: multi-node graph (matmul -> add) ──────────────────────── */
+/* ── Test: multi-node graph (matmul -> add -> softmax) ────────────── */
 
 static void test_metal_multi_node(void)
 {
@@ -292,6 +292,7 @@ static void test_metal_multi_node(void)
 		return;
 	}
 
+	/* C = softmax(A @ B + bias) */
 	int dims_a[] = {2, 3};
 	int dims_b[] = {3, 2};
 	int dims_c[] = {2, 2};
@@ -305,12 +306,14 @@ static void test_metal_multi_node(void)
 	struct sam3_tensor mb = make_tensor(SAM3_DTYPE_F32, 2, dims_b);
 	struct sam3_tensor m_mm = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
 	struct sam3_tensor m_bias = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
+	struct sam3_tensor m_add = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
 	struct sam3_tensor m_out = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
 
 	metal->ops->alloc_tensor(metal, &ma);
 	metal->ops->alloc_tensor(metal, &mb);
 	metal->ops->alloc_tensor(metal, &m_mm);
 	metal->ops->alloc_tensor(metal, &m_bias);
+	metal->ops->alloc_tensor(metal, &m_add);
 	metal->ops->alloc_tensor(metal, &m_out);
 	memcpy(ma.data, data_a, ma.nbytes);
 	memcpy(mb.data, data_b, mb.nbytes);
@@ -324,9 +327,13 @@ static void test_metal_multi_node(void)
 	};
 	mg.nodes[1] = (struct sam3_node){
 		.op = SAM3_OP_ADD, .n_inputs = 2,
-		.inputs = {&m_mm, &m_bias}, .output = &m_out,
+		.inputs = {&m_mm, &m_bias}, .output = &m_add,
 	};
-	mg.n_nodes = 2;
+	mg.nodes[2] = (struct sam3_node){
+		.op = SAM3_OP_SOFTMAX, .n_inputs = 1,
+		.inputs = {&m_add}, .output = &m_out,
+	};
+	mg.n_nodes = 3;
 
 	ASSERT_EQ(metal->ops->graph_eval(metal, &mg), SAM3_OK);
 
@@ -335,12 +342,14 @@ static void test_metal_multi_node(void)
 	struct sam3_tensor cb = make_tensor(SAM3_DTYPE_F32, 2, dims_b);
 	struct sam3_tensor c_mm = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
 	struct sam3_tensor c_bias = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
+	struct sam3_tensor c_add = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
 	struct sam3_tensor c_out = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
 
 	cpu->ops->alloc_tensor(cpu, &ca);
 	cpu->ops->alloc_tensor(cpu, &cb);
 	cpu->ops->alloc_tensor(cpu, &c_mm);
 	cpu->ops->alloc_tensor(cpu, &c_bias);
+	cpu->ops->alloc_tensor(cpu, &c_add);
 	cpu->ops->alloc_tensor(cpu, &c_out);
 	memcpy(ca.data, data_a, ca.nbytes);
 	memcpy(cb.data, data_b, cb.nbytes);
@@ -354,14 +363,18 @@ static void test_metal_multi_node(void)
 	};
 	cg.nodes[1] = (struct sam3_node){
 		.op = SAM3_OP_ADD, .n_inputs = 2,
-		.inputs = {&c_mm, &c_bias}, .output = &c_out,
+		.inputs = {&c_mm, &c_bias}, .output = &c_add,
 	};
-	cg.n_nodes = 2;
+	cg.nodes[2] = (struct sam3_node){
+		.op = SAM3_OP_SOFTMAX, .n_inputs = 1,
+		.inputs = {&c_add}, .output = &c_out,
+	};
+	cg.n_nodes = 3;
 
 	ASSERT_EQ(cpu->ops->graph_eval(cpu, &cg), SAM3_OK);
 
 	ASSERT(float_arrays_match((float *)m_out.data, (float *)c_out.data,
-				  4, 1e-5f));
+				  4, 1e-4f));
 
 	sam3_backend_free(metal);
 	sam3_backend_free(cpu);
@@ -381,6 +394,7 @@ static void test_backend_factory_metal(void)
 	}
 }
 
+#ifdef SAM3_HAS_CPU
 static void test_backend_factory_cpu(void)
 {
 	struct sam3_backend *be = sam3_backend_init(SAM3_BACKEND_CPU);
@@ -390,6 +404,7 @@ static void test_backend_factory_cpu(void)
 		sam3_backend_free(be);
 	}
 }
+#endif
 
 #endif /* SAM3_HAS_METAL */
 
@@ -402,7 +417,9 @@ int main(void)
 	printf("0 tests, 0 failures\n");
 	return 0;
 #else
+#ifdef SAM3_HAS_CPU
 	test_backend_factory_cpu();
+#endif
 	test_backend_factory_metal();
 	test_metal_init_free();
 	test_metal_alloc_tensor();
