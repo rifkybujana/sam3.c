@@ -212,6 +212,14 @@ wrap_gelu_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_gelu_bf16(node, pool);
 }
 
+static enum sam3_error
+wrap_matmul_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
+		 struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_matmul_bf16(node, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -224,6 +232,7 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	[SAM3_OP_MATMUL] = {
 		[SAM3_DTYPE_F32]  = wrap_matmul,
 		[SAM3_DTYPE_F16]  = wrap_matmul_f16,
+		[SAM3_DTYPE_BF16] = wrap_matmul_bf16,
 	},
 	[SAM3_OP_ADD] = {
 		[SAM3_DTYPE_F32]  = wrap_add,
