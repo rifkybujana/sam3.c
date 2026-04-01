@@ -35,6 +35,8 @@ enum sam3_op {
 	SAM3_OP_CONV2D,
 	SAM3_OP_RESHAPE,
 	SAM3_OP_TRANSPOSE,
+	SAM3_OP_CAST,
+	SAM3_OP_COUNT,  /* must be last */
 };
 
 /* A single node in the compute graph. */
@@ -59,5 +61,8 @@ void sam3_graph_init(struct sam3_graph *g);
 struct sam3_tensor *sam3_graph_add_op(struct sam3_graph *g, enum sam3_op op,
 				     struct sam3_tensor **inputs, int n_inputs,
 				     struct sam3_tensor *output);
+
+/* Return a short string name for the op ("MATMUL", "ADD", etc). */
+const char *sam3_op_str(enum sam3_op op);
 
 #endif /* SAM3_CORE_GRAPH_H */

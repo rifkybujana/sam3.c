@@ -23,6 +23,7 @@ const char *sam3_error_str(enum sam3_error err)
 	case SAM3_EIO:      return "I/O error";
 	case SAM3_EBACKEND: return "backend initialization failed";
 	case SAM3_EMODEL:   return "model format error";
+	case SAM3_EDTYPE:   return "unsupported or mismatched dtype";
 	}
 	return "unknown error";
 }

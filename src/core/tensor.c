@@ -43,3 +43,15 @@ void sam3_tensor_compute_strides(struct sam3_tensor *t)
 	for (int i = t->n_dims - 2; i >= 0; i--)
 		t->strides[i] = t->strides[i + 1] * t->dims[i + 1];
 }
+
+const char *sam3_dtype_str(enum sam3_dtype dtype)
+{
+	switch (dtype) {
+	case SAM3_DTYPE_F32:  return "F32";
+	case SAM3_DTYPE_F16:  return "F16";
+	case SAM3_DTYPE_BF16: return "BF16";
+	case SAM3_DTYPE_I32:  return "I32";
+	case SAM3_DTYPE_I8:   return "I8";
+	}
+	return "UNKNOWN";
+}

@@ -25,7 +25,6 @@
 #include "core/graph.h"
 
 #define SAM3_PROF_MAX_STAGES 32
-#define SAM3_OP_COUNT        (SAM3_OP_TRANSPOSE + 1)
 
 /* Per-stage timing record. */
 struct sam3_prof_stage {

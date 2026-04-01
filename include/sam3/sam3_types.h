@@ -29,6 +29,7 @@ enum sam3_error {
 	SAM3_EIO      = -3,  /* I/O error (file read, Metal shader) */
 	SAM3_EBACKEND = -4,  /* Backend initialization failed */
 	SAM3_EMODEL   = -5,  /* Model format error */
+	SAM3_EDTYPE   = -6,  /* Unsupported or mismatched dtype */
 };
 
 /* Supported tensor data types. */
@@ -39,6 +40,8 @@ enum sam3_dtype {
 	SAM3_DTYPE_I32,
 	SAM3_DTYPE_I8,
 };
+
+#define SAM3_DTYPE_COUNT 5
 
 /* Prompt type for segmentation. */
 enum sam3_prompt_type {

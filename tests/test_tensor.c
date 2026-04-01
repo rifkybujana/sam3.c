@@ -12,6 +12,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <string.h>
+
 #include "test_helpers.h"
 #include "core/tensor.h"
 
@@ -44,12 +46,22 @@ static void test_tensor_strides(void)
 	ASSERT_EQ(t.strides[0], 20);
 }
 
+static void test_dtype_str(void)
+{
+	ASSERT(strcmp(sam3_dtype_str(SAM3_DTYPE_F32), "F32") == 0);
+	ASSERT(strcmp(sam3_dtype_str(SAM3_DTYPE_F16), "F16") == 0);
+	ASSERT(strcmp(sam3_dtype_str(SAM3_DTYPE_BF16), "BF16") == 0);
+	ASSERT(strcmp(sam3_dtype_str(SAM3_DTYPE_I32), "I32") == 0);
+	ASSERT(strcmp(sam3_dtype_str(SAM3_DTYPE_I8), "I8") == 0);
+}
+
 int main(void)
 {
 	test_tensor_nelems_1d();
 	test_tensor_nelems_3d();
 	test_dtype_size();
 	test_tensor_strides();
+	test_dtype_str();
 
 	TEST_REPORT();
 }

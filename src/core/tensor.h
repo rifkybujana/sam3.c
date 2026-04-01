@@ -37,4 +37,7 @@ size_t sam3_dtype_size(enum sam3_dtype dtype);
 /* Compute strides from dims (row-major). Fills t->strides. */
 void sam3_tensor_compute_strides(struct sam3_tensor *t);
 
+/* Return a short string name for the dtype ("F32", "F16", etc). */
+const char *sam3_dtype_str(enum sam3_dtype dtype);
+
 #endif /* SAM3_CORE_TENSOR_H */

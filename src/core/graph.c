@@ -13,6 +13,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stddef.h>
 #include <string.h>
 
 #include "graph.h"
@@ -41,4 +42,25 @@ struct sam3_tensor *sam3_graph_add_op(struct sam3_graph *g, enum sam3_op op,
 		node->inputs[i] = inputs[i];
 
 	return output;
+}
+
+const char *sam3_op_str(enum sam3_op op)
+{
+	static const char *names[] = {
+		[SAM3_OP_NONE]      = "NONE",
+		[SAM3_OP_MATMUL]    = "MATMUL",
+		[SAM3_OP_ADD]       = "ADD",
+		[SAM3_OP_MUL]       = "MUL",
+		[SAM3_OP_SOFTMAX]   = "SOFTMAX",
+		[SAM3_OP_RELU]      = "RELU",
+		[SAM3_OP_GELU]      = "GELU",
+		[SAM3_OP_LAYERNORM] = "LAYERNORM",
+		[SAM3_OP_CONV2D]    = "CONV2D",
+		[SAM3_OP_RESHAPE]   = "RESHAPE",
+		[SAM3_OP_TRANSPOSE] = "TRANSPOSE",
+		[SAM3_OP_CAST]      = "CAST",
+	};
+	if (op >= 0 && op < SAM3_OP_COUNT)
+		return names[op];
+	return "UNKNOWN";
 }
