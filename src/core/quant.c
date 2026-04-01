@@ -148,8 +148,9 @@ void sam3_q8_dequantize(const struct sam3_q8_block *src, float *dst,
 #if SAM3_Q8_HAS_NEON
 		float32x4_t vs = vdupq_n_f32(scale);
 
-		for (; i + 4 <= count; i += 4) {
-			/* Load 4 int8 values, widen to int32, convert to f32 */
+		for (; i + 8 <= SAM3_Q8_BLOCK_SIZE && i + 4 <= count;
+		     i += 4) {
+			/* Load 8 int8 values (vld1_s8 min), use lower 4 */
 			int8x8_t vi8 = vld1_s8(&src[b].data[i]);
 			int16x8_t vi16 = vmovl_s8(vi8);
 			int32x4_t vi32 = vmovl_s16(vget_low_s16(vi16));
