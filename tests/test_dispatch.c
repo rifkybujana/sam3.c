@@ -133,7 +133,7 @@ static void test_dispatch_f32_add(void)
 }
 
 /*
- * F16 softmax is not yet registered; dispatch must return SAM3_EDTYPE.
+ * F16 conv2d is not yet registered; dispatch must return SAM3_EDTYPE.
  */
 static void test_dispatch_unimplemented(void)
 {
@@ -141,7 +141,7 @@ static void test_dispatch_unimplemented(void)
 	int dims[] = {4};
 	struct sam3_tensor *a   = alloc_tensor(&cpu, SAM3_DTYPE_F16, 1, dims);
 	struct sam3_tensor *out = alloc_tensor(&cpu, SAM3_DTYPE_F16, 1, dims);
-	struct sam3_node node   = make_unary_node(SAM3_OP_SOFTMAX, a, out);
+	struct sam3_node node   = make_unary_node(SAM3_OP_CONV2D, a, out);
 	enum sam3_error err;
 
 	err = cpu_dispatch_node(&node, &cpu.scratch, cpu.pool);

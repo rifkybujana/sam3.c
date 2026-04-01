@@ -77,4 +77,10 @@ enum sam3_error cpu_kernel_gelu_f16(const struct sam3_node *node,
 enum sam3_error cpu_kernel_matmul_f16(const struct sam3_node *node,
 				      struct sam3_threadpool *pool);
 
+/* FP16 softmax and layernorm */
+enum sam3_error cpu_kernel_softmax_f16(const struct sam3_node *node,
+				       struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_layernorm_f16(const struct sam3_node *node,
+					 struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */
