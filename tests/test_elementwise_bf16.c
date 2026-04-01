@@ -209,6 +209,130 @@ static void test_gelu_bf16(void)
 	sam3_threadpool_free(pool);
 }
 
+static void test_softmax_bf16(void)
+{
+	float in_f32[8] = {1.0f, 2.0f, 3.0f, 4.0f, 1.0f, 2.0f, 3.0f, 4.0f};
+	uint16_t in_bf16[8], out_bf16[8];
+	int i;
+
+	for (i = 0; i < 8; i++)
+		in_bf16[i] = f32_to_bf16(in_f32[i]);
+	memset(out_bf16, 0, sizeof(out_bf16));
+
+	/* Two rows of 4: softmax along last dim */
+	struct sam3_tensor tin, tout;
+	memset(&tin, 0, sizeof(tin));
+	memset(&tout, 0, sizeof(tout));
+	tin.dtype      = SAM3_DTYPE_BF16;
+	tin.n_dims     = 2;
+	tin.dims[0]    = 2;
+	tin.dims[1]    = 4;
+	tin.dims[2]    = 1;
+	tin.dims[3]    = 1;
+	tin.strides[0] = 4;
+	tin.strides[1] = 1;
+	tin.strides[2] = 8;
+	tin.strides[3] = 8;
+	tin.data       = in_bf16;
+	tin.nbytes     = sizeof(in_bf16);
+
+	tout = tin;
+	tout.data   = out_bf16;
+	tout.nbytes = sizeof(out_bf16);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_SOFTMAX;
+	node.n_inputs  = 1;
+	node.inputs[0] = &tin;
+	node.output    = &tout;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_softmax_bf16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Compute f32 reference for each row */
+	for (int r = 0; r < 2; r++) {
+		float row[4];
+		for (i = 0; i < 4; i++)
+			row[i] = in_f32[r * 4 + i];
+
+		/* Max */
+		float max_val = row[0];
+		for (i = 1; i < 4; i++)
+			if (row[i] > max_val)
+				max_val = row[i];
+
+		/* exp(x - max) and sum */
+		float sum = 0.0f;
+		for (i = 0; i < 4; i++) {
+			row[i] = expf(row[i] - max_val);
+			sum += row[i];
+		}
+
+		/* Normalize and compare */
+		for (i = 0; i < 4; i++) {
+			float expected = row[i] / sum;
+			float result = bf16_to_f32(out_bf16[r * 4 + i]);
+			ASSERT_NEAR(result, expected, 1e-2f);
+		}
+	}
+
+	sam3_threadpool_free(pool);
+}
+
+static void test_layernorm_bf16(void)
+{
+	float in_f32[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+	uint16_t in_bf16[8], out_bf16[8];
+	int i;
+
+	for (i = 0; i < 8; i++)
+		in_bf16[i] = f32_to_bf16(in_f32[i]);
+	memset(out_bf16, 0, sizeof(out_bf16));
+
+	/* Single row of 8, no gamma/beta */
+	struct sam3_tensor tin, tout;
+	make_bf16_tensor(&tin,  in_bf16,  8);
+	make_bf16_tensor(&tout, out_bf16, 8);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_LAYERNORM;
+	node.n_inputs  = 1;
+	node.inputs[0] = &tin;
+	node.output    = &tout;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_layernorm_bf16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Compute f32 reference: mean, variance, normalize */
+	float mean = 0.0f;
+	for (i = 0; i < 8; i++)
+		mean += in_f32[i];
+	mean /= 8.0f;
+
+	float var_sum = 0.0f;
+	for (i = 0; i < 8; i++) {
+		float d = in_f32[i] - mean;
+		var_sum += d * d;
+	}
+	float inv_std = 1.0f / sqrtf(var_sum / 8.0f + 1e-5f);
+
+	for (i = 0; i < 8; i++) {
+		float expected = (in_f32[i] - mean) * inv_std;
+		float result = bf16_to_f32(out_bf16[i]);
+		ASSERT_NEAR(result, expected, 1e-2f);
+	}
+
+	sam3_threadpool_free(pool);
+}
+
 static void test_add_bf16_dtype_reject(void)
 {
 	/* Passing F32 tensors to the BF16 kernel must return SAM3_EINVAL */
@@ -255,6 +379,8 @@ int main(void)
 	test_mul_bf16();
 	test_relu_bf16();
 	test_gelu_bf16();
+	test_softmax_bf16();
+	test_layernorm_bf16();
 	test_add_bf16_dtype_reject();
 
 	TEST_REPORT();

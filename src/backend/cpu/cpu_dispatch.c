@@ -220,6 +220,31 @@ wrap_matmul_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_matmul_bf16(node, pool);
 }
 
+static enum sam3_error
+wrap_softmax_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
+		  struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_softmax_bf16(node, pool);
+}
+
+static enum sam3_error
+wrap_layernorm_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
+		    struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_layernorm_bf16(node, pool);
+}
+
+static enum sam3_error
+wrap_conv2d_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
+		 struct sam3_threadpool *pool)
+{
+	if (node->n_inputs < 2 || !node->inputs[1])
+		return SAM3_EDTYPE;
+	return cpu_kernel_conv2d_bf16(node, scratch, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -247,6 +272,7 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	[SAM3_OP_SOFTMAX] = {
 		[SAM3_DTYPE_F32]  = wrap_softmax,
 		[SAM3_DTYPE_F16]  = wrap_softmax_f16,
+		[SAM3_DTYPE_BF16] = wrap_softmax_bf16,
 	},
 	[SAM3_OP_RELU] = {
 		[SAM3_DTYPE_F32]  = wrap_relu,
@@ -261,10 +287,12 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	[SAM3_OP_LAYERNORM] = {
 		[SAM3_DTYPE_F32]  = wrap_layernorm,
 		[SAM3_DTYPE_F16]  = wrap_layernorm_f16,
+		[SAM3_DTYPE_BF16] = wrap_layernorm_bf16,
 	},
 	[SAM3_OP_CONV2D] = {
 		[SAM3_DTYPE_F32]  = wrap_conv2d,
 		[SAM3_DTYPE_F16]  = wrap_conv2d_f16,
+		[SAM3_DTYPE_BF16] = wrap_conv2d_bf16,
 	},
 	[SAM3_OP_RESHAPE] = {
 		[SAM3_DTYPE_F32]  = wrap_reshape,

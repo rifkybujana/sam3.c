@@ -102,4 +102,15 @@ enum sam3_error cpu_kernel_gelu_bf16(const struct sam3_node *node,
 enum sam3_error cpu_kernel_matmul_bf16(const struct sam3_node *node,
 				       struct sam3_threadpool *pool);
 
+/* BF16 softmax and layernorm */
+enum sam3_error cpu_kernel_softmax_bf16(const struct sam3_node *node,
+					struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_layernorm_bf16(const struct sam3_node *node,
+					  struct sam3_threadpool *pool);
+
+/* BF16 conv2d kernel */
+enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
+				       struct sam3_arena *scratch,
+				       struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */
