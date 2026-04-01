@@ -39,9 +39,10 @@ enum sam3_dtype {
 	SAM3_DTYPE_BF16,
 	SAM3_DTYPE_I32,
 	SAM3_DTYPE_I8,
+	SAM3_DTYPE_Q8_0,   /* Block-quantized int8: 32 values + f32 scale */
 };
 
-#define SAM3_DTYPE_COUNT 5
+#define SAM3_DTYPE_COUNT 6
 
 /* Prompt type for segmentation. */
 enum sam3_prompt_type {

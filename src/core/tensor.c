@@ -28,11 +28,12 @@ int sam3_tensor_nelems(const struct sam3_tensor *t)
 size_t sam3_dtype_size(enum sam3_dtype dtype)
 {
 	switch (dtype) {
-	case SAM3_DTYPE_F32: return 4;
-	case SAM3_DTYPE_F16: return 2;
+	case SAM3_DTYPE_F32:  return 4;
+	case SAM3_DTYPE_F16:  return 2;
 	case SAM3_DTYPE_BF16: return 2;
-	case SAM3_DTYPE_I32: return 4;
-	case SAM3_DTYPE_I8:  return 1;
+	case SAM3_DTYPE_I32:  return 4;
+	case SAM3_DTYPE_I8:   return 1;
+	case SAM3_DTYPE_Q8_0: return 0; /* block type */
 	}
 	return 0;
 }
@@ -52,6 +53,7 @@ const char *sam3_dtype_str(enum sam3_dtype dtype)
 	case SAM3_DTYPE_BF16: return "BF16";
 	case SAM3_DTYPE_I32:  return "I32";
 	case SAM3_DTYPE_I8:   return "I8";
+	case SAM3_DTYPE_Q8_0: return "Q8_0";
 	}
 	return "UNKNOWN";
 }
