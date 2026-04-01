@@ -111,3 +111,7 @@ if(SAM3_TESTS)
 		target_compile_definitions(test_trace PRIVATE SAM3_HAS_TRACE)
 	endif()
 endif()
+
+# Benchmark (not included in CTest)
+add_executable(bench_dtype tests/bench_dtype.c)
+target_link_libraries(bench_dtype sam3)
