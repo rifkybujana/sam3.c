@@ -5,8 +5,8 @@
  * Each entry is a thin wrapper that adapts the uniform kernel signature
  * to the actual kernel API (some kernels omit scratch or pool). NULL
  * entries mean the (op, dtype) combination is not yet implemented and
- * will return SAM3_EDTYPE. Only F32 entries are populated here; fp16
- * and bf16 entries are filled in later tasks.
+ * will return SAM3_EDTYPE. F32, fp16, and bf16 entries are populated
+ * for all compute ops; reshape and transpose are dtype-agnostic.
  *
  * Key types:  sam3_kernel_fn
  * Depends on: cpu_dispatch.h, kernels/cpu_kernels.h, core/tensor.h,
@@ -257,8 +257,8 @@ wrap_cast(const struct sam3_node *node, struct sam3_arena *scratch,
 
 /*
  * cpu_dispatch_table[op][dtype] — NULL means not implemented.
- * Reshape is registered for all dtypes because it is dtype-agnostic.
- * All other ops are F32-only until later tasks add fp16/bf16 kernels.
+ * Reshape and transpose are registered for all dtypes (dtype-agnostic).
+ * Cast is registered for all floating-point source dtypes.
  */
 static const sam3_kernel_fn
 cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {

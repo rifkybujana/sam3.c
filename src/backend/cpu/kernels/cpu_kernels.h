@@ -1,14 +1,15 @@
 /*
  * src/backend/cpu/kernels/cpu_kernels.h - CPU kernel declarations
  *
- * Declares all CPU compute kernels. Each kernel validates its inputs,
- * selects scalar or SIMD path, and operates on the node's tensor data.
- * F32 kernels return SAM3_EINVAL for other dtypes; fp16 kernels handle
- * SAM3_DTYPE_F16 tensors via NEON or scalar fallback.
+ * Declares all CPU compute kernels for f32, fp16, and bf16 dtypes.
+ * Each kernel validates its inputs, selects scalar or SIMD path, and
+ * operates on the node's tensor data. fp16 kernels use native NEON
+ * fp16 arithmetic (ARMv8.2-A+) or scalar fallback; bf16 kernels always
+ * upcast to f32 for computation. Cast kernel converts between dtypes.
  *
  * Key types:  (function declarations only)
  * Depends on: core/graph.h, core/alloc.h, sam3/sam3_types.h
- * Used by:    cpu_backend.c (dispatch switch)
+ * Used by:    cpu_dispatch.c
  *
  * Copyright (c) 2026
  * SPDX-License-Identifier: MIT
