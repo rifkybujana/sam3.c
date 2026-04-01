@@ -165,6 +165,50 @@ static void test_relu_bf16(void)
 	sam3_threadpool_free(pool);
 }
 
+static void test_gelu_bf16(void)
+{
+	float in_f32[8] = {-2.0f, -1.0f, -0.5f, 0.0f,
+			   0.5f, 1.0f, 1.5f, 2.0f};
+	uint16_t in_bf16[8], out_bf16[8];
+	int i;
+
+	for (i = 0; i < 8; i++)
+		in_bf16[i] = f32_to_bf16(in_f32[i]);
+	memset(out_bf16, 0, sizeof(out_bf16));
+
+	/* Compute expected GELU in f32 */
+	float expected[8];
+	for (i = 0; i < 8; i++) {
+		float x = in_f32[i];
+		float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+		expected[i] = 0.5f * x * (1.0f + tanhf(inner));
+	}
+
+	struct sam3_tensor tin, tout;
+	make_bf16_tensor(&tin,  in_bf16,  8);
+	make_bf16_tensor(&tout, out_bf16, 8);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_GELU;
+	node.n_inputs  = 1;
+	node.inputs[0] = &tin;
+	node.output    = &tout;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_gelu_bf16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	for (i = 0; i < 8; i++) {
+		float result = bf16_to_f32(out_bf16[i]);
+		ASSERT_NEAR(result, expected[i], 1e-2f);
+	}
+
+	sam3_threadpool_free(pool);
+}
+
 static void test_add_bf16_dtype_reject(void)
 {
 	/* Passing F32 tensors to the BF16 kernel must return SAM3_EINVAL */
@@ -210,6 +254,7 @@ int main(void)
 	test_add_bf16();
 	test_mul_bf16();
 	test_relu_bf16();
+	test_gelu_bf16();
 	test_add_bf16_dtype_reject();
 
 	TEST_REPORT();
