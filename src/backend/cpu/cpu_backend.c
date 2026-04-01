@@ -4,11 +4,12 @@
  * Implements the CPU compute backend with arena-based tensor allocation.
  * The arena is initialized on cpu_init() and all tensor data is bump-
  * allocated from it, giving O(1) allocation with zero fragmentation.
- * The arena is freed on cpu_free().
+ * The arena is freed on cpu_free(). Graph evaluation delegates to
+ * cpu_dispatch_node() which routes each node through the 2D dispatch table.
  *
  * Key types:  sam3_cpu_backend
- * Depends on: cpu_backend.h, core/tensor.h, util/log.h, util/profile.h,
- *             util/threadpool.h
+ * Depends on: cpu_backend.h, cpu_dispatch.h, core/tensor.h, util/log.h,
+ *             util/profile.h, util/threadpool.h
  * Used by:    backend.h (registered at init)
  *
  * Copyright (c) 2026
@@ -16,7 +17,7 @@
  */
 
 #include "cpu_backend.h"
-#include "kernels/cpu_kernels.h"
+#include "cpu_dispatch.h"
 #include "core/tensor.h"
 #include "util/log.h"
 #include "util/profile.h"
@@ -131,46 +132,7 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 
 		SAM3_PROF_OP_BEGIN(prof, node->op);
 
-		switch (node->op) {
-		case SAM3_OP_MATMUL:
-			err = cpu_kernel_matmul(node, cpu->pool);
-			break;
-		case SAM3_OP_ADD:
-			err = cpu_kernel_add(node, cpu->pool);
-			break;
-		case SAM3_OP_MUL:
-			err = cpu_kernel_mul(node, cpu->pool);
-			break;
-		case SAM3_OP_SOFTMAX:
-			err = cpu_kernel_softmax(node, cpu->pool);
-			break;
-		case SAM3_OP_RELU:
-			err = cpu_kernel_relu(node, cpu->pool);
-			break;
-		case SAM3_OP_GELU:
-			err = cpu_kernel_gelu(node, cpu->pool);
-			break;
-		case SAM3_OP_LAYERNORM:
-			err = cpu_kernel_layernorm(node, cpu->pool);
-			break;
-		case SAM3_OP_CONV2D:
-			err = cpu_kernel_conv2d(node, &cpu->scratch, cpu->pool);
-			break;
-		case SAM3_OP_RESHAPE:
-			err = cpu_kernel_reshape(node);
-			break;
-		case SAM3_OP_TRANSPOSE:
-			err = cpu_kernel_transpose(node, cpu->pool);
-			break;
-		case SAM3_OP_NONE:
-			err = SAM3_OK;
-			break;
-		default:
-			sam3_log_error("cpu_graph_eval: unknown op %d",
-				       node->op);
-			err = SAM3_EINVAL;
-			break;
-		}
+		err = cpu_dispatch_node(node, &cpu->scratch, cpu->pool);
 
 		SAM3_PROF_OP_END(prof, node->op);
 

@@ -27,11 +27,6 @@ enum sam3_error cpu_kernel_reshape(const struct sam3_node *node)
 		return SAM3_EINVAL;
 	}
 
-	if (in->dtype != SAM3_DTYPE_F32) {
-		sam3_log_error("reshape: unsupported dtype %d", in->dtype);
-		return SAM3_EINVAL;
-	}
-
 	if (sam3_tensor_nelems(in) != sam3_tensor_nelems(out)) {
 		sam3_log_error("reshape: element count mismatch %d != %d",
 			       sam3_tensor_nelems(in),
