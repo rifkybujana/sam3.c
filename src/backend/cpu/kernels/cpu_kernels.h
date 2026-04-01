@@ -113,4 +113,8 @@ enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
 				       struct sam3_arena *scratch,
 				       struct sam3_threadpool *pool);
 
+/* Cast between dtypes: node->params[0] = target dtype */
+enum sam3_error cpu_kernel_cast(const struct sam3_node *node,
+				struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */

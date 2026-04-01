@@ -245,6 +245,14 @@ wrap_conv2d_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_conv2d_bf16(node, scratch, pool);
 }
 
+static enum sam3_error
+wrap_cast(const struct sam3_node *node, struct sam3_arena *scratch,
+	  struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_cast(node, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -307,6 +315,11 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 		[SAM3_DTYPE_BF16] = wrap_transpose,
 		[SAM3_DTYPE_I32]  = wrap_transpose,
 		[SAM3_DTYPE_I8]   = wrap_transpose,
+	},
+	[SAM3_OP_CAST] = {
+		[SAM3_DTYPE_F32]  = wrap_cast,
+		[SAM3_DTYPE_F16]  = wrap_cast,
+		[SAM3_DTYPE_BF16] = wrap_cast,
 	},
 };
 
