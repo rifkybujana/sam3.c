@@ -174,6 +174,9 @@ static enum sam3_error
 wrap_conv2d_f16(const struct sam3_node *node, struct sam3_arena *scratch,
 		struct sam3_threadpool *pool)
 {
+	/* Conv2d requires two inputs (input tensor + weight tensor). */
+	if (node->n_inputs < 2 || !node->inputs[1])
+		return SAM3_EDTYPE;
 	return cpu_kernel_conv2d_f16(node, scratch, pool);
 }
 
