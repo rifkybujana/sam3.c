@@ -221,6 +221,14 @@ wrap_matmul_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
 }
 
 static enum sam3_error
+wrap_matmul_q8(const struct sam3_node *node, struct sam3_arena *scratch,
+	       struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_matmul_q8(node, pool);
+}
+
+static enum sam3_error
 wrap_softmax_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
 		  struct sam3_threadpool *pool)
 {
@@ -266,6 +274,7 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 		[SAM3_DTYPE_F32]  = wrap_matmul,
 		[SAM3_DTYPE_F16]  = wrap_matmul_f16,
 		[SAM3_DTYPE_BF16] = wrap_matmul_bf16,
+		[SAM3_DTYPE_Q8_0] = wrap_matmul_q8,
 	},
 	[SAM3_OP_ADD] = {
 		[SAM3_DTYPE_F32]  = wrap_add,
@@ -308,6 +317,7 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 		[SAM3_DTYPE_BF16] = wrap_reshape,
 		[SAM3_DTYPE_I32]  = wrap_reshape,
 		[SAM3_DTYPE_I8]   = wrap_reshape,
+		[SAM3_DTYPE_Q8_0] = wrap_reshape,
 	},
 	[SAM3_OP_TRANSPOSE] = {
 		[SAM3_DTYPE_F32]  = wrap_transpose,
@@ -315,6 +325,7 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 		[SAM3_DTYPE_BF16] = wrap_transpose,
 		[SAM3_DTYPE_I32]  = wrap_transpose,
 		[SAM3_DTYPE_I8]   = wrap_transpose,
+		[SAM3_DTYPE_Q8_0] = wrap_transpose,
 	},
 	[SAM3_OP_CAST] = {
 		[SAM3_DTYPE_F32]  = wrap_cast,
@@ -357,16 +368,32 @@ cpu_dispatch_node(const struct sam3_node *node,
 
 	dtype = node->inputs[0]->dtype;
 
-	/* All inputs must share the same dtype. */
-	for (int i = 1; i < node->n_inputs; i++) {
-		if (!node->inputs[i])
-			continue;
-		if (node->inputs[i]->dtype != dtype) {
-			sam3_log_error(
-				"cpu_dispatch: dtype mismatch input[0]=%d "
-				"input[%d]=%d",
-				dtype, i, node->inputs[i]->dtype);
-			return SAM3_EDTYPE;
+	/*
+	 * All inputs must share the same dtype, EXCEPT:
+	 * - MATMUL with Q8_0: input[0]=F32 (activations), input[1]=Q8_0 (weights)
+	 * In that case, dispatch on input[1]'s dtype (Q8_0) to reach the
+	 * mixed-dtype kernel.
+	 */
+	int mixed_q8 = (node->op == SAM3_OP_MATMUL &&
+			node->n_inputs >= 2 &&
+			node->inputs[1] &&
+			node->inputs[1]->dtype == SAM3_DTYPE_Q8_0 &&
+			dtype == SAM3_DTYPE_F32);
+
+	if (mixed_q8) {
+		dtype = SAM3_DTYPE_Q8_0;
+	} else {
+		for (int i = 1; i < node->n_inputs; i++) {
+			if (!node->inputs[i])
+				continue;
+			if (node->inputs[i]->dtype != dtype) {
+				sam3_log_error(
+					"cpu_dispatch: dtype mismatch "
+					"input[0]=%d input[%d]=%d",
+					dtype, i,
+					node->inputs[i]->dtype);
+				return SAM3_EDTYPE;
+			}
 		}
 	}
 
