@@ -11,6 +11,7 @@ option(SAM3_METAL "Enable Metal backend" OFF)
 option(SAM3_CPU   "Enable CPU backend"   ON)
 option(SAM3_TESTS "Build tests"          ON)
 option(SAM3_PROFILE "Enable profiler"     OFF)
+option(SAM3_TRACE   "Enable dtype tracing" OFF)
 
 # Auto-detect Metal on macOS
 if(APPLE AND NOT DEFINED SAM3_METAL)
@@ -34,6 +35,10 @@ endif()
 
 if(SAM3_PROFILE)
 	add_definitions(-DSAM3_HAS_PROFILE)
+endif()
+
+if(SAM3_TRACE)
+	add_definitions(-DSAM3_HAS_TRACE)
 endif()
 
 # Include paths
@@ -100,4 +105,9 @@ if(SAM3_TESTS)
 		target_link_libraries(${test_name} sam3)
 		add_test(NAME ${test_name} COMMAND ${test_name})
 	endforeach()
+
+	# test_trace needs trace enabled regardless of global setting
+	if(TARGET test_trace)
+		target_compile_definitions(test_trace PRIVATE SAM3_HAS_TRACE)
+	endif()
 endif()
