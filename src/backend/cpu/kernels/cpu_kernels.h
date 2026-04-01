@@ -73,4 +73,8 @@ enum sam3_error cpu_kernel_relu_f16(const struct sam3_node *node,
 enum sam3_error cpu_kernel_gelu_f16(const struct sam3_node *node,
 				    struct sam3_threadpool *pool);
 
+/* FP16 matmul kernel */
+enum sam3_error cpu_kernel_matmul_f16(const struct sam3_node *node,
+				      struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */
