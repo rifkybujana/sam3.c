@@ -2,7 +2,8 @@
  * src/backend/cpu/kernels/cpu_transpose.c - 2D transpose kernel
  *
  * Transposes a 2D matrix [rows, cols] -> [cols, rows] by copying.
- * NEON path uses 4x4 block transpose for cache efficiency.
+ * NEON/AVX2 paths use block transpose for cache efficiency (f32 only).
+ * Non-f32 dtypes use a generic byte-level path via sam3_dtype_size().
  * Always copies data (no lazy stride swap).
  *
  * Key types:  sam3_node, sam3_tensor
@@ -12,6 +13,8 @@
  * Copyright (c) 2026
  * SPDX-License-Identifier: MIT
  */
+
+#include <string.h>
 
 #include "cpu_kernels.h"
 #include "cpu_simd.h"
@@ -33,6 +36,24 @@ static void transpose_f32_scalar(const float *in, float *out,
 }
 
 #endif /* !SAM3_HAS_NEON && !SAM3_HAS_AVX2 */
+
+/* --- Generic byte-level path (any dtype) --- */
+
+static void transpose_generic(const void *in, void *out,
+			       int rows, int cols, size_t elem_size,
+			       int row_start, int row_end)
+{
+	const unsigned char *src = (const unsigned char *)in;
+	unsigned char *dst = (unsigned char *)out;
+
+	for (int i = row_start; i < row_end; i++) {
+		for (int j = 0; j < cols; j++) {
+			memcpy(dst + ((size_t)j * rows + i) * elem_size,
+			       src + ((size_t)i * cols + j) * elem_size,
+			       elem_size);
+		}
+	}
+}
 
 /* --- NEON path --- */
 
@@ -162,10 +183,11 @@ static void transpose_f32_avx2(const float *in, float *out,
 /* --- Parallel dispatch --- */
 
 struct transpose_par_ctx {
-	const float *in;
-	float       *out;
-	int          rows;
-	int          cols;
+	const void *in;
+	void       *out;
+	int         rows;
+	int         cols;
+	size_t      elem_size;
 };
 
 static void transpose_parallel_fn(void *arg, int task_id, int n_tasks)
@@ -178,16 +200,26 @@ static void transpose_parallel_fn(void *arg, int task_id, int n_tasks)
 	if (row_start >= row_end)
 		return;
 
+	if (ctx->elem_size == 4) {
 #if SAM3_HAS_NEON
-	transpose_f32_neon(ctx->in, ctx->out, ctx->rows, ctx->cols,
-			   row_start, row_end);
+		transpose_f32_neon((const float *)ctx->in, (float *)ctx->out,
+				   ctx->rows, ctx->cols,
+				   row_start, row_end);
 #elif SAM3_HAS_AVX2
-	transpose_f32_avx2(ctx->in, ctx->out, ctx->rows, ctx->cols,
-			   row_start, row_end);
+		transpose_f32_avx2((const float *)ctx->in, (float *)ctx->out,
+				   ctx->rows, ctx->cols,
+				   row_start, row_end);
 #else
-	transpose_f32_scalar(ctx->in, ctx->out, ctx->rows, ctx->cols,
-			     row_start, row_end);
+		transpose_f32_scalar((const float *)ctx->in,
+				     (float *)ctx->out,
+				     ctx->rows, ctx->cols,
+				     row_start, row_end);
 #endif
+	} else {
+		transpose_generic(ctx->in, ctx->out,
+				  ctx->rows, ctx->cols, ctx->elem_size,
+				  row_start, row_end);
+	}
 }
 
 enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
@@ -201,11 +233,6 @@ enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
 	struct sam3_tensor *in = node->inputs[0];
 	struct sam3_tensor *out = node->output;
 
-	if (in->dtype != SAM3_DTYPE_F32) {
-		sam3_log_error("transpose: unsupported dtype");
-		return SAM3_EINVAL;
-	}
-
 	if (in->n_dims != 2) {
 		sam3_log_error("transpose: expected 2D tensor, got %dD",
 			       in->n_dims);
@@ -213,10 +240,11 @@ enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
 	}
 
 	struct transpose_par_ctx ctx = {
-		.in   = (const float *)in->data,
-		.out  = (float *)out->data,
-		.rows = in->dims[0],
-		.cols = in->dims[1],
+		.in        = in->data,
+		.out       = out->data,
+		.rows      = in->dims[0],
+		.cols      = in->dims[1],
+		.elem_size = sam3_dtype_size(in->dtype),
 	};
 
 	int n_tasks = sam3_threadpool_n_threads(pool);

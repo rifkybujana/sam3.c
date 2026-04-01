@@ -170,6 +170,13 @@ wrap_layernorm_f16(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_layernorm_f16(node, pool);
 }
 
+static enum sam3_error
+wrap_conv2d_f16(const struct sam3_node *node, struct sam3_arena *scratch,
+		struct sam3_threadpool *pool)
+{
+	return cpu_kernel_conv2d_f16(node, scratch, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -209,6 +216,7 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_CONV2D] = {
 		[SAM3_DTYPE_F32]  = wrap_conv2d,
+		[SAM3_DTYPE_F16]  = wrap_conv2d_f16,
 	},
 	[SAM3_OP_RESHAPE] = {
 		[SAM3_DTYPE_F32]  = wrap_reshape,
@@ -219,6 +227,10 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_TRANSPOSE] = {
 		[SAM3_DTYPE_F32]  = wrap_transpose,
+		[SAM3_DTYPE_F16]  = wrap_transpose,
+		[SAM3_DTYPE_BF16] = wrap_transpose,
+		[SAM3_DTYPE_I32]  = wrap_transpose,
+		[SAM3_DTYPE_I8]   = wrap_transpose,
 	},
 };
 
