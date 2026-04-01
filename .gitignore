@@ -1,30 +1,104 @@
-# Build
-.cache/
+# ==========================================
+# Build Artifacts & CMake
+# ==========================================
 build/
+build-*/
 cmake-build-*/
+out/
+bin/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+Testing/
+
+# ==========================================
+# Compiled Output & C/C++ Exts
+# ==========================================
 *.o
-*.a
+*.obj
 *.so
 *.dylib
+*.dll
+*.a
+*.lib
+*.out
+*.exe
+*.app
+*.gch
+*.pch
 
-# Models / weights
+# ==========================================
+# Models & Weights
+# ==========================================
 models/*.bin
 models/*.safetensors
 models/*.pt
 models/*.onnx
 models/*.sam3
+models/*.gguf
+models/*.pth
 
-# IDE
+# ==========================================
+# Testing, Profiling & Logs
+# ==========================================
+*.log
+*.gcov
+*.gcno
+*.gcda
+coverage/
+gmon.out
+perf.data
+valgrind.log
+callgrind.out.*
+asan.log.*
+ubsan.log.*
+
+# Core dumps / crashes
+core
+core.*
+*.core
+crash*.txt
+
+# ==========================================
+# Editors, IDEs & Tooling
+# ==========================================
 .vscode/
 .idea/
+.clangd/
+.ccls-cache/
+.cache/
+.fleet/
+.zed/
+compile_commands.json
 *.swp
 *.swo
 *~
+Session.vim
+
+# ==========================================
+# OS Generated
+# ==========================================
 .DS_Store
-docs/plans
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
-# Worktrees
+# ==========================================
+# Version Control & Patches
+# ==========================================
 .worktrees/
+*.patch
+*.diff
+*.orig
+*.rej
 
-# Generated
-compile_commands.json
+# ==========================================
+# Project Specific
+# ==========================================
+docs/plans/
