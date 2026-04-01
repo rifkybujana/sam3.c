@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(sam3 VERSION 0.1.0 LANGUAGES C)
+project(sam3 VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -70,11 +70,18 @@ if(SAM3_CPU)
 endif()
 
 if(SAM3_METAL)
+	include(FetchContent)
+	FetchContent_Declare(mlx-c
+		GIT_REPOSITORY https://github.com/ml-explore/mlx-c.git
+		GIT_TAG        v0.6.0
+	)
+	set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+	set(MLX_C_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+	FetchContent_MakeAvailable(mlx-c)
+
 	file(GLOB_RECURSE SAM3_METAL_SOURCES "src/backend/metal/*.c")
 	list(APPEND SAM3_SOURCES ${SAM3_METAL_SOURCES})
 	add_definitions(-DSAM3_HAS_METAL)
-	find_library(METAL_FRAMEWORK Metal REQUIRED)
-	find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 endif()
 
 # Static library
@@ -85,7 +92,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(sam3 Threads::Threads)
 
 if(SAM3_METAL)
-	target_link_libraries(sam3 ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+	target_link_libraries(sam3 mlxc)
 endif()
 
 # CLI tools
