@@ -215,7 +215,7 @@ static enum sam3_error metal_dispatch_node(const struct sam3_node *node,
 		break;
 
 	case SAM3_OP_SOFTMAX:
-		rc = mlx_softmax(&result, inputs[0], true, stream);
+		rc = mlx_softmax_axis(&result, inputs[0], -1, true, stream);
 		break;
 
 	case SAM3_OP_RELU: {
@@ -223,8 +223,7 @@ static enum sam3_error metal_dispatch_node(const struct sam3_node *node,
 		float zero = 0.0f;
 		mlx_array zero_arr = mlx_array_new_data(
 			&zero, scalar_shape, 1, MLX_FLOAT32);
-		mlx_dtype in_dtype;
-		mlx_array_dtype(&in_dtype, inputs[0]);
+		mlx_dtype in_dtype = mlx_array_dtype(inputs[0]);
 		mlx_array zero_cast = mlx_array_new();
 		mlx_astype(&zero_cast, zero_arr, in_dtype, stream);
 		rc = mlx_maximum(&result, inputs[0], zero_cast, stream);
@@ -237,8 +236,7 @@ static enum sam3_error metal_dispatch_node(const struct sam3_node *node,
 		/* gelu(x) ~ x * sigmoid(1.702 * x) */
 		int scalar_shape[] = {1};
 		float coeff = 1.702f;
-		mlx_dtype in_dtype;
-		mlx_array_dtype(&in_dtype, inputs[0]);
+		mlx_dtype in_dtype = mlx_array_dtype(inputs[0]);
 		mlx_array coeff_arr = mlx_array_new_data(
 			&coeff, scalar_shape, 1, MLX_FLOAT32);
 		mlx_array coeff_cast = mlx_array_new();
@@ -291,8 +289,7 @@ static enum sam3_error metal_dispatch_node(const struct sam3_node *node,
 	}
 
 	case SAM3_OP_TRANSPOSE: {
-		int ndim;
-		mlx_array_ndim(&ndim, inputs[0]);
+		int ndim = (int)mlx_array_ndim(inputs[0]);
 		int axes[SAM3_MAX_DIMS];
 		int has_perm = 0;
 		for (int i = 0; i < ndim; i++) {
@@ -459,7 +456,7 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 	for (int i = 0; i < g->n_nodes; i++) {
 		mlx_array *out = metal_map_get(&map, g->nodes[i].output);
 		if (out)
-			mlx_vector_array_append(outputs, *out);
+			mlx_vector_array_append_value(outputs, *out);
 	}
 
 	int rc = mlx_eval(outputs);
@@ -479,8 +476,7 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 			continue;
 
 		const void *src = NULL;
-		mlx_dtype mtype;
-		mlx_array_dtype(&mtype, *out_a);
+		mlx_dtype mtype = mlx_array_dtype(*out_a);
 
 		switch (mtype) {
 		case MLX_FLOAT32:
