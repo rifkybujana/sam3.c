@@ -435,7 +435,11 @@ enum sam3_error sam3_weight_to_tensor(
 	out->data   = (void *)sam3_weight_tensor_data(wf, desc);
 	out->nbytes = (size_t)desc->data_size;
 
-	sam3_tensor_compute_strides(out);
+	/* Q8_0 is block-quantized; per-element strides are meaningless */
+	if (out->dtype != SAM3_DTYPE_Q8_0)
+		sam3_tensor_compute_strides(out);
+	else
+		memset(out->strides, 0, sizeof(out->strides));
 
 	return SAM3_OK;
 }
