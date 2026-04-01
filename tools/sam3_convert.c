@@ -7,8 +7,8 @@
  *
  * Usage: sam3_convert -i <input.safetensors> -o <output.sam3> [options]
  *
- * Key types:  (standalone tool)
- * Depends on: core/weight.h, util/log.h, util/error.h
+ * Key types:  quant_reader_state, weight_reader_ops (quantizing wrapper)
+ * Depends on: core/weight.h, core/quant.h, core/half.h, util/log.h, util/error.h
  * Used by:    end users (pre-inference step)
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -21,6 +21,8 @@
 
 #include "sam3/sam3_types.h"
 #include "core/weight.h"
+#include "core/quant.h"
+#include "core/half.h"
 #include "util/log.h"
 #include "util/error.h"
 
@@ -44,6 +46,8 @@ static void print_usage(const char *prog)
 	       "(default: 32)\n");
 	printf("  --decoder-layers <N> Decoder layer count "
 	       "(default: 2)\n");
+	printf("  --quantize <type>    Quantize weights: "
+	       "\"q8_0\" (default: none)\n");
 	printf("  -v                   Verbose output "
 	       "(set log level to DEBUG)\n");
 	printf("  -h, --help           Show this help\n");
@@ -53,6 +57,7 @@ struct convert_args {
 	const char *input_path;
 	const char *output_path;
 	const char *format;
+	const char *quantize;   /* NULL or "q8_0" */
 	int         image_size;
 	int         encoder_dim;
 	int         decoder_dim;
@@ -66,6 +71,7 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->input_path     = NULL;
 	args->output_path    = NULL;
 	args->format         = "safetensors";
+	args->quantize       = NULL;
 	args->image_size     = 1024;
 	args->encoder_dim    = 1280;
 	args->decoder_dim    = 256;
@@ -131,6 +137,13 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 				return 1;
 			}
 			args->decoder_layers = atoi(argv[i]);
+		} else if (strcmp(argv[i], "--quantize") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --quantize requires a type\n");
+				return 1;
+			}
+			args->quantize = argv[i];
 		} else if (strcmp(argv[i], "-v") == 0) {
 			args->verbose = 1;
 		} else {
@@ -151,6 +164,139 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 
 	return 0;
 }
+
+/* ── Quantizing reader wrapper ─────────────────────────────────────── */
+
+struct quant_reader_state {
+	struct weight_reader *inner;
+	int                   nelems_threshold;
+};
+
+static enum sam3_error qr_open(struct weight_reader *r, const char *path)
+{
+	(void)r; (void)path;
+	return SAM3_OK; /* inner already opened */
+}
+
+static int qr_n_tensors(struct weight_reader *r)
+{
+	struct quant_reader_state *s = r->impl;
+	return s->inner->ops->n_tensors(s->inner);
+}
+
+static enum sam3_error qr_get_tensor_info(struct weight_reader *r, int idx,
+					  struct weight_tensor_info *info)
+{
+	struct quant_reader_state *s = r->impl;
+	enum sam3_error err;
+
+	err = s->inner->ops->get_tensor_info(s->inner, idx, info);
+	if (err != SAM3_OK)
+		return err;
+
+	/* Compute nelems */
+	int nelems = 1;
+	for (int d = 0; d < info->n_dims; d++)
+		nelems *= info->dims[d];
+
+	/* Quantize large float tensors */
+	if (nelems >= s->nelems_threshold &&
+	    (info->dtype == SAM3_DTYPE_F32 ||
+	     info->dtype == SAM3_DTYPE_F16 ||
+	     info->dtype == SAM3_DTYPE_BF16)) {
+		info->dtype  = SAM3_DTYPE_Q8_0;
+		info->nbytes = sam3_q8_nbytes(nelems);
+	}
+
+	return SAM3_OK;
+}
+
+static enum sam3_error qr_read_tensor_data(struct weight_reader *r, int idx,
+					   void *dst, size_t dst_size)
+{
+	struct quant_reader_state *s = r->impl;
+	struct weight_tensor_info orig_info;
+	enum sam3_error err;
+
+	/* Get original (pre-quantize) info */
+	err = s->inner->ops->get_tensor_info(s->inner, idx, &orig_info);
+	if (err != SAM3_OK)
+		return err;
+
+	int nelems = 1;
+	for (int d = 0; d < orig_info.n_dims; d++)
+		nelems *= orig_info.dims[d];
+
+	/* Check if this tensor should be quantized */
+	int should_quantize = (nelems >= s->nelems_threshold &&
+			       (orig_info.dtype == SAM3_DTYPE_F32 ||
+				orig_info.dtype == SAM3_DTYPE_F16 ||
+				orig_info.dtype == SAM3_DTYPE_BF16));
+
+	if (!should_quantize) {
+		return s->inner->ops->read_tensor_data(s->inner, idx,
+						       dst, dst_size);
+	}
+
+	/* Read original data */
+	void *orig_data = malloc(orig_info.nbytes);
+	if (!orig_data)
+		return SAM3_ENOMEM;
+
+	err = s->inner->ops->read_tensor_data(s->inner, idx,
+					       orig_data, orig_info.nbytes);
+	if (err != SAM3_OK) {
+		free(orig_data);
+		return err;
+	}
+
+	/* Convert to f32 if needed, then quantize */
+	float *f32_data;
+	int need_free_f32 = 0;
+
+	if (orig_info.dtype == SAM3_DTYPE_F32) {
+		f32_data = (float *)orig_data;
+	} else {
+		f32_data = malloc((size_t)nelems * sizeof(float));
+		if (!f32_data) {
+			free(orig_data);
+			return SAM3_ENOMEM;
+		}
+		need_free_f32 = 1;
+
+		if (orig_info.dtype == SAM3_DTYPE_F16) {
+			const uint16_t *fp16 = (const uint16_t *)orig_data;
+			for (int i = 0; i < nelems; i++)
+				f32_data[i] = fp16_to_f32(fp16[i]);
+		} else { /* BF16 */
+			const uint16_t *bf16 = (const uint16_t *)orig_data;
+			for (int i = 0; i < nelems; i++)
+				f32_data[i] = bf16_to_f32(bf16[i]);
+		}
+	}
+
+	/* Quantize to Q8_0 */
+	sam3_q8_quantize(f32_data, (struct sam3_q8_block *)dst, nelems);
+
+	if (need_free_f32)
+		free(f32_data);
+	free(orig_data);
+
+	return SAM3_OK;
+}
+
+static void qr_close(struct weight_reader *r)
+{
+	(void)r; /* inner closed separately */
+}
+
+static const struct weight_reader_ops quant_reader_ops = {
+	.open             = qr_open,
+	.n_tensors        = qr_n_tensors,
+	.get_tensor_info  = qr_get_tensor_info,
+	.read_tensor_data = qr_read_tensor_data,
+	.close            = qr_close,
+};
 
 int main(int argc, char **argv)
 {
@@ -215,8 +361,32 @@ int main(int argc, char **argv)
 	config.n_encoder_layers = args.encoder_layers;
 	config.n_decoder_layers = args.decoder_layers;
 
+	/* Set up quantizing wrapper if requested */
+	struct weight_reader *write_reader = &reader;
+	struct quant_reader_state qstate;
+	struct weight_reader quant_reader;
+
+	if (args.quantize) {
+		if (strcmp(args.quantize, "q8_0") != 0) {
+			fprintf(stderr,
+				"error: unsupported quantize type '%s' "
+				"(only \"q8_0\" is supported)\n",
+				args.quantize);
+			reader.ops->close(&reader);
+			return 1;
+		}
+
+		qstate.inner = &reader;
+		qstate.nelems_threshold = 1024;
+		quant_reader.ops = &quant_reader_ops;
+		quant_reader.impl = &qstate;
+		write_reader = &quant_reader;
+
+		printf("  quantize:       %s\n", args.quantize);
+	}
+
 	/* Write .sam3 output */
-	err = sam3_weight_write(args.output_path, &config, &reader);
+	err = sam3_weight_write(args.output_path, &config, write_reader);
 	if (err != SAM3_OK) {
 		fprintf(stderr, "error: conversion failed: %s\n",
 			sam3_error_str(err));
