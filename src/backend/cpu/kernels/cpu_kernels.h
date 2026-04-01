@@ -88,4 +88,12 @@ enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 				      struct sam3_arena *scratch,
 				      struct sam3_threadpool *pool);
 
+/* BF16 elementwise kernels */
+enum sam3_error cpu_kernel_add_bf16(const struct sam3_node *node,
+				    struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_mul_bf16(const struct sam3_node *node,
+				    struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_relu_bf16(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */
