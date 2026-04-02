@@ -75,79 +75,71 @@ static void metal_dequant_q8_to_f16(const struct sam3_q8_block *src,
 
 /* ── Tensor-to-mlx_array lookup table ─────────────────────────────── */
 
-#define METAL_MAP_SIZE 8192  /* Must be power of 2 */
-
-struct metal_tensor_map {
-	const struct sam3_tensor *keys[METAL_MAP_SIZE];
-	mlx_array                vals[METAL_MAP_SIZE];
-	int                      count;
-};
-
-static void metal_map_init(struct metal_tensor_map *m)
+static void metal_map_init(struct sam3_metal_backend *mtl)
 {
-	memset(m->keys, 0, sizeof(m->keys));
-	m->count = 0;
+	memset(mtl->map_keys, 0, sizeof(mtl->map_keys));
+	mtl->map_count = 0;
 }
 
-static void metal_map_free(struct metal_tensor_map *m)
+static void metal_map_free(struct sam3_metal_backend *mtl)
 {
-	for (int i = 0; i < METAL_MAP_SIZE; i++) {
-		if (m->keys[i])
-			mlx_array_free(m->vals[i]);
+	for (int i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
+		if (mtl->map_keys[i])
+			mlx_array_free(mtl->map_vals[i]);
 	}
-	m->count = 0;
+	mtl->map_count = 0;
 }
 
 static unsigned metal_map_hash(const struct sam3_tensor *ptr)
 {
 	uintptr_t v = (uintptr_t)ptr;
 	v = (v >> 4) ^ (v >> 16);
-	return (unsigned)(v & (METAL_MAP_SIZE - 1));
+	return (unsigned)(v & (SAM3_METAL_MAP_SIZE - 1));
 }
 
-static mlx_array *metal_map_get(struct metal_tensor_map *m,
+static mlx_array *metal_map_get(struct sam3_metal_backend *mtl,
 				const struct sam3_tensor *key)
 {
 	unsigned idx = metal_map_hash(key);
-	for (unsigned i = 0; i < METAL_MAP_SIZE; i++) {
-		unsigned slot = (idx + i) & (METAL_MAP_SIZE - 1);
-		if (m->keys[slot] == key)
-			return &m->vals[slot];
-		if (!m->keys[slot])
+	for (unsigned i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
+		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
+		if (mtl->map_keys[slot] == key)
+			return &mtl->map_vals[slot];
+		if (!mtl->map_keys[slot])
 			return NULL;
 	}
 	return NULL;
 }
 
-static void metal_map_put(struct metal_tensor_map *m,
+static void metal_map_put(struct sam3_metal_backend *mtl,
 			   const struct sam3_tensor *key, mlx_array val)
 {
 	unsigned idx = metal_map_hash(key);
-	for (unsigned i = 0; i < METAL_MAP_SIZE; i++) {
-		unsigned slot = (idx + i) & (METAL_MAP_SIZE - 1);
-		if (!m->keys[slot]) {
-			m->keys[slot] = key;
-			m->vals[slot] = val;
-			m->count++;
+	for (unsigned i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
+		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
+		if (!mtl->map_keys[slot]) {
+			mtl->map_keys[slot] = key;
+			mtl->map_vals[slot] = val;
+			mtl->map_count++;
 			return;
 		}
 	}
 	sam3_log_error("metal: tensor map full");
 }
 
-static void metal_map_evict(struct metal_tensor_map *m,
+static void metal_map_evict(struct sam3_metal_backend *mtl,
 			    const struct sam3_tensor *key)
 {
 	unsigned idx = metal_map_hash(key);
-	for (unsigned i = 0; i < METAL_MAP_SIZE; i++) {
-		unsigned slot = (idx + i) & (METAL_MAP_SIZE - 1);
-		if (m->keys[slot] == key) {
-			mlx_array_free(m->vals[slot]);
-			m->keys[slot] = NULL;
-			m->count--;
+	for (unsigned i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
+		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
+		if (mtl->map_keys[slot] == key) {
+			mlx_array_free(mtl->map_vals[slot]);
+			mtl->map_keys[slot] = NULL;
+			mtl->map_count--;
 			return;
 		}
-		if (!m->keys[slot])
+		if (!mtl->map_keys[slot])
 			return;
 	}
 }
@@ -161,12 +153,10 @@ static void metal_map_evict(struct metal_tensor_map *m,
  * Otherwise creates a new mlx_array from the tensor's host data,
  * handling Q8_0 dequantization to F16 if needed.
  */
-static mlx_array metal_wrap_tensor(struct metal_tensor_map *map,
-				   const struct sam3_tensor *t,
-				   struct sam3_arena *scratch,
-				   mlx_stream stream)
+static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
+				   const struct sam3_tensor *t)
 {
-	mlx_array *existing = metal_map_get(map, t);
+	mlx_array *existing = metal_map_get(mtl, t);
 	if (existing)
 		return *existing;
 
@@ -180,7 +170,7 @@ static mlx_array metal_wrap_tensor(struct metal_tensor_map *map,
 
 	if (t->dtype == SAM3_DTYPE_Q8_0) {
 		int nelems = sam3_tensor_nelems(t);
-		uint16_t *fp16_buf = sam3_arena_alloc(scratch,
+		uint16_t *fp16_buf = sam3_arena_alloc(&mtl->scratch,
 					(size_t)nelems * sizeof(uint16_t));
 		if (!fp16_buf) {
 			sam3_log_error("metal: scratch OOM for Q8 wrap");
@@ -188,12 +178,12 @@ static mlx_array metal_wrap_tensor(struct metal_tensor_map *map,
 		}
 		metal_dequant_q8_to_f16(
 			(const struct sam3_q8_block *)t->data,
-			fp16_buf, nelems, scratch);
+			fp16_buf, nelems, &mtl->scratch);
 		data = fp16_buf;
 	}
 
 	mlx_array arr = mlx_array_new_data(data, t->dims, t->n_dims, mtype);
-	metal_map_put(map, t, arr);
+	metal_map_put(mtl, t, arr);
 	return arr;
 }
 
@@ -205,18 +195,16 @@ static mlx_array metal_wrap_tensor(struct metal_tensor_map *map,
  * The result mlx_array is stored in the map keyed by node->output.
  * Returns SAM3_OK on success.
  */
-static enum sam3_error metal_dispatch_node(const struct sam3_node *node,
-					   struct metal_tensor_map *map,
-					   struct sam3_arena *scratch,
-					   mlx_stream stream)
+static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
+					   const struct sam3_node *node)
 {
 	mlx_array result = mlx_array_new();
 	mlx_array inputs[SAM3_NODE_MAX_INPUTS];
+	mlx_stream stream = mtl->stream;
 	int rc;
 
 	for (int i = 0; i < node->n_inputs; i++)
-		inputs[i] = metal_wrap_tensor(map, node->inputs[i],
-					      scratch, stream);
+		inputs[i] = metal_wrap_tensor(mtl, node->inputs[i]);
 
 	switch (node->op) {
 	case SAM3_OP_MATMUL:
@@ -347,7 +335,7 @@ static enum sam3_error metal_dispatch_node(const struct sam3_node *node,
 		return SAM3_EBACKEND;
 	}
 
-	metal_map_put(map, node->output, result);
+	metal_map_put(mtl, node->output, result);
 	return SAM3_OK;
 }
 
@@ -386,6 +374,7 @@ static enum sam3_error metal_init(struct sam3_backend *be)
 
 	mtl->device = mlx_device_new_type(MLX_GPU, 0);
 	mtl->stream = mlx_default_gpu_stream_new();
+	metal_map_init(mtl);
 
 	size_t mem_limit = 0;
 	mlx_set_memory_limit(&mem_limit,
@@ -400,6 +389,7 @@ static void metal_free(struct sam3_backend *be)
 {
 	struct sam3_metal_backend *mtl = (struct sam3_metal_backend *)be;
 
+	metal_map_free(mtl);
 	mlx_stream_free(mtl->stream);
 	mlx_device_free(mtl->device);
 	mlx_clear_cache();
@@ -451,19 +441,15 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 					struct sam3_graph *g)
 {
 	struct sam3_metal_backend *mtl = (struct sam3_metal_backend *)be;
-	struct metal_tensor_map map;
 	enum sam3_error err;
 
-	metal_map_init(&map);
 	sam3_arena_reset(&mtl->scratch);
 
 	/* Phase 1: translate all nodes to MLX lazy ops */
 	for (int i = 0; i < g->n_nodes; i++) {
-		err = metal_dispatch_node(&g->nodes[i], &map,
-					  &mtl->scratch, mtl->stream);
+		err = metal_dispatch_node(mtl, &g->nodes[i]);
 		if (err != SAM3_OK) {
 			sam3_log_error("metal_graph_eval: node %d failed", i);
-			metal_map_free(&map);
 			return err;
 		}
 	}
@@ -471,7 +457,7 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 	/* Phase 2: collect outputs and eval in one batch */
 	mlx_vector_array outputs = mlx_vector_array_new();
 	for (int i = 0; i < g->n_nodes; i++) {
-		mlx_array *out = metal_map_get(&map, g->nodes[i].output);
+		mlx_array *out = metal_map_get(mtl, g->nodes[i].output);
 		if (out)
 			mlx_vector_array_append_value(outputs, *out);
 	}
@@ -481,14 +467,13 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 
 	if (rc != 0) {
 		sam3_log_error("metal_graph_eval: mlx_eval failed");
-		metal_map_free(&map);
 		return SAM3_EBACKEND;
 	}
 
-	/* Phase 3: copy results back to sam3 tensors */
+	/* Phase 3: copy results back to sam3 tensors, evict outputs */
 	for (int i = 0; i < g->n_nodes; i++) {
 		struct sam3_tensor *out_t = g->nodes[i].output;
-		mlx_array *out_a = metal_map_get(&map, out_t);
+		mlx_array *out_a = metal_map_get(mtl, out_t);
 		if (!out_a || !out_t->data)
 			continue;
 
@@ -518,9 +503,10 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 
 		if (src)
 			memcpy(out_t->data, src, out_t->nbytes);
+
+		metal_map_evict(mtl, out_t);
 	}
 
-	metal_map_free(&map);
 	return SAM3_OK;
 }
 
