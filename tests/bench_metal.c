@@ -21,6 +21,7 @@
 #include "backend/backend.h"
 #include "core/graph.h"
 #include "core/tensor.h"
+#include "core/half.h"
 
 /* ── Configuration ─────────────────────────────────────────────────── */
 
@@ -42,6 +43,14 @@ static void fill_random_f32(float *buf, int n)
 {
 	for (int i = 0; i < n; i++)
 		buf[i] = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+}
+
+static void fill_random_f16(uint16_t *buf, int n)
+{
+	for (int i = 0; i < n; i++) {
+		float v = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+		buf[i] = f32_to_fp16(v);
+	}
 }
 
 /* ── Tensor setup ──────────────────────────────────────────────────── */
@@ -84,6 +93,54 @@ static double bench_matmul(enum sam3_backend_type type, int m, int k, int n)
 	struct sam3_tensor a = make_tensor_2d(SAM3_DTYPE_F32, m, k);
 	struct sam3_tensor b = make_tensor_2d(SAM3_DTYPE_F32, k, n);
 	struct sam3_tensor c = make_tensor_2d(SAM3_DTYPE_F32, m, n);
+
+	be->ops->alloc_tensor(be, &a);
+	be->ops->alloc_tensor(be, &b);
+	be->ops->alloc_tensor(be, &c);
+	memcpy(a.data, da, a.nbytes);
+	memcpy(b.data, db, b.nbytes);
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	g.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_MATMUL, .n_inputs = 2,
+		.inputs = {&a, &b}, .output = &c,
+	};
+	g.n_nodes = 1;
+
+	for (int i = 0; i < WARMUP_ITERS; i++)
+		be->ops->graph_eval(be, &g);
+
+	double t0 = get_time_ms();
+	for (int i = 0; i < TIMED_ITERS; i++)
+		be->ops->graph_eval(be, &g);
+	double elapsed = (get_time_ms() - t0) / TIMED_ITERS;
+
+	free(da);
+	free(db);
+	sam3_backend_free(be);
+	return elapsed;
+}
+
+/* ── Benchmark: matmul F16 ─────────────────────────────────────────── */
+
+static double bench_matmul_f16(enum sam3_backend_type type, int m, int k, int n)
+{
+	struct sam3_backend *be = sam3_backend_init(type);
+	if (!be) return -1.0;
+
+	uint16_t *da = malloc((size_t)m * k * sizeof(uint16_t));
+	uint16_t *db = malloc((size_t)k * n * sizeof(uint16_t));
+	if (!da || !db) {
+		free(da); free(db); sam3_backend_free(be);
+		return -1.0;
+	}
+	fill_random_f16(da, m * k);
+	fill_random_f16(db, k * n);
+
+	struct sam3_tensor a = make_tensor_2d(SAM3_DTYPE_F16, m, k);
+	struct sam3_tensor b = make_tensor_2d(SAM3_DTYPE_F16, k, n);
+	struct sam3_tensor c = make_tensor_2d(SAM3_DTYPE_F16, m, n);
 
 	be->ops->alloc_tensor(be, &a);
 	be->ops->alloc_tensor(be, &b);
@@ -351,6 +408,28 @@ int main(void)
 			double gf_metal = (2.0 * m * k * n) / (tm * 1e6);
 			printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS\n",
 			       "", gf_cpu, gf_metal);
+		}
+	}
+
+	/* ── Matmul F16 ────────────────────────────────────── */
+	printf("\n  MATMUL F16 (M x K x N)\n");
+	print_header();
+
+	for (int i = 0; i < n_mm; i++) {
+		int m = mm_sizes[i][0], k = mm_sizes[i][1];
+		int n = mm_sizes[i][2];
+		char label[64];
+		snprintf(label, sizeof(label), "%d x %d x %d", m, k, n);
+
+		double tc = bench_matmul_f16(SAM3_BACKEND_CPU, m, k, n);
+		double tm = bench_matmul_f16(SAM3_BACKEND_METAL, m, k, n);
+		print_row(label, tc, tm);
+
+		if (tm > 0) {
+			double gf_metal = (2.0 * m * k * n) / (tm * 1e6);
+			double pct = gf_metal / 6800.0 * 100.0;
+			printf("  %-28s %27.1f GFLOPS  (%4.1f%% of 6.8 TFLOPS)\n",
+			       "", gf_metal, pct);
 		}
 	}
 
