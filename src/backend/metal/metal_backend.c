@@ -135,6 +135,23 @@ static void metal_map_put(struct metal_tensor_map *m,
 	sam3_log_error("metal: tensor map full");
 }
 
+static void metal_map_evict(struct metal_tensor_map *m,
+			    const struct sam3_tensor *key)
+{
+	unsigned idx = metal_map_hash(key);
+	for (unsigned i = 0; i < METAL_MAP_SIZE; i++) {
+		unsigned slot = (idx + i) & (METAL_MAP_SIZE - 1);
+		if (m->keys[slot] == key) {
+			mlx_array_free(m->vals[slot]);
+			m->keys[slot] = NULL;
+			m->count--;
+			return;
+		}
+		if (!m->keys[slot])
+			return;
+	}
+}
+
 /* ── Tensor wrapping ──────────────────────────────────────────────── */
 
 /*
