@@ -39,14 +39,14 @@
 
 ### Priority 3 — Before shipping
 
-- [ ] **Metal backend** (`src/backend/metal/`)
-  - Device/queue/library initialization
-  - Metal buffer allocation for tensors
-  - Compute pipeline setup
-  - MSL kernel shaders for each op
-  - Graph evaluation via command buffers
+- [x] **Metal backend** (`src/backend/metal/`)
+  - MLX-C integration via FetchContent (v0.6.0)
+  - Batch lazy evaluation — single `mlx_eval()` per graph
+  - All 11 ops: matmul, add, mul, softmax, relu, gelu, layernorm, conv2d, reshape, transpose, cast
+  - Q8_0 dequantization to F16 on host
+  - 152x speedup over CPU at 2048x2048 matmul (2.4 TFLOPS)
 
-- [ ] **CLI tools**
+- [x] **CLI tools**
   - `sam3_main` — argument parsing, image load, model load, inference, output
 
 ## Model Implementation
@@ -77,3 +77,5 @@ Depends on all Priority 1 ground systems.
 - [x] Backend tensor allocation (`src/backend/cpu/cpu_backend.c`)
 - [x] CPU compute kernels with NEON SIMD (`src/backend/cpu/kernels/`)
 - [x] Backend graph evaluator (`src/backend/cpu/cpu_backend.c`)
+- [x] Metal backend via MLX-C (`src/backend/metal/metal_backend.c`)
+- [x] Backend factory (`src/backend/backend.c`)
