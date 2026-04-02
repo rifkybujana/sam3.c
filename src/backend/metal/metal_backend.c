@@ -23,6 +23,7 @@
 
 #include "core/quant.h"
 #include "core/half.h"
+#include <stdbool.h>
 #include <string.h>
 
 /* ── Dtype mapping ─────────────────────────────────────────────────── */
@@ -470,40 +471,62 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 		return SAM3_EBACKEND;
 	}
 
-	/* Phase 3: copy results back to sam3 tensors, evict outputs */
+	/* Phase 2.5: detect intermediate outputs (consumed by later nodes) */
+	bool is_intermediate[SAM3_GRAPH_MAX_NODES];
+	memset(is_intermediate, 0, (size_t)g->n_nodes * sizeof(bool));
+
+	for (int i = 0; i < g->n_nodes; i++) {
+		for (int j = 0; j < g->nodes[i].n_inputs; j++) {
+			const struct sam3_tensor *inp = g->nodes[i].inputs[j];
+			for (int k = 0; k < g->n_nodes; k++) {
+				if (g->nodes[k].output == inp) {
+					is_intermediate[k] = true;
+					break;
+				}
+			}
+		}
+	}
+
+	/* Phase 3: copy only non-intermediate results back */
 	for (int i = 0; i < g->n_nodes; i++) {
 		struct sam3_tensor *out_t = g->nodes[i].output;
 		mlx_array *out_a = metal_map_get(mtl, out_t);
 		if (!out_a || !out_t->data)
-			continue;
+			goto evict;
 
-		const void *src = NULL;
-		mlx_dtype mtype = mlx_array_dtype(*out_a);
+		if (is_intermediate[i])
+			goto evict;
 
-		switch (mtype) {
-		case MLX_FLOAT32:
-			src = mlx_array_data_float32(*out_a);
-			break;
-		case MLX_FLOAT16:
-			src = mlx_array_data_float16(*out_a);
-			break;
-		case MLX_BFLOAT16:
-			src = mlx_array_data_bfloat16(*out_a);
-			break;
-		case MLX_INT32:
-			src = mlx_array_data_int32(*out_a);
-			break;
-		case MLX_INT8:
-			src = mlx_array_data_int8(*out_a);
-			break;
-		default:
-			sam3_log_error("metal: unsupported output dtype");
-			break;
+		{
+			const void *src = NULL;
+			mlx_dtype mtype = mlx_array_dtype(*out_a);
+
+			switch (mtype) {
+			case MLX_FLOAT32:
+				src = mlx_array_data_float32(*out_a);
+				break;
+			case MLX_FLOAT16:
+				src = mlx_array_data_float16(*out_a);
+				break;
+			case MLX_BFLOAT16:
+				src = mlx_array_data_bfloat16(*out_a);
+				break;
+			case MLX_INT32:
+				src = mlx_array_data_int32(*out_a);
+				break;
+			case MLX_INT8:
+				src = mlx_array_data_int8(*out_a);
+				break;
+			default:
+				sam3_log_error("metal: unsupported output dtype");
+				break;
+			}
+
+			if (src)
+				memcpy(out_t->data, src, out_t->nbytes);
 		}
 
-		if (src)
-			memcpy(out_t->data, src, out_t->nbytes);
-
+	evict:
 		metal_map_evict(mtl, out_t);
 	}
 
