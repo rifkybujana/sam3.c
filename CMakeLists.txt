@@ -126,9 +126,15 @@ if(SAM3_TESTS)
 	endif()
 endif()
 
-# Benchmarks (not included in CTest)
-add_executable(bench_dtype tests/bench_dtype.c)
-target_link_libraries(bench_dtype sam3)
+# Benchmarks (not included in CTest; use Release build for accurate numbers)
+set(BENCH_SOURCES
+	tests/bench_dtype.c
+	tests/bench_metal.c
+	tests/bench_tokenizer.c
+)
 
-add_executable(bench_metal tests/bench_metal.c)
-target_link_libraries(bench_metal sam3)
+foreach(BENCH_SRC ${BENCH_SOURCES})
+	get_filename_component(BENCH_NAME ${BENCH_SRC} NAME_WE)
+	add_executable(${BENCH_NAME} ${BENCH_SRC})
+	target_link_libraries(${BENCH_NAME} sam3)
+endforeach()

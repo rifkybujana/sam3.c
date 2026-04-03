@@ -94,6 +94,143 @@ int sam3_tensor_reshape(struct sam3_tensor *t, const int *new_dims, int n_dims);
 * Backends must implement `struct sam3_backend_ops` (vtable of function pointers).
 * Never call Metal/CUDA/CPU functions directly from model code — always go through the backend vtable.
 
+## Performance Checklist
+
+These rules apply to every hot path change. If your code runs during inference
+(per-token, per-pixel, per-layer), all eight rules are mandatory.
+
+### 1. No allocations in hot paths
+
+Use stack buffers or arena allocators. Never `malloc`/`free` inside a loop.
+
+```c
+/* BAD */
+for (int i = 0; i < n; i++) {
+	char *key = malloc(len_a + len_b + 2);
+	/* ... */
+	free(key);
+}
+
+/* GOOD */
+char key_buf[128];
+for (int i = 0; i < n; i++) {
+	/* build key in key_buf */
+}
+```
+
+### 2. Don't compute what you can cache
+
+Track derived quantities in parallel arrays. If you call `strlen()` on the
+same string more than once, store the length.
+
+```c
+/* BAD: recompute every iteration */
+for (int i = 0; i < n - 1; i++) {
+	size_t la = strlen(symbols[i]);
+	size_t lb = strlen(symbols[i + 1]);
+}
+
+/* GOOD: parallel length array, update on mutation */
+int sym_len[MAX_SYMBOLS];
+```
+
+### 3. Don't scan data twice
+
+If you need the length and the content, do both in one pass.
+
+```c
+/* BAD */
+int len = (int)strlen(text);
+int n = len < limit ? len : limit;
+for (int i = 0; i < n; i++) { /* process */ }
+
+/* GOOD */
+int i = 0;
+while (i < limit && text[i]) { /* process */ i++; }
+```
+
+### 4. Bulk memory ops over scalar loops
+
+`memcpy`/`memset` use SIMD internally. For non-zero fill patterns, copy from
+a `static const` array.
+
+```c
+/* BAD */
+for (int i = pos; i < max; i++)
+	tokens[i] = EOT_TOKEN;
+
+/* GOOD */
+static const int32_t eot_pad[77] = { E_, E_, ... };
+memcpy(tokens + pos, eot_pad, (max - pos) * sizeof(int32_t));
+```
+
+### 5. Branchless over branchy for simple predicates
+
+Replace predictable branches with arithmetic.
+
+```c
+/* BAD */
+if (c >= 'A' && c <= 'Z')
+	c += 'a' - 'A';
+
+/* GOOD */
+c |= (unsigned char)(((unsigned)(c - 'A') < 26u) << 5);
+```
+
+### 6. SIMD for byte-level bulk work (always guarded)
+
+Use NEON (ARM64) or SSE (x86) to process 16 bytes at a time. Always provide
+a scalar fallback. Mark SIMD helpers that intentionally over-read with
+`no_sanitize("address")`.
+
+```c
+#ifdef __aarch64__
+__attribute__((no_sanitize("address")))
+static int neon_process(const uint8_t *src, int32_t *dst, int limit)
+{
+	/* 16 bytes per iteration, scalar fallback after */
+}
+#endif
+```
+
+### 7. Cache results of expensive pure functions
+
+If a deterministic function is called repeatedly with the same inputs, add a
+direct-mapped hash cache.
+
+```c
+int slot = fnv1a(word, len) & (CACHE_SIZE - 1);
+if (cache[slot].key_len == len && memcmp(...) == 0)
+	return cache[slot].result;   /* hit */
+/* miss: compute, then store in cache[slot] */
+```
+
+### 8. Benchmark in Release mode
+
+ASan adds 5-20x overhead per memory access. Debug builds measure sanitizer
+cost, not your code.
+
+```
+# Correctness
+cd build && ctest --output-on-failure
+
+# Performance
+cd build-release && ./bench_tokenizer
+```
+
+## Benchmarking
+
+Benchmark files live in `tests/bench_*.c` and are auto-registered via the
+`foreach` loop in `CMakeLists.txt`. They are not included in CTest.
+
+To add a new benchmark:
+
+1. Create `tests/bench_<module>.c` following existing patterns
+2. Use `clock_gettime(CLOCK_MONOTONIC)` for timing
+3. Include warmup iterations before timed iterations
+4. Report meaningful metrics (enc/s, GFLOPS, GB/s, ns/op)
+5. Run from a Release build: `cd build-release && ./bench_<module>`
+
 ## Testing Your Changes
 * Write tests for new modules in `tests/test_<module>.c`.
 * Name test functions `test_<module>_<behavior>`.

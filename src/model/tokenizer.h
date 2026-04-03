@@ -22,6 +22,17 @@
 
 #define SAM3_TOKENIZER_CONTEXT_LEN 77	/* max sequence length */
 
+#define SAM3_BPE_CACHE_SIZE 256	/* word cache entries (power of 2) */
+#define SAM3_BPE_CACHE_MAX_IDS 16	/* max token IDs cached per word */
+#define SAM3_BPE_CACHE_MAX_KEY 64	/* max word length to cache */
+
+struct sam3_bpe_cache_entry {
+	char    key[SAM3_BPE_CACHE_MAX_KEY];
+	int     key_len;
+	int32_t ids[SAM3_BPE_CACHE_MAX_IDS];
+	int     n_ids;
+};
+
 struct sam3_tokenizer {
 	char **vocab;		/* array of token strings */
 	int    vocab_size;
@@ -34,6 +45,7 @@ struct sam3_tokenizer {
 	char   byte_unicode[256][5]; /* bytes_to_unicode table (UTF-8) */
 	void  *encoder_map;	/* string -> token_id hash table (private) */
 	void  *merge_rank_map;	/* "tokA\x01tokB" -> rank hash table */
+	struct sam3_bpe_cache_entry *bpe_cache; /* word->ids cache (private) */
 };
 
 /*

@@ -24,6 +24,10 @@
 #include <string.h>
 #include <zlib.h>
 
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
+
 /* CLIP vocabulary constants */
 #define CLIP_VOCAB_SIZE 49408
 #define CLIP_SOT_TOKEN  49406
@@ -280,6 +284,36 @@ static char *make_pair_key(const char *a, const char *b)
 }
 
 /*
+ * lookup_pair_rank - Look up merge rank for a symbol pair using a stack buffer.
+ *
+ * Returns the merge rank (>= 0) or -1 if the pair has no merge rule.
+ */
+static int lookup_pair_rank(const struct tok_hash_table *ranks,
+			    const char symbols[][64], const int *sym_len,
+			    int pos, char *pair_buf)
+{
+	int la = sym_len[pos];
+	int lb = sym_len[pos + 1];
+	memcpy(pair_buf, symbols[pos], (size_t)la);
+	pair_buf[la] = '\x01';
+	memcpy(pair_buf + la + 1, symbols[pos + 1], (size_t)lb);
+	pair_buf[la + 1 + lb] = '\0';
+	int *rank = hash_table_lookup(ranks, pair_buf);
+	return rank ? *rank : -1;
+}
+
+/* Pre-computed EOT fill for fast memcpy-based padding */
+#define E_ CLIP_EOT_TOKEN
+static const int32_t eot_pad[SAM3_TOKENIZER_CONTEXT_LEN] = {
+	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
+	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
+	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
+	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
+	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
+};
+#undef E_
+
+/*
  * pretokenize_next - Scan the next pre-token from text.
  *
  * Matches CLIP's regex pattern: contractions, letter runs, single
@@ -386,11 +420,13 @@ static int bpe_encode_word(const struct sam3_tokenizer *tok,
 
 	/* Convert each byte to its bytes_to_unicode UTF-8 string */
 	char symbols[BPE_MAX_SYMBOLS][64];
+	int sym_len[BPE_MAX_SYMBOLS];
 	int n_sym = 0;
 
 	for (int i = 0; i < word_len && n_sym < BPE_MAX_SYMBOLS - 1; i++) {
 		int nb = byte_to_utf8((unsigned char)word[i], symbols[n_sym]);
 		symbols[n_sym][nb] = '\0';
+		sym_len[n_sym] = nb;
 		n_sym++;
 	}
 
@@ -398,25 +434,31 @@ static int bpe_encode_word(const struct sam3_tokenizer *tok,
 		return 0;
 
 	/* Append </w> to the last symbol */
-	size_t last_len = strlen(symbols[n_sym - 1]);
-	if (last_len + 4 < sizeof(symbols[0])) {
-		memcpy(symbols[n_sym - 1] + last_len, "</w>", 5);
+	int last = n_sym - 1;
+	if (sym_len[last] + 4 < (int)sizeof(symbols[0])) {
+		memcpy(symbols[last] + sym_len[last], "</w>", 5);
+		sym_len[last] += 4;
 	}
+
+	/* Stack buffer for pair key lookups (avoids malloc per pair) */
+	char pair_buf[132]; /* 64 + 1 + 64 + 1 + padding */
+
+	/* Cache pair ranks — avoids re-hashing unchanged pairs each iteration */
+	int pair_rank[BPE_MAX_SYMBOLS];
+	for (int i = 0; i < n_sym - 1; i++)
+		pair_rank[i] = lookup_pair_rank(ranks, symbols, sym_len,
+						i, pair_buf);
 
 	/* Iterative BPE merging */
 	while (n_sym > 1) {
 		int best_rank = -1;
 		int best_pos = -1;
 
-		/* Find the lowest-rank bigram */
+		/* Find lowest-rank bigram from cached ranks */
 		for (int i = 0; i < n_sym - 1; i++) {
-			char *pk = make_pair_key(symbols[i], symbols[i + 1]);
-			if (!pk)
-				return -1;
-			int *rank = hash_table_lookup(ranks, pk);
-			free(pk);
-			if (rank && (best_rank < 0 || *rank < best_rank)) {
-				best_rank = *rank;
+			if (pair_rank[i] >= 0 &&
+			    (best_rank < 0 || pair_rank[i] < best_rank)) {
+				best_rank = pair_rank[i];
 				best_pos = i;
 			}
 		}
@@ -425,18 +467,32 @@ static int bpe_encode_word(const struct sam3_tokenizer *tok,
 			break;
 
 		/* Merge symbols[best_pos] and symbols[best_pos + 1] */
-		size_t len_a = strlen(symbols[best_pos]);
-		size_t len_b = strlen(symbols[best_pos + 1]);
-		if (len_a + len_b >= sizeof(symbols[0]))
+		int len_a = sym_len[best_pos];
+		int len_b = sym_len[best_pos + 1];
+		if (len_a + len_b >= (int)sizeof(symbols[0]))
 			break;
-		memcpy(symbols[best_pos] + len_a, symbols[best_pos + 1],
-		       len_b + 1);
+		memcpy(symbols[best_pos] + len_a,
+		       symbols[best_pos + 1], (size_t)len_b + 1);
+		sym_len[best_pos] = len_a + len_b;
 
-		/* Shift remaining symbols left */
-		for (int i = best_pos + 1; i < n_sym - 1; i++)
+		/* Shift remaining symbols and cached ranks left */
+		for (int i = best_pos + 1; i < n_sym - 1; i++) {
 			memcpy(symbols[i], symbols[i + 1],
-			       strlen(symbols[i + 1]) + 1);
+			       (size_t)sym_len[i + 1] + 1);
+			sym_len[i] = sym_len[i + 1];
+			pair_rank[i] = pair_rank[i + 1];
+		}
 		n_sym--;
+
+		/* Re-lookup only the 2 pairs affected by the merge */
+		if (best_pos > 0)
+			pair_rank[best_pos - 1] = lookup_pair_rank(
+				ranks, symbols, sym_len,
+				best_pos - 1, pair_buf);
+		if (best_pos < n_sym - 1)
+			pair_rank[best_pos] = lookup_pair_rank(
+				ranks, symbols, sym_len,
+				best_pos, pair_buf);
 	}
 
 	/* Look up each final symbol in the encoder */
@@ -450,6 +506,61 @@ static int bpe_encode_word(const struct sam3_tokenizer *tok,
 
 	return n_out;
 }
+
+#ifdef __aarch64__
+/*
+ * neon_lower_widen - NEON-accelerated lowercase + byte-to-int32 widening.
+ *
+ * Loads 16 bytes at a time, lowercases A-Z, widens to int32_t, and stores.
+ * Stops when a NUL byte is found or @limit chars are processed. The 16-byte
+ * NEON load may read past the NUL terminator within the same page; this is
+ * architecturally safe on ARM but trips ASan, hence no_sanitize.
+ *
+ * Returns number of characters processed (always a multiple of 16 or less
+ * if NUL was found).
+ */
+__attribute__((no_sanitize("address")))
+static int neon_lower_widen(const unsigned char *src, int32_t *dst, int limit)
+{
+	const uint8x16_t v_A = vdupq_n_u8('A');
+	const uint8x16_t v_Z = vdupq_n_u8('Z');
+	const uint8x16_t v_bit5 = vdupq_n_u8(0x20);
+	const uint8x16_t v_zero = vdupq_n_u8(0);
+	int i = 0;
+
+	while (i + 16 <= limit) {
+		uint8x16_t chunk = vld1q_u8(src + i);
+
+		/* Bail if chunk contains NUL terminator */
+		if (vmaxvq_u8(vceqq_u8(chunk, v_zero)))
+			break;
+
+		/* Branchless lowercase: set bit 5 if A <= c <= Z */
+		uint8x16_t is_upper = vandq_u8(vcgeq_u8(chunk, v_A),
+						vcleq_u8(chunk, v_Z));
+		chunk = vorrq_u8(chunk, vandq_u8(is_upper, v_bit5));
+
+		/* Widen u8 → u16 → u32 and store */
+		uint8x8_t lo8 = vget_low_u8(chunk);
+		uint8x8_t hi8 = vget_high_u8(chunk);
+		uint16x8_t lo16 = vmovl_u8(lo8);
+		uint16x8_t hi16 = vmovl_u8(hi8);
+
+		vst1q_u32((uint32_t *)(dst + i),
+			  vmovl_u16(vget_low_u16(lo16)));
+		vst1q_u32((uint32_t *)(dst + i + 4),
+			  vmovl_u16(vget_high_u16(lo16)));
+		vst1q_u32((uint32_t *)(dst + i + 8),
+			  vmovl_u16(vget_low_u16(hi16)));
+		vst1q_u32((uint32_t *)(dst + i + 12),
+			  vmovl_u16(vget_high_u16(hi16)));
+
+		i += 16;
+	}
+
+	return i;
+}
+#endif
 
 /* ---- Public API ---- */
 
@@ -487,6 +598,7 @@ enum sam3_error sam3_tokenizer_init(struct sam3_tokenizer *tok)
 	tok->bpe_loaded = 0;
 	tok->encoder_map = NULL;
 	tok->merge_rank_map = NULL;
+	tok->bpe_cache = NULL;
 
 	build_bytes_to_unicode(tok->byte_unicode);
 
@@ -682,6 +794,11 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 	tok->sot_token = CLIP_SOT_TOKEN;
 	tok->eot_token = CLIP_EOT_TOKEN;
 
+	/* Allocate BPE word cache */
+	free(tok->bpe_cache);
+	tok->bpe_cache = calloc(SAM3_BPE_CACHE_SIZE,
+				sizeof(struct sam3_bpe_cache_entry));
+
 	/* Free merge string arrays (vocab took ownership of concat'd strings) */
 	for (int i = 0; i < n_merges; i++) {
 		free(merge_a[i]);
@@ -741,50 +858,116 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 		const char *cursor = lower;
 		const char *wstart;
 		int wlen;
+		int limit = max_tokens - 1;
 
 		while (pretokenize_next(&cursor, &wstart, &wlen)) {
 			int32_t word_ids[128];
-			int n = bpe_encode_word(tok, wstart, wlen,
-						word_ids, 128);
-			for (int i = 0; i < n && pos < max_tokens - 1; i++)
+			int n = 0;
+
+			/*
+			 * Check BPE word cache. The cache is a
+			 * mutable performance optimization behind
+			 * an otherwise const interface.
+			 */
+			struct sam3_bpe_cache_entry *cache =
+				((struct sam3_tokenizer *)tok)->bpe_cache;
+			int cached = 0;
+
+			if (cache && wlen < SAM3_BPE_CACHE_MAX_KEY) {
+				uint32_t h = 2166136261u;
+				for (int ci = 0; ci < wlen; ci++) {
+					h ^= (unsigned char)wstart[ci];
+					h *= 16777619u;
+				}
+				int slot = (int)(h & (SAM3_BPE_CACHE_SIZE - 1));
+				struct sam3_bpe_cache_entry *ce =
+					&cache[slot];
+				if (ce->key_len == wlen &&
+				    memcmp(ce->key, wstart,
+					   (size_t)wlen) == 0) {
+					n = ce->n_ids;
+					memcpy(word_ids, ce->ids,
+					       (size_t)n * sizeof(int32_t));
+					cached = 1;
+				}
+			}
+
+			if (!cached) {
+				n = bpe_encode_word(tok, wstart, wlen,
+						    word_ids, 128);
+
+				/* Insert into cache */
+				if (cache &&
+				    wlen < SAM3_BPE_CACHE_MAX_KEY &&
+				    n <= SAM3_BPE_CACHE_MAX_IDS) {
+					uint32_t h = 2166136261u;
+					for (int ci = 0; ci < wlen; ci++) {
+						h ^= (unsigned char)wstart[ci];
+						h *= 16777619u;
+					}
+					int slot = (int)(h & (SAM3_BPE_CACHE_SIZE - 1));
+					struct sam3_bpe_cache_entry *ce =
+						&cache[slot];
+					memcpy(ce->key, wstart, (size_t)wlen);
+					ce->key[wlen] = '\0';
+					ce->key_len = wlen;
+					ce->n_ids = n;
+					memcpy(ce->ids, word_ids,
+					       (size_t)n * sizeof(int32_t));
+				}
+			}
+
+			for (int i = 0; i < n && pos < limit; i++)
 				tokens[pos++] = word_ids[i];
-			if (pos >= max_tokens - 1)
+			if (pos >= limit)
 				break;
 		}
 
 		/* End-of-text token */
-		if (pos < max_tokens)
-			tokens[pos++] = (int32_t)tok->eot_token;
-
+		tokens[pos++] = (int32_t)tok->eot_token;
 		int n_tokens = pos;
 
 		/* Pad with 0 (CLIP convention) */
-		while (pos < max_tokens)
-			tokens[pos++] = 0;
+		if (pos < max_tokens)
+			memset(tokens + pos, 0,
+			       (size_t)(max_tokens - pos) * sizeof(int32_t));
 
 		return n_tokens;
 	}
 
 	/* Byte-level fallback mode */
-	for (const char *p = text; *p && pos < max_tokens - 1; p++) {
-		unsigned char c = (unsigned char)*p;
+	int limit = max_tokens - 2;
+	const unsigned char *src = (const unsigned char *)text;
+	int i = 0;
 
-		/* ASCII lowercase */
-		if (c >= 'A' && c <= 'Z')
-			c = c - 'A' + 'a';
+#ifdef __aarch64__
+	i = neon_lower_widen(src, tokens + pos, limit);
+	pos += i;
+#endif
 
+	/* Scalar tail (or full path on non-NEON) */
+	while (i < limit && src[i]) {
+		unsigned char c = src[i];
+		/* Branchless ASCII lowercase */
+		c |= (unsigned char)(((unsigned)(c - 'A') < 26u) << 5);
 		tokens[pos++] = (int32_t)c;
+		i++;
 	}
 
 	/* End-of-text token */
-	if (pos < max_tokens)
-		tokens[pos++] = (int32_t)tok->eot_token;
-
+	tokens[pos++] = (int32_t)tok->eot_token;
 	int n_tokens = pos;
 
-	/* Pad remainder with EOT */
-	while (pos < max_tokens)
-		tokens[pos++] = (int32_t)tok->eot_token;
+	/* Pad remainder with EOT via bulk memcpy */
+	int pad = max_tokens - pos;
+	if (pad > 0 && pad <= SAM3_TOKENIZER_CONTEXT_LEN) {
+		memcpy(tokens + pos, eot_pad,
+		       (size_t)pad * sizeof(int32_t));
+	} else {
+		int32_t eot = (int32_t)tok->eot_token;
+		while (pos < max_tokens)
+			tokens[pos++] = eot;
+	}
 
 	return n_tokens;
 }
@@ -812,6 +995,9 @@ void sam3_tokenizer_free(struct sam3_tokenizer *tok)
 
 	hash_table_free(tok->merge_rank_map);
 	tok->merge_rank_map = NULL;
+
+	free(tok->bpe_cache);
+	tok->bpe_cache = NULL;
 
 	tok->vocab_size = 0;
 	tok->n_merges = 0;

@@ -188,6 +188,53 @@ cleanup:
 - Imperative mood: "Add tensor reshape" not "Added tensor reshape"
 - Format: `<subsystem>: <description>` — e.g., `core/tensor: add reshape operation`
 
+### Performance Rules
+
+These rules apply to every new feature, hot path, or improvement. They are not
+optional micro-optimizations — they are the baseline expectation for code that
+runs during inference.
+
+**1. No allocations in hot paths.**
+Use stack buffers, arena allocators, or pre-allocated storage. Never call
+`malloc`/`free` inside a loop that runs per-token, per-pixel, or per-layer.
+If you need a temporary key or buffer, size it on the stack.
+
+**2. Don't compute what you can cache.**
+If a value is expensive to produce and reused across iterations, store it.
+Track derived quantities (string lengths, hash values, merge ranks) in
+parallel arrays rather than recomputing them.
+
+**3. Don't scan data twice.**
+If you need both the length and the content, do both in one pass. Avoid
+patterns like `strlen(s)` followed by a loop over `s`. Prefer a single loop
+with an early-out.
+
+**4. Bulk memory ops over scalar loops.**
+`memcpy`/`memset` use SIMD internally and are faster than hand-written byte
+loops. For filling with a non-zero pattern, use `memcpy` from a `static const`
+array. Reserve scalar loops for cases where per-element logic is required.
+
+**5. Branchless over branchy for simple predicates.**
+Replace predictable `if`/`else` on arithmetic conditions with bitwise
+operations. Example: `c |= ((unsigned)(c - 'A') < 26u) << 5` instead of
+`if (c >= 'A' && c <= 'Z') c += 32`. One instruction beats a branch.
+
+**6. SIMD for byte-level bulk work (always guarded).**
+When processing arrays of bytes (lowercase, copy, compare), use NEON/SSE
+to handle 16 at a time. Always behind `#ifdef __aarch64__` (or `__SSE2__`)
+with a scalar fallback. Use `__attribute__((no_sanitize("address")))` on
+SIMD helpers that intentionally over-read within a page boundary.
+
+**7. Cache results of expensive pure functions.**
+If a function is deterministic and called repeatedly with the same inputs,
+add a direct-mapped or small hash cache. BPE word encoding is a textbook
+example: the same words appear repeatedly, and each encode is O(n^2).
+
+**8. Benchmark without sanitizers.**
+ASan adds 5-20x overhead per memory access. Always measure performance in
+a Release build (`cmake .. -DCMAKE_BUILD_TYPE=Release`). Debug builds with
+sanitizers are for correctness, not speed.
+
 ### What NOT To Do
 
 - Do not use `typedef` to hide `struct` keywords in internal code.
