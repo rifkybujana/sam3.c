@@ -3,7 +3,9 @@
  *
  * Compares Metal (MLX-C GPU) and CPU backends across matmul, add,
  * softmax, and multi-op graphs at various sizes. Reports wall-clock
- * time and speedup ratios. Not included in CTest; run manually.
+ * time, speedup ratios, GFLOPS, and % of theoretical peak. Backends
+ * are created once and reused across all benchmarks for accuracy.
+ * Not included in CTest; run manually.
  *
  * Key types:  sam3_backend, sam3_graph, sam3_node
  * Depends on: backend/backend.h, core/graph.h, core/tensor.h
@@ -25,8 +27,12 @@
 
 /* ── Configuration ─────────────────────────────────────────────────── */
 
-#define WARMUP_ITERS  3
-#define TIMED_ITERS  10
+#define WARMUP_ITERS   5
+#define TIMED_ITERS   50
+
+/* Theoretical peak GFLOPS for Apple Silicon (M-series GPU). */
+#define PEAK_F32_GFLOPS  3400.0
+#define PEAK_F16_GFLOPS  6800.0
 
 /* ── Timing helper ─────────────────────────────────────────────────── */
 
@@ -74,17 +80,14 @@ static struct sam3_tensor make_tensor_2d(enum sam3_dtype dtype,
 	return t;
 }
 
-/* ── Benchmark: matmul ─────────────────────────────────────────────── */
+/* ── Benchmark: matmul F32 ─────────────────────────────────────────── */
 
-static double bench_matmul(enum sam3_backend_type type, int m, int k, int n)
+static double bench_matmul(struct sam3_backend *be, int m, int k, int n)
 {
-	struct sam3_backend *be = sam3_backend_init(type);
-	if (!be) return -1.0;
-
 	float *da = malloc((size_t)m * k * sizeof(float));
 	float *db = malloc((size_t)k * n * sizeof(float));
 	if (!da || !db) {
-		free(da); free(db); sam3_backend_free(be);
+		free(da); free(db);
 		return -1.0;
 	}
 	fill_random_f32(da, m * k);
@@ -118,21 +121,17 @@ static double bench_matmul(enum sam3_backend_type type, int m, int k, int n)
 
 	free(da);
 	free(db);
-	sam3_backend_free(be);
 	return elapsed;
 }
 
 /* ── Benchmark: matmul F16 ─────────────────────────────────────────── */
 
-static double bench_matmul_f16(enum sam3_backend_type type, int m, int k, int n)
+static double bench_matmul_f16(struct sam3_backend *be, int m, int k, int n)
 {
-	struct sam3_backend *be = sam3_backend_init(type);
-	if (!be) return -1.0;
-
 	uint16_t *da = malloc((size_t)m * k * sizeof(uint16_t));
 	uint16_t *db = malloc((size_t)k * n * sizeof(uint16_t));
 	if (!da || !db) {
-		free(da); free(db); sam3_backend_free(be);
+		free(da); free(db);
 		return -1.0;
 	}
 	fill_random_f16(da, m * k);
@@ -166,22 +165,18 @@ static double bench_matmul_f16(enum sam3_backend_type type, int m, int k, int n)
 
 	free(da);
 	free(db);
-	sam3_backend_free(be);
 	return elapsed;
 }
 
 /* ── Benchmark: elementwise add ────────────────────────────────────── */
 
-static double bench_add(enum sam3_backend_type type, int rows, int cols)
+static double bench_add(struct sam3_backend *be, int rows, int cols)
 {
-	struct sam3_backend *be = sam3_backend_init(type);
-	if (!be) return -1.0;
-
 	int n = rows * cols;
 	float *da = malloc((size_t)n * sizeof(float));
 	float *db = malloc((size_t)n * sizeof(float));
 	if (!da || !db) {
-		free(da); free(db); sam3_backend_free(be);
+		free(da); free(db);
 		return -1.0;
 	}
 	fill_random_f32(da, n);
@@ -215,20 +210,16 @@ static double bench_add(enum sam3_backend_type type, int rows, int cols)
 
 	free(da);
 	free(db);
-	sam3_backend_free(be);
 	return elapsed;
 }
 
 /* ── Benchmark: softmax ────────────────────────────────────────────── */
 
-static double bench_softmax(enum sam3_backend_type type, int rows, int cols)
+static double bench_softmax(struct sam3_backend *be, int rows, int cols)
 {
-	struct sam3_backend *be = sam3_backend_init(type);
-	if (!be) return -1.0;
-
 	int n = rows * cols;
 	float *da = malloc((size_t)n * sizeof(float));
-	if (!da) { sam3_backend_free(be); return -1.0; }
+	if (!da) return -1.0;
 	fill_random_f32(da, n);
 
 	struct sam3_tensor a = make_tensor_2d(SAM3_DTYPE_F32, rows, cols);
@@ -255,24 +246,19 @@ static double bench_softmax(enum sam3_backend_type type, int rows, int cols)
 	double elapsed = (get_time_ms() - t0) / TIMED_ITERS;
 
 	free(da);
-	sam3_backend_free(be);
 	return elapsed;
 }
 
 /* ── Benchmark: matmul + add + softmax pipeline ───────────────────── */
 
-static double bench_pipeline(enum sam3_backend_type type,
+static double bench_pipeline(struct sam3_backend *be,
 			     int m, int k, int n)
 {
-	struct sam3_backend *be = sam3_backend_init(type);
-	if (!be) return -1.0;
-
 	float *da = malloc((size_t)m * k * sizeof(float));
 	float *db = malloc((size_t)k * n * sizeof(float));
 	float *dbias = malloc((size_t)m * n * sizeof(float));
 	if (!da || !db || !dbias) {
 		free(da); free(db); free(dbias);
-		sam3_backend_free(be);
 		return -1.0;
 	}
 	fill_random_f32(da, m * k);
@@ -323,7 +309,6 @@ static double bench_pipeline(enum sam3_backend_type type,
 	free(da);
 	free(db);
 	free(dbias);
-	sam3_backend_free(be);
 	return elapsed;
 }
 
@@ -354,7 +339,6 @@ static void print_header(void)
 
 int main(void)
 {
-	/* Quick sanity check that both backends can init. */
 	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
 	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
 	if (!cpu) {
@@ -366,10 +350,9 @@ int main(void)
 		sam3_backend_free(cpu);
 		return 1;
 	}
-	sam3_backend_free(metal);
-	sam3_backend_free(cpu);
 
 	srand(42);
+	double peak_f32 = 0, peak_f16 = 0;
 
 	printf("\n");
 	printf("========================================"
@@ -380,8 +363,8 @@ int main(void)
 	printf("========================================"
 	       "========================================\n\n");
 
-	/* ── Matmul ─────────────────────────────────────────── */
-	printf("  MATMUL (M x K x N)\n");
+	/* ── Matmul F32 ────────────────────────────────────── */
+	printf("  MATMUL F32 (M x K x N)\n");
 	print_header();
 
 	static const int mm_sizes[][3] = {
@@ -390,6 +373,7 @@ int main(void)
 		{  512,  512,  512 },
 		{ 1024, 1024, 1024 },
 		{ 2048, 2048, 2048 },
+		{ 4096, 4096, 4096 },
 	};
 	int n_mm = (int)(sizeof(mm_sizes) / sizeof(mm_sizes[0]));
 
@@ -399,15 +383,19 @@ int main(void)
 		char label[64];
 		snprintf(label, sizeof(label), "%d x %d x %d", m, k, n);
 
-		double tc = bench_matmul(SAM3_BACKEND_CPU, m, k, n);
-		double tm = bench_matmul(SAM3_BACKEND_METAL, m, k, n);
+		double tc = bench_matmul(cpu, m, k, n);
+		double tm = bench_matmul(metal, m, k, n);
 		print_row(label, tc, tm);
 
 		if (tc > 0 && tm > 0) {
 			double gf_cpu = (2.0 * m * k * n) / (tc * 1e6);
 			double gf_metal = (2.0 * m * k * n) / (tm * 1e6);
-			printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS\n",
-			       "", gf_cpu, gf_metal);
+			printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS"
+			       "  (%4.1f%%)\n",
+			       "", gf_cpu, gf_metal,
+			       gf_metal / PEAK_F32_GFLOPS * 100.0);
+			if (gf_metal > peak_f32)
+				peak_f32 = gf_metal;
 		}
 	}
 
@@ -421,15 +409,19 @@ int main(void)
 		char label[64];
 		snprintf(label, sizeof(label), "%d x %d x %d", m, k, n);
 
-		double tc = bench_matmul_f16(SAM3_BACKEND_CPU, m, k, n);
-		double tm = bench_matmul_f16(SAM3_BACKEND_METAL, m, k, n);
+		double tc = bench_matmul_f16(cpu, m, k, n);
+		double tm = bench_matmul_f16(metal, m, k, n);
 		print_row(label, tc, tm);
 
-		if (tm > 0) {
+		if (tc > 0 && tm > 0) {
+			double gf_cpu = (2.0 * m * k * n) / (tc * 1e6);
 			double gf_metal = (2.0 * m * k * n) / (tm * 1e6);
-			double pct = gf_metal / 6800.0 * 100.0;
-			printf("  %-28s %27.1f GFLOPS  (%4.1f%% of 6.8 TFLOPS)\n",
-			       "", gf_metal, pct);
+			printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS"
+			       "  (%4.1f%%)\n",
+			       "", gf_cpu, gf_metal,
+			       gf_metal / PEAK_F16_GFLOPS * 100.0);
+			if (gf_metal > peak_f16)
+				peak_f16 = gf_metal;
 		}
 	}
 
@@ -450,8 +442,8 @@ int main(void)
 		char label[64];
 		snprintf(label, sizeof(label), "%d x %d", rows, cols);
 
-		double tc = bench_add(SAM3_BACKEND_CPU, rows, cols);
-		double tm = bench_add(SAM3_BACKEND_METAL, rows, cols);
+		double tc = bench_add(cpu, rows, cols);
+		double tm = bench_add(metal, rows, cols);
 		print_row(label, tc, tm);
 	}
 
@@ -472,8 +464,8 @@ int main(void)
 		char label[64];
 		snprintf(label, sizeof(label), "%d x %d", rows, cols);
 
-		double tc = bench_softmax(SAM3_BACKEND_CPU, rows, cols);
-		double tm = bench_softmax(SAM3_BACKEND_METAL, rows, cols);
+		double tc = bench_softmax(cpu, rows, cols);
+		double tm = bench_softmax(metal, rows, cols);
 		print_row(label, tc, tm);
 	}
 
@@ -495,11 +487,21 @@ int main(void)
 		char label[64];
 		snprintf(label, sizeof(label), "%d x %d x %d", m, k, n);
 
-		double tc = bench_pipeline(SAM3_BACKEND_CPU, m, k, n);
-		double tm = bench_pipeline(SAM3_BACKEND_METAL, m, k, n);
+		double tc = bench_pipeline(cpu, m, k, n);
+		double tm = bench_pipeline(metal, m, k, n);
 		print_row(label, tc, tm);
 	}
 
+	/* ── Peak summary ──────────────────────────────────── */
+	printf("\n  ---- Peak Throughput ----\n");
+	printf("  Peak F32: %.1f GFLOPS (%.1f%% of 3.4 TFLOPS)\n",
+	       peak_f32, peak_f32 / PEAK_F32_GFLOPS * 100.0);
+	printf("  Peak F16: %.1f GFLOPS (%.1f%% of 6.8 TFLOPS)\n",
+	       peak_f16, peak_f16 / PEAK_F16_GFLOPS * 100.0);
+
 	printf("\n");
+
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
 	return 0;
 }
