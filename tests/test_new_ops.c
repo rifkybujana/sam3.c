@@ -1,10 +1,10 @@
 /*
- * tests/test_new_ops.c - Unit tests for sigmoid, silu, embed, concat, slice, upsample
+ * tests/test_new_ops.c - Unit tests for sigmoid, silu, embed, concat, slice, upsample, rope
  *
  * Tests element-wise sigmoid, element-wise SiLU (Swish), embedding
- * table lookup, tensor concatenation, tensor slicing, and nearest-
- * neighbor upsampling kernels.  Uses the CPU backend with arena
- * allocation and graph_eval for execution.
+ * table lookup, tensor concatenation, tensor slicing, nearest-neighbor
+ * upsampling, and rotary position embedding kernels.  Uses the CPU
+ * backend with arena allocation and graph_eval for execution.
  *
  * Key types:  sam3_node, sam3_tensor, sam3_cpu_backend
  * Depends on: test_helpers.h, cpu_backend.h, core/graph.h, core/tensor.h
@@ -532,6 +532,139 @@ static void test_upsample_3x(void)
 	}
 }
 
+/* --- RoPE tests --- */
+
+static void test_rope_identity(void)
+{
+	/* cos=1.0, sin=0.0 everywhere -> output == input */
+	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 2, 1, 4});
+	struct sam3_tensor *cos_f = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *sin_f = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *out = make_tensor(4, (int[]){1, 2, 1, 4});
+
+	float inp_data[] = {1, 2, 3, 4, 5, 6, 7, 8};
+	float cos_data[] = {1, 1, 1, 1};
+	float sin_data[] = {0, 0, 0, 0};
+	fill_data(inp, inp_data);
+	fill_data(cos_f, cos_data);
+	fill_data(sin_f, sin_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_ROPE;
+	node.inputs[0] = inp;
+	node.inputs[1] = cos_f;
+	node.inputs[2] = sin_f;
+	node.n_inputs = 3;
+	node.output = out;
+	node.params[0] = 4;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	for (int i = 0; i < 8; i++)
+		ASSERT_NEAR(o[i], inp_data[i], EPS);
+}
+
+static void test_rope_90deg(void)
+{
+	/* cos=0, sin=1 -> 90-degree rotation */
+	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 1, 1, 4});
+	struct sam3_tensor *cos_f = make_tensor(2, (int[]){1, 2});
+	struct sam3_tensor *sin_f = make_tensor(2, (int[]){1, 2});
+	struct sam3_tensor *out = make_tensor(4, (int[]){1, 1, 1, 4});
+
+	float inp_data[] = {1, 2, 3, 4};
+	float cos_data[] = {0, 0};
+	float sin_data[] = {1, 1};
+	fill_data(inp, inp_data);
+	fill_data(cos_f, cos_data);
+	fill_data(sin_f, sin_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_ROPE;
+	node.inputs[0] = inp;
+	node.inputs[1] = cos_f;
+	node.inputs[2] = sin_f;
+	node.n_inputs = 3;
+	node.output = out;
+	node.params[0] = 4;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	/* x0*0 - x1*1 = -x1, x0*1 + x1*0 = x0 */
+	ASSERT_NEAR(o[0], -2.0f, EPS);  /* -x1 */
+	ASSERT_NEAR(o[1],  1.0f, EPS);  /*  x0 */
+	ASSERT_NEAR(o[2], -4.0f, EPS);  /* -x1 */
+	ASSERT_NEAR(o[3],  3.0f, EPS);  /*  x0 */
+}
+
+static void test_rope_known_values(void)
+{
+	/* 2 heads, specific cos/sin values */
+	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 1, 2, 4});
+	struct sam3_tensor *cos_f = make_tensor(2, (int[]){1, 2});
+	struct sam3_tensor *sin_f = make_tensor(2, (int[]){1, 2});
+	struct sam3_tensor *out = make_tensor(4, (int[]){1, 1, 2, 4});
+
+	float inp_data[] = {1, 0, 0, 1,  2, 1, 1, 2};
+	float cos_data[] = {0.5f, 0.866f};
+	float sin_data[] = {0.866f, 0.5f};
+	fill_data(inp, inp_data);
+	fill_data(cos_f, cos_data);
+	fill_data(sin_f, sin_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_ROPE;
+	node.inputs[0] = inp;
+	node.inputs[1] = cos_f;
+	node.inputs[2] = sin_f;
+	node.n_inputs = 3;
+	node.output = out;
+	node.params[0] = 4;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+
+	/*
+	 * Head 0: inp = {1, 0, 0, 1}
+	 *   d=0: x0=1, x1=0, cos=0.5, sin=0.866
+	 *     out[0] = 1*0.5 - 0*0.866 = 0.5
+	 *     out[1] = 1*0.866 + 0*0.5 = 0.866
+	 *   d=1: x0=0, x1=1, cos=0.866, sin=0.5
+	 *     out[2] = 0*0.866 - 1*0.5 = -0.5
+	 *     out[3] = 0*0.5 + 1*0.866 = 0.866
+	 */
+	ASSERT_NEAR(o[0],  0.5f,   EPS);
+	ASSERT_NEAR(o[1],  0.866f, EPS);
+	ASSERT_NEAR(o[2], -0.5f,   EPS);
+	ASSERT_NEAR(o[3],  0.866f, EPS);
+
+	/*
+	 * Head 1: inp = {2, 1, 1, 2}
+	 *   d=0: x0=2, x1=1, cos=0.5, sin=0.866
+	 *     out[4] = 2*0.5 - 1*0.866 = 1.0 - 0.866 = 0.134
+	 *     out[5] = 2*0.866 + 1*0.5 = 1.732 + 0.5 = 2.232
+	 *   d=1: x0=1, x1=2, cos=0.866, sin=0.5
+	 *     out[6] = 1*0.866 - 2*0.5 = 0.866 - 1.0 = -0.134
+	 *     out[7] = 1*0.5 + 2*0.866 = 0.5 + 1.732 = 2.232
+	 */
+	ASSERT_NEAR(o[4],  0.134f, EPS);
+	ASSERT_NEAR(o[5],  2.232f, EPS);
+	ASSERT_NEAR(o[6], -0.134f, EPS);
+	ASSERT_NEAR(o[7],  2.232f, EPS);
+}
+
 /* --- Main --- */
 
 int main(void)
@@ -562,6 +695,11 @@ int main(void)
 	/* Upsample */
 	test_upsample_2x();
 	test_upsample_3x();
+
+	/* RoPE */
+	test_rope_identity();
+	test_rope_90deg();
+	test_rope_known_values();
 
 	teardown();
 

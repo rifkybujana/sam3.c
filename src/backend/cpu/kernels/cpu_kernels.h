@@ -146,4 +146,8 @@ enum sam3_error cpu_kernel_slice(const struct sam3_node *node,
 enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
+/* Rotary position embedding: rotate pairs by precomputed frequencies */
+enum sam3_error cpu_kernel_rope(const struct sam3_node *node,
+				struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */

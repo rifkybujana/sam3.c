@@ -309,6 +309,14 @@ wrap_upsample(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_upsample(node, pool);
 }
 
+static enum sam3_error
+wrap_rope(const struct sam3_node *node, struct sam3_arena *scratch,
+	  struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_rope(node, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -397,6 +405,9 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_UPSAMPLE] = {
 		[SAM3_DTYPE_F32]  = wrap_upsample,
+	},
+	[SAM3_OP_ROPE] = {
+		[SAM3_DTYPE_F32]  = wrap_rope,
 	},
 };
 
