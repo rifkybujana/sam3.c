@@ -14,9 +14,14 @@
  */
 
 #include "test_helpers.h"
-#include "model/sam3_processor.h"
+#include "sam3/sam3_types.h"
+#include "model/text_encoder.h"
+#include "model/tokenizer.h"
 #include "model/graph_helpers.h"
 #include "backend/cpu/cpu_backend.h"
+#include "backend/backend.h"
+#include "core/graph.h"
+#include "core/tensor.h"
 
 #include <string.h>
 
@@ -72,10 +77,76 @@ static void test_extract_text_prompt(void)
 	ASSERT_EQ(n_text, 1);
 }
 
+/*
+ * test_text_prompt_graph_build - Verify text features flow through the
+ * text encoder graph with correct output shape.
+ *
+ * Sets up a CPU backend, creates a small text encoder with zero-init
+ * weights, tokenizes "a cat", builds the encoder graph, and checks
+ * the output tensor shape is [77, 16] (seq_len, d_model).
+ */
+static void test_text_prompt_graph_build(void)
+{
+	/* CPU backend with 128 MiB arena */
+	struct sam3_cpu_backend cpu;
+	memset(&cpu, 0, sizeof(cpu));
+	cpu.base.type = SAM3_BACKEND_CPU;
+	cpu.base.ops = sam3_cpu_backend_ops();
+	cpu.arena_capacity = 128 * 1024 * 1024;
+	cpu.base.ops->init(&cpu.base);
+
+	/* 64 MiB arena for model weights */
+	struct sam3_arena arena;
+	sam3_arena_init(&arena, 64 * 1024 * 1024);
+
+	/* Small text encoder */
+	struct sam3_text_encoder te;
+	memset(&te, 0, sizeof(te));
+	te.d_model = 16;
+	te.width = 32;
+	te.n_heads = 4;
+	te.n_layers = 2;
+	te.context_len = 77;
+	te.vocab_size = 49408;
+	sam3_text_encoder_load(&te, NULL, &arena);
+
+	/* Tokenizer */
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	int32_t tokens[77];
+	sam3_tokenizer_encode(&tok, "a cat", tokens, 77);
+
+	/* Token tensor [77] of I32 */
+	int tok_dims[] = {77};
+	struct sam3_tensor *tok_tensor = gh_alloc_tensor(&arena,
+							SAM3_DTYPE_I32,
+							1, tok_dims);
+	memcpy(tok_tensor->data, tokens, 77 * sizeof(int32_t));
+
+	/* Build text encoder graph */
+	struct sam3_graph graph;
+	sam3_graph_init(&graph);
+	struct sam3_tensor *pooled = NULL;
+	struct sam3_tensor *text_features = sam3_text_encoder_build(
+		&te, &graph, tok_tensor, &pooled, &arena);
+
+	/* Verify output shape: [77, 16] = [seq_len, d_model] */
+	ASSERT(text_features != NULL);
+	ASSERT_EQ(text_features->n_dims, 2);
+	ASSERT_EQ(text_features->dims[0], 77);
+	ASSERT_EQ(text_features->dims[1], 16);
+
+	/* Cleanup */
+	sam3_tokenizer_free(&tok);
+	sam3_arena_free(&arena);
+	cpu.base.ops->free(&cpu.base);
+}
+
 int main(void)
 {
 	test_text_prompt_type();
 	test_extract_text_prompt();
+	test_text_prompt_graph_build();
 
 	TEST_REPORT();
 }
