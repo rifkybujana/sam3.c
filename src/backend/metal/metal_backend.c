@@ -590,6 +590,16 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		break;
 	}
 
+	case SAM3_OP_CONV_TRANSPOSE2D:
+		sam3_log_warn("metal: conv_transpose2d not yet implemented");
+		mlx_array_free(result);
+		return SAM3_EINVAL;
+
+	case SAM3_OP_MAXPOOL2D:
+		sam3_log_warn("metal: maxpool2d not yet implemented");
+		mlx_array_free(result);
+		return SAM3_EINVAL;
+
 	default:
 		sam3_log_error("metal: unsupported op %d", node->op);
 		mlx_array_free(result);

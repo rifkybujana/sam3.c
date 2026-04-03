@@ -150,4 +150,13 @@ enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
 enum sam3_error cpu_kernel_rope(const struct sam3_node *node,
 				struct sam3_threadpool *pool);
 
+/* Transposed conv2d: scatter-accumulate. scratch arena for temp buffers. */
+enum sam3_error cpu_kernel_conv_transpose2d(const struct sam3_node *node,
+					    struct sam3_arena *scratch,
+					    struct sam3_threadpool *pool);
+
+/* Max pooling 2D: sliding-window max. params[0]=kernel, [1]=stride */
+enum sam3_error cpu_kernel_maxpool2d(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */

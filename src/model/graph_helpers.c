@@ -712,3 +712,154 @@ struct sam3_tensor *gh_mlp(struct sam3_graph *g, struct sam3_arena *a,
 	/* Second linear layer */
 	return gh_linear(g, a, activated, fc2_w, fc2_b);
 }
+
+/* ── Convolution helpers ──────────────────────────────────────────── */
+
+/*
+ * conv_add_bias - Add bias [C_out] to a 4D NCHW tensor.
+ *
+ * Reshapes to 2D, transposes so channels are last dim for broadcast,
+ * adds bias, transposes and reshapes back.
+ */
+static struct sam3_tensor *conv_add_bias(struct sam3_graph *g,
+					 struct sam3_arena *a,
+					 struct sam3_tensor *x,
+					 struct sam3_tensor *bias)
+{
+	int n = x->dims[0];
+	int c = x->dims[1];
+	int h = x->dims[2];
+	int w = x->dims[3];
+	int n_spatial = h * w;
+
+	/* [N, C, H, W] -> [C, N*H*W] */
+	int flat2d[] = {c, n * n_spatial};
+	struct sam3_tensor *flat = gh_reshape(g, a, x, 2, flat2d);
+	if (!flat)
+		return NULL;
+
+	/* Transpose -> [N*H*W, C] for bias broadcast */
+	flat = gh_transpose(g, a, flat);
+	if (!flat)
+		return NULL;
+
+	/* Add bias [C] */
+	flat = gh_add(g, a, flat, bias);
+	if (!flat)
+		return NULL;
+
+	/* Transpose back -> [C, N*H*W] */
+	flat = gh_transpose(g, a, flat);
+	if (!flat)
+		return NULL;
+
+	/* Reshape back to NCHW */
+	int nchw[] = {n, c, h, w};
+	return gh_reshape(g, a, flat, 4, nchw);
+}
+
+struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
+			      struct sam3_tensor *input,
+			      struct sam3_tensor *weight,
+			      struct sam3_tensor *bias,
+			      int stride, int padding)
+{
+	int N = input->dims[0];
+	int H = input->dims[2];
+	int W = input->dims[3];
+	int OC = weight->dims[0];
+	int KH = weight->dims[2];
+	int KW = weight->dims[3];
+
+	int OH = (H + 2 * padding - KH) / stride + 1;
+	int OW = (W + 2 * padding - KW) / stride + 1;
+
+	int out_dims[] = {N, OC, OH, OW};
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[] = {input, weight};
+	out = sam3_graph_add_op(g, SAM3_OP_CONV2D, inputs, 2, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = stride;
+	node->params[1] = padding;
+
+	if (bias)
+		out = conv_add_bias(g, a, out, bias);
+
+	return out;
+}
+
+struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
+					struct sam3_arena *a,
+					struct sam3_tensor *input,
+					struct sam3_tensor *weight,
+					struct sam3_tensor *bias,
+					int stride, int padding)
+{
+	int N = input->dims[0];
+	int H = input->dims[2];
+	int W = input->dims[3];
+	int C_out = weight->dims[1];
+	int KH = weight->dims[2];
+	int KW = weight->dims[3];
+
+	int OH = (H - 1) * stride - 2 * padding + KH;
+	int OW = (W - 1) * stride - 2 * padding + KW;
+
+	int out_dims[] = {N, C_out, OH, OW};
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[] = {input, weight};
+	out = sam3_graph_add_op(g, SAM3_OP_CONV_TRANSPOSE2D,
+				 inputs, 2, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = stride;
+	node->params[1] = padding;
+
+	if (bias)
+		out = conv_add_bias(g, a, out, bias);
+
+	return out;
+}
+
+struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
+				struct sam3_tensor *input,
+				int kernel_size, int stride)
+{
+	int N = input->dims[0];
+	int C = input->dims[1];
+	int H = input->dims[2];
+	int W = input->dims[3];
+
+	int OH = (H - kernel_size) / stride + 1;
+	int OW = (W - kernel_size) / stride + 1;
+
+	int out_dims[] = {N, C, OH, OW};
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[] = {input};
+	out = sam3_graph_add_op(g, SAM3_OP_MAXPOOL2D, inputs, 1, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = kernel_size;
+	node->params[1] = stride;
+
+	return out;
+}

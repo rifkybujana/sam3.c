@@ -317,6 +317,21 @@ wrap_rope(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_rope(node, pool);
 }
 
+static enum sam3_error
+wrap_conv_transpose2d(const struct sam3_node *node, struct sam3_arena *scratch,
+		      struct sam3_threadpool *pool)
+{
+	return cpu_kernel_conv_transpose2d(node, scratch, pool);
+}
+
+static enum sam3_error
+wrap_maxpool2d(const struct sam3_node *node, struct sam3_arena *scratch,
+	       struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_maxpool2d(node, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -408,6 +423,12 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_ROPE] = {
 		[SAM3_DTYPE_F32]  = wrap_rope,
+	},
+	[SAM3_OP_CONV_TRANSPOSE2D] = {
+		[SAM3_DTYPE_F32]  = wrap_conv_transpose2d,
+	},
+	[SAM3_OP_MAXPOOL2D] = {
+		[SAM3_DTYPE_F32]  = wrap_maxpool2d,
 	},
 };
 

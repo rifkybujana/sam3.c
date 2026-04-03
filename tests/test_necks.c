@@ -1,17 +1,17 @@
 /*
  * tests/test_necks.c - Feature pyramid neck unit tests
  *
- * Tests the multi-scale neck with small dimensions to verify
+ * Tests the multi-scale FPN neck with small dimensions to verify
  * initialization, weight loading, graph construction, and output
  * shapes. Uses zeroed weights (no weight file) and a small config:
- * d_model=16, backbone_dim=32, grid_size=4, 3 scales.
+ * d_model=16, backbone_dim=32, grid_size=4, 4 scales.
  *
  * Key types:  sam3_neck, sam3_graph, sam3_cpu_backend
  * Depends on: test_helpers.h, model/necks.h,
  *             backend/cpu/cpu_backend.h
  * Used by:    CTest
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
@@ -29,9 +29,9 @@
 #define TEST_BACKBONE_DIM 32
 #define TEST_GRID_SIZE    4
 #define TEST_N_PATCHES    (TEST_GRID_SIZE * TEST_GRID_SIZE)  /* 16 */
-#define TEST_N_SCALES     3
+#define TEST_N_SCALES     4
 
-static const float test_scales[] = {2.0f, 1.0f, 0.5f};
+static const float test_scales[] = {4.0f, 2.0f, 1.0f, 0.5f};
 
 static struct sam3_cpu_backend g_cpu;
 
@@ -66,9 +66,21 @@ static void test_neck_init(void)
 	ASSERT_EQ(neck.grid_size, TEST_GRID_SIZE);
 	ASSERT_EQ(neck.n_scales, TEST_N_SCALES);
 
-	ASSERT_NEAR(neck.stages[0].scale_factor, 2.0f, 1e-6f);
-	ASSERT_NEAR(neck.stages[1].scale_factor, 1.0f, 1e-6f);
-	ASSERT_NEAR(neck.stages[2].scale_factor, 0.5f, 1e-6f);
+	ASSERT_NEAR(neck.stages[0].scale_factor, 4.0f, 1e-6f);
+	ASSERT_NEAR(neck.stages[1].scale_factor, 2.0f, 1e-6f);
+	ASSERT_NEAR(neck.stages[2].scale_factor, 1.0f, 1e-6f);
+	ASSERT_NEAR(neck.stages[3].scale_factor, 0.5f, 1e-6f);
+
+	/* Verify stage metadata */
+	ASSERT_EQ(neck.stages[0].n_convs, 4);   /* 4x: 2 ConvT + 1x1 + 3x3 */
+	ASSERT_EQ(neck.stages[0].has_maxpool, 0);
+	ASSERT_EQ(neck.stages[0].is_transpose[0], 1);
+	ASSERT_EQ(neck.stages[0].gelu_after[0], 1);
+
+	ASSERT_EQ(neck.stages[1].n_convs, 3);   /* 2x: ConvT + 1x1 + 3x3 */
+	ASSERT_EQ(neck.stages[2].n_convs, 2);   /* 1x: 1x1 + 3x3 */
+	ASSERT_EQ(neck.stages[3].n_convs, 2);   /* 0.5x: 1x1 + 3x3 */
+	ASSERT_EQ(neck.stages[3].has_maxpool, 1);
 }
 
 /*
@@ -103,34 +115,46 @@ static void test_neck_load(void)
 	err = sam3_neck_load(&neck, NULL, &g_cpu.arena);
 	ASSERT_EQ(err, SAM3_OK);
 
+	/* Check all conv layers have been allocated */
 	for (int i = 0; i < TEST_N_SCALES; i++) {
-		/* Projection weights */
-		ASSERT(neck.stages[i].proj_w != NULL);
-		ASSERT_EQ(neck.stages[i].proj_w->n_dims, 2);
-		ASSERT_EQ(neck.stages[i].proj_w->dims[0], TEST_D_MODEL);
-		ASSERT_EQ(neck.stages[i].proj_w->dims[1],
-			  TEST_BACKBONE_DIM);
-
-		ASSERT(neck.stages[i].proj_b != NULL);
-		ASSERT_EQ(neck.stages[i].proj_b->dims[0], TEST_D_MODEL);
-
-		/* Layer norm */
-		ASSERT(neck.stages[i].ln_w != NULL);
-		ASSERT_EQ(neck.stages[i].ln_w->dims[0], TEST_D_MODEL);
-		ASSERT(neck.stages[i].ln_b != NULL);
-		ASSERT_EQ(neck.stages[i].ln_b->dims[0], TEST_D_MODEL);
+		for (int j = 0; j < neck.stages[i].n_convs; j++) {
+			ASSERT(neck.stages[i].conv_w[j] != NULL);
+			ASSERT_EQ(neck.stages[i].conv_w[j]->n_dims, 4);
+			ASSERT(neck.stages[i].conv_b[j] != NULL);
+			ASSERT_EQ(neck.stages[i].conv_b[j]->n_dims, 1);
+		}
 	}
 
-	/* Downsample conv should exist only for scale < 1.0 */
-	ASSERT(neck.stages[0].down_w == NULL); /* scale=2.0 */
-	ASSERT(neck.stages[1].down_w == NULL); /* scale=1.0 */
-	ASSERT(neck.stages[2].down_w != NULL); /* scale=0.5 */
+	/*
+	 * Verify scale=4.0 stage weight shapes:
+	 * conv[0]: ConvT [dim, dim/2, 2, 2] = [32, 16, 2, 2]
+	 * conv[1]: ConvT [dim/2, dim/4, 2, 2] = [16, 8, 2, 2]
+	 * conv[2]: Conv1x1 [d_model, dim/4, 1, 1] = [16, 8, 1, 1]
+	 * conv[3]: Conv3x3 [d_model, d_model, 3, 3] = [16, 16, 3, 3]
+	 */
+	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[0], TEST_BACKBONE_DIM);
+	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[1],
+		  TEST_BACKBONE_DIM / 2);
+	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[2], 2);
+	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[3], 2);
 
-	ASSERT_EQ(neck.stages[2].down_w->n_dims, 4);
-	ASSERT_EQ(neck.stages[2].down_w->dims[0], TEST_D_MODEL);
-	ASSERT_EQ(neck.stages[2].down_w->dims[1], TEST_D_MODEL);
-	ASSERT_EQ(neck.stages[2].down_w->dims[2], 1);
-	ASSERT_EQ(neck.stages[2].down_w->dims[3], 1);
+	ASSERT_EQ(neck.stages[0].conv_w[2]->dims[0], TEST_D_MODEL);
+	ASSERT_EQ(neck.stages[0].conv_w[2]->dims[1],
+		  TEST_BACKBONE_DIM / 4);
+
+	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[0], TEST_D_MODEL);
+	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[2], 3);
+	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[3], 3);
+
+	/*
+	 * Verify scale=0.5 stage has 2 convs (maxpool is not a conv).
+	 * conv[0]: Conv1x1 [d_model, dim, 1, 1] = [16, 32, 1, 1]
+	 * conv[1]: Conv3x3 [d_model, d_model, 3, 3] = [16, 16, 3, 3]
+	 */
+	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[0], TEST_D_MODEL);
+	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[1], TEST_BACKBONE_DIM);
+	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[2], 1);
 }
 
 /*
@@ -166,36 +190,44 @@ static void test_neck_build_shapes(void)
 
 	/*
 	 * Expected output shapes (NCHW):
-	 * scale=2.0: [1, d_model, 8, 8]   (4*2 = 8)
-	 * scale=1.0: [1, d_model, 4, 4]   (no change)
-	 * scale=0.5: [1, d_model, 2, 2]   (4/2 = 2)
+	 * scale=4.0: [1, d_model, 16, 16]  (4*4 = 16)
+	 * scale=2.0: [1, d_model, 8, 8]    (4*2 = 8)
+	 * scale=1.0: [1, d_model, 4, 4]    (no change)
+	 * scale=0.5: [1, d_model, 2, 2]    (4/2 = 2)
 	 */
 	ASSERT(features[0] != NULL);
 	ASSERT_EQ(features[0]->n_dims, 4);
 	ASSERT_EQ(features[0]->dims[0], 1);
 	ASSERT_EQ(features[0]->dims[1], TEST_D_MODEL);
-	ASSERT_EQ(features[0]->dims[2], TEST_GRID_SIZE * 2);
-	ASSERT_EQ(features[0]->dims[3], TEST_GRID_SIZE * 2);
+	ASSERT_EQ(features[0]->dims[2], TEST_GRID_SIZE * 4);
+	ASSERT_EQ(features[0]->dims[3], TEST_GRID_SIZE * 4);
 
 	ASSERT(features[1] != NULL);
 	ASSERT_EQ(features[1]->n_dims, 4);
 	ASSERT_EQ(features[1]->dims[0], 1);
 	ASSERT_EQ(features[1]->dims[1], TEST_D_MODEL);
-	ASSERT_EQ(features[1]->dims[2], TEST_GRID_SIZE);
-	ASSERT_EQ(features[1]->dims[3], TEST_GRID_SIZE);
+	ASSERT_EQ(features[1]->dims[2], TEST_GRID_SIZE * 2);
+	ASSERT_EQ(features[1]->dims[3], TEST_GRID_SIZE * 2);
 
 	ASSERT(features[2] != NULL);
 	ASSERT_EQ(features[2]->n_dims, 4);
 	ASSERT_EQ(features[2]->dims[0], 1);
 	ASSERT_EQ(features[2]->dims[1], TEST_D_MODEL);
-	ASSERT_EQ(features[2]->dims[2], TEST_GRID_SIZE / 2);
-	ASSERT_EQ(features[2]->dims[3], TEST_GRID_SIZE / 2);
+	ASSERT_EQ(features[2]->dims[2], TEST_GRID_SIZE);
+	ASSERT_EQ(features[2]->dims[3], TEST_GRID_SIZE);
+
+	ASSERT(features[3] != NULL);
+	ASSERT_EQ(features[3]->n_dims, 4);
+	ASSERT_EQ(features[3]->dims[0], 1);
+	ASSERT_EQ(features[3]->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(features[3]->dims[2], TEST_GRID_SIZE / 2);
+	ASSERT_EQ(features[3]->dims[3], TEST_GRID_SIZE / 2);
 }
 
 /*
  * test_neck_eval - Evaluate the neck graph on CPU.
  *
- * Builds and evaluates with zeroed weights (except layernorm gamma=1).
+ * Builds and evaluates with small nonzero conv weights.
  * Verifies that output values are finite.
  */
 static void test_neck_eval(void)
@@ -211,13 +243,17 @@ static void test_neck_eval(void)
 	ASSERT_EQ(err, SAM3_OK);
 
 	/*
-	 * Set layer norm gamma to 1.0 so layernorm produces finite
-	 * output even with zero input (avoids 0/0 = NaN).
+	 * Set conv weights to small nonzero values so the pipeline
+	 * produces finite output.
 	 */
 	for (int i = 0; i < TEST_N_SCALES; i++) {
-		float *w = (float *)neck.stages[i].ln_w->data;
-		for (int j = 0; j < TEST_D_MODEL; j++)
-			w[j] = 1.0f;
+		for (int j = 0; j < neck.stages[i].n_convs; j++) {
+			int nelems = sam3_tensor_nelems(
+				neck.stages[i].conv_w[j]);
+			float *w = (float *)neck.stages[i].conv_w[j]->data;
+			for (int k = 0; k < nelems; k++)
+				w[k] = 0.01f;
+		}
 	}
 
 	/* Create dummy ViT output with small values */

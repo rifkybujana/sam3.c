@@ -275,4 +275,53 @@ struct sam3_tensor *gh_mlp(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *fc2_w, struct sam3_tensor *fc2_b,
 			   enum sam3_op activation);
 
+/*
+ * gh_conv2d - 2D convolution with optional bias.
+ *
+ * @input:   [N, C_in, H, W]
+ * @weight:  [C_out, C_in, KH, KW]
+ * @bias:    [C_out] or NULL
+ * @stride:  Convolution stride
+ * @padding: Zero-padding on each side
+ *
+ * Bias is added via reshape+transpose+add+transpose+reshape.
+ * Returns [N, C_out, OH, OW].
+ */
+struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
+			      struct sam3_tensor *input,
+			      struct sam3_tensor *weight,
+			      struct sam3_tensor *bias,
+			      int stride, int padding);
+
+/*
+ * gh_conv_transpose2d - 2D transposed convolution with optional bias.
+ *
+ * @input:   [N, C_in, H, W]
+ * @weight:  [C_in, C_out, KH, KW] (PyTorch ConvTranspose2d layout)
+ * @bias:    [C_out] or NULL
+ * @stride:  Transposed convolution stride
+ * @padding: Zero-padding on each side
+ *
+ * Returns [N, C_out, OH, OW] where OH = (H-1)*stride - 2*pad + KH.
+ */
+struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
+					struct sam3_arena *a,
+					struct sam3_tensor *input,
+					struct sam3_tensor *weight,
+					struct sam3_tensor *bias,
+					int stride, int padding);
+
+/*
+ * gh_maxpool2d - 2D max pooling.
+ *
+ * @input:       [N, C, H, W]
+ * @kernel_size: Pooling window size
+ * @stride:      Pooling stride
+ *
+ * Returns [N, C, OH, OW] where OH = (H - kernel) / stride + 1.
+ */
+struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
+				struct sam3_tensor *input,
+				int kernel_size, int stride);
+
 #endif /* SAM3_MODEL_GRAPH_HELPERS_H */

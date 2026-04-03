@@ -42,7 +42,9 @@ enum sam3_op {
 	SAM3_OP_SIGMOID,    /* 1/(1+exp(-x))           */
 	SAM3_OP_UPSAMPLE,   /* Nearest-neighbor.       params[0]=scale */
 	SAM3_OP_ROPE,       /* Rotary position embed.  params[0]=head_dim */
-	SAM3_OP_SILU,       /* x * sigmoid(x)          */
+	SAM3_OP_SILU,            /* x * sigmoid(x)          */
+	SAM3_OP_CONV_TRANSPOSE2D, /* params[0]=stride, [1]=padding */
+	SAM3_OP_MAXPOOL2D,       /* params[0]=kernel, [1]=stride  */
 	SAM3_OP_COUNT,  /* must be last */
 };
 

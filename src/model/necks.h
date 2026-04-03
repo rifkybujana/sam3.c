@@ -1,17 +1,17 @@
 /*
- * src/model/necks.h - Multi-scale feature pyramid neck
+ * src/model/necks.h - Multi-scale feature pyramid neck (Meta SAM3 FPN)
  *
  * Defines the feature pyramid network (FPN) neck that converts the
- * single-scale ViT backbone output [n_patches, embed_dim] into
- * multi-resolution feature maps. Each scale applies a 1x1 projection
- * from backbone_dim to d_model, layer normalization, and spatial
- * rescaling (upsample for scale > 1, conv2d stride-2 for scale < 1).
+ * single-scale ViT backbone output [n_patches, backbone_dim] into
+ * multi-resolution feature maps. Follows Meta's SAM3 architecture:
+ * spatial rescaling (ConvTranspose2d or MaxPool) in backbone_dim space,
+ * then 1x1 conv projection to d_model, then 3x3 conv spatial mixing.
  *
  * Key types:  sam3_neck
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h, core/weight.h
  * Used by:    sam3.c (image encoding pipeline), tests/test_necks.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
@@ -24,6 +24,7 @@
 #include "core/weight.h"
 
 #define SAM3_NECK_MAX_SCALES 4
+#define SAM3_NECK_MAX_CONVS  4  /* scale 4.0 has 4 conv layers */
 
 struct sam3_neck {
 	int d_model;		/* 256 -- output channel dim */
@@ -31,17 +32,17 @@ struct sam3_neck {
 	int n_scales;		/* up to SAM3_NECK_MAX_SCALES */
 	int grid_size;		/* 72 -- spatial size from ViT */
 
-	/* Per-scale projection and normalization */
+	/* Per-scale FPN stage */
 	struct {
-		struct sam3_tensor *proj_w;	/* [d_model, backbone_dim] */
-		struct sam3_tensor *proj_b;	/* [d_model] */
-		struct sam3_tensor *ln_w;	/* [d_model] */
-		struct sam3_tensor *ln_b;	/* [d_model] */
-		float scale_factor;		/* e.g. 4.0, 2.0, 1.0, 0.5 */
-
-		/* For scale < 1: stride-2 downsample conv */
-		struct sam3_tensor *down_w;	/* [d_model, d_model, 1, 1] */
-		struct sam3_tensor *down_b;	/* [d_model] */
+		float scale_factor;
+		int   n_convs;
+		struct sam3_tensor *conv_w[SAM3_NECK_MAX_CONVS];
+		struct sam3_tensor *conv_b[SAM3_NECK_MAX_CONVS];
+		int  is_transpose[SAM3_NECK_MAX_CONVS]; /* 1 = ConvTranspose2d */
+		int  kernel_size[SAM3_NECK_MAX_CONVS];  /* 1, 2, or 3 */
+		int  gelu_after[SAM3_NECK_MAX_CONVS];   /* 1 = GELU after conv */
+		int  seq_idx[SAM3_NECK_MAX_CONVS];      /* PyTorch Sequential index */
+		int  has_maxpool;                        /* 1 = MaxPool before convs */
 	} stages[SAM3_NECK_MAX_SCALES];
 };
 
