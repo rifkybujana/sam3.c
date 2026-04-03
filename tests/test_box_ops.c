@@ -15,7 +15,6 @@
 
 #include "test_helpers.h"
 #include "model/box_ops.h"
-#include <math.h>
 
 #define TOL 1e-5f
 

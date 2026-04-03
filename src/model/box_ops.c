@@ -7,7 +7,7 @@
  * dependencies beyond standard C math.
  *
  * Key types:  (none, operates on raw float arrays)
- * Depends on: box_ops.h, <math.h>
+ * Depends on: box_ops.h
  * Used by:    decoder.c, tests/test_box_ops.c
  *
  * Copyright (c) 2026
@@ -15,7 +15,6 @@
  */
 
 #include "box_ops.h"
-#include <math.h>
 
 void box_xyxy_to_cxcywh(const float *xyxy, float *cxcywh, int n)
 {

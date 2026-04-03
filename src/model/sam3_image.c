@@ -8,7 +8,7 @@
  * features; the segment phase only builds the graph for later evaluation.
  *
  * Key types:  sam3_image_model
- * Depends on: sam3_image.h, graph_helpers.h
+ * Depends on: sam3_image.h
  * Used by:    sam3.c (top-level context)
  *
  * Copyright (c) 2026
@@ -18,7 +18,6 @@
 #include <string.h>
 
 #include "sam3_image.h"
-#include "graph_helpers.h"
 
 enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
 				      struct sam3_arena *arena)
