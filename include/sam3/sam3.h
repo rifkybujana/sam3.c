@@ -2,7 +2,7 @@
  * include/sam3/sam3.h - Main public API for sam3 inference
  *
  * This is the only header users need to include. Provides functions to
- * load a SAM3 model, run segmentation inference with point/box/mask
+ * load a SAM3 model, run segmentation inference with point/box/mask/text
  * prompts, and free resources. All functions are thread-safe with
  * respect to different sam3_ctx instances.
  *
@@ -74,13 +74,14 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path);
 /*
  * sam3_segment - Run segmentation with the given prompts.
  *
- * @ctx:      Context with image already set
- * @prompts:  Array of prompts (points, boxes, or masks)
+ * @ctx:       Context with image already set
+ * @prompts:   Array of prompts (points, boxes, masks, or text)
  * @n_prompts: Number of prompts
- * @result:   Output result (caller must call sam3_result_free)
+ * @result:    Output result (caller must call sam3_result_free)
  *
- * Returns SAM3_OK on success. The result contains one or more predicted
- * masks with IoU confidence scores.
+ * Supports text prompts (SAM3_PROMPT_TEXT) alone or mixed with
+ * geometric prompts. Only the first text prompt is used if multiple
+ * are provided. Returns SAM3_OK on success.
  */
 enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
 			     int n_prompts, struct sam3_result *result);
