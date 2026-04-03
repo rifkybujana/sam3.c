@@ -158,8 +158,18 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 				   const struct sam3_tensor *t)
 {
 	mlx_array *existing = metal_map_get(mtl, t);
-	if (existing)
-		return *existing;
+	if (existing) {
+		/* Validate cached array matches current tensor shape */
+		bool valid = ((int)mlx_array_ndim(*existing) == t->n_dims);
+		for (int i = 0; valid && i < t->n_dims; i++) {
+			if (mlx_array_dim(*existing, i) != t->dims[i])
+				valid = false;
+		}
+		if (valid)
+			return *existing;
+		/* Stale entry (pointer reuse) — evict and re-wrap */
+		metal_map_evict(mtl, t);
+	}
 
 	mlx_dtype mtype;
 	if (metal_map_dtype(t->dtype, &mtype) < 0) {

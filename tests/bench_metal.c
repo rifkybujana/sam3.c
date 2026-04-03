@@ -84,24 +84,19 @@ static struct sam3_tensor make_tensor_2d(enum sam3_dtype dtype,
 
 static double bench_matmul(struct sam3_backend *be, int m, int k, int n)
 {
-	float *da = malloc((size_t)m * k * sizeof(float));
-	float *db = malloc((size_t)k * n * sizeof(float));
-	if (!da || !db) {
-		free(da); free(db);
-		return -1.0;
-	}
-	fill_random_f32(da, m * k);
-	fill_random_f32(db, k * n);
-
 	struct sam3_tensor a = make_tensor_2d(SAM3_DTYPE_F32, m, k);
 	struct sam3_tensor b = make_tensor_2d(SAM3_DTYPE_F32, k, n);
 	struct sam3_tensor c = make_tensor_2d(SAM3_DTYPE_F32, m, n);
 
-	be->ops->alloc_tensor(be, &a);
-	be->ops->alloc_tensor(be, &b);
-	be->ops->alloc_tensor(be, &c);
-	memcpy(a.data, da, a.nbytes);
-	memcpy(b.data, db, b.nbytes);
+	a.data = malloc(a.nbytes);
+	b.data = malloc(b.nbytes);
+	c.data = malloc(c.nbytes);
+	if (!a.data || !b.data || !c.data) {
+		free(a.data); free(b.data); free(c.data);
+		return -1.0;
+	}
+	fill_random_f32(a.data, m * k);
+	fill_random_f32(b.data, k * n);
 
 	struct sam3_graph g;
 	sam3_graph_init(&g);
@@ -119,8 +114,9 @@ static double bench_matmul(struct sam3_backend *be, int m, int k, int n)
 		be->ops->graph_eval(be, &g);
 	double elapsed = (get_time_ms() - t0) / TIMED_ITERS;
 
-	free(da);
-	free(db);
+	free(a.data);
+	free(b.data);
+	free(c.data);
 	return elapsed;
 }
 
@@ -128,24 +124,19 @@ static double bench_matmul(struct sam3_backend *be, int m, int k, int n)
 
 static double bench_matmul_f16(struct sam3_backend *be, int m, int k, int n)
 {
-	uint16_t *da = malloc((size_t)m * k * sizeof(uint16_t));
-	uint16_t *db = malloc((size_t)k * n * sizeof(uint16_t));
-	if (!da || !db) {
-		free(da); free(db);
-		return -1.0;
-	}
-	fill_random_f16(da, m * k);
-	fill_random_f16(db, k * n);
-
 	struct sam3_tensor a = make_tensor_2d(SAM3_DTYPE_F16, m, k);
 	struct sam3_tensor b = make_tensor_2d(SAM3_DTYPE_F16, k, n);
 	struct sam3_tensor c = make_tensor_2d(SAM3_DTYPE_F16, m, n);
 
-	be->ops->alloc_tensor(be, &a);
-	be->ops->alloc_tensor(be, &b);
-	be->ops->alloc_tensor(be, &c);
-	memcpy(a.data, da, a.nbytes);
-	memcpy(b.data, db, b.nbytes);
+	a.data = malloc(a.nbytes);
+	b.data = malloc(b.nbytes);
+	c.data = malloc(c.nbytes);
+	if (!a.data || !b.data || !c.data) {
+		free(a.data); free(b.data); free(c.data);
+		return -1.0;
+	}
+	fill_random_f16(a.data, m * k);
+	fill_random_f16(b.data, k * n);
 
 	struct sam3_graph g;
 	sam3_graph_init(&g);
@@ -163,8 +154,9 @@ static double bench_matmul_f16(struct sam3_backend *be, int m, int k, int n)
 		be->ops->graph_eval(be, &g);
 	double elapsed = (get_time_ms() - t0) / TIMED_ITERS;
 
-	free(da);
-	free(db);
+	free(a.data);
+	free(b.data);
+	free(c.data);
 	return elapsed;
 }
 
@@ -172,25 +164,19 @@ static double bench_matmul_f16(struct sam3_backend *be, int m, int k, int n)
 
 static double bench_add(struct sam3_backend *be, int rows, int cols)
 {
-	int n = rows * cols;
-	float *da = malloc((size_t)n * sizeof(float));
-	float *db = malloc((size_t)n * sizeof(float));
-	if (!da || !db) {
-		free(da); free(db);
-		return -1.0;
-	}
-	fill_random_f32(da, n);
-	fill_random_f32(db, n);
-
 	struct sam3_tensor a = make_tensor_2d(SAM3_DTYPE_F32, rows, cols);
 	struct sam3_tensor b = make_tensor_2d(SAM3_DTYPE_F32, rows, cols);
 	struct sam3_tensor c = make_tensor_2d(SAM3_DTYPE_F32, rows, cols);
 
-	be->ops->alloc_tensor(be, &a);
-	be->ops->alloc_tensor(be, &b);
-	be->ops->alloc_tensor(be, &c);
-	memcpy(a.data, da, a.nbytes);
-	memcpy(b.data, db, b.nbytes);
+	a.data = malloc(a.nbytes);
+	b.data = malloc(b.nbytes);
+	c.data = malloc(c.nbytes);
+	if (!a.data || !b.data || !c.data) {
+		free(a.data); free(b.data); free(c.data);
+		return -1.0;
+	}
+	fill_random_f32(a.data, rows * cols);
+	fill_random_f32(b.data, rows * cols);
 
 	struct sam3_graph g;
 	sam3_graph_init(&g);
@@ -208,8 +194,9 @@ static double bench_add(struct sam3_backend *be, int rows, int cols)
 		be->ops->graph_eval(be, &g);
 	double elapsed = (get_time_ms() - t0) / TIMED_ITERS;
 
-	free(da);
-	free(db);
+	free(a.data);
+	free(b.data);
+	free(c.data);
 	return elapsed;
 }
 
@@ -217,17 +204,16 @@ static double bench_add(struct sam3_backend *be, int rows, int cols)
 
 static double bench_softmax(struct sam3_backend *be, int rows, int cols)
 {
-	int n = rows * cols;
-	float *da = malloc((size_t)n * sizeof(float));
-	if (!da) return -1.0;
-	fill_random_f32(da, n);
-
 	struct sam3_tensor a = make_tensor_2d(SAM3_DTYPE_F32, rows, cols);
 	struct sam3_tensor c = make_tensor_2d(SAM3_DTYPE_F32, rows, cols);
 
-	be->ops->alloc_tensor(be, &a);
-	be->ops->alloc_tensor(be, &c);
-	memcpy(a.data, da, a.nbytes);
+	a.data = malloc(a.nbytes);
+	c.data = malloc(c.nbytes);
+	if (!a.data || !c.data) {
+		free(a.data); free(c.data);
+		return -1.0;
+	}
+	fill_random_f32(a.data, rows * cols);
 
 	struct sam3_graph g;
 	sam3_graph_init(&g);
@@ -245,7 +231,8 @@ static double bench_softmax(struct sam3_backend *be, int rows, int cols)
 		be->ops->graph_eval(be, &g);
 	double elapsed = (get_time_ms() - t0) / TIMED_ITERS;
 
-	free(da);
+	free(a.data);
+	free(c.data);
 	return elapsed;
 }
 
@@ -254,17 +241,6 @@ static double bench_softmax(struct sam3_backend *be, int rows, int cols)
 static double bench_pipeline(struct sam3_backend *be,
 			     int m, int k, int n)
 {
-	float *da = malloc((size_t)m * k * sizeof(float));
-	float *db = malloc((size_t)k * n * sizeof(float));
-	float *dbias = malloc((size_t)m * n * sizeof(float));
-	if (!da || !db || !dbias) {
-		free(da); free(db); free(dbias);
-		return -1.0;
-	}
-	fill_random_f32(da, m * k);
-	fill_random_f32(db, k * n);
-	fill_random_f32(dbias, m * n);
-
 	struct sam3_tensor a    = make_tensor_2d(SAM3_DTYPE_F32, m, k);
 	struct sam3_tensor b    = make_tensor_2d(SAM3_DTYPE_F32, k, n);
 	struct sam3_tensor mm   = make_tensor_2d(SAM3_DTYPE_F32, m, n);
@@ -272,15 +248,21 @@ static double bench_pipeline(struct sam3_backend *be,
 	struct sam3_tensor add  = make_tensor_2d(SAM3_DTYPE_F32, m, n);
 	struct sam3_tensor out  = make_tensor_2d(SAM3_DTYPE_F32, m, n);
 
-	be->ops->alloc_tensor(be, &a);
-	be->ops->alloc_tensor(be, &b);
-	be->ops->alloc_tensor(be, &mm);
-	be->ops->alloc_tensor(be, &bias);
-	be->ops->alloc_tensor(be, &add);
-	be->ops->alloc_tensor(be, &out);
-	memcpy(a.data, da, a.nbytes);
-	memcpy(b.data, db, b.nbytes);
-	memcpy(bias.data, dbias, bias.nbytes);
+	a.data    = malloc(a.nbytes);
+	b.data    = malloc(b.nbytes);
+	mm.data   = malloc(mm.nbytes);
+	bias.data = malloc(bias.nbytes);
+	add.data  = malloc(add.nbytes);
+	out.data  = malloc(out.nbytes);
+	if (!a.data || !b.data || !mm.data ||
+	    !bias.data || !add.data || !out.data) {
+		free(a.data); free(b.data); free(mm.data);
+		free(bias.data); free(add.data); free(out.data);
+		return -1.0;
+	}
+	fill_random_f32(a.data, m * k);
+	fill_random_f32(b.data, k * n);
+	fill_random_f32(bias.data, m * n);
 
 	struct sam3_graph g;
 	sam3_graph_init(&g);
@@ -306,9 +288,12 @@ static double bench_pipeline(struct sam3_backend *be,
 		be->ops->graph_eval(be, &g);
 	double elapsed = (get_time_ms() - t0) / TIMED_ITERS;
 
-	free(da);
-	free(db);
-	free(dbias);
+	free(a.data);
+	free(b.data);
+	free(mm.data);
+	free(bias.data);
+	free(add.data);
+	free(out.data);
 	return elapsed;
 }
 
@@ -316,9 +301,14 @@ static double bench_pipeline(struct sam3_backend *be,
 
 static void print_row(const char *label, double cpu_ms, double metal_ms)
 {
-	if (cpu_ms < 0 || metal_ms < 0) {
+	if (metal_ms < 0) {
 		printf("  %-28s %13s  %13s  %9s\n",
-		       label, "FAILED", "FAILED", "---");
+		       label, "---", "FAILED", "---");
+		return;
+	}
+	if (cpu_ms < 0) {
+		printf("  %-28s %13s  %10.3f ms  %9s\n",
+		       label, "---", metal_ms, "---");
 		return;
 	}
 	double speedup = cpu_ms / metal_ms;
@@ -383,17 +373,25 @@ int main(void)
 		char label[64];
 		snprintf(label, sizeof(label), "%d x %d x %d", m, k, n);
 
-		double tc = bench_matmul(cpu, m, k, n);
+		/* Skip CPU for large sizes (too slow, not interesting) */
+		double tc = (m >= 4096) ? -1.0 : bench_matmul(cpu, m, k, n);
 		double tm = bench_matmul(metal, m, k, n);
 		print_row(label, tc, tm);
 
-		if (tc > 0 && tm > 0) {
-			double gf_cpu = (2.0 * m * k * n) / (tc * 1e6);
+		if (tm > 0) {
+			double gf_cpu = (tc > 0)
+				? (2.0 * m * k * n) / (tc * 1e6) : 0;
 			double gf_metal = (2.0 * m * k * n) / (tm * 1e6);
-			printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS"
-			       "  (%4.1f%%)\n",
-			       "", gf_cpu, gf_metal,
-			       gf_metal / PEAK_F32_GFLOPS * 100.0);
+			if (tc > 0)
+				printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS"
+				       "  (%4.1f%%)\n",
+				       "", gf_cpu, gf_metal,
+				       gf_metal / PEAK_F32_GFLOPS * 100.0);
+			else
+				printf("  %-28s %10s         %7.1f GFLOPS"
+				       "  (%4.1f%%)\n",
+				       "", "---", gf_metal,
+				       gf_metal / PEAK_F32_GFLOPS * 100.0);
 			if (gf_metal > peak_f32)
 				peak_f32 = gf_metal;
 		}
@@ -409,17 +407,25 @@ int main(void)
 		char label[64];
 		snprintf(label, sizeof(label), "%d x %d x %d", m, k, n);
 
-		double tc = bench_matmul_f16(cpu, m, k, n);
+		double tc = (m >= 4096) ? -1.0
+			: bench_matmul_f16(cpu, m, k, n);
 		double tm = bench_matmul_f16(metal, m, k, n);
 		print_row(label, tc, tm);
 
-		if (tc > 0 && tm > 0) {
-			double gf_cpu = (2.0 * m * k * n) / (tc * 1e6);
+		if (tm > 0) {
+			double gf_cpu = (tc > 0)
+				? (2.0 * m * k * n) / (tc * 1e6) : 0;
 			double gf_metal = (2.0 * m * k * n) / (tm * 1e6);
-			printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS"
-			       "  (%4.1f%%)\n",
-			       "", gf_cpu, gf_metal,
-			       gf_metal / PEAK_F16_GFLOPS * 100.0);
+			if (tc > 0)
+				printf("  %-28s %10.1f GFLOPS  %7.1f GFLOPS"
+				       "  (%4.1f%%)\n",
+				       "", gf_cpu, gf_metal,
+				       gf_metal / PEAK_F16_GFLOPS * 100.0);
+			else
+				printf("  %-28s %10s         %7.1f GFLOPS"
+				       "  (%4.1f%%)\n",
+				       "", "---", gf_metal,
+				       gf_metal / PEAK_F16_GFLOPS * 100.0);
 			if (gf_metal > peak_f16)
 				peak_f16 = gf_metal;
 		}
