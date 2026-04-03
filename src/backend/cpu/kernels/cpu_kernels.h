@@ -134,4 +134,16 @@ enum sam3_error cpu_kernel_silu(const struct sam3_node *node,
 enum sam3_error cpu_kernel_embed(const struct sam3_node *node,
 				 struct sam3_threadpool *pool);
 
+/* Concatenate tensors along axis: params[0]=axis */
+enum sam3_error cpu_kernel_concat(const struct sam3_node *node,
+				  struct sam3_threadpool *pool);
+
+/* Slice sub-tensor: params[0]=axis, [1]=start, [2]=end */
+enum sam3_error cpu_kernel_slice(const struct sam3_node *node,
+				 struct sam3_threadpool *pool);
+
+/* Nearest-neighbor upsample 4D [N,C,H,W]: params[0]=scale */
+enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */

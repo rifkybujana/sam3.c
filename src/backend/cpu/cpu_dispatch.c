@@ -285,6 +285,30 @@ wrap_embed(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_embed(node, pool);
 }
 
+static enum sam3_error
+wrap_concat(const struct sam3_node *node, struct sam3_arena *scratch,
+	    struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_concat(node, pool);
+}
+
+static enum sam3_error
+wrap_slice(const struct sam3_node *node, struct sam3_arena *scratch,
+	   struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_slice(node, pool);
+}
+
+static enum sam3_error
+wrap_upsample(const struct sam3_node *node, struct sam3_arena *scratch,
+	      struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_upsample(node, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -364,6 +388,15 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_EMBED] = {
 		[SAM3_DTYPE_F32]  = wrap_embed,
+	},
+	[SAM3_OP_CONCAT] = {
+		[SAM3_DTYPE_F32]  = wrap_concat,
+	},
+	[SAM3_OP_SLICE] = {
+		[SAM3_DTYPE_F32]  = wrap_slice,
+	},
+	[SAM3_OP_UPSAMPLE] = {
+		[SAM3_DTYPE_F32]  = wrap_upsample,
 	},
 };
 

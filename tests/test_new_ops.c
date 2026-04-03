@@ -1,9 +1,10 @@
 /*
- * tests/test_new_ops.c - Unit tests for sigmoid, silu, and embed kernels
+ * tests/test_new_ops.c - Unit tests for sigmoid, silu, embed, concat, slice, upsample
  *
- * Tests element-wise sigmoid, element-wise SiLU (Swish), and embedding
- * table lookup kernels with both small and large inputs.  Uses the CPU
- * backend with arena allocation and graph_eval for execution.
+ * Tests element-wise sigmoid, element-wise SiLU (Swish), embedding
+ * table lookup, tensor concatenation, tensor slicing, and nearest-
+ * neighbor upsampling kernels.  Uses the CPU backend with arena
+ * allocation and graph_eval for execution.
  *
  * Key types:  sam3_node, sam3_tensor, sam3_cpu_backend
  * Depends on: test_helpers.h, cpu_backend.h, core/graph.h, core/tensor.h
@@ -278,6 +279,259 @@ static void test_embed_single(void)
 	ASSERT_NEAR(out[2], 12.0f, EPS);
 }
 
+/* --- Concat tests --- */
+
+static void test_concat_axis0(void)
+{
+	/* concat([2,3], [1,3], axis=0) -> [3,3] */
+	struct sam3_tensor *a = make_tensor(2, (int[]){2, 3});
+	struct sam3_tensor *b = make_tensor(2, (int[]){1, 3});
+	struct sam3_tensor *out = make_tensor(2, (int[]){3, 3});
+
+	float a_data[] = {1, 2, 3, 4, 5, 6};
+	float b_data[] = {7, 8, 9};
+	fill_data(a, a_data);
+	fill_data(b, b_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_CONCAT;
+	node.inputs[0] = a;
+	node.inputs[1] = b;
+	node.n_inputs = 2;
+	node.output = out;
+	node.params[0] = 0; /* axis */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	float expect[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+	for (int i = 0; i < 9; i++)
+		ASSERT_NEAR(o[i], expect[i], EPS);
+}
+
+static void test_concat_axis1(void)
+{
+	/* concat([2,2], [2,3], axis=1) -> [2,5] */
+	struct sam3_tensor *a = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *b = make_tensor(2, (int[]){2, 3});
+	struct sam3_tensor *out = make_tensor(2, (int[]){2, 5});
+
+	float a_data[] = {1, 2, 3, 4};
+	float b_data[] = {5, 6, 7, 8, 9, 10};
+	fill_data(a, a_data);
+	fill_data(b, b_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_CONCAT;
+	node.inputs[0] = a;
+	node.inputs[1] = b;
+	node.n_inputs = 2;
+	node.output = out;
+	node.params[0] = 1; /* axis */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	/* row 0: a[0,0], a[0,1], b[0,0], b[0,1], b[0,2] = 1,2,5,6,7 */
+	/* row 1: a[1,0], a[1,1], b[1,0], b[1,1], b[1,2] = 3,4,8,9,10 */
+	float expect[] = {1, 2, 5, 6, 7, 3, 4, 8, 9, 10};
+	for (int i = 0; i < 10; i++)
+		ASSERT_NEAR(o[i], expect[i], EPS);
+}
+
+static void test_concat_three(void)
+{
+	/* concat three [2,2] tensors along axis 0 -> [6,2] */
+	struct sam3_tensor *a = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *b = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *c = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *out = make_tensor(2, (int[]){6, 2});
+
+	float a_data[] = {1, 2, 3, 4};
+	float b_data[] = {5, 6, 7, 8};
+	float c_data[] = {9, 10, 11, 12};
+	fill_data(a, a_data);
+	fill_data(b, b_data);
+	fill_data(c, c_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_CONCAT;
+	node.inputs[0] = a;
+	node.inputs[1] = b;
+	node.inputs[2] = c;
+	node.n_inputs = 3;
+	node.output = out;
+	node.params[0] = 0; /* axis */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	float expect[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+	for (int i = 0; i < 12; i++)
+		ASSERT_NEAR(o[i], expect[i], EPS);
+}
+
+/* --- Slice tests --- */
+
+static void test_slice_axis0(void)
+{
+	/* slice([4,3], axis=0, start=1, end=3) -> [2,3] */
+	struct sam3_tensor *inp = make_tensor(2, (int[]){4, 3});
+	struct sam3_tensor *out = make_tensor(2, (int[]){2, 3});
+
+	float inp_data[] = {
+		1, 2, 3,     /* row 0 */
+		4, 5, 6,     /* row 1 */
+		7, 8, 9,     /* row 2 */
+		10, 11, 12,  /* row 3 */
+	};
+	fill_data(inp, inp_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_SLICE;
+	node.inputs[0] = inp;
+	node.n_inputs = 1;
+	node.output = out;
+	node.params[0] = 0; /* axis */
+	node.params[1] = 1; /* start */
+	node.params[2] = 3; /* end */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	/* rows 1 and 2: {4,5,6, 7,8,9} */
+	float expect[] = {4, 5, 6, 7, 8, 9};
+	for (int i = 0; i < 6; i++)
+		ASSERT_NEAR(o[i], expect[i], EPS);
+}
+
+static void test_slice_axis1(void)
+{
+	/* slice([2,5], axis=1, start=1, end=4) -> [2,3] */
+	struct sam3_tensor *inp = make_tensor(2, (int[]){2, 5});
+	struct sam3_tensor *out = make_tensor(2, (int[]){2, 3});
+
+	float inp_data[] = {
+		1, 2, 3, 4, 5,     /* row 0 */
+		6, 7, 8, 9, 10,    /* row 1 */
+	};
+	fill_data(inp, inp_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_SLICE;
+	node.inputs[0] = inp;
+	node.n_inputs = 1;
+	node.output = out;
+	node.params[0] = 1; /* axis */
+	node.params[1] = 1; /* start */
+	node.params[2] = 4; /* end */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	/* row 0 cols 1..3: {2,3,4}, row 1 cols 1..3: {7,8,9} */
+	float expect[] = {2, 3, 4, 7, 8, 9};
+	for (int i = 0; i < 6; i++)
+		ASSERT_NEAR(o[i], expect[i], EPS);
+}
+
+/* --- Upsample tests --- */
+
+static void test_upsample_2x(void)
+{
+	/* [1,1,2,2] with scale=2 -> [1,1,4,4] */
+	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 1, 2, 2});
+	struct sam3_tensor *out = make_tensor(4, (int[]){1, 1, 4, 4});
+
+	float inp_data[] = {1, 2, 3, 4};
+	fill_data(inp, inp_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_UPSAMPLE;
+	node.inputs[0] = inp;
+	node.n_inputs = 1;
+	node.output = out;
+	node.params[0] = 2; /* scale */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	/*
+	 * Input:     Output (nearest-neighbor 2x):
+	 *  1 2        1 1 2 2
+	 *  3 4        1 1 2 2
+	 *             3 3 4 4
+	 *             3 3 4 4
+	 */
+	float expect[] = {
+		1, 1, 2, 2,
+		1, 1, 2, 2,
+		3, 3, 4, 4,
+		3, 3, 4, 4,
+	};
+	for (int i = 0; i < 16; i++)
+		ASSERT_NEAR(o[i], expect[i], EPS);
+}
+
+static void test_upsample_3x(void)
+{
+	/* [1,1,2,3] with scale=3 -> [1,1,6,9] */
+	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 1, 2, 3});
+	struct sam3_tensor *out = make_tensor(4, (int[]){1, 1, 6, 9});
+
+	float inp_data[] = {1, 2, 3, 4, 5, 6};
+	fill_data(inp, inp_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_UPSAMPLE;
+	node.inputs[0] = inp;
+	node.n_inputs = 1;
+	node.output = out;
+	node.params[0] = 3; /* scale */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	float *o = (float *)out->data;
+	/*
+	 * Input:        Output (nearest-neighbor 3x):
+	 *  1 2 3         1 1 1 2 2 2 3 3 3    (rows 0-2)
+	 *  4 5 6         1 1 1 2 2 2 3 3 3
+	 *                1 1 1 2 2 2 3 3 3
+	 *                4 4 4 5 5 5 6 6 6    (rows 3-5)
+	 *                4 4 4 5 5 5 6 6 6
+	 *                4 4 4 5 5 5 6 6 6
+	 */
+	for (int y = 0; y < 6; y++) {
+		int sy = y / 3;
+		for (int x = 0; x < 9; x++) {
+			int sx = x / 3;
+			float expected = inp_data[sy * 3 + sx];
+			ASSERT_NEAR(o[y * 9 + x], expected, EPS);
+		}
+	}
+}
+
 /* --- Main --- */
 
 int main(void)
@@ -295,6 +549,19 @@ int main(void)
 	/* Embed */
 	test_embed_basic();
 	test_embed_single();
+
+	/* Concat */
+	test_concat_axis0();
+	test_concat_axis1();
+	test_concat_three();
+
+	/* Slice */
+	test_slice_axis0();
+	test_slice_axis1();
+
+	/* Upsample */
+	test_upsample_2x();
+	test_upsample_3x();
 
 	teardown();
 
