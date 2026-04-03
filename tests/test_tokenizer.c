@@ -2,14 +2,14 @@
  * tests/test_tokenizer.c - Unit tests for BPE tokenizer
  *
  * Tests tokenizer initialization, byte-level encoding, case folding,
- * empty input, padding behavior, and truncation of long input. Uses
- * malloc-based allocation (no arena needed for tokenizer tests).
+ * empty input, padding behavior, truncation, and CLIP BPE mode with
+ * verified reference token IDs from the Python CLIP tokenizer.
  *
  * Key types:  sam3_tokenizer
  * Depends on: test_helpers.h, model/tokenizer.h
  * Used by:    CTest
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
@@ -18,6 +18,9 @@
 
 #include <stdio.h>
 #include <string.h>
+
+/* Path to CLIP BPE vocabulary (may not exist in CI) */
+#define BPE_VOCAB_PATH "models/bpe_simple_vocab_16e6.txt"
 
 /* --- test_tokenizer_init --- */
 
@@ -34,6 +37,9 @@ static void test_tokenizer_init(void)
 	ASSERT_EQ(tok.n_merges, 0);
 	ASSERT(tok.merge_first == NULL);
 	ASSERT(tok.merge_second == NULL);
+	ASSERT_EQ(tok.bpe_loaded, 0);
+	ASSERT(tok.encoder_map == NULL);
+	ASSERT(tok.merge_rank_map == NULL);
 
 	/* Verify byte tokens are initialized */
 	ASSERT(tok.vocab[0] != NULL);
@@ -164,13 +170,7 @@ static void test_encode_truncation(void)
 	int32_t tokens[5];
 	int n = sam3_tokenizer_encode(&tok, "abcdefghij", tokens, 5);
 
-	/* SOT + 'a' + 'b' + 'c' + 'd' = 5, truncated (no room for EOT
-	 * beyond the 4 byte tokens that fit after SOT)
-	 *
-	 * Actually: pos=0 SOT, then loop adds bytes while pos < 4
-	 * (max_tokens - 1), so we get SOT + 'a' + 'b' + 'c', then
-	 * EOT at pos 4.
-	 */
+	/* SOT + 'a' + 'b' + 'c' + EOT = 5 */
 	ASSERT_EQ(n, 5);
 	ASSERT_EQ(tokens[0], 49406);		/* SOT */
 	ASSERT_EQ(tokens[1], (int32_t)'a');
@@ -220,46 +220,6 @@ static void test_tokenizer_free_null(void)
 	sam3_tokenizer_free(&tok);
 }
 
-/* --- test_load_bpe --- */
-
-static void test_load_bpe(void)
-{
-	struct sam3_tokenizer tok;
-	sam3_tokenizer_init(&tok);
-
-	/* Write a small BPE merge file */
-	const char *path = "/tmp/test_bpe.txt";
-	FILE *fp = fopen(path, "w");
-	ASSERT(fp != NULL);
-	fprintf(fp, "# version comment\n");
-	fprintf(fp, "h i\n");
-	fprintf(fp, "hi !\n");
-	fclose(fp);
-
-	enum sam3_error err = sam3_tokenizer_load_bpe(&tok, path);
-	ASSERT_EQ(err, SAM3_OK);
-
-	/* Verify merge count */
-	ASSERT_EQ(tok.n_merges, 2);
-	ASSERT(tok.merge_first != NULL);
-	ASSERT(tok.merge_second != NULL);
-
-	/* First merge: 'h' + 'i' -> "hi" at vocab[256] */
-	ASSERT_EQ(tok.merge_first[0], (int)'h');
-	ASSERT_EQ(tok.merge_second[0], (int)'i');
-	ASSERT(tok.vocab[256] != NULL);
-	ASSERT(strcmp(tok.vocab[256], "hi") == 0);
-
-	/* Second merge: "hi" + '!' -> "hi!" at vocab[257] */
-	ASSERT_EQ(tok.merge_first[1], 256);	/* "hi" token ID */
-	ASSERT_EQ(tok.merge_second[1], (int)'!');
-	ASSERT(tok.vocab[257] != NULL);
-	ASSERT(strcmp(tok.vocab[257], "hi!") == 0);
-
-	sam3_tokenizer_free(&tok);
-	remove(path);
-}
-
 /* --- test_load_bpe_missing_file --- */
 
 static void test_load_bpe_missing_file(void)
@@ -273,8 +233,7 @@ static void test_load_bpe_missing_file(void)
 
 	/* Tokenizer should be unchanged */
 	ASSERT_EQ(tok.n_merges, 0);
-	ASSERT(tok.merge_first == NULL);
-	ASSERT(tok.merge_second == NULL);
+	ASSERT_EQ(tok.bpe_loaded, 0);
 
 	sam3_tokenizer_free(&tok);
 }
@@ -296,92 +255,34 @@ static void test_load_bpe_invalid_args(void)
 	sam3_tokenizer_free(&tok);
 }
 
-/* --- test_load_bpe_malformed --- */
+/* --- test_bytes_to_unicode --- */
 
-static void test_load_bpe_malformed(void)
+/*
+ * test_bytes_to_unicode - Verify the bytes_to_unicode table matches CLIP.
+ */
+static void test_bytes_to_unicode(void)
 {
 	struct sam3_tokenizer tok;
-	sam3_tokenizer_init(&tok);
-
-	/* Write a malformed BPE file (missing second token) */
-	const char *path = "/tmp/test_bpe_bad.txt";
-	FILE *fp = fopen(path, "w");
-	ASSERT(fp != NULL);
-	fprintf(fp, "h\n");  /* no space-separated pair */
-	fclose(fp);
-
-	enum sam3_error err = sam3_tokenizer_load_bpe(&tok, path);
-	ASSERT_EQ(err, SAM3_EINVAL);
-
-	/* Tokenizer merges should be unchanged */
-	ASSERT_EQ(tok.n_merges, 0);
-
-	sam3_tokenizer_free(&tok);
-	remove(path);
-}
-
-/* --- test_encode_bpe_two_merges --- */
-
-static void test_encode_bpe_two_merges(void)
-{
-	struct sam3_tokenizer tok;
-	sam3_tokenizer_init(&tok);
-
-	/* Write BPE merge file: "h i" then "hi !" */
-	const char *path = "/tmp/test_bpe_encode.txt";
-	FILE *fp = fopen(path, "w");
-	ASSERT(fp != NULL);
-	fprintf(fp, "h i\n");
-	fprintf(fp, "hi !\n");
-	fclose(fp);
-
-	enum sam3_error err = sam3_tokenizer_load_bpe(&tok, path);
+	enum sam3_error err = sam3_tokenizer_init(&tok);
 	ASSERT_EQ(err, SAM3_OK);
 
-	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
-	int n = sam3_tokenizer_encode(&tok, "hi!", tokens,
-				      SAM3_TOKENIZER_CONTEXT_LEN);
+	/* Printable ASCII: byte 65 ('A') -> "A" */
+	ASSERT_EQ(strcmp(tok.byte_unicode[65], "A"), 0);
 
-	/* SOT + "hi!" (257) + EOT = 3 meaningful tokens */
-	ASSERT_EQ(n, 3);
-	ASSERT_EQ(tokens[0], 49406);	/* SOT */
-	ASSERT_EQ(tokens[1], 257);	/* "hi!" merged token */
-	ASSERT_EQ(tokens[2], 49407);	/* EOT */
+	/* Printable ASCII: byte 97 ('a') -> "a" */
+	ASSERT_EQ(strcmp(tok.byte_unicode[97], "a"), 0);
 
-	sam3_tokenizer_free(&tok);
-	remove(path);
-}
+	/* Non-printable: byte 0 maps to chr(256) = U+0100 = UTF-8: C4 80 */
+	ASSERT_EQ((unsigned char)tok.byte_unicode[0][0], 0xC4);
+	ASSERT_EQ((unsigned char)tok.byte_unicode[0][1], 0x80);
 
-/* --- test_encode_bpe_one_merge --- */
+	/* Byte 32 (space) is non-printable in CLIP */
+	ASSERT(tok.byte_unicode[32][0] != ' ');
 
-static void test_encode_bpe_one_merge(void)
-{
-	struct sam3_tokenizer tok;
-	sam3_tokenizer_init(&tok);
-
-	/* Write BPE merge file: "h i" then "hi !" */
-	const char *path = "/tmp/test_bpe_encode2.txt";
-	FILE *fp = fopen(path, "w");
-	ASSERT(fp != NULL);
-	fprintf(fp, "h i\n");
-	fprintf(fp, "hi !\n");
-	fclose(fp);
-
-	enum sam3_error err = sam3_tokenizer_load_bpe(&tok, path);
-	ASSERT_EQ(err, SAM3_OK);
-
-	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
-	int n = sam3_tokenizer_encode(&tok, "hi", tokens,
-				      SAM3_TOKENIZER_CONTEXT_LEN);
-
-	/* SOT + "hi" (256) + EOT = 3 meaningful tokens */
-	ASSERT_EQ(n, 3);
-	ASSERT_EQ(tokens[0], 49406);	/* SOT */
-	ASSERT_EQ(tokens[1], 256);	/* "hi" merged token */
-	ASSERT_EQ(tokens[2], 49407);	/* EOT */
+	/* Byte 33 ('!') is printable -> maps to "!" */
+	ASSERT_EQ(strcmp(tok.byte_unicode[33], "!"), 0);
 
 	sam3_tokenizer_free(&tok);
-	remove(path);
 }
 
 /* --- test_encode_bpe_backward_compat --- */
@@ -407,11 +308,209 @@ static void test_encode_bpe_backward_compat(void)
 	sam3_tokenizer_free(&tok);
 }
 
+/* ---- CLIP BPE mode tests (skip if vocab file not found) ---- */
+
+static int load_clip_bpe(struct sam3_tokenizer *tok)
+{
+	enum sam3_error err = sam3_tokenizer_load_bpe(tok, BPE_VOCAB_PATH);
+	if (err == SAM3_EIO) {
+		printf("  [SKIP] BPE file not found: %s\n", BPE_VOCAB_PATH);
+		return 0;
+	}
+	ASSERT_EQ(err, SAM3_OK);
+	ASSERT_EQ(tok->bpe_loaded, 1);
+	return (err == SAM3_OK);
+}
+
+static void test_clip_hello_world(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "hello world", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 4);
+	ASSERT_EQ(tokens[0], 49406);	/* SOT */
+	ASSERT_EQ(tokens[1], 3306);	/* hello */
+	ASSERT_EQ(tokens[2], 1002);	/* world */
+	ASSERT_EQ(tokens[3], 49407);	/* EOT */
+
+	/* CLIP pads with 0 */
+	for (int i = 4; i < SAM3_TOKENIZER_CONTEXT_LEN; i++)
+		ASSERT_EQ(tokens[i], 0);
+
+	sam3_tokenizer_free(&tok);
+}
+
+static void test_clip_cat(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "cat", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 3);
+	ASSERT_EQ(tokens[0], 49406);
+	ASSERT_EQ(tokens[1], 2368);
+	ASSERT_EQ(tokens[2], 49407);
+
+	sam3_tokenizer_free(&tok);
+}
+
+static void test_clip_contraction(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "it's", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 4);
+	ASSERT_EQ(tokens[0], 49406);
+	ASSERT_EQ(tokens[1], 585);	/* it */
+	ASSERT_EQ(tokens[2], 568);	/* 's */
+	ASSERT_EQ(tokens[3], 49407);
+
+	sam3_tokenizer_free(&tok);
+}
+
+static void test_clip_multi_word(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "the quick brown fox", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 6);
+	ASSERT_EQ(tokens[0], 49406);
+	ASSERT_EQ(tokens[1], 518);	/* the */
+	ASSERT_EQ(tokens[2], 3712);	/* quick */
+	ASSERT_EQ(tokens[3], 2866);	/* brown */
+	ASSERT_EQ(tokens[4], 3240);	/* fox */
+	ASSERT_EQ(tokens[5], 49407);
+
+	sam3_tokenizer_free(&tok);
+}
+
+static void test_clip_single_char(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "a", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 3);
+	ASSERT_EQ(tokens[0], 49406);
+	ASSERT_EQ(tokens[1], 320);	/* a */
+	ASSERT_EQ(tokens[2], 49407);
+
+	sam3_tokenizer_free(&tok);
+}
+
+static void test_clip_phrase(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "a photo of a cat", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 7);
+	ASSERT_EQ(tokens[0], 49406);
+	ASSERT_EQ(tokens[1], 320);	/* a */
+	ASSERT_EQ(tokens[2], 1125);	/* photo */
+	ASSERT_EQ(tokens[3], 539);	/* of */
+	ASSERT_EQ(tokens[4], 320);	/* a */
+	ASSERT_EQ(tokens[5], 2368);	/* cat */
+	ASSERT_EQ(tokens[6], 49407);
+
+	sam3_tokenizer_free(&tok);
+}
+
+static void test_clip_person(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "person", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 3);
+	ASSERT_EQ(tokens[0], 49406);
+	ASSERT_EQ(tokens[1], 2533);	/* person */
+	ASSERT_EQ(tokens[2], 49407);
+
+	sam3_tokenizer_free(&tok);
+}
+
+static void test_clip_case_insensitive(void)
+{
+	struct sam3_tokenizer tok;
+	sam3_tokenizer_init(&tok);
+	if (!load_clip_bpe(&tok)) {
+		sam3_tokenizer_free(&tok);
+		return;
+	}
+
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int n = sam3_tokenizer_encode(&tok, "A dog", tokens,
+				      SAM3_TOKENIZER_CONTEXT_LEN);
+
+	ASSERT_EQ(n, 4);
+	ASSERT_EQ(tokens[0], 49406);
+	ASSERT_EQ(tokens[1], 320);	/* a */
+	ASSERT_EQ(tokens[2], 1929);	/* dog */
+	ASSERT_EQ(tokens[3], 49407);
+
+	sam3_tokenizer_free(&tok);
+}
+
 /* --- Main --- */
 
 int main(void)
 {
+	/* Byte-level fallback tests */
 	test_tokenizer_init();
+	test_bytes_to_unicode();
 	test_encode_simple();
 	test_encode_uppercase();
 	test_encode_empty();
@@ -419,13 +518,19 @@ int main(void)
 	test_encode_truncation();
 	test_encode_invalid_args();
 	test_tokenizer_free_null();
-	test_load_bpe();
 	test_load_bpe_missing_file();
 	test_load_bpe_invalid_args();
-	test_load_bpe_malformed();
-	test_encode_bpe_two_merges();
-	test_encode_bpe_one_merge();
 	test_encode_bpe_backward_compat();
+
+	/* CLIP BPE mode tests */
+	test_clip_hello_world();
+	test_clip_cat();
+	test_clip_contraction();
+	test_clip_multi_word();
+	test_clip_single_char();
+	test_clip_phrase();
+	test_clip_person();
+	test_clip_case_insensitive();
 
 	TEST_REPORT();
 }

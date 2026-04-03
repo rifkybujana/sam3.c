@@ -30,6 +30,10 @@ struct sam3_tokenizer {
 	int    n_merges;
 	int    sot_token;	/* start-of-text token ID */
 	int    eot_token;	/* end-of-text token ID */
+	int    bpe_loaded;	/* 0 = byte-level fallback, 1 = CLIP BPE */
+	char   byte_unicode[256][5]; /* bytes_to_unicode table (UTF-8) */
+	void  *encoder_map;	/* string -> token_id hash table (private) */
+	void  *merge_rank_map;	/* "tokA\x01tokB" -> rank hash table */
 };
 
 /*
@@ -74,10 +78,12 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
  * @tokens:     Output array for token IDs (caller-allocated)
  * @max_tokens: Size of output array (should be SAM3_TOKENIZER_CONTEXT_LEN)
  *
- * The first token is always SOT. Each byte of the lowercased text maps
- * to its byte token ID. The sequence is terminated with EOT and padded
- * with EOT tokens to fill max_tokens. If the text is too long, it is
- * truncated to fit within max_tokens (SOT at start, EOT at end).
+ * The first token is always SOT. In byte-level fallback mode, each byte
+ * of the lowercased text maps to its byte token ID and padding uses EOT.
+ * In CLIP BPE mode (after load_bpe), text is pre-tokenized and BPE-merged
+ * per the CLIP vocabulary; padding uses 0. The sequence is terminated
+ * with EOT. If the text is too long, it is truncated to fit within
+ * max_tokens (SOT at start, EOT at end).
  *
  * Returns number of meaningful tokens written (including SOT and EOT),
  * or 0 on invalid arguments.

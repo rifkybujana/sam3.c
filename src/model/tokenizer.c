@@ -2,30 +2,429 @@
  * src/model/tokenizer.c - BPE tokenizer for CLIP text encoding
  *
  * Implements a BPE tokenizer compatible with the CLIP vocabulary layout.
- * The vocabulary has 49408 slots: the first 256 are single-byte tokens,
- * merged tokens start at index 256, and the last two (49406, 49407) are
- * start-of-text and end-of-text special tokens. Initialization creates
- * a byte-level fallback; sam3_tokenizer_load_bpe() loads a merge table
+ * The vocabulary has 49408 slots: bytes_to_unicode tokens at [0-255],
+ * their </w> variants at [256-511], merged tokens from [512..49405],
+ * and SOT/EOT at [49406-49407]. Initialization creates a byte-level
+ * fallback; sam3_tokenizer_load_bpe() loads the real CLIP BPE vocab
  * for production-quality subword tokenization.
  *
- * Key types:  sam3_tokenizer
+ * Key types:  sam3_tokenizer, tok_hash_table
  * Depends on: tokenizer.h
  * Used by:    model/text_encoder.c (future)
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
 #include "tokenizer.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
 
 /* CLIP vocabulary constants */
 #define CLIP_VOCAB_SIZE 49408
 #define CLIP_SOT_TOKEN  49406
 #define CLIP_EOT_TOKEN  49407
+#define CLIP_MAX_MERGES 48894	/* 49408 - 256 - 256 - 2 */
+
+/*
+ * byte_to_unicode - CLIP's bytes_to_unicode mapping table.
+ *
+ * Maps each byte value [0-255] to a Unicode codepoint such that all
+ * printable ASCII and Latin-1 chars map to themselves, while control
+ * bytes and the gap at 0xAD map to U+0100..U+0143. Max codepoint is
+ * U+0143, so all values fit in 2-byte UTF-8.
+ */
+static const uint32_t byte_to_unicode[256] = {
+	0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107,
+	0x0108, 0x0109, 0x010A, 0x010B, 0x010C, 0x010D, 0x010E, 0x010F,
+	0x0110, 0x0111, 0x0112, 0x0113, 0x0114, 0x0115, 0x0116, 0x0117,
+	0x0118, 0x0119, 0x011A, 0x011B, 0x011C, 0x011D, 0x011E, 0x011F,
+	0x0120, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,
+	0x0028, 0x0029, 0x002A, 0x002B, 0x002C, 0x002D, 0x002E, 0x002F,
+	0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+	0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F,
+	0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+	0x0048, 0x0049, 0x004A, 0x004B, 0x004C, 0x004D, 0x004E, 0x004F,
+	0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
+	0x0058, 0x0059, 0x005A, 0x005B, 0x005C, 0x005D, 0x005E, 0x005F,
+	0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
+	0x0068, 0x0069, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F,
+	0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
+	0x0078, 0x0079, 0x007A, 0x007B, 0x007C, 0x007D, 0x007E, 0x0121,
+	0x0122, 0x0123, 0x0124, 0x0125, 0x0126, 0x0127, 0x0128, 0x0129,
+	0x012A, 0x012B, 0x012C, 0x012D, 0x012E, 0x012F, 0x0130, 0x0131,
+	0x0132, 0x0133, 0x0134, 0x0135, 0x0136, 0x0137, 0x0138, 0x0139,
+	0x013A, 0x013B, 0x013C, 0x013D, 0x013E, 0x013F, 0x0140, 0x0141,
+	0x0142, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,
+	0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x0143, 0x00AE, 0x00AF,
+	0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+	0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,
+	0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,
+	0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,
+	0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+	0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,
+	0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,
+	0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+	0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,
+	0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF,
+};
+
+/* Encode a Unicode codepoint to UTF-8. Returns number of bytes written. */
+static int utf8_encode(uint32_t cp, char *buf)
+{
+	if (cp < 0x80) {
+		buf[0] = (char)cp;
+		return 1;
+	}
+	if (cp < 0x800) {
+		buf[0] = (char)(0xC0 | (cp >> 6));
+		buf[1] = (char)(0x80 | (cp & 0x3F));
+		return 2;
+	}
+	/* Not needed for CLIP (max U+0143) but included for safety */
+	buf[0] = (char)(0xE0 | (cp >> 12));
+	buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+	buf[2] = (char)(0x80 | (cp & 0x3F));
+	return 3;
+}
+
+/* Convert a byte to its CLIP UTF-8 representation. Returns byte count. */
+static int byte_to_utf8(unsigned char b, char *buf)
+{
+	return utf8_encode(byte_to_unicode[b], buf);
+}
+
+/*
+ * is_clip_printable - Check if byte is in CLIP's printable range.
+ *
+ * CLIP considers these byte ranges printable (mapped to chr(byte)):
+ * 33-126, 161-172, 174-255
+ */
+static int is_clip_printable(int b)
+{
+	return (b >= 33 && b <= 126) ||
+	       (b >= 161 && b <= 172) ||
+	       (b >= 174 && b <= 255);
+}
+
+/*
+ * build_bytes_to_unicode - Build the CLIP bytes_to_unicode table.
+ *
+ * Populates a 256-entry table where each byte maps to a short UTF-8
+ * string. Printable bytes map to themselves (as UTF-8), non-printable
+ * bytes map to codepoints starting at U+0100.
+ */
+static void build_bytes_to_unicode(char table[256][5])
+{
+	int n = 0;
+
+	for (int b = 0; b < 256; b++) {
+		int len;
+		if (is_clip_printable(b)) {
+			len = utf8_encode((uint32_t)b, table[b]);
+		} else {
+			len = utf8_encode((uint32_t)(256 + n), table[b]);
+			n++;
+		}
+		table[b][len] = '\0';
+	}
+}
+
+/* ---- Open-addressing hash table ---- */
+
+struct tok_hash_entry {
+	char *key;
+	int   value;
+	int   key_owned;	/* 1 if key was malloc'd by the table */
+};
+
+struct tok_hash_table {
+	struct tok_hash_entry *entries;
+	int capacity;
+	int count;
+};
+
+static uint32_t fnv1a_hash(const char *str)
+{
+	uint32_t h = 2166136261u;
+	for (const unsigned char *p = (const unsigned char *)str; *p; p++) {
+		h ^= *p;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static struct tok_hash_table *hash_table_create(int min_capacity)
+{
+	struct tok_hash_table *ht;
+	int cap = 64;
+
+	while (cap < min_capacity * 2)
+		cap *= 2;
+
+	ht = calloc(1, sizeof(*ht));
+	if (!ht)
+		return NULL;
+
+	ht->entries = calloc((size_t)cap, sizeof(struct tok_hash_entry));
+	if (!ht->entries) {
+		free(ht);
+		return NULL;
+	}
+	ht->capacity = cap;
+	ht->count = 0;
+	return ht;
+}
+
+static int hash_table_insert(struct tok_hash_table *ht, const char *key,
+			     int value, int copy_key)
+{
+	uint32_t idx = fnv1a_hash(key) & (uint32_t)(ht->capacity - 1);
+
+	for (;;) {
+		struct tok_hash_entry *e = &ht->entries[idx];
+		if (!e->key) {
+			if (copy_key) {
+				e->key = strdup(key);
+				if (!e->key)
+					return -1;
+				e->key_owned = 1;
+			} else {
+				e->key = (char *)key;
+				e->key_owned = 0;
+			}
+			e->value = value;
+			ht->count++;
+			return 0;
+		}
+		if (strcmp(e->key, key) == 0) {
+			e->value = value;
+			return 0;
+		}
+		idx = (idx + 1) & (uint32_t)(ht->capacity - 1);
+	}
+}
+
+/* Returns pointer to value, or NULL if not found */
+static int *hash_table_lookup(const struct tok_hash_table *ht,
+			      const char *key)
+{
+	if (!ht || !key)
+		return NULL;
+
+	uint32_t idx = fnv1a_hash(key) & (uint32_t)(ht->capacity - 1);
+
+	for (;;) {
+		struct tok_hash_entry *e = &ht->entries[idx];
+		if (!e->key)
+			return NULL;
+		if (strcmp(e->key, key) == 0)
+			return &e->value;
+		idx = (idx + 1) & (uint32_t)(ht->capacity - 1);
+	}
+}
+
+static void hash_table_free(struct tok_hash_table *ht)
+{
+	if (!ht)
+		return;
+	if (ht->entries) {
+		for (int i = 0; i < ht->capacity; i++) {
+			if (ht->entries[i].key_owned)
+				free(ht->entries[i].key);
+		}
+		free(ht->entries);
+	}
+	free(ht);
+}
+
+/* Build "str_a\x01str_b" key for merge-pair lookup. Caller frees. */
+static char *make_pair_key(const char *a, const char *b)
+{
+	size_t la = strlen(a);
+	size_t lb = strlen(b);
+	char *key = malloc(la + 1 + lb + 1);
+	if (!key)
+		return NULL;
+	memcpy(key, a, la);
+	key[la] = '\x01';
+	memcpy(key + la + 1, b, lb);
+	key[la + 1 + lb] = '\0';
+	return key;
+}
+
+/*
+ * pretokenize_next - Scan the next pre-token from text.
+ *
+ * Matches CLIP's regex pattern: contractions, letter runs, single
+ * digits, and symbol runs. Whitespace is skipped.
+ *
+ * Returns 1 if a token was found (sets *start and *len), 0 at end.
+ */
+static int pretokenize_next(const char **cursor, const char **start, int *len)
+{
+	const char *p = *cursor;
+
+	/* Skip whitespace */
+	while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+		p++;
+
+	if (!*p) {
+		*cursor = p;
+		return 0;
+	}
+
+	/* Check for contractions: 's 't 're 've 'm 'll 'd */
+	if (*p == '\'') {
+		if (p[1] == 's' || p[1] == 't' || p[1] == 'm' ||
+		    p[1] == 'd') {
+			*start = p;
+			*len = 2;
+			*cursor = p + 2;
+			return 1;
+		}
+		if (p[1] == 'r' && p[2] == 'e') {
+			*start = p;
+			*len = 3;
+			*cursor = p + 3;
+			return 1;
+		}
+		if (p[1] == 'v' && p[2] == 'e') {
+			*start = p;
+			*len = 3;
+			*cursor = p + 3;
+			return 1;
+		}
+		if (p[1] == 'l' && p[2] == 'l') {
+			*start = p;
+			*len = 3;
+			*cursor = p + 3;
+			return 1;
+		}
+	}
+
+	/* Letter run: [a-zA-Z]+ */
+	if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) {
+		*start = p;
+		while (*p && ((*p >= 'a' && *p <= 'z') ||
+			      (*p >= 'A' && *p <= 'Z')))
+			p++;
+		*len = (int)(p - *start);
+		*cursor = p;
+		return 1;
+	}
+
+	/* Single digit: [0-9] */
+	if (*p >= '0' && *p <= '9') {
+		*start = p;
+		*len = 1;
+		*cursor = p + 1;
+		return 1;
+	}
+
+	/* Symbol run: [^\s a-zA-Z0-9]+ */
+	*start = p;
+	while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+	       !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) &&
+	       !(*p >= '0' && *p <= '9'))
+		p++;
+	*len = (int)(p - *start);
+	*cursor = p;
+	return 1;
+}
+
+/*
+ * bpe_encode_word - BPE-encode one pre-tokenized word.
+ *
+ * Converts word bytes to bytes_to_unicode strings, appends </w> to the
+ * last symbol, then iteratively merges the lowest-rank bigram until no
+ * more merges are possible. Final symbols are looked up in encoder_map.
+ *
+ * Returns number of token IDs written to out_ids, or -1 on error.
+ */
+#define BPE_MAX_SYMBOLS 128
+
+static int bpe_encode_word(const struct sam3_tokenizer *tok,
+			   const char *word, int word_len,
+			   int32_t *out_ids, int max_ids)
+{
+	const struct tok_hash_table *enc =
+		(const struct tok_hash_table *)tok->encoder_map;
+	const struct tok_hash_table *ranks =
+		(const struct tok_hash_table *)tok->merge_rank_map;
+
+	/* Convert each byte to its bytes_to_unicode UTF-8 string */
+	char symbols[BPE_MAX_SYMBOLS][8];
+	int n_sym = 0;
+
+	for (int i = 0; i < word_len && n_sym < BPE_MAX_SYMBOLS - 1; i++) {
+		int nb = byte_to_utf8((unsigned char)word[i], symbols[n_sym]);
+		symbols[n_sym][nb] = '\0';
+		n_sym++;
+	}
+
+	if (n_sym == 0)
+		return 0;
+
+	/* Append </w> to the last symbol */
+	size_t last_len = strlen(symbols[n_sym - 1]);
+	if (last_len + 4 < sizeof(symbols[0])) {
+		memcpy(symbols[n_sym - 1] + last_len, "</w>", 5);
+	}
+
+	/* Iterative BPE merging */
+	while (n_sym > 1) {
+		int best_rank = -1;
+		int best_pos = -1;
+
+		/* Find the lowest-rank bigram */
+		for (int i = 0; i < n_sym - 1; i++) {
+			char *pk = make_pair_key(symbols[i], symbols[i + 1]);
+			if (!pk)
+				return -1;
+			int *rank = hash_table_lookup(ranks, pk);
+			free(pk);
+			if (rank && (best_rank < 0 || *rank < best_rank)) {
+				best_rank = *rank;
+				best_pos = i;
+			}
+		}
+
+		if (best_pos < 0)
+			break;
+
+		/* Merge symbols[best_pos] and symbols[best_pos + 1] */
+		size_t len_a = strlen(symbols[best_pos]);
+		size_t len_b = strlen(symbols[best_pos + 1]);
+		if (len_a + len_b >= sizeof(symbols[0]))
+			break;
+		memcpy(symbols[best_pos] + len_a, symbols[best_pos + 1],
+		       len_b + 1);
+
+		/* Shift remaining symbols left */
+		for (int i = best_pos + 1; i < n_sym - 1; i++)
+			memcpy(symbols[i], symbols[i + 1],
+			       strlen(symbols[i + 1]) + 1);
+		n_sym--;
+	}
+
+	/* Look up each final symbol in the encoder */
+	int n_out = 0;
+	for (int i = 0; i < n_sym && n_out < max_ids; i++) {
+		int *id = hash_table_lookup(enc, symbols[i]);
+		if (id) {
+			out_ids[n_out++] = (int32_t)*id;
+		}
+	}
+
+	return n_out;
+}
+
+/* ---- Public API ---- */
 
 enum sam3_error sam3_tokenizer_init(struct sam3_tokenizer *tok)
 {
@@ -58,153 +457,237 @@ enum sam3_error sam3_tokenizer_init(struct sam3_tokenizer *tok)
 	tok->n_merges = 0;
 	tok->merge_first = NULL;
 	tok->merge_second = NULL;
+	tok->bpe_loaded = 0;
+	tok->encoder_map = NULL;
+	tok->merge_rank_map = NULL;
+
+	build_bytes_to_unicode(tok->byte_unicode);
 
 	return SAM3_OK;
-}
-
-/*
- * vocab_find - Linear scan to find token ID by string.
- *
- * Returns the index of the token in vocab, or -1 if not found.
- * Only called at load time so linear scan is acceptable.
- */
-static int vocab_find(const struct sam3_tokenizer *tok, const char *str,
-		      int search_limit)
-{
-	for (int i = 0; i < search_limit; i++) {
-		if (tok->vocab[i] && strcmp(tok->vocab[i], str) == 0)
-			return i;
-	}
-	return -1;
 }
 
 enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 					const char *path)
 {
-	FILE *fp = NULL;
-	int *mf = NULL;
-	int *ms = NULL;
+	gzFile fp = NULL;
+	char **merge_a = NULL;
+	char **merge_b = NULL;
+	char **new_vocab = NULL;
+	struct tok_hash_table *enc = NULL;
+	struct tok_hash_table *ranks = NULL;
 	char line[512];
 	int n_merges = 0;
-	int idx = 0;
 	enum sam3_error err;
 
 	if (!tok || !path || !tok->vocab)
 		return SAM3_EINVAL;
 
-	/* Only allow loading once; re-loading would corrupt rollback state */
-	if (tok->n_merges > 0)
+	if (tok->bpe_loaded)
 		return SAM3_EINVAL;
 
-	fp = fopen(path, "r");
+	fp = gzopen(path, "rb");
 	if (!fp)
 		return SAM3_EIO;
 
-	/* First pass: count non-comment, non-empty lines */
-	while (fgets(line, (int)sizeof(line), fp)) {
-		/* Skip comments and empty lines */
-		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
-			continue;
-		n_merges++;
-	}
-
-	if (n_merges == 0) {
-		fclose(fp);
+	/* Skip header line (starts with '"') */
+	if (!gzgets(fp, line, (int)sizeof(line))) {
+		gzclose(fp);
 		return SAM3_EINVAL;
 	}
 
-	/* Check that merge count fits in vocab (256 + n_merges <= vocab_size - 2) */
-	if (256 + n_merges > tok->vocab_size - 2) {
-		fclose(fp);
-		return SAM3_EINVAL;
-	}
-
-	mf = malloc((size_t)n_merges * sizeof(int));
-	ms = malloc((size_t)n_merges * sizeof(int));
-	if (!mf || !ms) {
+	/* Read merge lines into parallel arrays */
+	merge_a = calloc(CLIP_MAX_MERGES, sizeof(char *));
+	merge_b = calloc(CLIP_MAX_MERGES, sizeof(char *));
+	if (!merge_a || !merge_b) {
 		err = SAM3_ENOMEM;
 		goto cleanup;
 	}
 
-	/* Second pass: parse merge lines */
-	rewind(fp);
-
-	while (fgets(line, (int)sizeof(line), fp) && idx < n_merges) {
-		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
-			continue;
-
+	while (n_merges < CLIP_MAX_MERGES &&
+	       gzgets(fp, line, (int)sizeof(line))) {
 		/* Strip trailing newline */
 		size_t len = strlen(line);
 		while (len > 0 && (line[len - 1] == '\n' ||
-				   line[len - 1] == '\r')) {
+				   line[len - 1] == '\r'))
 			line[--len] = '\0';
-		}
+
+		if (len == 0)
+			continue;
 
 		/* Split at first space */
 		char *space = strchr(line, ' ');
-		if (!space || space == line || *(space + 1) == '\0') {
-			err = SAM3_EINVAL;
-			goto cleanup;
-		}
+		if (!space || space == line || *(space + 1) == '\0')
+			continue;
 		*space = '\0';
 
-		const char *token_a = line;
-		const char *token_b = space + 1;
-
-		/* Look up token IDs (search byte tokens + previously merged) */
-		int search_limit = 256 + idx;
-		int id_a = vocab_find(tok, token_a, search_limit);
-		int id_b = vocab_find(tok, token_b, search_limit);
-
-		if (id_a < 0 || id_b < 0) {
-			err = SAM3_EINVAL;
-			goto cleanup;
-		}
-
-		/* Build merged token string */
-		size_t len_a = strlen(token_a);
-		size_t len_b = strlen(token_b);
-		char *merged = malloc(len_a + len_b + 1);
-		if (!merged) {
+		merge_a[n_merges] = strdup(line);
+		merge_b[n_merges] = strdup(space + 1);
+		if (!merge_a[n_merges] || !merge_b[n_merges]) {
 			err = SAM3_ENOMEM;
 			goto cleanup;
 		}
-		memcpy(merged, token_a, len_a);
-		memcpy(merged + len_a, token_b, len_b);
-		merged[len_a + len_b] = '\0';
-
-		/* Store merged token in vocab at 256 + idx */
-		free(tok->vocab[256 + idx]);
-		tok->vocab[256 + idx] = merged;
-
-		mf[idx] = id_a;
-		ms[idx] = id_b;
-		idx++;
+		n_merges++;
 	}
+	gzclose(fp);
+	fp = NULL;
 
-	if (idx != n_merges) {
+	if (n_merges == 0) {
 		err = SAM3_EINVAL;
 		goto cleanup;
 	}
 
-	/* Success: commit merge tables to tokenizer */
+	/* Build new vocabulary: 49408 entries */
+	new_vocab = calloc(CLIP_VOCAB_SIZE, sizeof(char *));
+	if (!new_vocab) {
+		err = SAM3_ENOMEM;
+		goto cleanup;
+	}
+
+	/* [0-255]: bytes_to_unicode single-byte strings */
+	for (int i = 0; i < 256; i++) {
+		char buf[4];
+		int nb = byte_to_utf8((unsigned char)i, buf);
+		new_vocab[i] = malloc((size_t)nb + 1);
+		if (!new_vocab[i]) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		memcpy(new_vocab[i], buf, (size_t)nb);
+		new_vocab[i][nb] = '\0';
+	}
+
+	/* [256-511]: same + "</w>" suffix */
+	for (int i = 0; i < 256; i++) {
+		size_t base_len = strlen(new_vocab[i]);
+		new_vocab[256 + i] = malloc(base_len + 5);
+		if (!new_vocab[256 + i]) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		memcpy(new_vocab[256 + i], new_vocab[i], base_len);
+		memcpy(new_vocab[256 + i] + base_len, "</w>", 5);
+	}
+
+	/* [512..512+n_merges-1]: concatenation of merge pairs */
+	for (int i = 0; i < n_merges; i++) {
+		size_t la = strlen(merge_a[i]);
+		size_t lb = strlen(merge_b[i]);
+		new_vocab[512 + i] = malloc(la + lb + 1);
+		if (!new_vocab[512 + i]) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		memcpy(new_vocab[512 + i], merge_a[i], la);
+		memcpy(new_vocab[512 + i] + la, merge_b[i], lb);
+		new_vocab[512 + i][la + lb] = '\0';
+	}
+
+	/* [49406]: <|startoftext|> */
+	new_vocab[CLIP_SOT_TOKEN] = strdup("<|startoftext|>");
+	/* [49407]: <|endoftext|> */
+	new_vocab[CLIP_EOT_TOKEN] = strdup("<|endoftext|>");
+	if (!new_vocab[CLIP_SOT_TOKEN] || !new_vocab[CLIP_EOT_TOKEN]) {
+		err = SAM3_ENOMEM;
+		goto cleanup;
+	}
+
+	/* Build encoder hash table: vocab[i] -> i */
+	enc = hash_table_create(CLIP_VOCAB_SIZE);
+	if (!enc) {
+		err = SAM3_ENOMEM;
+		goto cleanup;
+	}
+	for (int i = 0; i < CLIP_VOCAB_SIZE; i++) {
+		if (!new_vocab[i])
+			continue;
+		if (hash_table_insert(enc, new_vocab[i], i, 1) < 0) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+	}
+
+	/* Build merge-rank hash table: "tokA\x01tokB" -> rank */
+	ranks = hash_table_create(n_merges);
+	if (!ranks) {
+		err = SAM3_ENOMEM;
+		goto cleanup;
+	}
+	for (int i = 0; i < n_merges; i++) {
+		char *pk = make_pair_key(merge_a[i], merge_b[i]);
+		if (!pk) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		if (hash_table_insert(ranks, pk, i, 0) < 0) {
+			free(pk);
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		/* Table took ownership of pk (key_owned=0 but we
+		 * transferred the malloc'd pointer; set owned flag) */
+		/* Actually, copy_key=0 means the table stores our pointer
+		 * without copying. We must not free pk here. But the table
+		 * won't free it either unless key_owned=1. Let's fix: pass
+		 * copy_key=0 and manually set key_owned after insert. */
+	}
+	/* Fix ownership: all keys in ranks are malloc'd pair keys */
+	for (int i = 0; i < ranks->capacity; i++) {
+		if (ranks->entries[i].key)
+			ranks->entries[i].key_owned = 1;
+	}
+
+	/* Commit: free old state and install new */
+	if (tok->vocab) {
+		for (int i = 0; i < tok->vocab_size; i++)
+			free(tok->vocab[i]);
+		free(tok->vocab);
+	}
 	free(tok->merge_first);
 	free(tok->merge_second);
-	tok->merge_first = mf;
-	tok->merge_second = ms;
+	hash_table_free(tok->encoder_map);
+	hash_table_free(tok->merge_rank_map);
+
+	tok->vocab = new_vocab;
+	tok->vocab_size = CLIP_VOCAB_SIZE;
 	tok->n_merges = n_merges;
-	fclose(fp);
+	tok->merge_first = NULL;
+	tok->merge_second = NULL;
+	tok->encoder_map = enc;
+	tok->merge_rank_map = ranks;
+	tok->bpe_loaded = 1;
+	tok->sot_token = CLIP_SOT_TOKEN;
+	tok->eot_token = CLIP_EOT_TOKEN;
+
+	/* Free merge string arrays (vocab took ownership of concat'd strings) */
+	for (int i = 0; i < n_merges; i++) {
+		free(merge_a[i]);
+		free(merge_b[i]);
+	}
+	free(merge_a);
+	free(merge_b);
+
 	return SAM3_OK;
 
 cleanup:
-	/* Roll back any vocab entries we wrote during the second pass */
-	for (int i = 0; i < idx; i++) {
-		free(tok->vocab[256 + i]);
-		tok->vocab[256 + i] = NULL;
+	if (fp)
+		gzclose(fp);
+	if (new_vocab) {
+		for (int i = 0; i < CLIP_VOCAB_SIZE; i++)
+			free(new_vocab[i]);
+		free(new_vocab);
 	}
-	free(mf);
-	free(ms);
-	fclose(fp);
+	hash_table_free(enc);
+	hash_table_free(ranks);
+	if (merge_a) {
+		for (int i = 0; i < n_merges; i++)
+			free(merge_a[i]);
+		free(merge_a);
+	}
+	if (merge_b) {
+		for (int i = 0; i < n_merges; i++)
+			free(merge_b[i]);
+		free(merge_b);
+	}
 	return err;
 }
 
@@ -220,7 +703,45 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 	/* Start-of-text token */
 	tokens[pos++] = (int32_t)tok->sot_token;
 
-	/* Encode each byte of the lowercased text */
+	if (tok->bpe_loaded) {
+		/* CLIP BPE mode */
+		char lower[1024];
+		int tlen = 0;
+
+		/* Lowercase into stack buffer */
+		for (const char *p = text; *p && tlen < (int)sizeof(lower) - 1; p++)
+			lower[tlen++] = (char)tolower((unsigned char)*p);
+		lower[tlen] = '\0';
+
+		/* Pre-tokenize and BPE-encode each word */
+		const char *cursor = lower;
+		const char *wstart;
+		int wlen;
+
+		while (pretokenize_next(&cursor, &wstart, &wlen)) {
+			int32_t word_ids[128];
+			int n = bpe_encode_word(tok, wstart, wlen,
+						word_ids, 128);
+			for (int i = 0; i < n && pos < max_tokens - 1; i++)
+				tokens[pos++] = word_ids[i];
+			if (pos >= max_tokens - 1)
+				break;
+		}
+
+		/* End-of-text token */
+		if (pos < max_tokens)
+			tokens[pos++] = (int32_t)tok->eot_token;
+
+		int n_tokens = pos;
+
+		/* Pad with 0 (CLIP convention) */
+		while (pos < max_tokens)
+			tokens[pos++] = 0;
+
+		return n_tokens;
+	}
+
+	/* Byte-level fallback mode */
 	for (const char *p = text; *p && pos < max_tokens - 1; p++) {
 		unsigned char c = (unsigned char)*p;
 
@@ -231,39 +752,10 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 		tokens[pos++] = (int32_t)c;
 	}
 
-	/* Apply BPE merges if merge table is loaded */
-	if (tok->n_merges > 0) {
-		int changed = 1;
-		while (changed) {
-			changed = 0;
-			int best_merge = tok->n_merges;
-			int best_pos = -1;
-			for (int i = 1; i < pos; i++) {
-				for (int m = 0; m < best_merge; m++) {
-					if (tokens[i] == tok->merge_first[m] &&
-					    i + 1 < pos &&
-					    tokens[i + 1] == tok->merge_second[m]) {
-						best_merge = m;
-						best_pos = i;
-						break;
-					}
-				}
-			}
-			if (best_pos >= 0) {
-				tokens[best_pos] = (int32_t)(256 + best_merge);
-				for (int i = best_pos + 1; i < pos - 1; i++)
-					tokens[i] = tokens[i + 1];
-				pos--;
-				changed = 1;
-			}
-		}
-	}
-
 	/* End-of-text token */
 	if (pos < max_tokens)
 		tokens[pos++] = (int32_t)tok->eot_token;
 
-	/* Record meaningful token count before padding */
 	int n_tokens = pos;
 
 	/* Pad remainder with EOT */
@@ -291,6 +783,13 @@ void sam3_tokenizer_free(struct sam3_tokenizer *tok)
 	free(tok->merge_second);
 	tok->merge_second = NULL;
 
+	hash_table_free(tok->encoder_map);
+	tok->encoder_map = NULL;
+
+	hash_table_free(tok->merge_rank_map);
+	tok->merge_rank_map = NULL;
+
 	tok->vocab_size = 0;
 	tok->n_merges = 0;
+	tok->bpe_loaded = 0;
 }

@@ -94,6 +94,10 @@ add_library(sam3 STATIC ${SAM3_SOURCES})
 find_package(Threads REQUIRED)
 target_link_libraries(sam3 Threads::Threads)
 
+# Link zlib (for gzip BPE vocab loading)
+find_package(ZLIB REQUIRED)
+target_link_libraries(sam3 ZLIB::ZLIB)
+
 if(SAM3_METAL)
 	target_link_libraries(sam3 mlxc)
 endif()
