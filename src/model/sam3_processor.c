@@ -287,17 +287,34 @@ static struct sam3_tensor *project_prompts(
 	return gh_concat(g, arena, parts, n_parts, 0);
 }
 
+/*
+ * find_text_prompt - Find the first text prompt in the array.
+ *
+ * Returns the text string, or NULL if no text prompt is present.
+ */
+static const char *find_text_prompt(const struct sam3_prompt *prompts,
+				    int n_prompts)
+{
+	for (int i = 0; i < n_prompts; i++) {
+		if (prompts[i].type == SAM3_PROMPT_TEXT)
+			return prompts[i].text;
+	}
+	return NULL;
+}
+
 enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       const struct sam3_prompt *prompts,
 				       int n_prompts,
 				       struct sam3_result *result)
 {
 	struct sam3_graph graph;
-	struct sam3_tensor *prompt_tokens;
+	struct sam3_tensor *prompt_tokens = NULL;
+	struct sam3_tensor *text_features = NULL;
 	struct sam3_tensor *mask_logits;
 	enum sam3_error err;
 	size_t mask_bytes;
 	int nelems;
+	const char *text;
 
 	if (!proc || !prompts || n_prompts <= 0 || !result)
 		return SAM3_EINVAL;
@@ -312,16 +329,28 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 
 	sam3_graph_init(&graph);
 
-	/* Project prompt coordinates to d_model embeddings */
+	/* Encode text prompt if present */
+	text = find_text_prompt(prompts, n_prompts);
+	if (text) {
+		text_features = sam3_vl_backbone_build_text(
+			&proc->model.backbone, &graph,
+			text, NULL, &proc->scratch_arena);
+		if (!text_features)
+			return SAM3_ENOMEM;
+	}
+
+	/* Project geometric prompt coordinates to d_model embeddings */
 	prompt_tokens = project_prompts(&proc->model, &graph, prompts,
 					n_prompts, &proc->scratch_arena);
-	if (!prompt_tokens)
-		return SAM3_ENOMEM;
 
-	/* Build segmentation graph (geom enc + fusion + decoder + seg head) */
+	/* At least one of text or geometry must be present */
+	if (!prompt_tokens && !text_features)
+		return SAM3_EINVAL;
+
+	/* Build segmentation graph */
 	mask_logits = sam3_image_model_segment(&proc->model, &graph,
 					       proc->backend, prompt_tokens,
-					       NULL,
+					       text_features,
 					       &proc->scratch_arena);
 	if (!mask_logits)
 		return SAM3_ENOMEM;
