@@ -24,7 +24,6 @@
 #include "core/tensor.h"
 
 #include <string.h>
-#include <math.h>
 
 /* Small ViT config for fast testing */
 #define TEST_IMG_SIZE     28
