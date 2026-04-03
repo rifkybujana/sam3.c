@@ -385,7 +385,7 @@ static int bpe_encode_word(const struct sam3_tokenizer *tok,
 		(const struct tok_hash_table *)tok->merge_rank_map;
 
 	/* Convert each byte to its bytes_to_unicode UTF-8 string */
-	char symbols[BPE_MAX_SYMBOLS][8];
+	char symbols[BPE_MAX_SYMBOLS][64];
 	int n_sym = 0;
 
 	for (int i = 0; i < word_len && n_sym < BPE_MAX_SYMBOLS - 1; i++) {

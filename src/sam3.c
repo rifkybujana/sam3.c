@@ -3,11 +3,11 @@
  *
  * Implements the functions declared in sam3/sam3.h: context lifecycle,
  * model loading, image encoding, segmentation, and version query.
- * Currently provides stubs that return error codes; real logic will
- * be wired up as each subsystem is completed.
+ * Delegates inference to sam3_processor which manages backend, arenas,
+ * and the full image model pipeline.
  *
  * Key types:  sam3_ctx
- * Depends on: sam3/sam3.h
+ * Depends on: sam3/sam3.h, model/sam3_processor.h
  * Used by:    tools/sam3_main.c, user applications
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -19,6 +19,7 @@
 #include "sam3/sam3.h"
 #include "core/weight.h"
 #include "util/image.h"
+#include "model/sam3_processor.h"
 #ifdef SAM3_HAS_PROFILE
 #include "util/profile.h"
 #endif
@@ -28,6 +29,8 @@ struct sam3_ctx {
 	struct sam3_model_config config;
 	struct sam3_weight_file weights;
 	int loaded;
+	struct sam3_processor proc;
+	int proc_ready;
 #ifdef SAM3_HAS_PROFILE
 	struct sam3_profiler *profiler;
 #endif
@@ -48,6 +51,8 @@ void sam3_free(sam3_ctx *ctx)
 {
 	if (!ctx)
 		return;
+	if (ctx->proc_ready)
+		sam3_processor_free(&ctx->proc);
 	if (ctx->loaded)
 		sam3_weight_close(&ctx->weights);
 #ifdef SAM3_HAS_PROFILE
@@ -78,17 +83,31 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->config.n_decoder_layers = h->n_decoder_layers;
 
 	ctx->loaded = 1;
+
+	/* Initialize processor and load model weights */
+	err = sam3_processor_init(&ctx->proc);
+	if (err != SAM3_OK)
+		return err;
+
+	err = sam3_processor_load(&ctx->proc, path, NULL);
+	if (err != SAM3_OK) {
+		sam3_processor_free(&ctx->proc);
+		return err;
+	}
+	ctx->proc_ready = 1;
+
 	return SAM3_OK;
 }
 
 enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
 			       int width, int height)
 {
-	(void)ctx;
-	(void)pixels;
-	(void)width;
-	(void)height;
-	return SAM3_EINVAL; /* Not yet implemented */
+	if (!ctx || !pixels || width <= 0 || height <= 0)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	return sam3_processor_set_image(&ctx->proc, pixels, width, height);
 }
 
 enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
@@ -111,7 +130,6 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
 	if (err)
 		return err;
 
-	/* sam3_set_image() is a stub until the image encoder is wired up */
 	err = sam3_set_image(ctx, letterboxed.pixels,
 			     letterboxed.width, letterboxed.height);
 	sam3_image_free(&letterboxed);
@@ -121,11 +139,12 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
 enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
 			     int n_prompts, struct sam3_result *result)
 {
-	(void)ctx;
-	(void)prompts;
-	(void)n_prompts;
-	(void)result;
-	return SAM3_EINVAL; /* Not yet implemented */
+	if (!ctx || !result)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	return sam3_processor_segment(&ctx->proc, prompts, n_prompts, result);
 }
 
 void sam3_result_free(struct sam3_result *result)

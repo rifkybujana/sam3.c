@@ -71,14 +71,13 @@ enum sam3_error sam3_image_model_load(struct sam3_image_model *model,
 	if (err != SAM3_OK)
 		return err;
 
-	/*
-	 * Tokenizer vocab: the backbone init already sets up a byte-level
-	 * fallback tokenizer. If a vocab path is provided, re-initialize
-	 * with the full BPE vocabulary. Currently sam3_tokenizer only
-	 * supports byte-level init, so vocab_path is reserved for future
-	 * use when BPE file loading is implemented.
-	 */
-	(void)vocab_path;
+	/* Load full CLIP BPE vocabulary if a vocab path is provided */
+	if (vocab_path) {
+		err = sam3_tokenizer_load_bpe(&model->backbone.tokenizer,
+					      vocab_path);
+		if (err != SAM3_OK)
+			return err;
+	}
 
 	/* Load encoder fusion weights */
 	err = sam3_encoder_fusion_load(&model->encoder, wf, arena);
