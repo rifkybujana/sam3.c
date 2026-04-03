@@ -22,7 +22,6 @@
 #include "core/tensor.h"
 
 #include <string.h>
-#include <math.h>
 
 #define EPS 1e-4f
 
