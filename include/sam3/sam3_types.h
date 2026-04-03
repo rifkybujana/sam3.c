@@ -49,6 +49,7 @@ enum sam3_prompt_type {
 	SAM3_PROMPT_POINT,
 	SAM3_PROMPT_BOX,
 	SAM3_PROMPT_MASK,
+	SAM3_PROMPT_TEXT,
 };
 
 /* A 2D point prompt (x, y) with label (foreground=1, background=0). */
@@ -66,7 +67,7 @@ struct sam3_box {
 	float y2;
 };
 
-/* Segmentation prompt (union of point, box, or mask input). */
+/* Segmentation prompt (union of point, box, mask, or text input). */
 struct sam3_prompt {
 	enum sam3_prompt_type type;
 	union {
@@ -78,6 +79,7 @@ struct sam3_prompt {
 			int          width;
 			int          height;
 		} mask;
+		const char *text;  /* Null-terminated UTF-8 string */
 	};
 };
 
