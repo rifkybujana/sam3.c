@@ -93,11 +93,11 @@ static void test_text_prompt_graph_build(void)
 	cpu.base.type = SAM3_BACKEND_CPU;
 	cpu.base.ops = sam3_cpu_backend_ops();
 	cpu.arena_capacity = 128 * 1024 * 1024;
-	cpu.base.ops->init(&cpu.base);
+	ASSERT_EQ(cpu.base.ops->init(&cpu.base), SAM3_OK);
 
 	/* 64 MiB arena for model weights */
 	struct sam3_arena arena;
-	sam3_arena_init(&arena, 64 * 1024 * 1024);
+	ASSERT_EQ(sam3_arena_init(&arena, 64 * 1024 * 1024), SAM3_OK);
 
 	/* Small text encoder */
 	struct sam3_text_encoder te;
@@ -108,11 +108,11 @@ static void test_text_prompt_graph_build(void)
 	te.n_layers = 2;
 	te.context_len = 77;
 	te.vocab_size = 49408;
-	sam3_text_encoder_load(&te, NULL, &arena);
+	ASSERT_EQ(sam3_text_encoder_load(&te, NULL, &arena), SAM3_OK);
 
 	/* Tokenizer */
 	struct sam3_tokenizer tok;
-	sam3_tokenizer_init(&tok);
+	ASSERT_EQ(sam3_tokenizer_init(&tok), SAM3_OK);
 	int32_t tokens[77];
 	sam3_tokenizer_encode(&tok, "a cat", tokens, 77);
 

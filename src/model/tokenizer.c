@@ -134,6 +134,28 @@ static void build_bytes_to_unicode(char table[256][5])
 	}
 }
 
+/*
+ * build_clip_byte_order - Build the CLIP byte ordering table.
+ *
+ * CLIP's vocab lists printable bytes first (33-126, 161-172, 174-255)
+ * then non-printable bytes (0-32, 127-160, 173). This determines which
+ * byte goes at vocab position i for i in [0..255].
+ */
+static void build_clip_byte_order(int order[256])
+{
+	int n = 0;
+	for (int b = 33; b <= 126; b++)
+		order[n++] = b;
+	for (int b = 161; b <= 172; b++)
+		order[n++] = b;
+	for (int b = 174; b <= 255; b++)
+		order[n++] = b;
+	for (int b = 0; b < 256; b++) {
+		if (!is_clip_printable(b))
+			order[n++] = b;
+	}
+}
+
 /* ---- Open-addressing hash table ---- */
 
 struct tok_hash_entry {
@@ -261,7 +283,12 @@ static char *make_pair_key(const char *a, const char *b)
  * pretokenize_next - Scan the next pre-token from text.
  *
  * Matches CLIP's regex pattern: contractions, letter runs, single
- * digits, and symbol runs. Whitespace is skipped.
+ * digits, and symbol runs. Whitespace between tokens is stripped
+ * rather than prepended to the following token as in the original
+ * CLIP regex (\s+(?=[^\s])). This simplification works because
+ * the BPE vocabulary encodes word boundaries via </w> suffixes
+ * rather than leading-space tokens, so stripping inter-word
+ * whitespace produces equivalent tokenization.
  *
  * Returns 1 if a token was found (sets *start and *len), 0 at end.
  */
@@ -543,10 +570,13 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 		goto cleanup;
 	}
 
-	/* [0-255]: bytes_to_unicode single-byte strings */
+	/* [0-255]: bytes_to_unicode strings in CLIP ordering */
+	int clip_order[256];
+	build_clip_byte_order(clip_order);
+
 	for (int i = 0; i < 256; i++) {
 		char buf[4];
-		int nb = byte_to_utf8((unsigned char)i, buf);
+		int nb = byte_to_utf8((unsigned char)clip_order[i], buf);
 		new_vocab[i] = malloc((size_t)nb + 1);
 		if (!new_vocab[i]) {
 			err = SAM3_ENOMEM;
@@ -623,14 +653,8 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 			err = SAM3_ENOMEM;
 			goto cleanup;
 		}
-		/* Table took ownership of pk (key_owned=0 but we
-		 * transferred the malloc'd pointer; set owned flag) */
-		/* Actually, copy_key=0 means the table stores our pointer
-		 * without copying. We must not free pk here. But the table
-		 * won't free it either unless key_owned=1. Let's fix: pass
-		 * copy_key=0 and manually set key_owned after insert. */
 	}
-	/* Fix ownership: all keys in ranks are malloc'd pair keys */
+	/* Mark all inserted pair keys as table-owned for cleanup */
 	for (int i = 0; i < ranks->capacity; i++) {
 		if (ranks->entries[i].key)
 			ranks->entries[i].key_owned = 1;
