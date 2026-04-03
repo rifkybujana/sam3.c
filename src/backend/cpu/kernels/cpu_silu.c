@@ -15,7 +15,6 @@
  */
 
 #include "cpu_kernels.h"
-#include "cpu_simd.h"
 #include "core/tensor.h"
 #include "util/log.h"
 #include "util/threadpool.h"
