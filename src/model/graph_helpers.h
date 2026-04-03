@@ -143,6 +143,56 @@ struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input, int scale);
 
 /*
+ * gh_rope - Apply rotary position embedding.
+ *
+ * @input: [batch, seq, n_heads, head_dim] tensor
+ * @cos_f: Precomputed cosine [seq, head_dim/2]
+ * @sin_f: Precomputed sine [seq, head_dim/2]
+ *
+ * Returns rotated tensor, same shape as input.
+ */
+struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
+			     struct sam3_tensor *input,
+			     struct sam3_tensor *cos_f,
+			     struct sam3_tensor *sin_f);
+
+/*
+ * gh_multihead_attention_rope - Multi-head attention with optional RoPE
+ *                               and causal mask.
+ *
+ * @q:         Query  [batch, seq_q, d_model]
+ * @k:         Key    (unused; QKV is packed via qkv_w)
+ * @v:         Value  (unused; QKV is packed via qkv_w)
+ * @qkv_w:    Packed QKV weight [3*d_model, d_model]
+ * @qkv_b:    Packed QKV bias [3*d_model] or NULL
+ * @out_w:    Output projection weight [d_model, d_model]
+ * @out_b:    Output projection bias [d_model] or NULL
+ * @n_heads:  Number of attention heads
+ * @rope_cos: Precomputed RoPE cosine [seq, head_dim/2] or NULL
+ * @rope_sin: Precomputed RoPE sine [seq, head_dim/2] or NULL
+ * @attn_mask: Additive attention mask [bs, bs] or NULL
+ *
+ * Extends gh_multihead_attention with optional rotary position
+ * embeddings applied after QKV projection and optional additive
+ * mask applied to attention scores before softmax.
+ *
+ * Returns output tensor [batch*seq_q, d_model].
+ */
+struct sam3_tensor *gh_multihead_attention_rope(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *q,
+	struct sam3_tensor *k,
+	struct sam3_tensor *v,
+	struct sam3_tensor *qkv_w,
+	struct sam3_tensor *qkv_b,
+	struct sam3_tensor *out_w,
+	struct sam3_tensor *out_b,
+	int n_heads,
+	struct sam3_tensor *rope_cos,
+	struct sam3_tensor *rope_sin,
+	struct sam3_tensor *attn_mask);
+
+/*
  * gh_multihead_attention - Full multi-head attention from primitives.
  *
  * @q:       Query  [batch, seq_q, d_model]

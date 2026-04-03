@@ -343,9 +343,31 @@ struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 	return result;
 }
 
+/* ── Rotary position embedding ───────────────────────────────────── */
+
+struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
+			     struct sam3_tensor *input,
+			     struct sam3_tensor *cos_f,
+			     struct sam3_tensor *sin_f)
+{
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  input->n_dims, input->dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *result = sam3_graph_add_op(g, SAM3_OP_ROPE,
+		(struct sam3_tensor *[]){input, cos_f, sin_f}, 3, out);
+	if (!result)
+		return NULL;
+
+	/* params[0] = head_dim (last dim of 4D input) */
+	g->nodes[g->n_nodes - 1].params[0] = input->dims[3];
+	return result;
+}
+
 /* ── Multi-head attention ────────────────────────────────────────── */
 
-struct sam3_tensor *gh_multihead_attention(
+struct sam3_tensor *gh_multihead_attention_rope(
 	struct sam3_graph *g, struct sam3_arena *a,
 	struct sam3_tensor *q,
 	struct sam3_tensor *k,
@@ -354,7 +376,10 @@ struct sam3_tensor *gh_multihead_attention(
 	struct sam3_tensor *qkv_b,
 	struct sam3_tensor *out_w,
 	struct sam3_tensor *out_b,
-	int n_heads)
+	int n_heads,
+	struct sam3_tensor *rope_cos,
+	struct sam3_tensor *rope_sin,
+	struct sam3_tensor *attn_mask)
 {
 	/*
 	 * q is [batch, seq, d_model].
@@ -402,6 +427,38 @@ struct sam3_tensor *gh_multihead_attention(
 	if (!sq || !sk || !sv)
 		return NULL;
 	/* Each is [batch*seq, d_model] = [bs, d_model] */
+
+	/*
+	 * Step 2b: Apply RoPE to Q and K if requested.
+	 *
+	 * Reshape from [bs, d_model] to [batch, seq_q, n_heads, head_dim],
+	 * apply gh_rope, then reshape back to [bs, d_model].
+	 */
+	if (rope_cos && rope_sin) {
+		int rope_4d[] = {batch, seq_q, n_heads, head_dim};
+
+		struct sam3_tensor *sq_4d;
+		sq_4d = gh_reshape(g, a, sq, 4, rope_4d);
+		if (!sq_4d)
+			return NULL;
+		sq_4d = gh_rope(g, a, sq_4d, rope_cos, rope_sin);
+		if (!sq_4d)
+			return NULL;
+		sq = gh_reshape(g, a, sq_4d, 2, flat_dims);
+		if (!sq)
+			return NULL;
+
+		struct sam3_tensor *sk_4d;
+		sk_4d = gh_reshape(g, a, sk, 4, rope_4d);
+		if (!sk_4d)
+			return NULL;
+		sk_4d = gh_rope(g, a, sk_4d, rope_cos, rope_sin);
+		if (!sk_4d)
+			return NULL;
+		sk = gh_reshape(g, a, sk_4d, 2, flat_dims);
+		if (!sk)
+			return NULL;
+	}
 
 	/*
 	 * Step 3-5: Attention per head.
@@ -457,6 +514,13 @@ struct sam3_tensor *gh_multihead_attention(
 		if (!scaled)
 			return NULL;
 
+		/* Apply causal mask before softmax if provided */
+		if (attn_mask) {
+			scaled = gh_add(g, a, scaled, attn_mask);
+			if (!scaled)
+				return NULL;
+		}
+
 		/* softmax */
 		struct sam3_tensor *attn = gh_softmax(g, a, scaled);
 		if (!attn)
@@ -485,6 +549,22 @@ struct sam3_tensor *gh_multihead_attention(
 
 	/* Step 10: Output projection */
 	return gh_linear(g, a, merged, out_w, out_b);
+}
+
+struct sam3_tensor *gh_multihead_attention(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *q,
+	struct sam3_tensor *k,
+	struct sam3_tensor *v,
+	struct sam3_tensor *qkv_w,
+	struct sam3_tensor *qkv_b,
+	struct sam3_tensor *out_w,
+	struct sam3_tensor *out_b,
+	int n_heads)
+{
+	return gh_multihead_attention_rope(g, a, q, k, v,
+		qkv_w, qkv_b, out_w, out_b,
+		n_heads, NULL, NULL, NULL);
 }
 
 /* ── MLP ─────────────────────────────────────────────────────────── */

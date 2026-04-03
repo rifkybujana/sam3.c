@@ -243,11 +243,32 @@ struct sam3_tensor *sam3_text_encoder_build(
 		return NULL;
 
 	/*
-	 * Step 3: Transformer blocks.
+	 * Step 3: Build causal attention mask.
+	 *
+	 * Upper triangle filled with -1e9 (masked), lower triangle
+	 * and diagonal = 0.0 (allowed).  Shape: [seq_len, seq_len].
+	 */
+	int mask_dims[] = {seq_len, seq_len};
+	struct sam3_tensor *causal_mask;
+	causal_mask = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+				       2, mask_dims);
+	if (!causal_mask)
+		return NULL;
+
+	float *mask_data = (float *)causal_mask->data;
+	for (int r = 0; r < seq_len; r++) {
+		for (int c = 0; c < seq_len; c++) {
+			mask_data[r * seq_len + c] =
+				(c > r) ? -1e9f : 0.0f;
+		}
+	}
+
+	/*
+	 * Step 4: Transformer blocks.
 	 * Each block: pre-norm self-attention + residual,
 	 *             pre-norm MLP + residual.
 	 *
-	 * gh_multihead_attention expects q as [batch, seq, d_model].
+	 * gh_multihead_attention_rope expects q as [batch, seq, d_model].
 	 * Our x is [seq_len, width] (2D).  We reshape to
 	 * [1, seq_len, width] for attention, then back to 2D.
 	 */
@@ -267,16 +288,18 @@ struct sam3_tensor *sam3_text_encoder_build(
 		if (!x3d)
 			return NULL;
 
-		/* Self-attention (Q=K=V=x_norm) */
+		/* Self-attention (Q=K=V=x_norm) with causal mask */
 		struct sam3_tensor *attn;
-		attn = gh_multihead_attention(
+		attn = gh_multihead_attention_rope(
 			g, arena,
 			x3d, x3d, x3d,
 			te->layers[i].attn_qkv_w,
 			te->layers[i].attn_qkv_b,
 			te->layers[i].attn_out_w,
 			te->layers[i].attn_out_b,
-			te->n_heads);
+			te->n_heads,
+			NULL, NULL,         /* no RoPE */
+			causal_mask);       /* causal attention mask */
 		if (!attn)
 			return NULL;
 
@@ -313,7 +336,7 @@ struct sam3_tensor *sam3_text_encoder_build(
 	}
 
 	/*
-	 * Step 4: Final layer norm.
+	 * Step 5: Final layer norm.
 	 * x is [seq_len, width].
 	 */
 	x = gh_layernorm(g, arena, x, te->ln_final_w, te->ln_final_b);
@@ -321,7 +344,7 @@ struct sam3_tensor *sam3_text_encoder_build(
 		return NULL;
 
 	/*
-	 * Step 5: Pooled output (from last token / EOT position).
+	 * Step 6: Pooled output (from last token / EOT position).
 	 * Slice the last row: [1, width].
 	 * Project through text_projection: matmul([1, width], [width, d_model])
 	 *   -> [1, d_model].
@@ -350,7 +373,7 @@ struct sam3_tensor *sam3_text_encoder_build(
 	}
 
 	/*
-	 * Step 6: Project all per-token embeddings to d_model.
+	 * Step 7: Project all per-token embeddings to d_model.
 	 * x is [seq_len, width].
 	 * matmul(x, text_projection) -> [seq_len, d_model].
 	 */

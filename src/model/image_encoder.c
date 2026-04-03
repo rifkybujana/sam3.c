@@ -375,16 +375,19 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 		if (!x3d)
 			return NULL;
 
-		/* Self-attention (Q=K=V=x_norm) */
+		/* Self-attention (Q=K=V=x_norm) with RoPE */
 		struct sam3_tensor *attn;
-		attn = gh_multihead_attention(
+		attn = gh_multihead_attention_rope(
 			g, arena,
 			x3d, x3d, x3d,
 			vit->layers[i].qkv_w,
 			vit->layers[i].qkv_b,
 			vit->layers[i].proj_w,
 			vit->layers[i].proj_b,
-			vit->n_heads);
+			vit->n_heads,
+			vit->rope_cos,    /* RoPE cos */
+			vit->rope_sin,    /* RoPE sin */
+			NULL);             /* no causal mask */
 		if (!attn)
 			return NULL;
 
