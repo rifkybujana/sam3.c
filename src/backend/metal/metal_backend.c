@@ -76,6 +76,13 @@ static void metal_dequant_q8_to_f16(const struct sam3_q8_block *src,
 
 /* ── Tensor-to-mlx_array lookup table ─────────────────────────────── */
 
+/*
+ * Tombstone sentinel for deleted slots in the open-addressing hash
+ * table. Required so that linear probing does not stop early when a
+ * slot in the middle of a probe chain is evicted.
+ */
+#define METAL_MAP_TOMBSTONE ((const struct sam3_tensor *)(uintptr_t)1)
+
 static void metal_map_init(struct sam3_metal_backend *mtl)
 {
 	memset(mtl->map_keys, 0, sizeof(mtl->map_keys));
@@ -85,9 +92,11 @@ static void metal_map_init(struct sam3_metal_backend *mtl)
 static void metal_map_free(struct sam3_metal_backend *mtl)
 {
 	for (int i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
-		if (mtl->map_keys[i])
+		if (mtl->map_keys[i] &&
+		    mtl->map_keys[i] != METAL_MAP_TOMBSTONE)
 			mlx_array_free(mtl->map_vals[i]);
 	}
+	memset(mtl->map_keys, 0, sizeof(mtl->map_keys));
 	mtl->map_count = 0;
 }
 
@@ -108,24 +117,28 @@ static mlx_array *metal_map_get(struct sam3_metal_backend *mtl,
 			return &mtl->map_vals[slot];
 		if (!mtl->map_keys[slot])
 			return NULL;
+		/* Skip tombstones — keep probing */
 	}
 	return NULL;
 }
 
-static void metal_map_put(struct sam3_metal_backend *mtl,
-			   const struct sam3_tensor *key, mlx_array val)
+static int metal_map_put(struct sam3_metal_backend *mtl,
+			 const struct sam3_tensor *key, mlx_array val)
 {
 	unsigned idx = metal_map_hash(key);
 	for (unsigned i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
 		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
-		if (!mtl->map_keys[slot]) {
+		if (!mtl->map_keys[slot] ||
+		    mtl->map_keys[slot] == METAL_MAP_TOMBSTONE) {
 			mtl->map_keys[slot] = key;
 			mtl->map_vals[slot] = val;
 			mtl->map_count++;
-			return;
+			return 0;
 		}
 	}
-	sam3_log_error("metal: tensor map full");
+	sam3_log_error("metal: tensor map full (%d entries)",
+		       mtl->map_count);
+	return -1;
 }
 
 static void metal_map_evict(struct sam3_metal_backend *mtl,
@@ -136,12 +149,13 @@ static void metal_map_evict(struct sam3_metal_backend *mtl,
 		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
 		if (mtl->map_keys[slot] == key) {
 			mlx_array_free(mtl->map_vals[slot]);
-			mtl->map_keys[slot] = NULL;
+			mtl->map_keys[slot] = METAL_MAP_TOMBSTONE;
 			mtl->map_count--;
 			return;
 		}
 		if (!mtl->map_keys[slot])
 			return;
+		/* Skip tombstones — keep probing */
 	}
 }
 
@@ -159,8 +173,12 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 {
 	mlx_array *existing = metal_map_get(mtl, t);
 	if (existing) {
-		/* Validate cached array matches current tensor shape */
+		/* Validate cached array matches current tensor shape + dtype */
+		mlx_dtype expected_mtype;
+		metal_map_dtype(t->dtype, &expected_mtype);
 		bool valid = ((int)mlx_array_ndim(*existing) == t->n_dims);
+		if (valid)
+			valid = (mlx_array_dtype(*existing) == expected_mtype);
 		for (int i = 0; valid && i < t->n_dims; i++) {
 			if (mlx_array_dim(*existing, i) != t->dims[i])
 				valid = false;
@@ -194,7 +212,8 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 	}
 
 	mlx_array arr = mlx_array_new_data(data, t->dims, t->n_dims, mtype);
-	metal_map_put(mtl, t, arr);
+	if (metal_map_put(mtl, t, arr) < 0)
+		sam3_log_warn("metal: wrap_tensor: map full, array not cached");
 	return arr;
 }
 
@@ -346,7 +365,10 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		return SAM3_EBACKEND;
 	}
 
-	metal_map_put(mtl, node->output, result);
+	if (metal_map_put(mtl, node->output, result) < 0) {
+		mlx_array_free(result);
+		return SAM3_ENOMEM;
+	}
 	return SAM3_OK;
 }
 
@@ -483,7 +505,7 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 
 	/* Phase 2.5: detect intermediate outputs (consumed by later nodes) */
 	bool is_intermediate[SAM3_GRAPH_MAX_NODES];
-	memset(is_intermediate, 0, (size_t)g->n_nodes * sizeof(bool));
+	memset(is_intermediate, 0, sizeof(is_intermediate));
 
 	for (int i = 0; i < g->n_nodes; i++) {
 		for (int j = 0; j < g->nodes[i].n_inputs; j++) {
