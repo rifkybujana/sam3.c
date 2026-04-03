@@ -14,6 +14,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include "box_ops.h"
 
 void box_xyxy_to_cxcywh(const float *xyxy, float *cxcywh, int n)
@@ -129,7 +130,10 @@ int box_nms(const float *boxes, const float *scores, int n,
 		return 0;
 
 	/* Build index array and sort by score descending (selection sort) */
-	int order[n];
+	int *order = malloc(n * sizeof(int));
+	if (!order)
+		return -1;
+
 	for (int i = 0; i < n; i++)
 		order[i] = i;
 
@@ -147,9 +151,11 @@ int box_nms(const float *boxes, const float *scores, int n,
 	}
 
 	/* Greedy suppression */
-	int suppressed[n];
-	for (int i = 0; i < n; i++)
-		suppressed[i] = 0;
+	int *suppressed = calloc(n, sizeof(int));
+	if (!suppressed) {
+		free(order);
+		return -1;
+	}
 
 	int n_keep = 0;
 	for (int i = 0; i < n; i++) {
@@ -171,5 +177,7 @@ int box_nms(const float *boxes, const float *scores, int n,
 		}
 	}
 
+	free(suppressed);
+	free(order);
 	return n_keep;
 }
