@@ -46,9 +46,11 @@ enum sam3_error sam3_pos_encoding_precompute(
 			float *row = data + (y * width + x) * out_dim;
 
 			for (int i = 0; i < num_pos_feats; i++) {
+				/* Pairs share frequency: floor(i/2) */
+				int pair = i / 2;
 				float dim_t = powf(
 					pe->temperature,
-					2.0f * (float)(i / 2) /
+					2.0f * (float)pair /
 					(float)num_pos_feats);
 
 				/* Y dimension: first half */
