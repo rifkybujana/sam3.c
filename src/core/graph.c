@@ -59,6 +59,13 @@ const char *sam3_op_str(enum sam3_op op)
 		[SAM3_OP_RESHAPE]   = "RESHAPE",
 		[SAM3_OP_TRANSPOSE] = "TRANSPOSE",
 		[SAM3_OP_CAST]      = "CAST",
+		[SAM3_OP_CONCAT]    = "CONCAT",
+		[SAM3_OP_SLICE]     = "SLICE",
+		[SAM3_OP_EMBED]     = "EMBED",
+		[SAM3_OP_SIGMOID]   = "SIGMOID",
+		[SAM3_OP_UPSAMPLE]  = "UPSAMPLE",
+		[SAM3_OP_ROPE]      = "ROPE",
+		[SAM3_OP_SILU]      = "SILU",
 	};
 	if (op >= 0 && op < SAM3_OP_COUNT)
 		return names[op];

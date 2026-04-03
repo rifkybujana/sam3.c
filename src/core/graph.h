@@ -19,8 +19,8 @@
 
 #include "tensor.h"
 
-#define SAM3_GRAPH_MAX_NODES 4096
-#define SAM3_NODE_MAX_INPUTS 4
+#define SAM3_GRAPH_MAX_NODES 16384
+#define SAM3_NODE_MAX_INPUTS 8
 
 /* Compute operation types. */
 enum sam3_op {
@@ -36,6 +36,13 @@ enum sam3_op {
 	SAM3_OP_RESHAPE,
 	SAM3_OP_TRANSPOSE,
 	SAM3_OP_CAST,
+	SAM3_OP_CONCAT,     /* Join tensors along axis. params[0]=axis */
+	SAM3_OP_SLICE,      /* Extract sub-tensor.     params[0]=axis, [1]=start, [2]=end */
+	SAM3_OP_EMBED,      /* Table lookup by index.  inputs: table, indices */
+	SAM3_OP_SIGMOID,    /* 1/(1+exp(-x))           */
+	SAM3_OP_UPSAMPLE,   /* Nearest-neighbor.       params[0]=scale */
+	SAM3_OP_ROPE,       /* Rotary position embed.  params[0]=head_dim */
+	SAM3_OP_SILU,       /* x * sigmoid(x)          */
 	SAM3_OP_COUNT,  /* must be last */
 };
 
