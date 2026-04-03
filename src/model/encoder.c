@@ -17,160 +17,9 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 
 #include "encoder.h"
 #include "graph_helpers.h"
-
-/*
- * load_or_alloc - Load a weight tensor by name, or allocate zeroed.
- *
- * Mirrors the pattern used in image_encoder.c. When wf is NULL or the
- * tensor is not found, allocates a zero-initialized tensor from the
- * arena.
- */
-static struct sam3_tensor *load_or_alloc(const struct sam3_weight_file *wf,
-					  const char *name,
-					  struct sam3_arena *arena,
-					  enum sam3_dtype dtype,
-					  int n_dims, const int *dims)
-{
-	if (wf) {
-		const struct sam3_weight_tensor_desc *desc;
-		desc = sam3_weight_find(wf, name);
-		if (desc) {
-			struct sam3_tensor *t;
-			t = gh_alloc_tensor(arena, dtype, n_dims, dims);
-			if (t)
-				sam3_weight_to_tensor(wf, desc, t);
-			return t;
-		}
-	}
-	return gh_alloc_tensor(arena, dtype, n_dims, dims);
-}
-
-/*
- * cross_attention - Multi-head cross-attention with separate Q and KV.
- *
- * Q is projected from q_src, K and V are projected from kv_src.
- * Uses packed KV weight [2*d_model, d_model] which is sliced into
- * separate K and V projections.
- *
- * @g:      Graph to add nodes to
- * @arena:  Arena for intermediate tensors
- * @q_src:  Query source [n_q, d_model]
- * @kv_src: Key/value source [n_kv, d_model]
- * @q_w:    Query projection weight [d_model, d_model]
- * @q_b:    Query projection bias [d_model]
- * @kv_w:   Packed KV projection weight [2*d_model, d_model]
- * @kv_b:   Packed KV projection bias [2*d_model]
- * @out_w:  Output projection weight [d_model, d_model]
- * @out_b:  Output projection bias [d_model]
- * @n_heads: Number of attention heads
- *
- * Returns output tensor [n_q, d_model], or NULL on error.
- */
-static struct sam3_tensor *cross_attention(
-	struct sam3_graph *g, struct sam3_arena *arena,
-	struct sam3_tensor *q_src,
-	struct sam3_tensor *kv_src,
-	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
-	struct sam3_tensor *kv_w, struct sam3_tensor *kv_b,
-	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
-	int n_heads)
-{
-	int n_kv = kv_src->dims[0];
-	int d_model = q_src->dims[1];
-	int head_dim = d_model / n_heads;
-
-	/* Project Q: [n_q, d_model] */
-	struct sam3_tensor *q = gh_linear(g, arena, q_src, q_w, q_b);
-	if (!q)
-		return NULL;
-
-	/* Project KV: [n_kv, 2*d_model] */
-	struct sam3_tensor *kv = gh_linear(g, arena, kv_src, kv_w, kv_b);
-	if (!kv)
-		return NULL;
-
-	/* Slice K and V from packed KV */
-	struct sam3_tensor *k = gh_slice(g, arena, kv, 1, 0, d_model);
-	struct sam3_tensor *v = gh_slice(g, arena, kv, 1,
-					  d_model, 2 * d_model);
-	if (!k || !v)
-		return NULL;
-
-	/*
-	 * Per-head attention using 2D ops.
-	 * Each head: slice columns, compute scaled dot-product attention.
-	 */
-	struct sam3_tensor *head_outs[64]; /* up to 64 heads */
-	for (int h = 0; h < n_heads; h++) {
-		int hstart = h * head_dim;
-		int hend = hstart + head_dim;
-
-		/* Slice head columns: [n_q/n_kv, head_dim] */
-		struct sam3_tensor *hq, *hk, *hv;
-		hq = gh_slice(g, arena, q, 1, hstart, hend);
-		hk = gh_slice(g, arena, k, 1, hstart, hend);
-		hv = gh_slice(g, arena, v, 1, hstart, hend);
-		if (!hq || !hk || !hv)
-			return NULL;
-
-		/* K^T: [head_dim, n_kv] */
-		struct sam3_tensor *hkt = gh_transpose(g, arena, hk);
-		if (!hkt)
-			return NULL;
-
-		/* scores = Q_h @ K_h^T -> [n_q, n_kv] */
-		struct sam3_tensor *scores = gh_matmul(g, arena, hq, hkt);
-		if (!scores)
-			return NULL;
-
-		/* Scale by 1/sqrt(head_dim) */
-		int scale_dims[] = {n_kv};
-		struct sam3_tensor *scale_t;
-		scale_t = gh_alloc_tensor(arena, q_src->dtype,
-					   1, scale_dims);
-		if (!scale_t)
-			return NULL;
-
-		float inv_sqrt = 1.0f / sqrtf((float)head_dim);
-		float *sd = (float *)scale_t->data;
-		for (int i = 0; i < n_kv; i++)
-			sd[i] = inv_sqrt;
-
-		struct sam3_tensor *scaled;
-		scaled = gh_mul(g, arena, scores, scale_t);
-		if (!scaled)
-			return NULL;
-
-		/* softmax */
-		struct sam3_tensor *attn = gh_softmax(g, arena, scaled);
-		if (!attn)
-			return NULL;
-
-		/* attn_out = attn @ V_h -> [n_q, head_dim] */
-		struct sam3_tensor *ho = gh_matmul(g, arena, attn, hv);
-		if (!ho)
-			return NULL;
-
-		head_outs[h] = ho;
-	}
-
-	/* Concatenate heads: [n_q, d_model] */
-	struct sam3_tensor *merged;
-	if (n_heads == 1) {
-		merged = head_outs[0];
-	} else {
-		merged = gh_concat(g, arena, head_outs, n_heads, 1);
-		if (!merged)
-			return NULL;
-	}
-
-	/* Output projection */
-	return gh_linear(g, arena, merged, out_w, out_b);
-}
 
 enum sam3_error sam3_encoder_fusion_init(struct sam3_encoder_fusion *enc,
 					 int d_model, int n_heads,
@@ -212,7 +61,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* Self-attention QKV */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.sa.qkv.weight", i);
-		enc->layers[i].sa_qkv_w = load_or_alloc(
+		enc->layers[i].sa_qkv_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, sa_qkv_w_dims);
 		if (!enc->layers[i].sa_qkv_w)
@@ -220,7 +69,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.sa.qkv.bias", i);
-		enc->layers[i].sa_qkv_b = load_or_alloc(
+		enc->layers[i].sa_qkv_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, sa_qkv_b_dims);
 		if (!enc->layers[i].sa_qkv_b)
@@ -229,7 +78,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* Self-attention output */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.sa.out.weight", i);
-		enc->layers[i].sa_out_w = load_or_alloc(
+		enc->layers[i].sa_out_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!enc->layers[i].sa_out_w)
@@ -237,7 +86,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.sa.out.bias", i);
-		enc->layers[i].sa_out_b = load_or_alloc(
+		enc->layers[i].sa_out_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].sa_out_b)
@@ -246,7 +95,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* Self-attention layer norm */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.sa.ln.weight", i);
-		enc->layers[i].sa_ln_w = load_or_alloc(
+		enc->layers[i].sa_ln_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].sa_ln_w)
@@ -254,7 +103,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.sa.ln.bias", i);
-		enc->layers[i].sa_ln_b = load_or_alloc(
+		enc->layers[i].sa_ln_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].sa_ln_b)
@@ -263,7 +112,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* Cross-attention Q */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.q.weight", i);
-		enc->layers[i].ca_q_w = load_or_alloc(
+		enc->layers[i].ca_q_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!enc->layers[i].ca_q_w)
@@ -271,7 +120,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.q.bias", i);
-		enc->layers[i].ca_q_b = load_or_alloc(
+		enc->layers[i].ca_q_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_q_b)
@@ -280,7 +129,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* Cross-attention KV (packed) */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.kv.weight", i);
-		enc->layers[i].ca_kv_w = load_or_alloc(
+		enc->layers[i].ca_kv_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, ca_kv_w_dims);
 		if (!enc->layers[i].ca_kv_w)
@@ -288,7 +137,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.kv.bias", i);
-		enc->layers[i].ca_kv_b = load_or_alloc(
+		enc->layers[i].ca_kv_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, ca_kv_b_dims);
 		if (!enc->layers[i].ca_kv_b)
@@ -297,7 +146,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* Cross-attention output */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.out.weight", i);
-		enc->layers[i].ca_out_w = load_or_alloc(
+		enc->layers[i].ca_out_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!enc->layers[i].ca_out_w)
@@ -305,7 +154,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.out.bias", i);
-		enc->layers[i].ca_out_b = load_or_alloc(
+		enc->layers[i].ca_out_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_out_b)
@@ -314,7 +163,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* Cross-attention layer norm */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.ln.weight", i);
-		enc->layers[i].ca_ln_w = load_or_alloc(
+		enc->layers[i].ca_ln_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_ln_w)
@@ -322,7 +171,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ca.ln.bias", i);
-		enc->layers[i].ca_ln_b = load_or_alloc(
+		enc->layers[i].ca_ln_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_ln_b)
@@ -331,7 +180,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* FFN fc1 */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ffn.fc1.weight", i);
-		enc->layers[i].ffn_fc1_w = load_or_alloc(
+		enc->layers[i].ffn_fc1_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, fc1_w_dims);
 		if (!enc->layers[i].ffn_fc1_w)
@@ -339,7 +188,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ffn.fc1.bias", i);
-		enc->layers[i].ffn_fc1_b = load_or_alloc(
+		enc->layers[i].ffn_fc1_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, fc1_b_dims);
 		if (!enc->layers[i].ffn_fc1_b)
@@ -348,7 +197,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* FFN fc2 */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ffn.fc2.weight", i);
-		enc->layers[i].ffn_fc2_w = load_or_alloc(
+		enc->layers[i].ffn_fc2_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, fc2_w_dims);
 		if (!enc->layers[i].ffn_fc2_w)
@@ -356,7 +205,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ffn.fc2.bias", i);
-		enc->layers[i].ffn_fc2_b = load_or_alloc(
+		enc->layers[i].ffn_fc2_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ffn_fc2_b)
@@ -365,7 +214,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 		/* FFN layer norm */
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ffn.ln.weight", i);
-		enc->layers[i].ffn_ln_w = load_or_alloc(
+		enc->layers[i].ffn_ln_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ffn_ln_w)
@@ -373,7 +222,7 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 
 		snprintf(name, sizeof(name),
 			 "enc_fusion.layer.%d.ffn.ln.bias", i);
-		enc->layers[i].ffn_ln_b = load_or_alloc(
+		enc->layers[i].ffn_ln_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ffn_ln_b)
@@ -440,7 +289,7 @@ struct sam3_tensor *sam3_encoder_fusion_build(
 			return NULL;
 
 		struct sam3_tensor *ca_out;
-		ca_out = cross_attention(
+		ca_out = gh_cross_attention(
 			g, arena,
 			x_norm, text_features,
 			enc->layers[i].ca_q_w,

@@ -113,41 +113,6 @@ enum sam3_error sam3_vit_init(struct sam3_vit *vit,
 	return precompute_rope(vit, arena);
 }
 
-/*
- * load_or_alloc - Load a weight tensor by name, or allocate zeroed.
- *
- * @wf:     Open weight file (may be NULL)
- * @name:   Tensor name to look up
- * @arena:  Arena for allocation
- * @dtype:  Data type for the tensor
- * @n_dims: Number of dimensions
- * @dims:   Array of dimension sizes
- *
- * If wf is non-NULL and the tensor is found, it is loaded from the
- * weight file. Otherwise a zero-initialized tensor is allocated from
- * the arena. Returns NULL if the arena is full.
- */
-static struct sam3_tensor *load_or_alloc(const struct sam3_weight_file *wf,
-					  const char *name,
-					  struct sam3_arena *arena,
-					  enum sam3_dtype dtype,
-					  int n_dims, const int *dims)
-{
-	if (wf) {
-		const struct sam3_weight_tensor_desc *desc;
-		desc = sam3_weight_find(wf, name);
-		if (desc) {
-			struct sam3_tensor *t;
-			t = gh_alloc_tensor(arena, dtype, n_dims, dims);
-			if (t)
-				sam3_weight_to_tensor(wf, desc, t);
-			return t;
-		}
-	}
-	/* Fallback: allocate zeroed tensor */
-	return gh_alloc_tensor(arena, dtype, n_dims, dims);
-}
-
 enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 			       const struct sam3_weight_file *wf,
 			       struct sam3_arena *arena)
@@ -160,7 +125,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 	/* Patch embedding: conv2d weight [embed_dim, 3, ps, ps] */
 	int pe_w_dims[] = {e, 3, ps, ps};
-	vit->patch_embed_w = load_or_alloc(wf, "vit.patch_embed.weight",
+	vit->patch_embed_w = gh_load_or_alloc(wf, "vit.patch_embed.weight",
 					    arena, SAM3_DTYPE_F32,
 					    4, pe_w_dims);
 	if (!vit->patch_embed_w)
@@ -168,7 +133,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 	/* Patch embedding bias [embed_dim] */
 	int pe_b_dims[] = {e};
-	vit->patch_embed_b = load_or_alloc(wf, "vit.patch_embed.bias",
+	vit->patch_embed_b = gh_load_or_alloc(wf, "vit.patch_embed.bias",
 					    arena, SAM3_DTYPE_F32,
 					    1, pe_b_dims);
 	if (!vit->patch_embed_b)
@@ -187,7 +152,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* Layer norm 1 */
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.ln1.weight", i);
-		vit->layers[i].ln1_w = load_or_alloc(wf, name, arena,
+		vit->layers[i].ln1_w = gh_load_or_alloc(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln1_w)
@@ -195,7 +160,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.ln1.bias", i);
-		vit->layers[i].ln1_b = load_or_alloc(wf, name, arena,
+		vit->layers[i].ln1_b = gh_load_or_alloc(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln1_b)
@@ -204,7 +169,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* Attention QKV */
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.attn.qkv.weight", i);
-		vit->layers[i].qkv_w = load_or_alloc(wf, name, arena,
+		vit->layers[i].qkv_w = gh_load_or_alloc(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       2, qkv_w_dims);
 		if (!vit->layers[i].qkv_w)
@@ -212,7 +177,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.attn.qkv.bias", i);
-		vit->layers[i].qkv_b = load_or_alloc(wf, name, arena,
+		vit->layers[i].qkv_b = gh_load_or_alloc(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       1, qkv_b_dims);
 		if (!vit->layers[i].qkv_b)
@@ -221,7 +186,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* Attention output projection */
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.attn.proj.weight", i);
-		vit->layers[i].proj_w = load_or_alloc(wf, name, arena,
+		vit->layers[i].proj_w = gh_load_or_alloc(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       2, proj_w_dims);
 		if (!vit->layers[i].proj_w)
@@ -229,7 +194,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.attn.proj.bias", i);
-		vit->layers[i].proj_b = load_or_alloc(wf, name, arena,
+		vit->layers[i].proj_b = gh_load_or_alloc(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       1, e_dims);
 		if (!vit->layers[i].proj_b)
@@ -238,7 +203,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* Layer norm 2 */
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.ln2.weight", i);
-		vit->layers[i].ln2_w = load_or_alloc(wf, name, arena,
+		vit->layers[i].ln2_w = gh_load_or_alloc(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln2_w)
@@ -246,7 +211,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.ln2.bias", i);
-		vit->layers[i].ln2_b = load_or_alloc(wf, name, arena,
+		vit->layers[i].ln2_b = gh_load_or_alloc(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln2_b)
@@ -255,14 +220,14 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* MLP fc1 */
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.mlp.fc1.weight", i);
-		vit->layers[i].mlp_fc1_w = load_or_alloc(
+		vit->layers[i].mlp_fc1_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
 		if (!vit->layers[i].mlp_fc1_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.mlp.fc1.bias", i);
-		vit->layers[i].mlp_fc1_b = load_or_alloc(
+		vit->layers[i].mlp_fc1_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
 		if (!vit->layers[i].mlp_fc1_b)
 			return SAM3_ENOMEM;
@@ -270,14 +235,14 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* MLP fc2 */
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.mlp.fc2.weight", i);
-		vit->layers[i].mlp_fc2_w = load_or_alloc(
+		vit->layers[i].mlp_fc2_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
 		if (!vit->layers[i].mlp_fc2_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 "vit.layer.%d.mlp.fc2.bias", i);
-		vit->layers[i].mlp_fc2_b = load_or_alloc(
+		vit->layers[i].mlp_fc2_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 1, e_dims);
 		if (!vit->layers[i].mlp_fc2_b)
 			return SAM3_ENOMEM;

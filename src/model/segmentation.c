@@ -22,33 +22,6 @@
 #include "segmentation.h"
 #include "graph_helpers.h"
 
-/*
- * load_or_alloc - Load a weight tensor by name, or allocate zeroed.
- *
- * Mirrors the pattern used in necks.c and image_encoder.c. When wf is
- * NULL or the tensor is not found, allocates a zero-initialized tensor
- * from the arena.
- */
-static struct sam3_tensor *load_or_alloc(const struct sam3_weight_file *wf,
-					 const char *name,
-					 struct sam3_arena *arena,
-					 enum sam3_dtype dtype,
-					 int n_dims, const int *dims)
-{
-	if (wf) {
-		const struct sam3_weight_tensor_desc *desc;
-		desc = sam3_weight_find(wf, name);
-		if (desc) {
-			struct sam3_tensor *t;
-			t = gh_alloc_tensor(arena, dtype, n_dims, dims);
-			if (t)
-				sam3_weight_to_tensor(wf, desc, t);
-			return t;
-		}
-	}
-	return gh_alloc_tensor(arena, dtype, n_dims, dims);
-}
-
 enum sam3_error sam3_seg_head_init(struct sam3_seg_head *head, int d_model)
 {
 	if (!head || d_model <= 0)
@@ -76,7 +49,7 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 		snprintf(name, sizeof(name),
 			 "seg_head.pixel_dec.stages.%d.conv.weight", i);
 		head->pixel_dec.stages[i].conv_w =
-			load_or_alloc(wf, name, arena,
+			gh_load_or_alloc(wf, name, arena,
 				      SAM3_DTYPE_F32, 2, conv_w_dims);
 		if (!head->pixel_dec.stages[i].conv_w)
 			return SAM3_ENOMEM;
@@ -85,7 +58,7 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 		snprintf(name, sizeof(name),
 			 "seg_head.pixel_dec.stages.%d.conv.bias", i);
 		head->pixel_dec.stages[i].conv_b =
-			load_or_alloc(wf, name, arena,
+			gh_load_or_alloc(wf, name, arena,
 				      SAM3_DTYPE_F32, 1, d_dims);
 		if (!head->pixel_dec.stages[i].conv_b)
 			return SAM3_ENOMEM;
@@ -94,7 +67,7 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 		snprintf(name, sizeof(name),
 			 "seg_head.pixel_dec.stages.%d.ln.weight", i);
 		head->pixel_dec.stages[i].ln_w =
-			load_or_alloc(wf, name, arena,
+			gh_load_or_alloc(wf, name, arena,
 				      SAM3_DTYPE_F32, 1, d_dims);
 		if (!head->pixel_dec.stages[i].ln_w)
 			return SAM3_ENOMEM;
@@ -103,7 +76,7 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 		snprintf(name, sizeof(name),
 			 "seg_head.pixel_dec.stages.%d.ln.bias", i);
 		head->pixel_dec.stages[i].ln_b =
-			load_or_alloc(wf, name, arena,
+			gh_load_or_alloc(wf, name, arena,
 				      SAM3_DTYPE_F32, 1, d_dims);
 		if (!head->pixel_dec.stages[i].ln_b)
 			return SAM3_ENOMEM;

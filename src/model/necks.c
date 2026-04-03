@@ -43,33 +43,6 @@ enum sam3_error sam3_neck_init(struct sam3_neck *neck,
 	return SAM3_OK;
 }
 
-/*
- * load_or_alloc - Load a weight tensor by name, or allocate zeroed.
- *
- * Mirrors the pattern used in image_encoder.c. When wf is NULL or the
- * tensor is not found, allocates a zero-initialized tensor from the
- * arena.
- */
-static struct sam3_tensor *load_or_alloc(const struct sam3_weight_file *wf,
-					  const char *name,
-					  struct sam3_arena *arena,
-					  enum sam3_dtype dtype,
-					  int n_dims, const int *dims)
-{
-	if (wf) {
-		const struct sam3_weight_tensor_desc *desc;
-		desc = sam3_weight_find(wf, name);
-		if (desc) {
-			struct sam3_tensor *t;
-			t = gh_alloc_tensor(arena, dtype, n_dims, dims);
-			if (t)
-				sam3_weight_to_tensor(wf, desc, t);
-			return t;
-		}
-	}
-	return gh_alloc_tensor(arena, dtype, n_dims, dims);
-}
-
 enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			       const struct sam3_weight_file *wf,
 			       struct sam3_arena *arena)
@@ -85,7 +58,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 		/* Projection weight: [d_model, backbone_dim] */
 		snprintf(name, sizeof(name),
 			 "neck.stage.%d.proj.weight", i);
-		neck->stages[i].proj_w = load_or_alloc(wf, name, arena,
+		neck->stages[i].proj_w = gh_load_or_alloc(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       2, proj_w_dims);
 		if (!neck->stages[i].proj_w)
@@ -94,7 +67,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 		/* Projection bias: [d_model] */
 		snprintf(name, sizeof(name),
 			 "neck.stage.%d.proj.bias", i);
-		neck->stages[i].proj_b = load_or_alloc(wf, name, arena,
+		neck->stages[i].proj_b = gh_load_or_alloc(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       1, d_dims);
 		if (!neck->stages[i].proj_b)
@@ -103,7 +76,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 		/* Layer norm weight: [d_model] */
 		snprintf(name, sizeof(name),
 			 "neck.stage.%d.ln.weight", i);
-		neck->stages[i].ln_w = load_or_alloc(wf, name, arena,
+		neck->stages[i].ln_w = gh_load_or_alloc(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, d_dims);
 		if (!neck->stages[i].ln_w)
@@ -112,7 +85,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 		/* Layer norm bias: [d_model] */
 		snprintf(name, sizeof(name),
 			 "neck.stage.%d.ln.bias", i);
-		neck->stages[i].ln_b = load_or_alloc(wf, name, arena,
+		neck->stages[i].ln_b = gh_load_or_alloc(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, d_dims);
 		if (!neck->stages[i].ln_b)
@@ -123,7 +96,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			int down_w_dims[] = {d, d, 1, 1};
 			snprintf(name, sizeof(name),
 				 "neck.stage.%d.down.weight", i);
-			neck->stages[i].down_w = load_or_alloc(
+			neck->stages[i].down_w = gh_load_or_alloc(
 				wf, name, arena, SAM3_DTYPE_F32,
 				4, down_w_dims);
 			if (!neck->stages[i].down_w)
@@ -131,7 +104,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 
 			snprintf(name, sizeof(name),
 				 "neck.stage.%d.down.bias", i);
-			neck->stages[i].down_b = load_or_alloc(
+			neck->stages[i].down_b = gh_load_or_alloc(
 				wf, name, arena, SAM3_DTYPE_F32,
 				1, d_dims);
 			if (!neck->stages[i].down_b)

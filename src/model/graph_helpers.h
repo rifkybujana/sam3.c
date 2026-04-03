@@ -6,7 +6,7 @@
  * to build their compute subgraphs with minimal boilerplate.
  *
  * Key types:  (none -- uses sam3_tensor, sam3_graph, sam3_arena)
- * Depends on: core/graph.h, core/alloc.h, core/tensor.h
+ * Depends on: core/graph.h, core/alloc.h, core/tensor.h, core/weight.h
  * Used by:    model/ files (vitdet.c, text_encoder.c, decoder.c, etc.)
  *
  * Copyright (c) 2026
@@ -19,6 +19,7 @@
 #include "core/graph.h"
 #include "core/alloc.h"
 #include "core/tensor.h"
+#include "core/weight.h"
 
 /*
  * gh_alloc_tensor - Allocate a tensor with given shape from the arena.
@@ -35,6 +36,18 @@
 struct sam3_tensor *gh_alloc_tensor(struct sam3_arena *arena,
 				    enum sam3_dtype dtype,
 				    int n_dims, const int *dims);
+
+/*
+ * gh_load_or_alloc - Load a weight tensor by name, or allocate zeroed.
+ *
+ * When wf is NULL or the tensor is not found, allocates a
+ * zero-initialized tensor from the arena.
+ */
+struct sam3_tensor *gh_load_or_alloc(const struct sam3_weight_file *wf,
+				      const char *name,
+				      struct sam3_arena *arena,
+				      enum sam3_dtype dtype,
+				      int n_dims, const int *dims);
 
 /* --- Unary activation ops (output shape = input shape) --- */
 
@@ -219,6 +232,36 @@ struct sam3_tensor *gh_multihead_attention(
 	struct sam3_tensor *qkv_b,
 	struct sam3_tensor *out_w,
 	struct sam3_tensor *out_b,
+	int n_heads);
+
+/*
+ * gh_cross_attention - Multi-head cross-attention with separate Q and KV.
+ *
+ * Q is projected from q_src, K and V are projected from kv_src.
+ * Uses packed KV weight [2*d_model, d_model] which is sliced into
+ * separate K and V projections.
+ *
+ * @g:       Graph to add nodes to
+ * @arena:   Arena for intermediate tensors
+ * @q_src:   Query source [n_q, d_model]
+ * @kv_src:  Key/value source [n_kv, d_model]
+ * @q_w:     Query projection weight [d_model, d_model]
+ * @q_b:     Query projection bias [d_model]
+ * @kv_w:    Packed KV projection weight [2*d_model, d_model]
+ * @kv_b:    Packed KV projection bias [2*d_model]
+ * @out_w:   Output projection weight [d_model, d_model]
+ * @out_b:   Output projection bias [d_model]
+ * @n_heads: Number of attention heads
+ *
+ * Returns output tensor [n_q, d_model], or NULL on error.
+ */
+struct sam3_tensor *gh_cross_attention(
+	struct sam3_graph *g, struct sam3_arena *arena,
+	struct sam3_tensor *q_src,
+	struct sam3_tensor *kv_src,
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *kv_w, struct sam3_tensor *kv_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
 	int n_heads);
 
 /*

@@ -21,151 +21,9 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 
 #include "decoder.h"
 #include "graph_helpers.h"
-
-/*
- * load_or_alloc - Load a weight tensor by name, or allocate zeroed.
- *
- * Mirrors the pattern used in image_encoder.c. When wf is NULL or the
- * tensor is not found, allocates a zero-initialized tensor from the
- * arena.
- */
-static struct sam3_tensor *load_or_alloc(const struct sam3_weight_file *wf,
-					  const char *name,
-					  struct sam3_arena *arena,
-					  enum sam3_dtype dtype,
-					  int n_dims, const int *dims)
-{
-	if (wf) {
-		const struct sam3_weight_tensor_desc *desc;
-		desc = sam3_weight_find(wf, name);
-		if (desc) {
-			struct sam3_tensor *t;
-			t = gh_alloc_tensor(arena, dtype, n_dims, dims);
-			if (t)
-				sam3_weight_to_tensor(wf, desc, t);
-			return t;
-		}
-	}
-	return gh_alloc_tensor(arena, dtype, n_dims, dims);
-}
-
-/*
- * cross_attention - Multi-head cross-attention with separate Q and KV.
- *
- * Q is projected from q_src, K and V are projected from kv_src via
- * packed KV weight [2*d_model, d_model]. Per-head scaled dot-product
- * attention using 2D slice-matmul-softmax ops.
- *
- * @g:       Graph to add nodes to
- * @arena:   Arena for intermediate tensors
- * @q_src:   Query source [n_q, d_model]
- * @kv_src:  Key/value source [n_kv, d_model]
- * @q_w:     Query projection weight [d_model, d_model]
- * @q_b:     Query projection bias [d_model]
- * @kv_w:    Packed KV weight [2*d_model, d_model]
- * @kv_b:    Packed KV bias [2*d_model]
- * @out_w:   Output projection weight [d_model, d_model]
- * @out_b:   Output projection bias [d_model]
- * @n_heads: Number of attention heads
- *
- * Returns output tensor [n_q, d_model], or NULL on error.
- */
-static struct sam3_tensor *cross_attention(
-	struct sam3_graph *g, struct sam3_arena *arena,
-	struct sam3_tensor *q_src,
-	struct sam3_tensor *kv_src,
-	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
-	struct sam3_tensor *kv_w, struct sam3_tensor *kv_b,
-	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
-	int n_heads)
-{
-	int n_kv = kv_src->dims[0];
-	int d_model = q_src->dims[1];
-	int head_dim = d_model / n_heads;
-
-	/* Project Q: [n_q, d_model] */
-	struct sam3_tensor *q = gh_linear(g, arena, q_src, q_w, q_b);
-	if (!q)
-		return NULL;
-
-	/* Project KV: [n_kv, 2*d_model] */
-	struct sam3_tensor *kv = gh_linear(g, arena, kv_src, kv_w, kv_b);
-	if (!kv)
-		return NULL;
-
-	/* Slice K and V from packed KV */
-	struct sam3_tensor *k = gh_slice(g, arena, kv, 1, 0, d_model);
-	struct sam3_tensor *v = gh_slice(g, arena, kv, 1,
-					  d_model, 2 * d_model);
-	if (!k || !v)
-		return NULL;
-
-	/* Per-head attention */
-	struct sam3_tensor *head_outs[64];
-	for (int h = 0; h < n_heads; h++) {
-		int hstart = h * head_dim;
-		int hend = hstart + head_dim;
-
-		struct sam3_tensor *hq, *hk, *hv;
-		hq = gh_slice(g, arena, q, 1, hstart, hend);
-		hk = gh_slice(g, arena, k, 1, hstart, hend);
-		hv = gh_slice(g, arena, v, 1, hstart, hend);
-		if (!hq || !hk || !hv)
-			return NULL;
-
-		struct sam3_tensor *hkt = gh_transpose(g, arena, hk);
-		if (!hkt)
-			return NULL;
-
-		struct sam3_tensor *scores = gh_matmul(g, arena, hq, hkt);
-		if (!scores)
-			return NULL;
-
-		/* Scale by 1/sqrt(head_dim) */
-		int scale_dims[] = {n_kv};
-		struct sam3_tensor *scale_t;
-		scale_t = gh_alloc_tensor(arena, q_src->dtype,
-					   1, scale_dims);
-		if (!scale_t)
-			return NULL;
-
-		float inv_sqrt = 1.0f / sqrtf((float)head_dim);
-		float *sd = (float *)scale_t->data;
-		for (int j = 0; j < n_kv; j++)
-			sd[j] = inv_sqrt;
-
-		struct sam3_tensor *scaled;
-		scaled = gh_mul(g, arena, scores, scale_t);
-		if (!scaled)
-			return NULL;
-
-		struct sam3_tensor *attn = gh_softmax(g, arena, scaled);
-		if (!attn)
-			return NULL;
-
-		struct sam3_tensor *ho = gh_matmul(g, arena, attn, hv);
-		if (!ho)
-			return NULL;
-
-		head_outs[h] = ho;
-	}
-
-	/* Concatenate heads */
-	struct sam3_tensor *merged;
-	if (n_heads == 1) {
-		merged = head_outs[0];
-	} else {
-		merged = gh_concat(g, arena, head_outs, n_heads, 1);
-		if (!merged)
-			return NULL;
-	}
-
-	return gh_linear(g, arena, merged, out_w, out_b);
-}
 
 /*
  * box_refine_mlp - 3-layer MLP for box refinement.
@@ -235,7 +93,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 	/* Learned query embeddings: [n_queries, d_model] */
 	int qe_dims[] = {nq, d};
-	dec->query_embed = load_or_alloc(wf, "decoder.query_embed",
+	dec->query_embed = gh_load_or_alloc(wf, "decoder.query_embed",
 					  arena, SAM3_DTYPE_F32,
 					  2, qe_dims);
 	if (!dec->query_embed)
@@ -262,7 +120,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Self-attention QKV */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.sa.qkv.weight", i);
-		dec->layers[i].sa_qkv_w = load_or_alloc(
+		dec->layers[i].sa_qkv_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, sa_qkv_w_dims);
 		if (!dec->layers[i].sa_qkv_w)
@@ -270,7 +128,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.sa.qkv.bias", i);
-		dec->layers[i].sa_qkv_b = load_or_alloc(
+		dec->layers[i].sa_qkv_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, sa_qkv_b_dims);
 		if (!dec->layers[i].sa_qkv_b)
@@ -279,7 +137,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Self-attention output */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.sa.out.weight", i);
-		dec->layers[i].sa_out_w = load_or_alloc(
+		dec->layers[i].sa_out_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].sa_out_w)
@@ -287,7 +145,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.sa.out.bias", i);
-		dec->layers[i].sa_out_b = load_or_alloc(
+		dec->layers[i].sa_out_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].sa_out_b)
@@ -296,7 +154,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Self-attention layer norm */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.sa.ln.weight", i);
-		dec->layers[i].sa_ln_w = load_or_alloc(
+		dec->layers[i].sa_ln_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].sa_ln_w)
@@ -304,7 +162,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.sa.ln.bias", i);
-		dec->layers[i].sa_ln_b = load_or_alloc(
+		dec->layers[i].sa_ln_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].sa_ln_b)
@@ -313,7 +171,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Encoder cross-attention Q */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.q.weight", i);
-		dec->layers[i].ca_q_w = load_or_alloc(
+		dec->layers[i].ca_q_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].ca_q_w)
@@ -321,7 +179,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.q.bias", i);
-		dec->layers[i].ca_q_b = load_or_alloc(
+		dec->layers[i].ca_q_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_q_b)
@@ -330,7 +188,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Encoder cross-attention KV */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.kv.weight", i);
-		dec->layers[i].ca_kv_w = load_or_alloc(
+		dec->layers[i].ca_kv_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, ca_kv_w_dims);
 		if (!dec->layers[i].ca_kv_w)
@@ -338,7 +196,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.kv.bias", i);
-		dec->layers[i].ca_kv_b = load_or_alloc(
+		dec->layers[i].ca_kv_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, ca_kv_b_dims);
 		if (!dec->layers[i].ca_kv_b)
@@ -347,7 +205,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Encoder cross-attention output */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.out.weight", i);
-		dec->layers[i].ca_out_w = load_or_alloc(
+		dec->layers[i].ca_out_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].ca_out_w)
@@ -355,7 +213,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.out.bias", i);
-		dec->layers[i].ca_out_b = load_or_alloc(
+		dec->layers[i].ca_out_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_out_b)
@@ -364,7 +222,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Encoder cross-attention layer norm */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.ln.weight", i);
-		dec->layers[i].ca_ln_w = load_or_alloc(
+		dec->layers[i].ca_ln_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_ln_w)
@@ -372,7 +230,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ca.ln.bias", i);
-		dec->layers[i].ca_ln_b = load_or_alloc(
+		dec->layers[i].ca_ln_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_ln_b)
@@ -381,7 +239,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Text cross-attention Q */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.q.weight", i);
-		dec->layers[i].tca_q_w = load_or_alloc(
+		dec->layers[i].tca_q_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].tca_q_w)
@@ -389,7 +247,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.q.bias", i);
-		dec->layers[i].tca_q_b = load_or_alloc(
+		dec->layers[i].tca_q_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_q_b)
@@ -398,7 +256,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Text cross-attention KV */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.kv.weight", i);
-		dec->layers[i].tca_kv_w = load_or_alloc(
+		dec->layers[i].tca_kv_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, ca_kv_w_dims);
 		if (!dec->layers[i].tca_kv_w)
@@ -406,7 +264,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.kv.bias", i);
-		dec->layers[i].tca_kv_b = load_or_alloc(
+		dec->layers[i].tca_kv_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, ca_kv_b_dims);
 		if (!dec->layers[i].tca_kv_b)
@@ -415,7 +273,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Text cross-attention output */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.out.weight", i);
-		dec->layers[i].tca_out_w = load_or_alloc(
+		dec->layers[i].tca_out_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].tca_out_w)
@@ -423,7 +281,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.out.bias", i);
-		dec->layers[i].tca_out_b = load_or_alloc(
+		dec->layers[i].tca_out_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_out_b)
@@ -432,7 +290,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Text cross-attention layer norm */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.ln.weight", i);
-		dec->layers[i].tca_ln_w = load_or_alloc(
+		dec->layers[i].tca_ln_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_ln_w)
@@ -440,7 +298,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.tca.ln.bias", i);
-		dec->layers[i].tca_ln_b = load_or_alloc(
+		dec->layers[i].tca_ln_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_ln_b)
@@ -449,7 +307,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* FFN fc1 */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ffn.fc1.weight", i);
-		dec->layers[i].ffn_fc1_w = load_or_alloc(
+		dec->layers[i].ffn_fc1_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, fc1_w_dims);
 		if (!dec->layers[i].ffn_fc1_w)
@@ -457,7 +315,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ffn.fc1.bias", i);
-		dec->layers[i].ffn_fc1_b = load_or_alloc(
+		dec->layers[i].ffn_fc1_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, fc1_b_dims);
 		if (!dec->layers[i].ffn_fc1_b)
@@ -466,7 +324,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* FFN fc2 */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ffn.fc2.weight", i);
-		dec->layers[i].ffn_fc2_w = load_or_alloc(
+		dec->layers[i].ffn_fc2_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, fc2_w_dims);
 		if (!dec->layers[i].ffn_fc2_w)
@@ -474,7 +332,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ffn.fc2.bias", i);
-		dec->layers[i].ffn_fc2_b = load_or_alloc(
+		dec->layers[i].ffn_fc2_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ffn_fc2_b)
@@ -483,7 +341,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* FFN layer norm */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ffn.ln.weight", i);
-		dec->layers[i].ffn_ln_w = load_or_alloc(
+		dec->layers[i].ffn_ln_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ffn_ln_w)
@@ -491,7 +349,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.ffn.ln.bias", i);
-		dec->layers[i].ffn_ln_b = load_or_alloc(
+		dec->layers[i].ffn_ln_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ffn_ln_b)
@@ -500,7 +358,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Box refinement fc1: [d_model, d_model] */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.box.fc1.weight", i);
-		dec->layers[i].box_fc1_w = load_or_alloc(
+		dec->layers[i].box_fc1_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, box_fc1_w_dims);
 		if (!dec->layers[i].box_fc1_w)
@@ -508,7 +366,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.box.fc1.bias", i);
-		dec->layers[i].box_fc1_b = load_or_alloc(
+		dec->layers[i].box_fc1_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].box_fc1_b)
@@ -517,7 +375,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Box refinement fc2: [d_model, d_model] */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.box.fc2.weight", i);
-		dec->layers[i].box_fc2_w = load_or_alloc(
+		dec->layers[i].box_fc2_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, box_fc2_w_dims);
 		if (!dec->layers[i].box_fc2_w)
@@ -525,7 +383,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.box.fc2.bias", i);
-		dec->layers[i].box_fc2_b = load_or_alloc(
+		dec->layers[i].box_fc2_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].box_fc2_b)
@@ -534,7 +392,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Box refinement fc3: [4, d_model] / [4] */
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.box.fc3.weight", i);
-		dec->layers[i].box_fc3_w = load_or_alloc(
+		dec->layers[i].box_fc3_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, box_fc3_w_dims);
 		if (!dec->layers[i].box_fc3_w)
@@ -542,7 +400,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 "decoder.layer.%d.box.fc3.bias", i);
-		dec->layers[i].box_fc3_b = load_or_alloc(
+		dec->layers[i].box_fc3_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, box_fc3_b_dims);
 		if (!dec->layers[i].box_fc3_b)
@@ -625,7 +483,7 @@ struct sam3_tensor *sam3_decoder_build(
 			return NULL;
 
 		struct sam3_tensor *ca_out;
-		ca_out = cross_attention(
+		ca_out = gh_cross_attention(
 			g, arena,
 			q_norm, enc_features,
 			dec->layers[i].ca_q_w,
@@ -653,7 +511,7 @@ struct sam3_tensor *sam3_decoder_build(
 			return NULL;
 
 		struct sam3_tensor *tca_out;
-		tca_out = cross_attention(
+		tca_out = gh_cross_attention(
 			g, arena,
 			q_norm, text_features,
 			dec->layers[i].tca_q_w,
