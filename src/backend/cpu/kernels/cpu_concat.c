@@ -81,12 +81,13 @@ enum sam3_error cpu_kernel_concat(const struct sam3_node *node,
 	for (int d = axis + 1; d < n_dims; d++)
 		inner_size *= first->dims[d];
 
-	float *dst = (float *)out->data;
+	size_t esz = sam3_dtype_size(first->dtype);
+	char *dst = (char *)out->data;
 
 	for (int o = 0; o < outer_iters; o++) {
 		for (int i = 0; i < node->n_inputs; i++) {
 			const struct sam3_tensor *inp = node->inputs[i];
-			const float *src = (const float *)inp->data;
+			const char *src = (const char *)inp->data;
 			int axis_len = inp->dims[axis];
 			int block = axis_len * inner_size;
 
@@ -95,9 +96,9 @@ enum sam3_error cpu_kernel_concat(const struct sam3_node *node,
 			 * (axis_len * inner_size) elements in that input.
 			 */
 			int src_off = o * block;
-			memcpy(dst, src + src_off,
-			       (size_t)block * sizeof(float));
-			dst += block;
+			memcpy(dst, src + (size_t)src_off * esz,
+			       (size_t)block * esz);
+			dst += (size_t)block * esz;
 		}
 	}
 

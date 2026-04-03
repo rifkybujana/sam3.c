@@ -316,6 +316,88 @@ static void test_layernorm_f16(void)
 	sam3_threadpool_free(pool);
 }
 
+static void test_sigmoid_f16(void)
+{
+	float in_f32[8] = {-2.0f, -1.0f, 0.0f, 1.0f,
+			   2.0f, 3.0f, -0.5f, 0.5f};
+	uint16_t in_f16[8], out_f16[8];
+	int i;
+
+	for (i = 0; i < 8; i++)
+		in_f16[i] = f32_to_fp16(in_f32[i]);
+	memset(out_f16, 0, sizeof(out_f16));
+
+	/* Compute expected sigmoid in f32 */
+	float expected[8];
+	for (i = 0; i < 8; i++)
+		expected[i] = 1.0f / (1.0f + expf(-in_f32[i]));
+
+	struct sam3_tensor t_in, t_out;
+	make_f16_tensor(&t_in,  in_f16,  8);
+	make_f16_tensor(&t_out, out_f16, 8);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_SIGMOID;
+	node.n_inputs  = 1;
+	node.inputs[0] = &t_in;
+	node.output    = &t_out;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_sigmoid_f16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	for (i = 0; i < 8; i++) {
+		float result = fp16_to_f32(out_f16[i]);
+		ASSERT_NEAR(result, expected[i], 1e-3f);
+	}
+
+	sam3_threadpool_free(pool);
+}
+
+static void test_silu_f16(void)
+{
+	float in_f32[8] = {-2.0f, -1.0f, 0.0f, 1.0f,
+			   2.0f, 3.0f, -0.5f, 0.5f};
+	uint16_t in_f16[8], out_f16[8];
+	int i;
+
+	for (i = 0; i < 8; i++)
+		in_f16[i] = f32_to_fp16(in_f32[i]);
+	memset(out_f16, 0, sizeof(out_f16));
+
+	/* Compute expected SiLU in f32 */
+	float expected[8];
+	for (i = 0; i < 8; i++)
+		expected[i] = in_f32[i] / (1.0f + expf(-in_f32[i]));
+
+	struct sam3_tensor t_in, t_out;
+	make_f16_tensor(&t_in,  in_f16,  8);
+	make_f16_tensor(&t_out, out_f16, 8);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_SILU;
+	node.n_inputs  = 1;
+	node.inputs[0] = &t_in;
+	node.output    = &t_out;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_silu_f16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	for (i = 0; i < 8; i++) {
+		float result = fp16_to_f32(out_f16[i]);
+		ASSERT_NEAR(result, expected[i], 1e-3f);
+	}
+
+	sam3_threadpool_free(pool);
+}
+
 static void test_add_f16_dtype_reject(void)
 {
 	/* Passing F32 tensors to the F16 kernel must return SAM3_EINVAL */
@@ -362,6 +444,8 @@ int main(void)
 	test_mul_f16();
 	test_relu_f16();
 	test_gelu_f16();
+	test_sigmoid_f16();
+	test_silu_f16();
 	test_softmax_f16();
 	test_layernorm_f16();
 	test_add_f16_dtype_reject();

@@ -130,6 +130,16 @@ enum sam3_error cpu_kernel_sigmoid(const struct sam3_node *node,
 enum sam3_error cpu_kernel_silu(const struct sam3_node *node,
 				struct sam3_threadpool *pool);
 
+/* FP16 sigmoid and silu */
+enum sam3_error cpu_kernel_sigmoid_f16(const struct sam3_node *node,
+				       struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_sigmoid_bf16(const struct sam3_node *node,
+					struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_silu_f16(const struct sam3_node *node,
+				    struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_silu_bf16(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
+
 /* Embedding table lookup: table[indices[i], :] -> output[i, :] */
 enum sam3_error cpu_kernel_embed(const struct sam3_node *node,
 				 struct sam3_threadpool *pool);
@@ -149,6 +159,12 @@ enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
 /* Rotary position embedding: rotate pairs by precomputed frequencies */
 enum sam3_error cpu_kernel_rope(const struct sam3_node *node,
 				struct sam3_threadpool *pool);
+
+/* FP16/BF16 rope (mixed-dtype: input F16/BF16, cos/sin F32) */
+enum sam3_error cpu_kernel_rope_f16(const struct sam3_node *node,
+				    struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_rope_bf16(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
 
 /* Transposed conv2d: scatter-accumulate. scratch arena for temp buffers. */
 enum sam3_error cpu_kernel_conv_transpose2d(const struct sam3_node *node,

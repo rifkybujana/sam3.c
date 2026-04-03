@@ -270,11 +270,43 @@ wrap_sigmoid(const struct sam3_node *node, struct sam3_arena *scratch,
 }
 
 static enum sam3_error
+wrap_sigmoid_f16(const struct sam3_node *node, struct sam3_arena *scratch,
+		 struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_sigmoid_f16(node, pool);
+}
+
+static enum sam3_error
+wrap_sigmoid_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
+		  struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_sigmoid_bf16(node, pool);
+}
+
+static enum sam3_error
 wrap_silu(const struct sam3_node *node, struct sam3_arena *scratch,
 	  struct sam3_threadpool *pool)
 {
 	(void)scratch;
 	return cpu_kernel_silu(node, pool);
+}
+
+static enum sam3_error
+wrap_silu_f16(const struct sam3_node *node, struct sam3_arena *scratch,
+	      struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_silu_f16(node, pool);
+}
+
+static enum sam3_error
+wrap_silu_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
+	       struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_silu_bf16(node, pool);
 }
 
 static enum sam3_error
@@ -315,6 +347,22 @@ wrap_rope(const struct sam3_node *node, struct sam3_arena *scratch,
 {
 	(void)scratch;
 	return cpu_kernel_rope(node, pool);
+}
+
+static enum sam3_error
+wrap_rope_f16(const struct sam3_node *node, struct sam3_arena *scratch,
+	      struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_rope_f16(node, pool);
+}
+
+static enum sam3_error
+wrap_rope_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
+	       struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_rope_bf16(node, pool);
 }
 
 static enum sam3_error
@@ -405,24 +453,36 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_SIGMOID] = {
 		[SAM3_DTYPE_F32]  = wrap_sigmoid,
+		[SAM3_DTYPE_F16]  = wrap_sigmoid_f16,
+		[SAM3_DTYPE_BF16] = wrap_sigmoid_bf16,
 	},
 	[SAM3_OP_SILU] = {
 		[SAM3_DTYPE_F32]  = wrap_silu,
+		[SAM3_DTYPE_F16]  = wrap_silu_f16,
+		[SAM3_DTYPE_BF16] = wrap_silu_bf16,
 	},
 	[SAM3_OP_EMBED] = {
 		[SAM3_DTYPE_F32]  = wrap_embed,
 	},
 	[SAM3_OP_CONCAT] = {
 		[SAM3_DTYPE_F32]  = wrap_concat,
+		[SAM3_DTYPE_F16]  = wrap_concat,
+		[SAM3_DTYPE_BF16] = wrap_concat,
 	},
 	[SAM3_OP_SLICE] = {
 		[SAM3_DTYPE_F32]  = wrap_slice,
+		[SAM3_DTYPE_F16]  = wrap_slice,
+		[SAM3_DTYPE_BF16] = wrap_slice,
 	},
 	[SAM3_OP_UPSAMPLE] = {
 		[SAM3_DTYPE_F32]  = wrap_upsample,
+		[SAM3_DTYPE_F16]  = wrap_upsample,
+		[SAM3_DTYPE_BF16] = wrap_upsample,
 	},
 	[SAM3_OP_ROPE] = {
 		[SAM3_DTYPE_F32]  = wrap_rope,
+		[SAM3_DTYPE_F16]  = wrap_rope_f16,
+		[SAM3_DTYPE_BF16] = wrap_rope_bf16,
 	},
 	[SAM3_OP_CONV_TRANSPOSE2D] = {
 		[SAM3_DTYPE_F32]  = wrap_conv_transpose2d,
@@ -472,6 +532,8 @@ cpu_dispatch_node(const struct sam3_node *node,
 	 *   Dispatch on input[1]'s dtype (Q8_0) to reach the mixed kernel.
 	 * - EMBED: input[0]=F32 (table), input[1]=I32 (indices)
 	 *   Dispatch on input[0]'s dtype (F32); kernel validates I32 internally.
+	 * - ROPE with F16/BF16: input[0]=F16/BF16, inputs[1..2]=F32 (cos/sin)
+	 *   Dispatch on input[0]'s dtype; kernel validates F32 cos/sin internally.
 	 */
 	int mixed_q8 = (node->op == SAM3_OP_MATMUL &&
 			node->n_inputs >= 2 &&
@@ -485,9 +547,17 @@ cpu_dispatch_node(const struct sam3_node *node,
 			   node->inputs[1]->dtype == SAM3_DTYPE_I32 &&
 			   dtype == SAM3_DTYPE_F32);
 
+	int mixed_rope = (node->op == SAM3_OP_ROPE &&
+			  node->n_inputs >= 3 &&
+			  node->inputs[1] && node->inputs[2] &&
+			  node->inputs[1]->dtype == SAM3_DTYPE_F32 &&
+			  node->inputs[2]->dtype == SAM3_DTYPE_F32 &&
+			  (dtype == SAM3_DTYPE_F16 ||
+			   dtype == SAM3_DTYPE_BF16));
+
 	if (mixed_q8) {
 		dtype = SAM3_DTYPE_Q8_0;
-	} else if (!mixed_embed) {
+	} else if (!mixed_embed && !mixed_rope) {
 		for (int i = 1; i < node->n_inputs; i++) {
 			if (!node->inputs[i])
 				continue;

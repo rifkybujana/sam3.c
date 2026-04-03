@@ -19,20 +19,24 @@
 #include "util/log.h"
 #include "util/threadpool.h"
 
+#include <string.h>
+
 struct upsample_ctx {
-	const float *src;
-	float       *dst;
-	int          src_h;
-	int          src_w;
-	int          dst_h;
-	int          dst_w;
-	int          scale;
-	int          nc;      /* N * C */
+	const void *src;
+	void       *dst;
+	size_t      esz;      /* bytes per element */
+	int         src_h;
+	int         src_w;
+	int         dst_h;
+	int         dst_w;
+	int         scale;
+	int         nc;       /* N * C */
 };
 
 static void upsample_parallel_fn(void *arg, int task_id, int n_tasks)
 {
 	struct upsample_ctx *ctx = (struct upsample_ctx *)arg;
+	size_t esz = ctx->esz;
 	int chunk = ctx->nc / n_tasks;
 	int start = task_id * chunk;
 	int end = (task_id == n_tasks - 1) ? ctx->nc : start + chunk;
@@ -41,15 +45,18 @@ static void upsample_parallel_fn(void *arg, int task_id, int n_tasks)
 	int dst_plane = ctx->dst_h * ctx->dst_w;
 
 	for (int nc = start; nc < end; nc++) {
-		const float *sp = ctx->src + nc * src_plane;
-		float *dp = ctx->dst + nc * dst_plane;
+		const char *sp = (const char *)ctx->src +
+				 (size_t)nc * src_plane * esz;
+		char *dp = (char *)ctx->dst +
+			   (size_t)nc * dst_plane * esz;
 
 		for (int y = 0; y < ctx->dst_h; y++) {
 			int sy = y / ctx->scale;
 			for (int x = 0; x < ctx->dst_w; x++) {
 				int sx = x / ctx->scale;
-				dp[y * ctx->dst_w + x] =
-					sp[sy * ctx->src_w + sx];
+				memcpy(dp + (size_t)(y * ctx->dst_w + x) * esz,
+				       sp + (size_t)(sy * ctx->src_w + sx) * esz,
+				       esz);
 			}
 		}
 	}
@@ -96,8 +103,9 @@ enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
 	}
 
 	struct upsample_ctx ctx = {
-		.src   = (const float *)inp->data,
-		.dst   = (float *)out->data,
+		.src   = inp->data,
+		.dst   = out->data,
+		.esz   = sam3_dtype_size(inp->dtype),
 		.src_h = src_h,
 		.src_w = src_w,
 		.dst_h = dst_h,

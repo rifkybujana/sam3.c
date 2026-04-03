@@ -73,14 +73,15 @@ enum sam3_error cpu_kernel_slice(const struct sam3_node *node,
 	int src_axis_stride = inp->dims[axis] * inner_size;
 	int copy_block = slice_len * inner_size;
 
-	const float *src = (const float *)inp->data;
-	float *dst = (float *)out->data;
+	size_t esz = sam3_dtype_size(inp->dtype);
+	const char *src = (const char *)inp->data;
+	char *dst = (char *)out->data;
 
 	for (int o = 0; o < outer_iters; o++) {
 		int src_off = o * src_axis_stride + start * inner_size;
-		memcpy(dst, src + src_off,
-		       (size_t)copy_block * sizeof(float));
-		dst += copy_block;
+		memcpy(dst, src + (size_t)src_off * esz,
+		       (size_t)copy_block * esz);
+		dst += (size_t)copy_block * esz;
 	}
 
 	return SAM3_OK;

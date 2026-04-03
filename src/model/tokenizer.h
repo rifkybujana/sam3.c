@@ -48,6 +48,25 @@ struct sam3_tokenizer {
 enum sam3_error sam3_tokenizer_init(struct sam3_tokenizer *tok);
 
 /*
+ * sam3_tokenizer_load_bpe - Load BPE merge table from a text file.
+ *
+ * @tok:  Initialized tokenizer (must have byte-level vocab set up)
+ * @path: Path to BPE merges file (one merge per line, space-separated)
+ *
+ * Reads a CLIP-format BPE merge file. Lines starting with '#' are skipped
+ * as comments. Each non-comment line contains two space-separated token
+ * strings representing a merge pair. For merge at index i, the merged
+ * token is stored at vocab[256 + i] and merge_first[i] / merge_second[i]
+ * record the constituent token IDs.
+ *
+ * Returns SAM3_OK on success, SAM3_EINVAL on bad arguments or malformed
+ * file, SAM3_EIO if the file cannot be opened, SAM3_ENOMEM on allocation
+ * failure. On error, existing tokenizer state is not modified.
+ */
+enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
+					const char *path);
+
+/*
  * sam3_tokenizer_encode - Encode text to token IDs.
  *
  * @tok:        Initialized tokenizer

@@ -22,6 +22,8 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
+#include "core/half.h"
 
 #define EPS 1e-4f
 
@@ -67,6 +69,36 @@ static struct sam3_tensor *make_i32_tensor(int n_dims, const int *dims)
 		t->dims[i] = dims[i];
 	g_cpu.base.ops->alloc_tensor(&g_cpu.base, t);
 	return t;
+}
+
+static struct sam3_tensor *make_typed_tensor(enum sam3_dtype dtype,
+					     int n_dims, const int *dims)
+{
+	struct sam3_tensor *t = (struct sam3_tensor *)
+		sam3_arena_alloc(&g_cpu.arena, sizeof(struct sam3_tensor));
+	memset(t, 0, sizeof(*t));
+	t->dtype = dtype;
+	t->n_dims = n_dims;
+	for (int i = 0; i < n_dims; i++)
+		t->dims[i] = dims[i];
+	g_cpu.base.ops->alloc_tensor(&g_cpu.base, t);
+	return t;
+}
+
+static void fill_f16_from_f32(struct sam3_tensor *t, const float *src,
+			       int n)
+{
+	uint16_t *dst = (uint16_t *)t->data;
+	for (int i = 0; i < n; i++)
+		dst[i] = f32_to_fp16(src[i]);
+}
+
+static void fill_bf16_from_f32(struct sam3_tensor *t, const float *src,
+				int n)
+{
+	uint16_t *dst = (uint16_t *)t->data;
+	for (int i = 0; i < n; i++)
+		dst[i] = f32_to_bf16(src[i]);
 }
 
 static void fill_data(struct sam3_tensor *t, const void *data)
@@ -665,6 +697,258 @@ static void test_rope_known_values(void)
 	ASSERT_NEAR(o[7],  2.232f, EPS);
 }
 
+/* --- F16 Concat tests --- */
+
+static void test_concat_f16_axis0(void)
+{
+	/* concat([2,3], [1,3], axis=0) -> [3,3] in F16 */
+	struct sam3_tensor *a = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						  (int[]){2, 3});
+	struct sam3_tensor *b = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						  (int[]){1, 3});
+	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						    (int[]){3, 3});
+
+	float a_f32[] = {1, 2, 3, 4, 5, 6};
+	float b_f32[] = {7, 8, 9};
+	fill_f16_from_f32(a, a_f32, 6);
+	fill_f16_from_f32(b, b_f32, 3);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_CONCAT;
+	node.inputs[0] = a;
+	node.inputs[1] = b;
+	node.n_inputs = 2;
+	node.output = out;
+	node.params[0] = 0; /* axis */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	uint16_t *o = (uint16_t *)out->data;
+	float expect[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+	for (int i = 0; i < 9; i++)
+		ASSERT_NEAR(fp16_to_f32(o[i]), expect[i], EPS);
+}
+
+static void test_concat_f16_axis1(void)
+{
+	/* concat([2,2], [2,3], axis=1) -> [2,5] in F16 */
+	struct sam3_tensor *a = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						  (int[]){2, 2});
+	struct sam3_tensor *b = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						  (int[]){2, 3});
+	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						    (int[]){2, 5});
+
+	float a_f32[] = {1, 2, 3, 4};
+	float b_f32[] = {5, 6, 7, 8, 9, 10};
+	fill_f16_from_f32(a, a_f32, 4);
+	fill_f16_from_f32(b, b_f32, 6);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_CONCAT;
+	node.inputs[0] = a;
+	node.inputs[1] = b;
+	node.n_inputs = 2;
+	node.output = out;
+	node.params[0] = 1; /* axis */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	uint16_t *o = (uint16_t *)out->data;
+	float expect[] = {1, 2, 5, 6, 7, 3, 4, 8, 9, 10};
+	for (int i = 0; i < 10; i++)
+		ASSERT_NEAR(fp16_to_f32(o[i]), expect[i], EPS);
+}
+
+/* --- F16 Slice tests --- */
+
+static void test_slice_f16_axis0(void)
+{
+	/* slice([4,3], axis=0, start=1, end=3) -> [2,3] in F16 */
+	struct sam3_tensor *inp = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						    (int[]){4, 3});
+	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						    (int[]){2, 3});
+
+	float inp_f32[] = {
+		1, 2, 3,
+		4, 5, 6,
+		7, 8, 9,
+		10, 11, 12,
+	};
+	fill_f16_from_f32(inp, inp_f32, 12);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_SLICE;
+	node.inputs[0] = inp;
+	node.n_inputs = 1;
+	node.output = out;
+	node.params[0] = 0; /* axis */
+	node.params[1] = 1; /* start */
+	node.params[2] = 3; /* end */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	uint16_t *o = (uint16_t *)out->data;
+	float expect[] = {4, 5, 6, 7, 8, 9};
+	for (int i = 0; i < 6; i++)
+		ASSERT_NEAR(fp16_to_f32(o[i]), expect[i], EPS);
+}
+
+static void test_slice_f16_axis1(void)
+{
+	/* slice([2,5], axis=1, start=1, end=4) -> [2,3] in F16 */
+	struct sam3_tensor *inp = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						    (int[]){2, 5});
+	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_F16, 2,
+						    (int[]){2, 3});
+
+	float inp_f32[] = {
+		1, 2, 3, 4, 5,
+		6, 7, 8, 9, 10,
+	};
+	fill_f16_from_f32(inp, inp_f32, 10);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_SLICE;
+	node.inputs[0] = inp;
+	node.n_inputs = 1;
+	node.output = out;
+	node.params[0] = 1; /* axis */
+	node.params[1] = 1; /* start */
+	node.params[2] = 4; /* end */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	uint16_t *o = (uint16_t *)out->data;
+	float expect[] = {2, 3, 4, 7, 8, 9};
+	for (int i = 0; i < 6; i++)
+		ASSERT_NEAR(fp16_to_f32(o[i]), expect[i], EPS);
+}
+
+/* --- F16 Upsample tests --- */
+
+static void test_upsample_f16_2x(void)
+{
+	/* [1,1,2,2] with scale=2 -> [1,1,4,4] in F16 */
+	struct sam3_tensor *inp = make_typed_tensor(SAM3_DTYPE_F16, 4,
+						    (int[]){1, 1, 2, 2});
+	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_F16, 4,
+						    (int[]){1, 1, 4, 4});
+
+	float inp_f32[] = {1, 2, 3, 4};
+	fill_f16_from_f32(inp, inp_f32, 4);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_UPSAMPLE;
+	node.inputs[0] = inp;
+	node.n_inputs = 1;
+	node.output = out;
+	node.params[0] = 2; /* scale */
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	uint16_t *o = (uint16_t *)out->data;
+	float expect[] = {
+		1, 1, 2, 2,
+		1, 1, 2, 2,
+		3, 3, 4, 4,
+		3, 3, 4, 4,
+	};
+	for (int i = 0; i < 16; i++)
+		ASSERT_NEAR(fp16_to_f32(o[i]), expect[i], EPS);
+}
+
+/* --- RoPE F16/BF16 tests --- */
+
+static void test_rope_f16_identity(void)
+{
+	/* cos=1.0, sin=0.0 everywhere -> output == input (through F16) */
+	struct sam3_tensor *inp = make_typed_tensor(SAM3_DTYPE_F16, 4,
+						    (int[]){1, 2, 1, 4});
+	struct sam3_tensor *cos_f = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *sin_f = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_F16, 4,
+						    (int[]){1, 2, 1, 4});
+
+	float inp_f32[] = {1, 2, 3, 4, 5, 6, 7, 8};
+	float cos_data[] = {1, 1, 1, 1};
+	float sin_data[] = {0, 0, 0, 0};
+	fill_f16_from_f32(inp, inp_f32, 8);
+	fill_data(cos_f, cos_data);
+	fill_data(sin_f, sin_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_ROPE;
+	node.inputs[0] = inp;
+	node.inputs[1] = cos_f;
+	node.inputs[2] = sin_f;
+	node.n_inputs = 3;
+	node.output = out;
+	node.params[0] = 4;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	uint16_t *o = (uint16_t *)out->data;
+	for (int i = 0; i < 8; i++)
+		ASSERT_NEAR(fp16_to_f32(o[i]), inp_f32[i], 1e-3f);
+}
+
+static void test_rope_bf16_identity(void)
+{
+	/* cos=1.0, sin=0.0 everywhere -> output == input (through BF16) */
+	struct sam3_tensor *inp = make_typed_tensor(SAM3_DTYPE_BF16, 4,
+						    (int[]){1, 2, 1, 4});
+	struct sam3_tensor *cos_f = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *sin_f = make_tensor(2, (int[]){2, 2});
+	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_BF16, 4,
+						    (int[]){1, 2, 1, 4});
+
+	float inp_f32[] = {1, 2, 3, 4, 5, 6, 7, 8};
+	float cos_data[] = {1, 1, 1, 1};
+	float sin_data[] = {0, 0, 0, 0};
+	fill_bf16_from_f32(inp, inp_f32, 8);
+	fill_data(cos_f, cos_data);
+	fill_data(sin_f, sin_data);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op = SAM3_OP_ROPE;
+	node.inputs[0] = inp;
+	node.inputs[1] = cos_f;
+	node.inputs[2] = sin_f;
+	node.n_inputs = 3;
+	node.output = out;
+	node.params[0] = 4;
+
+	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base,
+		  &(struct sam3_graph){.nodes = {node}, .n_nodes = 1}),
+		  SAM3_OK);
+
+	uint16_t *o = (uint16_t *)out->data;
+	for (int i = 0; i < 8; i++)
+		ASSERT_NEAR(bf16_to_f32(o[i]), inp_f32[i], 1e-2f);
+}
+
 /* --- Main --- */
 
 int main(void)
@@ -700,6 +984,21 @@ int main(void)
 	test_rope_identity();
 	test_rope_90deg();
 	test_rope_known_values();
+
+	/* F16 Concat */
+	test_concat_f16_axis0();
+	test_concat_f16_axis1();
+
+	/* F16 Slice */
+	test_slice_f16_axis0();
+	test_slice_f16_axis1();
+
+	/* F16 Upsample */
+	test_upsample_f16_2x();
+
+	/* RoPE F16/BF16 */
+	test_rope_f16_identity();
+	test_rope_bf16_identity();
 
 	teardown();
 

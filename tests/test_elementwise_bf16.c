@@ -209,6 +209,88 @@ static void test_gelu_bf16(void)
 	sam3_threadpool_free(pool);
 }
 
+static void test_sigmoid_bf16(void)
+{
+	float in_f32[8] = {-2.0f, -1.0f, 0.0f, 1.0f,
+			   2.0f, 3.0f, -0.5f, 0.5f};
+	uint16_t in_bf16[8], out_bf16[8];
+	int i;
+
+	for (i = 0; i < 8; i++)
+		in_bf16[i] = f32_to_bf16(in_f32[i]);
+	memset(out_bf16, 0, sizeof(out_bf16));
+
+	/* Compute expected sigmoid in f32 */
+	float expected[8];
+	for (i = 0; i < 8; i++)
+		expected[i] = 1.0f / (1.0f + expf(-in_f32[i]));
+
+	struct sam3_tensor tin, tout;
+	make_bf16_tensor(&tin,  in_bf16,  8);
+	make_bf16_tensor(&tout, out_bf16, 8);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_SIGMOID;
+	node.n_inputs  = 1;
+	node.inputs[0] = &tin;
+	node.output    = &tout;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_sigmoid_bf16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	for (i = 0; i < 8; i++) {
+		float result = bf16_to_f32(out_bf16[i]);
+		ASSERT_NEAR(result, expected[i], 1e-2f);
+	}
+
+	sam3_threadpool_free(pool);
+}
+
+static void test_silu_bf16(void)
+{
+	float in_f32[8] = {-2.0f, -1.0f, 0.0f, 1.0f,
+			   2.0f, 3.0f, -0.5f, 0.5f};
+	uint16_t in_bf16[8], out_bf16[8];
+	int i;
+
+	for (i = 0; i < 8; i++)
+		in_bf16[i] = f32_to_bf16(in_f32[i]);
+	memset(out_bf16, 0, sizeof(out_bf16));
+
+	/* Compute expected SiLU in f32 */
+	float expected[8];
+	for (i = 0; i < 8; i++)
+		expected[i] = in_f32[i] / (1.0f + expf(-in_f32[i]));
+
+	struct sam3_tensor tin, tout;
+	make_bf16_tensor(&tin,  in_bf16,  8);
+	make_bf16_tensor(&tout, out_bf16, 8);
+
+	struct sam3_node node;
+	memset(&node, 0, sizeof(node));
+	node.op        = SAM3_OP_SILU;
+	node.n_inputs  = 1;
+	node.inputs[0] = &tin;
+	node.output    = &tout;
+
+	struct sam3_threadpool *pool = sam3_threadpool_create(1);
+	ASSERT(pool != NULL);
+
+	enum sam3_error err = cpu_kernel_silu_bf16(&node, pool);
+	ASSERT_EQ(err, SAM3_OK);
+
+	for (i = 0; i < 8; i++) {
+		float result = bf16_to_f32(out_bf16[i]);
+		ASSERT_NEAR(result, expected[i], 1e-2f);
+	}
+
+	sam3_threadpool_free(pool);
+}
+
 static void test_softmax_bf16(void)
 {
 	float in_f32[8] = {1.0f, 2.0f, 3.0f, 4.0f, 1.0f, 2.0f, 3.0f, 4.0f};
@@ -379,6 +461,8 @@ int main(void)
 	test_mul_bf16();
 	test_relu_bf16();
 	test_gelu_bf16();
+	test_sigmoid_bf16();
+	test_silu_bf16();
 	test_softmax_bf16();
 	test_layernorm_bf16();
 	test_add_bf16_dtype_reject();

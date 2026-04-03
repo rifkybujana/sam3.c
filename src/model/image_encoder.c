@@ -10,8 +10,8 @@
  *
  * RoPE frequencies are precomputed during init using 2D positional
  * encoding (y for first half of head dimensions, x for second half).
- * Windowed attention is not yet implemented; all layers use global
- * (full) attention over all patches.
+ * A window mask is precomputed for non-global layers: patches in the
+ * same window get 0.0f, patches in different windows get -1e9f.
  *
  * Key types:  sam3_vit
  * Depends on: image_encoder.h, graph_helpers.h
@@ -81,6 +81,45 @@ static enum sam3_error precompute_rope(struct sam3_vit *vit,
 	return SAM3_OK;
 }
 
+/*
+ * precompute_window_mask - Build additive mask for windowed attention.
+ *
+ * Allocates an [n_patches, n_patches] F32 tensor. For each pair (i, j),
+ * computes grid positions and checks if they fall in the same window.
+ * Same-window pairs get 0.0f; different-window pairs get -1e9f.
+ */
+static enum sam3_error precompute_window_mask(struct sam3_vit *vit,
+					      struct sam3_arena *arena)
+{
+	int np = vit->n_patches;
+	int gs = vit->grid_size;
+	int ws = vit->window_size;
+
+	int mask_dims[] = {np, np};
+	vit->window_mask = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+					   2, mask_dims);
+	if (!vit->window_mask)
+		return SAM3_ENOMEM;
+
+	float *data = (float *)vit->window_mask->data;
+
+	for (int i = 0; i < np; i++) {
+		int iy = i / gs;
+		int ix = i % gs;
+		int wy = iy / ws;
+		int wx = ix / ws;
+
+		for (int j = 0; j < np; j++) {
+			int jy = j / gs;
+			int jx = j % gs;
+			int same = (wy == jy / ws) && (wx == jx / ws);
+			data[i * np + j] = same ? 0.0f : -1e9f;
+		}
+	}
+
+	return SAM3_OK;
+}
+
 enum sam3_error sam3_vit_init(struct sam3_vit *vit,
 			       int img_size, int patch_size,
 			       int embed_dim, int depth, int n_heads,
@@ -110,7 +149,11 @@ enum sam3_error sam3_vit_init(struct sam3_vit *vit,
 		}
 	}
 
-	return precompute_rope(vit, arena);
+	enum sam3_error err = precompute_rope(vit, arena);
+	if (err != SAM3_OK)
+		return err;
+
+	return precompute_window_mask(vit, arena);
 }
 
 enum sam3_error sam3_vit_load(struct sam3_vit *vit,
@@ -341,6 +384,8 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 			return NULL;
 
 		/* Self-attention (Q=K=V=x_norm) with RoPE */
+		struct sam3_tensor *mask = vit->layers[i].is_global
+					? NULL : vit->window_mask;
 		struct sam3_tensor *attn;
 		attn = gh_multihead_attention_rope(
 			g, arena,
@@ -352,7 +397,7 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 			vit->n_heads,
 			vit->rope_cos,    /* RoPE cos */
 			vit->rope_sin,    /* RoPE sin */
-			NULL);             /* no causal mask */
+			mask);             /* window mask for non-global */
 		if (!attn)
 			return NULL;
 

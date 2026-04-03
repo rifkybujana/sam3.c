@@ -6,8 +6,8 @@
  * (implemented as conv2d), 32 transformer blocks with multi-head
  * self-attention and GELU MLP, and RoPE for position encoding.
  * Global attention is used at layers 7, 15, 23, 31; the remaining
- * layers also use global attention in this initial implementation
- * (windowed attention is a future optimization).
+ * layers use windowed attention via a precomputed additive mask that
+ * blocks cross-window attention scores.
  *
  * Key types:  sam3_vit
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h, core/weight.h
@@ -46,6 +46,9 @@ struct sam3_vit {
 	/* RoPE precomputed frequencies */
 	struct sam3_tensor *rope_cos; /* [n_patches, head_dim/2] */
 	struct sam3_tensor *rope_sin; /* [n_patches, head_dim/2] */
+
+	/* Windowed attention mask */
+	struct sam3_tensor *window_mask; /* [n_patches, n_patches] */
 
 	/* Per-layer weights */
 	struct {

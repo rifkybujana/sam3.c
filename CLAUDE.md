@@ -83,7 +83,7 @@ important convention — it gives an LLM instant context about any file.
  * Depends on: <direct header dependencies, not transitive>
  * Used by:    <files that directly include or call into this>
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 ```
