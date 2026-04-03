@@ -27,7 +27,7 @@
 
 struct sam3_text_encoder {
 	int d_model;		/* 256 -- output dimension */
-	int width;		/* 1024 -- internal transformer width */
+	int width;		    /* 1024 -- internal transformer width */
 	int n_heads;		/* 16 */
 	int n_layers;		/* 24 */
 	int context_len;	/* 77 */
