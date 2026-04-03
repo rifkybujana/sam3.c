@@ -20,7 +20,7 @@
 #include <string.h>
 
 /* Path to CLIP BPE vocabulary (may not exist in CI) */
-#define BPE_VOCAB_PATH "models/bpe_simple_vocab_16e6.txt"
+#define BPE_VOCAB_PATH "models/bpe_simple_vocab_16e6.txt.gz"
 
 /* --- test_tokenizer_init --- */
 
