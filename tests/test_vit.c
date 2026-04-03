@@ -1,0 +1,305 @@
+/*
+ * tests/test_vit.c - ViT image encoder unit tests
+ *
+ * Tests the ViT backbone with small dimensions to verify
+ * initialization, weight loading, graph construction, output shapes,
+ * and numerical stability. Uses zeroed weights (no weight file) so
+ * the encoder can be tested standalone.
+ *
+ * Key types:  sam3_vit, sam3_graph, sam3_cpu_backend
+ * Depends on: test_helpers.h, model/image_encoder.h,
+ *             backend/cpu/cpu_backend.h
+ * Used by:    CTest
+ *
+ * Copyright (c) 2026
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "test_helpers.h"
+#include "model/image_encoder.h"
+#include "model/graph_helpers.h"
+#include "backend/cpu/cpu_backend.h"
+#include "backend/backend.h"
+#include "core/graph.h"
+#include "core/tensor.h"
+
+#include <string.h>
+#include <math.h>
+
+/* Small ViT config for fast testing */
+#define TEST_IMG_SIZE     28
+#define TEST_PATCH_SIZE   14
+#define TEST_EMBED_DIM    32
+#define TEST_DEPTH        2
+#define TEST_N_HEADS      4
+#define TEST_WINDOW_SIZE  2
+#define TEST_MLP_DIM      64
+#define TEST_GRID_SIZE    (TEST_IMG_SIZE / TEST_PATCH_SIZE)   /* 2 */
+#define TEST_N_PATCHES    (TEST_GRID_SIZE * TEST_GRID_SIZE)   /* 4 */
+
+static struct sam3_cpu_backend g_cpu;
+
+static void setup(void)
+{
+	memset(&g_cpu, 0, sizeof(g_cpu));
+	g_cpu.base.type = SAM3_BACKEND_CPU;
+	g_cpu.base.ops = sam3_cpu_backend_ops();
+	g_cpu.arena_capacity = 128 * 1024 * 1024; /* 128 MiB */
+	g_cpu.base.ops->init(&g_cpu.base);
+}
+
+static void teardown(void)
+{
+	g_cpu.base.ops->free(&g_cpu.base);
+}
+
+/*
+ * test_vit_init - Verify ViT initialization sets all fields correctly.
+ */
+static void test_vit_init(void)
+{
+	struct sam3_vit vit;
+	enum sam3_error err;
+
+	err = sam3_vit_init(&vit, TEST_IMG_SIZE, TEST_PATCH_SIZE,
+			     TEST_EMBED_DIM, TEST_DEPTH, TEST_N_HEADS,
+			     TEST_WINDOW_SIZE, TEST_MLP_DIM,
+			     &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	ASSERT_EQ(vit.img_size, TEST_IMG_SIZE);
+	ASSERT_EQ(vit.patch_size, TEST_PATCH_SIZE);
+	ASSERT_EQ(vit.embed_dim, TEST_EMBED_DIM);
+	ASSERT_EQ(vit.depth, TEST_DEPTH);
+	ASSERT_EQ(vit.n_heads, TEST_N_HEADS);
+	ASSERT_EQ(vit.window_size, TEST_WINDOW_SIZE);
+	ASSERT_EQ(vit.mlp_dim, TEST_MLP_DIM);
+	ASSERT_EQ(vit.grid_size, TEST_GRID_SIZE);
+	ASSERT_EQ(vit.n_patches, TEST_N_PATCHES);
+
+	/* RoPE tables should be allocated */
+	ASSERT(vit.rope_cos != NULL);
+	ASSERT(vit.rope_sin != NULL);
+
+	int head_dim = TEST_EMBED_DIM / TEST_N_HEADS; /* 8 */
+	int half = head_dim / 2;                       /* 4 */
+	ASSERT_EQ(vit.rope_cos->n_dims, 2);
+	ASSERT_EQ(vit.rope_cos->dims[0], TEST_N_PATCHES);
+	ASSERT_EQ(vit.rope_cos->dims[1], half);
+	ASSERT_EQ(vit.rope_sin->n_dims, 2);
+	ASSERT_EQ(vit.rope_sin->dims[0], TEST_N_PATCHES);
+	ASSERT_EQ(vit.rope_sin->dims[1], half);
+
+	/* Verify RoPE values are finite */
+	float *cos_data = (float *)vit.rope_cos->data;
+	float *sin_data = (float *)vit.rope_sin->data;
+	for (int i = 0; i < TEST_N_PATCHES * half; i++) {
+		ASSERT(cos_data[i] == cos_data[i]); /* Not NaN */
+		ASSERT(sin_data[i] == sin_data[i]);
+	}
+
+	/* Check is_global flags: depth=2, so no global blocks */
+	for (int i = 0; i < TEST_DEPTH; i++)
+		ASSERT_EQ(vit.layers[i].is_global, 0);
+}
+
+/*
+ * test_vit_load - Verify weight loading with NULL wf.
+ *
+ * All weights should be allocated as zero-initialized tensors
+ * with correct shapes.
+ */
+static void test_vit_load(void)
+{
+	struct sam3_vit vit;
+	enum sam3_error err;
+
+	err = sam3_vit_init(&vit, TEST_IMG_SIZE, TEST_PATCH_SIZE,
+			     TEST_EMBED_DIM, TEST_DEPTH, TEST_N_HEADS,
+			     TEST_WINDOW_SIZE, TEST_MLP_DIM,
+			     &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	err = sam3_vit_load(&vit, NULL, &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Patch embedding weight */
+	ASSERT(vit.patch_embed_w != NULL);
+	ASSERT_EQ(vit.patch_embed_w->n_dims, 4);
+	ASSERT_EQ(vit.patch_embed_w->dims[0], TEST_EMBED_DIM);
+	ASSERT_EQ(vit.patch_embed_w->dims[1], 3);
+	ASSERT_EQ(vit.patch_embed_w->dims[2], TEST_PATCH_SIZE);
+	ASSERT_EQ(vit.patch_embed_w->dims[3], TEST_PATCH_SIZE);
+
+	/* Patch embedding bias */
+	ASSERT(vit.patch_embed_b != NULL);
+	ASSERT_EQ(vit.patch_embed_b->n_dims, 1);
+	ASSERT_EQ(vit.patch_embed_b->dims[0], TEST_EMBED_DIM);
+
+	/* Per-layer weights */
+	for (int i = 0; i < TEST_DEPTH; i++) {
+		ASSERT(vit.layers[i].ln1_w != NULL);
+		ASSERT(vit.layers[i].ln1_b != NULL);
+		ASSERT_EQ(vit.layers[i].ln1_w->dims[0], TEST_EMBED_DIM);
+
+		ASSERT(vit.layers[i].qkv_w != NULL);
+		ASSERT_EQ(vit.layers[i].qkv_w->dims[0],
+			  3 * TEST_EMBED_DIM);
+		ASSERT_EQ(vit.layers[i].qkv_w->dims[1], TEST_EMBED_DIM);
+
+		ASSERT(vit.layers[i].qkv_b != NULL);
+		ASSERT_EQ(vit.layers[i].qkv_b->dims[0],
+			  3 * TEST_EMBED_DIM);
+
+		ASSERT(vit.layers[i].proj_w != NULL);
+		ASSERT_EQ(vit.layers[i].proj_w->dims[0], TEST_EMBED_DIM);
+		ASSERT_EQ(vit.layers[i].proj_w->dims[1], TEST_EMBED_DIM);
+
+		ASSERT(vit.layers[i].proj_b != NULL);
+		ASSERT_EQ(vit.layers[i].proj_b->dims[0], TEST_EMBED_DIM);
+
+		ASSERT(vit.layers[i].ln2_w != NULL);
+		ASSERT(vit.layers[i].ln2_b != NULL);
+
+		ASSERT(vit.layers[i].mlp_fc1_w != NULL);
+		ASSERT_EQ(vit.layers[i].mlp_fc1_w->dims[0], TEST_MLP_DIM);
+		ASSERT_EQ(vit.layers[i].mlp_fc1_w->dims[1],
+			  TEST_EMBED_DIM);
+
+		ASSERT(vit.layers[i].mlp_fc1_b != NULL);
+		ASSERT_EQ(vit.layers[i].mlp_fc1_b->dims[0], TEST_MLP_DIM);
+
+		ASSERT(vit.layers[i].mlp_fc2_w != NULL);
+		ASSERT_EQ(vit.layers[i].mlp_fc2_w->dims[0],
+			  TEST_EMBED_DIM);
+		ASSERT_EQ(vit.layers[i].mlp_fc2_w->dims[1], TEST_MLP_DIM);
+
+		ASSERT(vit.layers[i].mlp_fc2_b != NULL);
+		ASSERT_EQ(vit.layers[i].mlp_fc2_b->dims[0],
+			  TEST_EMBED_DIM);
+	}
+}
+
+/*
+ * test_vit_build_shapes - Verify output tensor shapes.
+ *
+ * Builds the graph with a dummy image and checks that the output
+ * is [n_patches, embed_dim].
+ */
+static void test_vit_build_shapes(void)
+{
+	struct sam3_vit vit;
+	enum sam3_error err;
+
+	err = sam3_vit_init(&vit, TEST_IMG_SIZE, TEST_PATCH_SIZE,
+			     TEST_EMBED_DIM, TEST_DEPTH, TEST_N_HEADS,
+			     TEST_WINDOW_SIZE, TEST_MLP_DIM,
+			     &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	err = sam3_vit_load(&vit, NULL, &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Create dummy input image [3, img_size, img_size] */
+	int img_dims[] = {3, TEST_IMG_SIZE, TEST_IMG_SIZE};
+	struct sam3_tensor *image;
+	image = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				 3, img_dims);
+	ASSERT(image != NULL);
+
+	/* Build graph */
+	struct sam3_graph graph;
+	sam3_graph_init(&graph);
+
+	struct sam3_tensor *out;
+	out = sam3_vit_build(&vit, &graph, image, &g_cpu.arena);
+	ASSERT(out != NULL);
+
+	/* Output shape: [n_patches, embed_dim] */
+	ASSERT_EQ(out->n_dims, 2);
+	ASSERT_EQ(out->dims[0], TEST_N_PATCHES);
+	ASSERT_EQ(out->dims[1], TEST_EMBED_DIM);
+}
+
+/*
+ * test_vit_eval - Evaluate the graph on CPU.
+ *
+ * Builds and evaluates with zeroed weights (except layernorm gamma=1).
+ * Verifies that the output values are finite (no NaN or Inf).
+ */
+static void test_vit_eval(void)
+{
+	struct sam3_vit vit;
+	enum sam3_error err;
+
+	err = sam3_vit_init(&vit, TEST_IMG_SIZE, TEST_PATCH_SIZE,
+			     TEST_EMBED_DIM, TEST_DEPTH, TEST_N_HEADS,
+			     TEST_WINDOW_SIZE, TEST_MLP_DIM,
+			     &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	err = sam3_vit_load(&vit, NULL, &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/*
+	 * Set layer norm gamma to 1.0 so that layernorm produces
+	 * finite output even with zero input (avoids 0/0 = NaN).
+	 */
+	for (int l = 0; l < TEST_DEPTH; l++) {
+		float *w;
+		w = (float *)vit.layers[l].ln1_w->data;
+		for (int i = 0; i < TEST_EMBED_DIM; i++)
+			w[i] = 1.0f;
+		w = (float *)vit.layers[l].ln2_w->data;
+		for (int i = 0; i < TEST_EMBED_DIM; i++)
+			w[i] = 1.0f;
+	}
+
+	/* Create dummy input image [3, img_size, img_size] */
+	int img_dims[] = {3, TEST_IMG_SIZE, TEST_IMG_SIZE};
+	struct sam3_tensor *image;
+	image = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				 3, img_dims);
+	ASSERT(image != NULL);
+
+	/* Fill with small values to avoid numerical issues */
+	float *img_data = (float *)image->data;
+	int img_elems = 3 * TEST_IMG_SIZE * TEST_IMG_SIZE;
+	for (int i = 0; i < img_elems; i++)
+		img_data[i] = 0.01f * (float)(i % 17);
+
+	/* Build graph */
+	struct sam3_graph graph;
+	sam3_graph_init(&graph);
+
+	struct sam3_tensor *out;
+	out = sam3_vit_build(&vit, &graph, image, &g_cpu.arena);
+	ASSERT(out != NULL);
+
+	/* Evaluate on CPU backend */
+	err = g_cpu.base.ops->graph_eval(&g_cpu.base, &graph);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Verify output is finite */
+	int n_out = TEST_N_PATCHES * TEST_EMBED_DIM;
+	float *od = (float *)out->data;
+	for (int i = 0; i < n_out; i++) {
+		ASSERT(od[i] == od[i]);   /* Not NaN */
+		ASSERT(od[i] < 1e10f);   /* Not huge */
+		ASSERT(od[i] > -1e10f);
+	}
+}
+
+int main(void)
+{
+	setup();
+
+	test_vit_init();
+	test_vit_load();
+	test_vit_build_shapes();
+	test_vit_eval();
+
+	teardown();
+
+	TEST_REPORT();
+}

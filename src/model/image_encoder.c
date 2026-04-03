@@ -1,31 +1,426 @@
 /*
- * src/model/image_encoder.c - Image encoder graph construction
+ * src/model/image_encoder.c - ViT image encoder graph construction
  *
- * Builds the compute graph for the Hiera vision transformer backbone.
- * The encoder produces multi-scale feature maps that are consumed by
- * the prompt encoder and mask decoder.
+ * Implements initialization, weight loading, and compute graph
+ * construction for the Vision Transformer (ViT) backbone used in
+ * SAM3. The encoder takes a normalized RGB image, applies patch
+ * embedding via conv2d, runs through 32 transformer blocks with
+ * multi-head self-attention and GELU MLP, and produces per-patch
+ * feature embeddings.
  *
- * Key types:  sam3_image_encoder
- * Depends on: image_encoder.h
+ * RoPE frequencies are precomputed during init using 2D positional
+ * encoding (y for first half of head dimensions, x for second half).
+ * Windowed attention is not yet implemented; all layers use global
+ * (full) attention over all patches.
+ *
+ * Key types:  sam3_vit
+ * Depends on: image_encoder.h, graph_helpers.h
  * Used by:    sam3.c (top-level API)
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
-#include "image_encoder.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
 
-enum sam3_error sam3_image_encoder_build(struct sam3_image_encoder *enc,
-					struct sam3_graph *g,
-					struct sam3_tensor *input_image,
-					struct sam3_tensor *output_features,
+#include "image_encoder.h"
+#include "graph_helpers.h"
+
+/* Global attention block indices */
+static const int global_blocks[] = {7, 15, 23, 31};
+
+/*
+ * precompute_rope - Precompute 2D RoPE cosine and sine tables.
+ *
+ * Each patch position (y, x) maps to a frequency vector. The first
+ * half of head dimensions encode the y position, the second half
+ * encodes the x position.
+ */
+static enum sam3_error precompute_rope(struct sam3_vit *vit,
 					struct sam3_arena *arena)
 {
-	(void)enc;
-	(void)g;
-	(void)input_image;
-	(void)output_features;
-	(void)arena;
-	/* TODO: patch embedding -> Hiera blocks -> multi-scale output */
+	int head_dim = vit->embed_dim / vit->n_heads; /* 64 */
+	int half = head_dim / 2;                       /* 32 */
+	float theta = 10000.0f;
+
+	int cos_dims[] = {vit->n_patches, half};
+	vit->rope_cos = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+					 2, cos_dims);
+	if (!vit->rope_cos)
+		return SAM3_ENOMEM;
+
+	int sin_dims[] = {vit->n_patches, half};
+	vit->rope_sin = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+					 2, sin_dims);
+	if (!vit->rope_sin)
+		return SAM3_ENOMEM;
+
+	float *cos_data = (float *)vit->rope_cos->data;
+	float *sin_data = (float *)vit->rope_sin->data;
+
+	/* 2D position encoding: treat each patch position as (y, x) */
+	for (int py = 0; py < vit->grid_size; py++) {
+		for (int px = 0; px < vit->grid_size; px++) {
+			int pos = py * vit->grid_size + px;
+			for (int d = 0; d < half; d++) {
+				float freq = 1.0f / powf(theta,
+					2.0f * (float)d / (float)head_dim);
+				float angle;
+				if (d < half / 2)
+					angle = (float)py * freq;
+				else
+					angle = (float)px * freq;
+				cos_data[pos * half + d] = cosf(angle);
+				sin_data[pos * half + d] = sinf(angle);
+			}
+		}
+	}
+
 	return SAM3_OK;
+}
+
+enum sam3_error sam3_vit_init(struct sam3_vit *vit,
+			       int img_size, int patch_size,
+			       int embed_dim, int depth, int n_heads,
+			       int window_size, int mlp_dim,
+			       struct sam3_arena *arena)
+{
+	memset(vit, 0, sizeof(*vit));
+
+	vit->img_size = img_size;
+	vit->patch_size = patch_size;
+	vit->embed_dim = embed_dim;
+	vit->depth = depth;
+	vit->n_heads = n_heads;
+	vit->window_size = window_size;
+	vit->mlp_dim = mlp_dim;
+	vit->grid_size = img_size / patch_size;
+	vit->n_patches = vit->grid_size * vit->grid_size;
+
+	/* Mark global attention blocks */
+	for (int i = 0; i < depth; i++) {
+		vit->layers[i].is_global = 0;
+		for (int j = 0; j < SAM3_VIT_N_GLOBAL_BLOCKS; j++) {
+			if (i == global_blocks[j]) {
+				vit->layers[i].is_global = 1;
+				break;
+			}
+		}
+	}
+
+	return precompute_rope(vit, arena);
+}
+
+/*
+ * load_or_alloc - Load a weight tensor by name, or allocate zeroed.
+ *
+ * @wf:     Open weight file (may be NULL)
+ * @name:   Tensor name to look up
+ * @arena:  Arena for allocation
+ * @dtype:  Data type for the tensor
+ * @n_dims: Number of dimensions
+ * @dims:   Array of dimension sizes
+ *
+ * If wf is non-NULL and the tensor is found, it is loaded from the
+ * weight file. Otherwise a zero-initialized tensor is allocated from
+ * the arena. Returns NULL if the arena is full.
+ */
+static struct sam3_tensor *load_or_alloc(const struct sam3_weight_file *wf,
+					  const char *name,
+					  struct sam3_arena *arena,
+					  enum sam3_dtype dtype,
+					  int n_dims, const int *dims)
+{
+	if (wf) {
+		const struct sam3_weight_tensor_desc *desc;
+		desc = sam3_weight_find(wf, name);
+		if (desc) {
+			struct sam3_tensor *t;
+			t = gh_alloc_tensor(arena, dtype, n_dims, dims);
+			if (t)
+				sam3_weight_to_tensor(wf, desc, t);
+			return t;
+		}
+	}
+	/* Fallback: allocate zeroed tensor */
+	return gh_alloc_tensor(arena, dtype, n_dims, dims);
+}
+
+enum sam3_error sam3_vit_load(struct sam3_vit *vit,
+			       const struct sam3_weight_file *wf,
+			       struct sam3_arena *arena)
+{
+	int e = vit->embed_dim;
+	int e3 = e * 3;
+	int m = vit->mlp_dim;
+	int ps = vit->patch_size;
+	char name[128];
+
+	/* Patch embedding: conv2d weight [embed_dim, 3, ps, ps] */
+	int pe_w_dims[] = {e, 3, ps, ps};
+	vit->patch_embed_w = load_or_alloc(wf, "vit.patch_embed.weight",
+					    arena, SAM3_DTYPE_F32,
+					    4, pe_w_dims);
+	if (!vit->patch_embed_w)
+		return SAM3_ENOMEM;
+
+	/* Patch embedding bias [embed_dim] */
+	int pe_b_dims[] = {e};
+	vit->patch_embed_b = load_or_alloc(wf, "vit.patch_embed.bias",
+					    arena, SAM3_DTYPE_F32,
+					    1, pe_b_dims);
+	if (!vit->patch_embed_b)
+		return SAM3_ENOMEM;
+
+	/* Per-layer weights */
+	int e_dims[] = {e};
+	int qkv_w_dims[] = {e3, e};
+	int qkv_b_dims[] = {e3};
+	int proj_w_dims[] = {e, e};
+	int fc1_w_dims[] = {m, e};
+	int fc1_b_dims[] = {m};
+	int fc2_w_dims[] = {e, m};
+
+	for (int i = 0; i < vit->depth; i++) {
+		/* Layer norm 1 */
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.ln1.weight", i);
+		vit->layers[i].ln1_w = load_or_alloc(wf, name, arena,
+						      SAM3_DTYPE_F32,
+						      1, e_dims);
+		if (!vit->layers[i].ln1_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.ln1.bias", i);
+		vit->layers[i].ln1_b = load_or_alloc(wf, name, arena,
+						      SAM3_DTYPE_F32,
+						      1, e_dims);
+		if (!vit->layers[i].ln1_b)
+			return SAM3_ENOMEM;
+
+		/* Attention QKV */
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.attn.qkv.weight", i);
+		vit->layers[i].qkv_w = load_or_alloc(wf, name, arena,
+						       SAM3_DTYPE_F32,
+						       2, qkv_w_dims);
+		if (!vit->layers[i].qkv_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.attn.qkv.bias", i);
+		vit->layers[i].qkv_b = load_or_alloc(wf, name, arena,
+						       SAM3_DTYPE_F32,
+						       1, qkv_b_dims);
+		if (!vit->layers[i].qkv_b)
+			return SAM3_ENOMEM;
+
+		/* Attention output projection */
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.attn.proj.weight", i);
+		vit->layers[i].proj_w = load_or_alloc(wf, name, arena,
+						       SAM3_DTYPE_F32,
+						       2, proj_w_dims);
+		if (!vit->layers[i].proj_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.attn.proj.bias", i);
+		vit->layers[i].proj_b = load_or_alloc(wf, name, arena,
+						       SAM3_DTYPE_F32,
+						       1, e_dims);
+		if (!vit->layers[i].proj_b)
+			return SAM3_ENOMEM;
+
+		/* Layer norm 2 */
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.ln2.weight", i);
+		vit->layers[i].ln2_w = load_or_alloc(wf, name, arena,
+						      SAM3_DTYPE_F32,
+						      1, e_dims);
+		if (!vit->layers[i].ln2_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.ln2.bias", i);
+		vit->layers[i].ln2_b = load_or_alloc(wf, name, arena,
+						      SAM3_DTYPE_F32,
+						      1, e_dims);
+		if (!vit->layers[i].ln2_b)
+			return SAM3_ENOMEM;
+
+		/* MLP fc1 */
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.mlp.fc1.weight", i);
+		vit->layers[i].mlp_fc1_w = load_or_alloc(
+			wf, name, arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
+		if (!vit->layers[i].mlp_fc1_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.mlp.fc1.bias", i);
+		vit->layers[i].mlp_fc1_b = load_or_alloc(
+			wf, name, arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
+		if (!vit->layers[i].mlp_fc1_b)
+			return SAM3_ENOMEM;
+
+		/* MLP fc2 */
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.mlp.fc2.weight", i);
+		vit->layers[i].mlp_fc2_w = load_or_alloc(
+			wf, name, arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
+		if (!vit->layers[i].mlp_fc2_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 "vit.layer.%d.mlp.fc2.bias", i);
+		vit->layers[i].mlp_fc2_b = load_or_alloc(
+			wf, name, arena, SAM3_DTYPE_F32, 1, e_dims);
+		if (!vit->layers[i].mlp_fc2_b)
+			return SAM3_ENOMEM;
+	}
+
+	return SAM3_OK;
+}
+
+struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
+				    struct sam3_graph *g,
+				    struct sam3_tensor *image,
+				    struct sam3_arena *arena)
+{
+	int gs = vit->grid_size;
+	int e = vit->embed_dim;
+	int np = vit->n_patches;
+
+	/*
+	 * Step 1: Patch embedding via conv2d.
+	 *
+	 * Input image is [3, H, W]. Reshape to [1, 3, H, W] for conv2d.
+	 * Conv2d with stride=patch_size, padding=0 produces
+	 * [1, embed_dim, grid_size, grid_size].
+	 */
+	int img4d_dims[] = {1, 3, vit->img_size, vit->img_size};
+	struct sam3_tensor *image_4d;
+	image_4d = gh_reshape(g, arena, image, 4, img4d_dims);
+	if (!image_4d)
+		return NULL;
+
+	int conv_dims[] = {1, e, gs, gs};
+	struct sam3_tensor *conv_out;
+	conv_out = gh_alloc_tensor(arena, SAM3_DTYPE_F32, 4, conv_dims);
+	if (!conv_out)
+		return NULL;
+
+	struct sam3_tensor *conv_inputs[] = {image_4d, vit->patch_embed_w};
+	conv_out = sam3_graph_add_op(g, SAM3_OP_CONV2D,
+				      conv_inputs, 2, conv_out);
+	if (!conv_out)
+		return NULL;
+
+	/* Set conv2d params: stride and padding */
+	struct sam3_node *conv_node = &g->nodes[g->n_nodes - 1];
+	conv_node->params[0] = vit->patch_size; /* stride */
+	conv_node->params[1] = 0;               /* padding */
+
+	/*
+	 * Reshape to [n_patches, embed_dim].
+	 * conv_out is [1, embed_dim, gs, gs].
+	 * Reshape to [embed_dim, n_patches], transpose to get
+	 * [n_patches, embed_dim], then add bias [embed_dim] which
+	 * broadcasts as [n_patches, embed_dim] + [embed_dim].
+	 */
+	int flat_dims[] = {e, np};
+	struct sam3_tensor *x;
+	x = gh_reshape(g, arena, conv_out, 2, flat_dims);
+	if (!x)
+		return NULL;
+
+	x = gh_transpose(g, arena, x);
+	if (!x)
+		return NULL;
+	/* x is now [n_patches, embed_dim] */
+
+	/* Add patch embedding bias (broadcast: [np, e] + [e]) */
+	x = gh_add(g, arena, x, vit->patch_embed_b);
+	if (!x)
+		return NULL;
+
+	/*
+	 * Step 2: Transformer blocks.
+	 *
+	 * For each layer:
+	 *   a. Pre-norm attention with residual
+	 *   b. Pre-norm MLP with residual
+	 *
+	 * gh_multihead_attention expects q as [batch, seq, d_model].
+	 * Our x is [n_patches, embed_dim] (2D). We reshape to
+	 * [1, n_patches, embed_dim] for attention.
+	 */
+	for (int i = 0; i < vit->depth; i++) {
+		/* Pre-norm for attention */
+		struct sam3_tensor *x_norm;
+		x_norm = gh_layernorm(g, arena, x,
+				       vit->layers[i].ln1_w,
+				       vit->layers[i].ln1_b);
+		if (!x_norm)
+			return NULL;
+
+		/* Reshape to 3D for multihead attention */
+		int attn_dims[] = {1, np, e};
+		struct sam3_tensor *x3d;
+		x3d = gh_reshape(g, arena, x_norm, 3, attn_dims);
+		if (!x3d)
+			return NULL;
+
+		/* Self-attention (Q=K=V=x_norm) */
+		struct sam3_tensor *attn;
+		attn = gh_multihead_attention(
+			g, arena,
+			x3d, x3d, x3d,
+			vit->layers[i].qkv_w,
+			vit->layers[i].qkv_b,
+			vit->layers[i].proj_w,
+			vit->layers[i].proj_b,
+			vit->n_heads);
+		if (!attn)
+			return NULL;
+
+		/*
+		 * attn output is [batch*seq, embed_dim] =
+		 * [n_patches, embed_dim] which matches x's shape.
+		 * Add residual.
+		 */
+		x = gh_add(g, arena, x, attn);
+		if (!x)
+			return NULL;
+
+		/* Pre-norm for MLP */
+		x_norm = gh_layernorm(g, arena, x,
+				       vit->layers[i].ln2_w,
+				       vit->layers[i].ln2_b);
+		if (!x_norm)
+			return NULL;
+
+		/* MLP: fc1 -> GELU -> fc2 */
+		struct sam3_tensor *ff;
+		ff = gh_mlp(g, arena, x_norm,
+			     vit->layers[i].mlp_fc1_w,
+			     vit->layers[i].mlp_fc1_b,
+			     vit->layers[i].mlp_fc2_w,
+			     vit->layers[i].mlp_fc2_b,
+			     SAM3_OP_GELU);
+		if (!ff)
+			return NULL;
+
+		/* Residual connection */
+		x = gh_add(g, arena, x, ff);
+		if (!x)
+			return NULL;
+	}
+
+	/* x is [n_patches, embed_dim] */
+	return x;
 }
