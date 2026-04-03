@@ -321,6 +321,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	/* Build segmentation graph (geom enc + fusion + decoder + seg head) */
 	mask_logits = sam3_image_model_segment(&proc->model, &graph,
 					       proc->backend, prompt_tokens,
+					       NULL,
 					       &proc->scratch_arena);
 	if (!mask_logits)
 		return SAM3_ENOMEM;

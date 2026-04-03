@@ -8,7 +8,7 @@
  * features; the segment phase only builds the graph for later evaluation.
  *
  * Key types:  sam3_image_model
- * Depends on: sam3_image.h
+ * Depends on: sam3_image.h, graph_helpers.h
  * Used by:    sam3.c (top-level context)
  *
  * Copyright (c) 2026
@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "sam3_image.h"
+#include "graph_helpers.h"
 
 enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
 				      struct sam3_arena *arena)
@@ -152,9 +153,11 @@ struct sam3_tensor *sam3_image_model_segment(
 	struct sam3_graph *g,
 	struct sam3_backend *be,
 	struct sam3_tensor *prompt_tokens,
+	struct sam3_tensor *text_features,
 	struct sam3_arena *arena)
 {
-	struct sam3_tensor *geom_out;
+	struct sam3_tensor *geom_out = NULL;
+	struct sam3_tensor *context;
 	struct sam3_tensor *fused;
 	struct sam3_tensor *queries;
 	struct sam3_tensor *box_out = NULL;
@@ -166,42 +169,66 @@ struct sam3_tensor *sam3_image_model_segment(
 	if (!model->image_encoded)
 		return NULL;
 
+	if (!prompt_tokens && !text_features)
+		return NULL;
+
 	/*
 	 * Geometry encoder: cross-attend prompt tokens to cached
 	 * image features. Output is [N+1, d_model].
 	 */
-	geom_out = sam3_geometry_encoder_build(&model->geom_enc, g,
-					       prompt_tokens,
-					       model->cached_image_features,
-					       arena);
-	if (!geom_out)
-		return NULL;
+	if (prompt_tokens) {
+		geom_out = sam3_geometry_encoder_build(
+			&model->geom_enc, g,
+			prompt_tokens,
+			model->cached_image_features,
+			arena);
+		if (!geom_out)
+			return NULL;
+	}
 
 	/*
-	 * Encoder fusion: fuse image features with geometry-encoded
-	 * prompt features via self-attention and cross-attention.
-	 * Output is [n_pixels, d_model].
+	 * Build context for encoder fusion and decoder.
+	 * - Text only: use text_features
+	 * - Geometry only: use geom_out
+	 * - Both: concat(text_features, geom_out) along axis 0
+	 */
+	if (text_features && geom_out) {
+		struct sam3_tensor *parts[2] = {
+			text_features, geom_out
+		};
+		context = gh_concat(g, arena, parts, 2, 0);
+		if (!context)
+			return NULL;
+	} else if (text_features) {
+		context = text_features;
+	} else {
+		context = geom_out;
+	}
+
+	/*
+	 * Encoder fusion: fuse image features with context
+	 * (text and/or geometry) via self-attention and
+	 * cross-attention. Output is [n_pixels, d_model].
 	 */
 	fused = sam3_encoder_fusion_build(&model->encoder, g,
 					  model->cached_image_features,
-					  geom_out, arena);
+					  context, arena);
 	if (!fused)
 		return NULL;
 
 	/*
 	 * Decoder: process fused features with learned queries.
-	 * Cross-attends to encoder output and geometry tokens.
+	 * Cross-attends to encoder output and context tokens.
 	 * Output is query embeddings [n_queries, d_model].
 	 */
 	queries = sam3_decoder_build(&model->decoder, g, fused,
-				     geom_out, &box_out, arena);
+				     context, &box_out, arena);
 	if (!queries)
 		return NULL;
 
 	/*
 	 * Segmentation head: upsamples fused features and computes
 	 * dot product with query embeddings to produce mask logits.
-	 * Grid size comes from the backbone's ViT configuration.
 	 */
 	grid_h = model->backbone.vit.grid_size;
 	grid_w = model->backbone.vit.grid_size;

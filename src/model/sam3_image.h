@@ -117,11 +117,16 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
  * segmentation head subgraphs. Does NOT evaluate the graph --
  * caller must call be->ops->graph_eval() after this returns.
  *
- * @model:         Initialized, loaded, and image-encoded model
- * @g:             Graph to add segmentation nodes to
- * @be:            Backend (unused, reserved for future use)
- * @prompt_tokens: [N, d_model] pre-projected prompt embeddings
- * @arena:         Arena for intermediate tensors
+ * @model:          Initialized, loaded, and image-encoded model
+ * @g:              Graph to add segmentation nodes to
+ * @be:             Backend (unused, reserved for future use)
+ * @prompt_tokens:  [N, d_model] pre-projected prompt embeddings, or NULL
+ * @text_features:  [seq_len, d_model] text encoder output, or NULL
+ * @arena:          Arena for intermediate tensors
+ *
+ * At least one of prompt_tokens or text_features must be non-NULL.
+ * When both are provided, their features are concatenated along the
+ * sequence dimension for encoder fusion and decoder cross-attention.
  *
  * Returns mask logits tensor, or NULL on error.
  */
@@ -130,6 +135,7 @@ struct sam3_tensor *sam3_image_model_segment(
 	struct sam3_graph *g,
 	struct sam3_backend *be,
 	struct sam3_tensor *prompt_tokens,
+	struct sam3_tensor *text_features,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_SAM3_IMAGE_H */
