@@ -353,6 +353,243 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		break;
 	}
 
+	case SAM3_OP_SIGMOID:
+		rc = mlx_sigmoid(&result, inputs[0], stream);
+		break;
+
+	case SAM3_OP_SILU: {
+		/* silu(x) = x * sigmoid(x) */
+		mlx_array sig = mlx_array_new();
+		rc = mlx_sigmoid(&sig, inputs[0], stream);
+		if (!rc)
+			rc = mlx_multiply(&result, inputs[0], sig, stream);
+		mlx_array_free(sig);
+		break;
+	}
+
+	case SAM3_OP_CONCAT: {
+		int axis = node->params[0];
+		mlx_vector_array arr = mlx_vector_array_new_data(
+			inputs, (size_t)node->n_inputs);
+		rc = mlx_concatenate_axis(&result, arr, axis, stream);
+		mlx_vector_array_free(arr);
+		break;
+	}
+
+	case SAM3_OP_SLICE: {
+		/*
+		 * params: [0]=axis, [1]=start, [2]=end
+		 * mlx_slice wants per-dimension start/stop/stride arrays.
+		 */
+		int axis = node->params[0];
+		int s_start = node->params[1];
+		int s_end = node->params[2];
+		int ndim = (int)mlx_array_ndim(inputs[0]);
+
+		int start_arr[SAM3_MAX_DIMS];
+		int stop_arr[SAM3_MAX_DIMS];
+		int stride_arr[SAM3_MAX_DIMS];
+
+		for (int d = 0; d < ndim; d++) {
+			start_arr[d] = 0;
+			stop_arr[d] = mlx_array_dim(inputs[0], d);
+			stride_arr[d] = 1;
+		}
+		start_arr[axis] = s_start;
+		stop_arr[axis] = s_end;
+
+		rc = mlx_slice(&result, inputs[0],
+			       start_arr, (size_t)ndim,
+			       stop_arr, (size_t)ndim,
+			       stride_arr, (size_t)ndim,
+			       stream);
+		break;
+	}
+
+	case SAM3_OP_EMBED:
+		/* Embedding lookup = gather rows: take(table, indices, axis=0) */
+		rc = mlx_take_axis(&result, inputs[0], inputs[1], 0, stream);
+		break;
+
+	case SAM3_OP_UPSAMPLE: {
+		/*
+		 * Nearest-neighbor upsample of [N,C,H,W] by integer scale.
+		 * Strategy: reshape to [N,C,H,1,W,1], broadcast to
+		 * [N,C,H,s,W,s], then reshape to [N,C,H*s,W*s].
+		 */
+		int scale = node->params[0];
+		int ndim = (int)mlx_array_ndim(inputs[0]);
+		if (ndim != 4) {
+			sam3_log_error("metal: upsample requires 4D input");
+			mlx_array_free(result);
+			return SAM3_EINVAL;
+		}
+		int n = mlx_array_dim(inputs[0], 0);
+		int c = mlx_array_dim(inputs[0], 1);
+		int h = mlx_array_dim(inputs[0], 2);
+		int w = mlx_array_dim(inputs[0], 3);
+
+		/* Reshape: [N,C,H,1,W,1] */
+		int shape6[] = {n, c, h, 1, w, 1};
+		mlx_array reshaped = mlx_array_new();
+		rc = mlx_reshape(&reshaped, inputs[0], shape6, 6, stream);
+		if (rc) { mlx_array_free(reshaped); break; }
+
+		/* Broadcast: [N,C,H,s,W,s] */
+		int bcast[] = {n, c, h, scale, w, scale};
+		mlx_array expanded = mlx_array_new();
+		rc = mlx_broadcast_to(&expanded, reshaped, bcast, 6, stream);
+		mlx_array_free(reshaped);
+		if (rc) { mlx_array_free(expanded); break; }
+
+		/* Reshape: [N,C,H*s,W*s] */
+		int shape4[] = {n, c, h * scale, w * scale};
+		rc = mlx_reshape(&result, expanded, shape4, 4, stream);
+		mlx_array_free(expanded);
+		break;
+	}
+
+	case SAM3_OP_ROPE: {
+		/*
+		 * Rotary position embedding from primitives.
+		 * inputs[0] = x [batch, seq, heads, head_dim]
+		 * inputs[1] = cos [seq, head_dim/2]
+		 * inputs[2] = sin [seq, head_dim/2]
+		 * params[0] = head_dim
+		 *
+		 * Interleaved pairs: x[...,2d], x[...,2d+1]
+		 *   out_even = x_even * cos - x_odd * sin
+		 *   out_odd  = x_even * sin + x_odd * cos
+		 *
+		 * Strategy: reshape x to [..., head_dim/2, 2], split,
+		 * apply rotation, interleave back.
+		 */
+		int ndim = (int)mlx_array_ndim(inputs[0]);
+		if (ndim != 4) {
+			sam3_log_error("metal: rope requires 4D input");
+			mlx_array_free(result);
+			return SAM3_EINVAL;
+		}
+
+		int batch = mlx_array_dim(inputs[0], 0);
+		int seq = mlx_array_dim(inputs[0], 1);
+		int heads = mlx_array_dim(inputs[0], 2);
+		int head_dim = mlx_array_dim(inputs[0], 3);
+		int half_dim = head_dim / 2;
+
+		/* Reshape x to [batch, seq, heads, half_dim, 2] */
+		int shape5[] = {batch, seq, heads, half_dim, 2};
+		mlx_array x5 = mlx_array_new();
+		rc = mlx_reshape(&x5, inputs[0], shape5, 5, stream);
+		if (rc) { mlx_array_free(x5); break; }
+
+		/* Slice even: x5[..., 0:1] and odd: x5[..., 1:2] */
+		int s_start_e[] = {0, 0, 0, 0, 0};
+		int s_stop_e[]  = {batch, seq, heads, half_dim, 1};
+		int s_stride[]  = {1, 1, 1, 1, 1};
+		int s_start_o[] = {0, 0, 0, 0, 1};
+		int s_stop_o[]  = {batch, seq, heads, half_dim, 2};
+
+		mlx_array x_even5 = mlx_array_new();
+		rc = mlx_slice(&x_even5, x5,
+			       s_start_e, 5, s_stop_e, 5, s_stride, 5,
+			       stream);
+		if (rc) {
+			mlx_array_free(x5);
+			mlx_array_free(x_even5);
+			break;
+		}
+
+		mlx_array x_odd5 = mlx_array_new();
+		rc = mlx_slice(&x_odd5, x5,
+			       s_start_o, 5, s_stop_o, 5, s_stride, 5,
+			       stream);
+		mlx_array_free(x5);
+		if (rc) {
+			mlx_array_free(x_even5);
+			mlx_array_free(x_odd5);
+			break;
+		}
+
+		/* Squeeze trailing dim: [batch, seq, heads, half_dim] */
+		mlx_array x_even = mlx_array_new();
+		mlx_squeeze_axis(&x_even, x_even5, -1, stream);
+		mlx_array_free(x_even5);
+
+		mlx_array x_odd = mlx_array_new();
+		mlx_squeeze_axis(&x_odd, x_odd5, -1, stream);
+		mlx_array_free(x_odd5);
+
+		/*
+		 * cos/sin are [seq, half_dim].
+		 * Reshape to [1, seq, 1, half_dim] for broadcasting.
+		 */
+		int cs_shape[] = {1, seq, 1, half_dim};
+		mlx_array cos_r = mlx_array_new();
+		mlx_reshape(&cos_r, inputs[1], cs_shape, 4, stream);
+		mlx_array sin_r = mlx_array_new();
+		mlx_reshape(&sin_r, inputs[2], cs_shape, 4, stream);
+
+		/* out_even = x_even * cos - x_odd * sin */
+		mlx_array ec = mlx_array_new();
+		mlx_multiply(&ec, x_even, cos_r, stream);
+		mlx_array os = mlx_array_new();
+		mlx_multiply(&os, x_odd, sin_r, stream);
+		mlx_array r_even = mlx_array_new();
+		mlx_subtract(&r_even, ec, os, stream);
+		mlx_array_free(ec);
+		mlx_array_free(os);
+
+		/* out_odd = x_even * sin + x_odd * cos */
+		mlx_array es = mlx_array_new();
+		mlx_multiply(&es, x_even, sin_r, stream);
+		mlx_array oc = mlx_array_new();
+		mlx_multiply(&oc, x_odd, cos_r, stream);
+		mlx_array r_odd = mlx_array_new();
+		mlx_add(&r_odd, es, oc, stream);
+		mlx_array_free(es);
+		mlx_array_free(oc);
+
+		mlx_array_free(x_even);
+		mlx_array_free(x_odd);
+		mlx_array_free(cos_r);
+		mlx_array_free(sin_r);
+
+		/*
+		 * Stack even/odd along a new last dim, then reshape
+		 * to interleave back into [batch, seq, heads, head_dim].
+		 *
+		 * Expand both to [B,S,H,half,1], stack => [B,S,H,half,2]
+		 */
+		mlx_array re_exp = mlx_array_new();
+		mlx_expand_dims(&re_exp, r_even, -1, stream);
+		mlx_array_free(r_even);
+
+		mlx_array ro_exp = mlx_array_new();
+		mlx_expand_dims(&ro_exp, r_odd, -1, stream);
+		mlx_array_free(r_odd);
+
+		mlx_vector_array pair = mlx_vector_array_new();
+		mlx_vector_array_append_value(pair, re_exp);
+		mlx_vector_array_append_value(pair, ro_exp);
+
+		mlx_array interleaved = mlx_array_new();
+		rc = mlx_concatenate_axis(&interleaved, pair, -1, stream);
+		mlx_vector_array_free(pair);
+		mlx_array_free(re_exp);
+		mlx_array_free(ro_exp);
+		if (rc) {
+			mlx_array_free(interleaved);
+			break;
+		}
+
+		/* Final reshape: [batch, seq, heads, head_dim] */
+		int out_shape[] = {batch, seq, heads, head_dim};
+		rc = mlx_reshape(&result, interleaved, out_shape, 4, stream);
+		mlx_array_free(interleaved);
+		break;
+	}
+
 	default:
 		sam3_log_error("metal: unsupported op %d", node->op);
 		mlx_array_free(result);
