@@ -160,6 +160,41 @@ cleanup:
 
 - **Never silently ignore errors.** Log or propagate.
 
+### Logging
+
+All diagnostic output goes through `src/util/log.h`. Never use raw
+`printf`/`fprintf` for diagnostics — use the logging macros.
+
+**Levels** (defined in `enum sam3_log_level`):
+- `SAM3_LOG_DEBUG` — detailed tracing (suppressed by default)
+- `SAM3_LOG_INFO` — operational milestones (model loaded, patches evaluated)
+- `SAM3_LOG_WARN` — non-fatal issues (cache miss, map full)
+- `SAM3_LOG_ERROR` — failures that affect correctness
+
+**Macros** — use these, not `sam3_log_write()` directly:
+
+```c
+sam3_log_debug("block %d/%d evaluated", i + 1, depth);
+sam3_log_info("patch embedding evaluated (%d patches)", np);
+sam3_log_warn("tensor map full, array not cached");
+sam3_log_error("unsupported dtype %d", t->dtype);
+```
+
+Each macro captures `__FILE__` and `__LINE__` automatically. Output format:
+`[LEVEL] file:line: message` on stderr.
+
+**Configuration:**
+- Default level is `SAM3_LOG_INFO`. Call `sam3_log_set_level(SAM3_LOG_DEBUG)`
+  to enable debug output (CLI tools do this with `-v`).
+- No initialization required — the macros work immediately.
+
+**Rules:**
+- Error paths must log before returning an error code.
+- Use `sam3_log_error` for failures, not `sam3_log_warn`.
+- Keep messages short and include relevant numeric context
+  (sizes, counts, indices).
+- Do not log in tight loops. One message per operation, not per iteration.
+
 ### Backend Abstraction
 
 - Backends implement `struct sam3_backend_ops` (vtable of function pointers).

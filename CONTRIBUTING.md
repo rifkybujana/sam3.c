@@ -45,6 +45,39 @@ These rules are non-negotiable. Every file must follow them exactly.
 * **Cleanup:** Use the `goto cleanup` pattern for functions that acquire multiple resources.
 * **Never silently ignore errors.** Log or propagate them.
 
+### Logging
+
+All diagnostic output uses the macros in `src/util/log.h`. Never use raw
+`printf`/`fprintf` for diagnostics.
+
+**Log levels** (`enum sam3_log_level`):
+
+| Level | Macro | Use for |
+|-------|-------|---------|
+| `SAM3_LOG_DEBUG` | `sam3_log_debug(...)` | Detailed tracing (suppressed by default) |
+| `SAM3_LOG_INFO` | `sam3_log_info(...)` | Operational milestones |
+| `SAM3_LOG_WARN` | `sam3_log_warn(...)` | Non-fatal issues |
+| `SAM3_LOG_ERROR` | `sam3_log_error(...)` | Failures that affect correctness |
+
+**Example:**
+
+```c
+sam3_log_error("unsupported dtype %d", t->dtype);
+sam3_log_info("patch embedding evaluated (%d patches)", np);
+```
+
+Output goes to stderr in the format `[LEVEL] file:line: message`. The macros
+capture `__FILE__` and `__LINE__` automatically.
+
+**Configuration:** Default level is `SAM3_LOG_INFO`. CLI tools accept `-v` to
+enable `SAM3_LOG_DEBUG`. Call `sam3_log_set_level()` to change at runtime.
+
+**Guidelines:**
+* Always log before returning an error code.
+* Use `sam3_log_error` for failures, `sam3_log_warn` for non-fatal issues.
+* Keep messages short with relevant numeric context (sizes, counts, indices).
+* Do not log in tight loops — one message per operation, not per iteration.
+
 ### File Documentation Header
 
 **Every `.c` and `.h` file MUST begin with this header.** 
