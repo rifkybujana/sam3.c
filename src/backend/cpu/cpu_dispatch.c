@@ -261,6 +261,30 @@ wrap_cast(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_cast(node, pool);
 }
 
+static enum sam3_error
+wrap_sigmoid(const struct sam3_node *node, struct sam3_arena *scratch,
+	     struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_sigmoid(node, pool);
+}
+
+static enum sam3_error
+wrap_silu(const struct sam3_node *node, struct sam3_arena *scratch,
+	  struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_silu(node, pool);
+}
+
+static enum sam3_error
+wrap_embed(const struct sam3_node *node, struct sam3_arena *scratch,
+	   struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_embed(node, pool);
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -332,6 +356,15 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 		[SAM3_DTYPE_F16]  = wrap_cast,
 		[SAM3_DTYPE_BF16] = wrap_cast,
 	},
+	[SAM3_OP_SIGMOID] = {
+		[SAM3_DTYPE_F32]  = wrap_sigmoid,
+	},
+	[SAM3_OP_SILU] = {
+		[SAM3_DTYPE_F32]  = wrap_silu,
+	},
+	[SAM3_OP_EMBED] = {
+		[SAM3_DTYPE_F32]  = wrap_embed,
+	},
 };
 
 /* ── Dispatch function ─────────────────────────────────────────────── */
@@ -371,8 +404,9 @@ cpu_dispatch_node(const struct sam3_node *node,
 	/*
 	 * All inputs must share the same dtype, EXCEPT:
 	 * - MATMUL with Q8_0: input[0]=F32 (activations), input[1]=Q8_0 (weights)
-	 * In that case, dispatch on input[1]'s dtype (Q8_0) to reach the
-	 * mixed-dtype kernel.
+	 *   Dispatch on input[1]'s dtype (Q8_0) to reach the mixed kernel.
+	 * - EMBED: input[0]=F32 (table), input[1]=I32 (indices)
+	 *   Dispatch on input[0]'s dtype (F32); kernel validates I32 internally.
 	 */
 	int mixed_q8 = (node->op == SAM3_OP_MATMUL &&
 			node->n_inputs >= 2 &&
@@ -380,9 +414,15 @@ cpu_dispatch_node(const struct sam3_node *node,
 			node->inputs[1]->dtype == SAM3_DTYPE_Q8_0 &&
 			dtype == SAM3_DTYPE_F32);
 
+	int mixed_embed = (node->op == SAM3_OP_EMBED &&
+			   node->n_inputs >= 2 &&
+			   node->inputs[1] &&
+			   node->inputs[1]->dtype == SAM3_DTYPE_I32 &&
+			   dtype == SAM3_DTYPE_F32);
+
 	if (mixed_q8) {
 		dtype = SAM3_DTYPE_Q8_0;
-	} else {
+	} else if (!mixed_embed) {
 		for (int i = 1; i < node->n_inputs; i++) {
 			if (!node->inputs[i])
 				continue;

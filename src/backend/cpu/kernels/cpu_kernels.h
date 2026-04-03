@@ -122,4 +122,16 @@ enum sam3_error cpu_kernel_cast(const struct sam3_node *node,
 enum sam3_error cpu_kernel_matmul_q8(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
+/* Element-wise sigmoid: 1/(1+exp(-x)) */
+enum sam3_error cpu_kernel_sigmoid(const struct sam3_node *node,
+				   struct sam3_threadpool *pool);
+
+/* Element-wise SiLU (Swish): x * sigmoid(x) */
+enum sam3_error cpu_kernel_silu(const struct sam3_node *node,
+				struct sam3_threadpool *pool);
+
+/* Embedding table lookup: table[indices[i], :] -> output[i, :] */
+enum sam3_error cpu_kernel_embed(const struct sam3_node *node,
+				 struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */
