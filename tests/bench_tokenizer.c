@@ -91,9 +91,99 @@ static void bench_encode(const struct sam3_tokenizer *tok,
 	(void)mode_label;
 }
 
+/* ── Corpus loader ─────────────────────────────────────────────────── */
+
+/*
+ * load_corpus - Read a text file into a single buffer and index lines.
+ *
+ * @path:      Path to UTF-8 text file, one line per entry.
+ * @out_buf:   Receives malloc'd buffer holding the whole file.
+ * @out_lines: Receives malloc'd array of char* pointing into the buffer.
+ *             Each pointer is a null-terminated C string (newlines
+ *             replaced with \0 in place).
+ * @out_count: Receives number of lines.
+ * @out_size:  Receives total file size in bytes.
+ *
+ * Returns 0 on success, -1 on failure (prints error to stderr).
+ * Caller frees *out_buf and *out_lines on success.
+ */
+static int load_corpus(const char *path, char **out_buf, char ***out_lines,
+		       int *out_count, long *out_size)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		fprintf(stderr, "error: cannot open corpus '%s'\n", path);
+		fprintf(stderr,
+			"hint: run 'python3 tests/data/gen_bench_corpus.py'\n");
+		return -1;
+	}
+
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (sz <= 0) {
+		fprintf(stderr, "error: corpus '%s' is empty\n", path);
+		fclose(f);
+		return -1;
+	}
+
+	char *buf = malloc((size_t)sz + 1);
+	if (!buf) {
+		fprintf(stderr, "error: out of memory loading corpus\n");
+		fclose(f);
+		return -1;
+	}
+	if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+		fprintf(stderr, "error: short read on corpus '%s'\n", path);
+		free(buf);
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	buf[sz] = '\0';
+
+	/* Count lines and replace \n with \0 in place. */
+	int n = 0;
+	for (long i = 0; i < sz; i++) {
+		if (buf[i] == '\n') {
+			buf[i] = '\0';
+			n++;
+		}
+	}
+	/* Handle missing trailing newline. */
+	if (sz > 0 && buf[sz - 1] != '\0')
+		n++;
+
+	char **lines = malloc((size_t)n * sizeof(char *));
+	if (!lines) {
+		fprintf(stderr, "error: out of memory indexing corpus\n");
+		free(buf);
+		return -1;
+	}
+
+	int idx = 0;
+	const char *p = buf;
+	const char *end = buf + sz;
+	while (p < end && idx < n) {
+		/* Skip empty lines produced by consecutive newlines. */
+		if (*p == '\0') {
+			p++;
+			continue;
+		}
+		lines[idx++] = (char *)p;
+		p += strlen(p) + 1;
+	}
+
+	*out_buf = buf;
+	*out_lines = lines;
+	*out_count = idx;
+	*out_size = sz;
+	return 0;
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
-int main(void)
+int main(int argc, char **argv)
 {
 	printf("SAM3 Tokenizer Benchmark\n");
 	printf("========================\n");
@@ -157,6 +247,93 @@ int main(void)
 			     test_inputs[i].text, "bpe");
 
 	sam3_tokenizer_free(&tok);
+
+	/* ── Corpus throughput ────────────────────────────────────── */
+	const char *corpus_path = (argc > 1)
+		? argv[1]
+		: "tests/data/bench_corpus.txt";
+
+	char *corpus_buf = NULL;
+	char **corpus_lines = NULL;
+	int n_lines = 0;
+	long corpus_size = 0;
+
+	printf("\n");
+	if (load_corpus(corpus_path, &corpus_buf, &corpus_lines,
+			&n_lines, &corpus_size) != 0) {
+		printf("Done.\n");
+		return 1;
+	}
+
+	printf("Corpus: %s (%d lines, %ld KB)\n\n",
+	       corpus_path, n_lines, corpus_size / 1024);
+	printf("  %-12s | %10s | %12s | %12s | %8s\n",
+	       "Mode", "Total", "Lines/sec", "Tokens/sec", "MB/s");
+	printf("  %-12s-+-%10s-+-%12s-+-%12s-+-%8s\n",
+	       "------------", "----------", "------------",
+	       "------------", "--------");
+
+	#define PASSES 3
+	for (int mode = 0; mode < 2; mode++) {
+		struct sam3_tokenizer ctok;
+		if (sam3_tokenizer_init(&ctok) != SAM3_OK) {
+			fprintf(stderr, "failed to init tokenizer\n");
+			free(corpus_buf);
+			free(corpus_lines);
+			return 1;
+		}
+		const char *mode_label = "byte-level";
+		if (mode == 1) {
+			if (sam3_tokenizer_load_bpe(&ctok, BPE_VOCAB_PATH)
+			    != SAM3_OK) {
+				sam3_tokenizer_free(&ctok);
+				continue;
+			}
+			mode_label = "BPE";
+		}
+
+		int32_t ctokens[SAM3_TOKENIZER_CONTEXT_LEN];
+		long total_tokens = 0;
+
+		/* Warmup pass. */
+		for (int i = 0; i < n_lines; i++) {
+			sam3_tokenizer_encode(&ctok, corpus_lines[i],
+					      ctokens,
+					      SAM3_TOKENIZER_CONTEXT_LEN);
+		}
+
+		/* Timed passes; report best. */
+		double best_ms = 1e30;
+		for (int p = 0; p < PASSES; p++) {
+			total_tokens = 0;
+			double t0 = get_time_ms();
+			for (int i = 0; i < n_lines; i++) {
+				total_tokens += sam3_tokenizer_encode(
+					&ctok, corpus_lines[i], ctokens,
+					SAM3_TOKENIZER_CONTEXT_LEN);
+			}
+			double t1 = get_time_ms();
+			double ms = t1 - t0;
+			if (ms < best_ms)
+				best_ms = ms;
+		}
+
+		double secs = best_ms / 1000.0;
+		double lines_per_sec = (double)n_lines / secs;
+		double tokens_per_sec = (double)total_tokens / secs;
+		double mb_per_sec = (double)corpus_size
+				  / (secs * 1024.0 * 1024.0);
+
+		printf("  %-12s | %7.1f ms | %10.0f/s | %10.0f/s | %6.2f MB/s\n",
+		       mode_label, best_ms, lines_per_sec,
+		       tokens_per_sec, mb_per_sec);
+
+		sam3_tokenizer_free(&ctok);
+	}
+	#undef PASSES
+
+	free(corpus_lines);
+	free(corpus_buf);
 
 	printf("\nDone.\n");
 	return 0;
