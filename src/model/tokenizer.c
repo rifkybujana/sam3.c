@@ -268,38 +268,68 @@ static void hash_table_free(struct tok_hash_table *ht)
 	free(ht);
 }
 
-/* Build "str_a\x01str_b" key for merge-pair lookup. Caller frees. */
-static char *make_pair_key(const char *a, const char *b)
+/* ---- Int-pair keyed rank map (open-addressing) ---- */
+
+struct pair_rank_map {
+	uint64_t *keys;		/* UINT64_MAX = empty slot */
+	int32_t  *vals;		/* merge rank */
+	int       capacity;	/* power of 2 */
+};
+
+static struct pair_rank_map *pair_map_create(int n_entries)
 {
-	size_t la = strlen(a);
-	size_t lb = strlen(b);
-	char *key = malloc(la + 1 + lb + 1);
-	if (!key)
+	int cap = 16;
+	while (cap < n_entries * 2)
+		cap <<= 1;
+	struct pair_rank_map *m = calloc(1, sizeof(*m));
+	if (!m)
 		return NULL;
-	memcpy(key, a, la);
-	key[la] = '\x01';
-	memcpy(key + la + 1, b, lb);
-	key[la + 1 + lb] = '\0';
-	return key;
+	m->keys = malloc((size_t)cap * sizeof(uint64_t));
+	m->vals = malloc((size_t)cap * sizeof(int32_t));
+	if (!m->keys || !m->vals) {
+		free(m->keys);
+		free(m->vals);
+		free(m);
+		return NULL;
+	}
+	for (int i = 0; i < cap; i++)
+		m->keys[i] = UINT64_MAX;
+	m->capacity = cap;
+	return m;
 }
 
-/*
- * lookup_pair_rank - Look up merge rank for a symbol pair using a stack buffer.
- *
- * Returns the merge rank (>= 0) or -1 if the pair has no merge rule.
- */
-static int lookup_pair_rank(const struct tok_hash_table *ranks,
-			    const char symbols[][64], const int *sym_len,
-			    int pos, char *pair_buf)
+static void pair_map_insert(struct pair_rank_map *m, uint64_t key, int32_t val)
 {
-	int la = sym_len[pos];
-	int lb = sym_len[pos + 1];
-	memcpy(pair_buf, symbols[pos], (size_t)la);
-	pair_buf[la] = '\x01';
-	memcpy(pair_buf + la + 1, symbols[pos + 1], (size_t)lb);
-	pair_buf[la + 1 + lb] = '\0';
-	int *rank = hash_table_lookup(ranks, pair_buf);
-	return rank ? *rank : -1;
+	uint64_t h = key * 0x9E3779B97F4A7C15ull;
+	uint32_t idx = (uint32_t)(h >> 32) & (uint32_t)(m->capacity - 1);
+	while (m->keys[idx] != UINT64_MAX)
+		idx = (idx + 1) & (uint32_t)(m->capacity - 1);
+	m->keys[idx] = key;
+	m->vals[idx] = val;
+}
+
+static inline int pair_map_lookup(const struct pair_rank_map *m, uint64_t key)
+{
+	uint64_t h = key * 0x9E3779B97F4A7C15ull;
+	uint32_t mask = (uint32_t)(m->capacity - 1);
+	uint32_t idx = (uint32_t)(h >> 32) & mask;
+	for (;;) {
+		uint64_t k = m->keys[idx];
+		if (k == key)
+			return m->vals[idx];
+		if (k == UINT64_MAX)
+			return -1;
+		idx = (idx + 1) & mask;
+	}
+}
+
+static void pair_map_free(struct pair_rank_map *m)
+{
+	if (!m)
+		return;
+	free(m->keys);
+	free(m->vals);
+	free(m);
 }
 
 /* Pre-computed EOT fill for fast memcpy-based padding */
@@ -398,11 +428,13 @@ static int pretokenize_next(const char **cursor, const char **start, int *len)
 /*
  * bpe_encode_word - BPE-encode one pre-tokenized word.
  *
- * Converts word bytes to bytes_to_unicode strings, appends </w> to the
- * last symbol, then iteratively merges the lowest-rank bigram until no
- * more merges are possible. Final symbols are looked up in encoder_map.
+ * Tracks integer vocab IDs throughout. Each input byte maps to a base
+ * vocab ID via byte_to_vocab; the last symbol gets +256 for the </w>
+ * variant. Pairs are looked up in pair_rank_map (int-pair keyed). Each
+ * merge of rank r produces vocab ID 512+r directly, with no string
+ * construction or encoder-map lookup.
  *
- * Returns number of token IDs written to out_ids, or -1 on error.
+ * Returns number of token IDs written to out_ids.
  */
 #define BPE_MAX_SYMBOLS 128
 
@@ -410,48 +442,36 @@ static int bpe_encode_word(const struct sam3_tokenizer *tok,
 			   const char *word, int word_len,
 			   int32_t *out_ids, int max_ids)
 {
-	const struct tok_hash_table *enc =
-		(const struct tok_hash_table *)tok->encoder_map;
-	const struct tok_hash_table *ranks =
-		(const struct tok_hash_table *)tok->merge_rank_map;
+	const struct pair_rank_map *prm =
+		(const struct pair_rank_map *)tok->pair_rank_map;
+	const uint8_t *b2v = tok->byte_to_vocab;
 
-	/* Convert each byte to its bytes_to_unicode UTF-8 string */
-	char symbols[BPE_MAX_SYMBOLS][64];
-	int sym_len[BPE_MAX_SYMBOLS];
+	/* Initial symbols: each byte maps to a base vocab ID in [0..255] */
+	int32_t sym[BPE_MAX_SYMBOLS];
 	int n_sym = 0;
 
-	for (int i = 0; i < word_len && n_sym < BPE_MAX_SYMBOLS - 1; i++) {
-		int nb = byte_to_utf8((unsigned char)word[i], symbols[n_sym]);
-		symbols[n_sym][nb] = '\0';
-		sym_len[n_sym] = nb;
-		n_sym++;
-	}
+	for (int i = 0; i < word_len && n_sym < BPE_MAX_SYMBOLS - 1; i++)
+		sym[n_sym++] = (int32_t)b2v[(unsigned char)word[i]];
 
 	if (n_sym == 0)
 		return 0;
 
-	/* Append </w> to the last symbol */
-	int last = n_sym - 1;
-	if (sym_len[last] + 4 < (int)sizeof(symbols[0])) {
-		memcpy(symbols[last] + sym_len[last], "</w>", 5);
-		sym_len[last] += 4;
-	}
+	/* </w> suffix on last symbol: base+256 is the </w> variant */
+	sym[n_sym - 1] += 256;
 
-	/* Stack buffer for pair key lookups (avoids malloc per pair) */
-	char pair_buf[132]; /* 64 + 1 + 64 + 1 + padding */
-
-	/* Cache pair ranks — avoids re-hashing unchanged pairs each iteration */
+	/* Cache pair ranks — avoids re-looking unchanged pairs each iter */
 	int pair_rank[BPE_MAX_SYMBOLS];
-	for (int i = 0; i < n_sym - 1; i++)
-		pair_rank[i] = lookup_pair_rank(ranks, symbols, sym_len,
-						i, pair_buf);
+	for (int i = 0; i < n_sym - 1; i++) {
+		uint64_t k = ((uint64_t)(uint32_t)sym[i] << 32) |
+			     (uint32_t)sym[i + 1];
+		pair_rank[i] = pair_map_lookup(prm, k);
+	}
 
 	/* Iterative BPE merging */
 	while (n_sym > 1) {
 		int best_rank = -1;
 		int best_pos = -1;
 
-		/* Find lowest-rank bigram from cached ranks */
 		for (int i = 0; i < n_sym - 1; i++) {
 			if (pair_rank[i] >= 0 &&
 			    (best_rank < 0 || pair_rank[i] < best_rank)) {
@@ -463,44 +483,31 @@ static int bpe_encode_word(const struct sam3_tokenizer *tok,
 		if (best_pos < 0)
 			break;
 
-		/* Merge symbols[best_pos] and symbols[best_pos + 1] */
-		int len_a = sym_len[best_pos];
-		int len_b = sym_len[best_pos + 1];
-		if (len_a + len_b >= (int)sizeof(symbols[0]))
-			break;
-		memcpy(symbols[best_pos] + len_a,
-		       symbols[best_pos + 1], (size_t)len_b + 1);
-		sym_len[best_pos] = len_a + len_b;
+		/* Merged symbol is at vocab[512 + best_rank] */
+		sym[best_pos] = 512 + best_rank;
 
-		/* Shift remaining symbols and cached ranks left */
+		/* Shift symbols and pair_rank left */
 		for (int i = best_pos + 1; i < n_sym - 1; i++) {
-			memcpy(symbols[i], symbols[i + 1],
-			       (size_t)sym_len[i + 1] + 1);
-			sym_len[i] = sym_len[i + 1];
+			sym[i] = sym[i + 1];
 			pair_rank[i] = pair_rank[i + 1];
 		}
 		n_sym--;
 
 		/* Re-lookup only the 2 pairs affected by the merge */
-		if (best_pos > 0)
-			pair_rank[best_pos - 1] = lookup_pair_rank(
-				ranks, symbols, sym_len,
-				best_pos - 1, pair_buf);
-		if (best_pos < n_sym - 1)
-			pair_rank[best_pos] = lookup_pair_rank(
-				ranks, symbols, sym_len,
-				best_pos, pair_buf);
-	}
-
-	/* Look up each final symbol in the encoder */
-	int n_out = 0;
-	for (int i = 0; i < n_sym && n_out < max_ids; i++) {
-		int *id = hash_table_lookup(enc, symbols[i]);
-		if (id) {
-			out_ids[n_out++] = (int32_t)*id;
+		if (best_pos > 0) {
+			uint64_t k = ((uint64_t)(uint32_t)sym[best_pos - 1] << 32) |
+				     (uint32_t)sym[best_pos];
+			pair_rank[best_pos - 1] = pair_map_lookup(prm, k);
+		}
+		if (best_pos < n_sym - 1) {
+			uint64_t k = ((uint64_t)(uint32_t)sym[best_pos] << 32) |
+				     (uint32_t)sym[best_pos + 1];
+			pair_rank[best_pos] = pair_map_lookup(prm, k);
 		}
 	}
 
+	int n_out = (n_sym < max_ids) ? n_sym : max_ids;
+	memcpy(out_ids, sym, (size_t)n_out * sizeof(int32_t));
 	return n_out;
 }
 
@@ -557,6 +564,37 @@ static int neon_lower_widen(const unsigned char *src, int32_t *dst, int limit)
 
 	return i;
 }
+
+/*
+ * neon_lower_copy - NEON-accelerated lowercase copy, NUL-aware.
+ *
+ * Reads 16 bytes at a time from @src, lowercases A-Z, stores to @dst.
+ * Stops when NUL is seen in a chunk or @limit bytes are processed.
+ * Same no_sanitize caveat as neon_lower_widen.
+ *
+ * Returns number of bytes processed (multiple of 16, or less if NUL hit).
+ */
+__attribute__((no_sanitize("address")))
+static int neon_lower_copy(const unsigned char *src, char *dst, int limit)
+{
+	const uint8x16_t v_A = vdupq_n_u8('A');
+	const uint8x16_t v_Z = vdupq_n_u8('Z');
+	const uint8x16_t v_bit5 = vdupq_n_u8(0x20);
+	const uint8x16_t v_zero = vdupq_n_u8(0);
+	int i = 0;
+
+	while (i + 16 <= limit) {
+		uint8x16_t chunk = vld1q_u8(src + i);
+		if (vmaxvq_u8(vceqq_u8(chunk, v_zero)))
+			break;
+		uint8x16_t is_upper = vandq_u8(vcgeq_u8(chunk, v_A),
+						vcleq_u8(chunk, v_Z));
+		chunk = vorrq_u8(chunk, vandq_u8(is_upper, v_bit5));
+		vst1q_u8((unsigned char *)(dst + i), chunk);
+		i += 16;
+	}
+	return i;
+}
 #endif
 
 /* ---- Public API ---- */
@@ -594,7 +632,7 @@ enum sam3_error sam3_tokenizer_init(struct sam3_tokenizer *tok)
 	tok->merge_second = NULL;
 	tok->bpe_loaded = 0;
 	tok->encoder_map = NULL;
-	tok->merge_rank_map = NULL;
+	tok->pair_rank_map = NULL;
 	tok->bpe_cache = NULL;
 
 	build_bytes_to_unicode(tok->byte_unicode);
@@ -610,7 +648,6 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 	char **merge_b = NULL;
 	char **new_vocab = NULL;
 	struct tok_hash_table *enc = NULL;
-	struct tok_hash_table *ranks = NULL;
 	char line[512];
 	int n_merges = 0;
 	enum sam3_error err;
@@ -683,6 +720,11 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 	int clip_order[256];
 	build_clip_byte_order(clip_order);
 
+	/* Inverse: byte -> vocab index (used in bpe_encode_word) */
+	uint8_t byte_to_vocab[256];
+	for (int i = 0; i < 256; i++)
+		byte_to_vocab[clip_order[i]] = (uint8_t)i;
+
 	for (int i = 0; i < 256; i++) {
 		char buf[4];
 		int nb = byte_to_utf8((unsigned char)clip_order[i], buf);
@@ -745,28 +787,27 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 		}
 	}
 
-	/* Build merge-rank hash table: "tokA\x01tokB" -> rank */
-	ranks = hash_table_create(n_merges);
-	if (!ranks) {
+	/*
+	 * Build int-pair keyed rank map: (first_id << 32 | second_id) -> rank.
+	 * Each merge's parts (merge_a[i], merge_b[i]) are existing vocab
+	 * strings; look them up in encoder_map to get their token IDs.
+	 */
+	struct pair_rank_map *pm = pair_map_create(n_merges);
+	if (!pm) {
 		err = SAM3_ENOMEM;
 		goto cleanup;
 	}
 	for (int i = 0; i < n_merges; i++) {
-		char *pk = make_pair_key(merge_a[i], merge_b[i]);
-		if (!pk) {
-			err = SAM3_ENOMEM;
+		int *ida = hash_table_lookup(enc, merge_a[i]);
+		int *idb = hash_table_lookup(enc, merge_b[i]);
+		if (!ida || !idb) {
+			pair_map_free(pm);
+			err = SAM3_EINVAL;
 			goto cleanup;
 		}
-		if (hash_table_insert(ranks, pk, i, 0) < 0) {
-			free(pk);
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-	}
-	/* Mark all inserted pair keys as table-owned for cleanup */
-	for (int i = 0; i < ranks->capacity; i++) {
-		if (ranks->entries[i].key)
-			ranks->entries[i].key_owned = 1;
+		uint64_t k = ((uint64_t)(uint32_t)*ida << 32) |
+			     (uint32_t)*idb;
+		pair_map_insert(pm, k, i);
 	}
 
 	/* Commit: free old state and install new */
@@ -778,7 +819,7 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 	free(tok->merge_first);
 	free(tok->merge_second);
 	hash_table_free(tok->encoder_map);
-	hash_table_free(tok->merge_rank_map);
+	pair_map_free(tok->pair_rank_map);
 
 	tok->vocab = new_vocab;
 	tok->vocab_size = CLIP_VOCAB_SIZE;
@@ -786,7 +827,8 @@ enum sam3_error sam3_tokenizer_load_bpe(struct sam3_tokenizer *tok,
 	tok->merge_first = NULL;
 	tok->merge_second = NULL;
 	tok->encoder_map = enc;
-	tok->merge_rank_map = ranks;
+	tok->pair_rank_map = pm;
+	memcpy(tok->byte_to_vocab, byte_to_vocab, sizeof(byte_to_vocab));
 	tok->bpe_loaded = 1;
 	tok->sot_token = CLIP_SOT_TOKEN;
 	tok->eot_token = CLIP_EOT_TOKEN;
@@ -815,7 +857,6 @@ cleanup:
 		free(new_vocab);
 	}
 	hash_table_free(enc);
-	hash_table_free(ranks);
 	if (merge_a) {
 		for (int i = 0; i < n_merges; i++)
 			free(merge_a[i]);
@@ -845,10 +886,18 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 		/* CLIP BPE mode */
 		char lower[1024];
 		int tlen = 0;
+		const int lim = (int)sizeof(lower) - 1;
 
-		/* Lowercase into stack buffer */
-		for (const char *p = text; *p && tlen < (int)sizeof(lower) - 1; p++)
-			lower[tlen++] = (char)tolower((unsigned char)*p);
+#ifdef __aarch64__
+		/* NEON lowercase in 16-byte chunks, then scalar tail */
+		tlen = neon_lower_copy((const unsigned char *)text, lower, lim);
+#endif
+		/* Scalar tail / non-NEON path */
+		while (tlen < lim && text[tlen]) {
+			unsigned char c = (unsigned char)text[tlen];
+			c |= (unsigned char)(((unsigned)(c - 'A') < 26u) << 5);
+			lower[tlen++] = (char)c;
+		}
 		lower[tlen] = '\0';
 
 		/* Pre-tokenize and BPE-encode each word */
@@ -869,6 +918,7 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 			struct sam3_bpe_cache_entry *cache =
 				((struct sam3_tokenizer *)tok)->bpe_cache;
 			int cached = 0;
+			int slot = -1;
 
 			if (cache && wlen < SAM3_BPE_CACHE_MAX_KEY) {
 				uint32_t h = 2166136261u;
@@ -876,7 +926,7 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 					h ^= (unsigned char)wstart[ci];
 					h *= 16777619u;
 				}
-				int slot = (int)(h & (SAM3_BPE_CACHE_SIZE - 1));
+				slot = (int)(h & (SAM3_BPE_CACHE_SIZE - 1));
 				struct sam3_bpe_cache_entry *ce =
 					&cache[slot];
 				if (ce->key_len == wlen &&
@@ -893,16 +943,9 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 				n = bpe_encode_word(tok, wstart, wlen,
 						    word_ids, 128);
 
-				/* Insert into cache */
-				if (cache &&
-				    wlen < SAM3_BPE_CACHE_MAX_KEY &&
+				/* Insert into cache — reuse slot from lookup */
+				if (slot >= 0 &&
 				    n <= SAM3_BPE_CACHE_MAX_IDS) {
-					uint32_t h = 2166136261u;
-					for (int ci = 0; ci < wlen; ci++) {
-						h ^= (unsigned char)wstart[ci];
-						h *= 16777619u;
-					}
-					int slot = (int)(h & (SAM3_BPE_CACHE_SIZE - 1));
 					struct sam3_bpe_cache_entry *ce =
 						&cache[slot];
 					memcpy(ce->key, wstart, (size_t)wlen);
@@ -990,8 +1033,8 @@ void sam3_tokenizer_free(struct sam3_tokenizer *tok)
 	hash_table_free(tok->encoder_map);
 	tok->encoder_map = NULL;
 
-	hash_table_free(tok->merge_rank_map);
-	tok->merge_rank_map = NULL;
+	pair_map_free(tok->pair_rank_map);
+	tok->pair_rank_map = NULL;
 
 	free(tok->bpe_cache);
 	tok->bpe_cache = NULL;

@@ -39,7 +39,7 @@ static void test_tokenizer_init(void)
 	ASSERT(tok.merge_second == NULL);
 	ASSERT_EQ(tok.bpe_loaded, 0);
 	ASSERT(tok.encoder_map == NULL);
-	ASSERT(tok.merge_rank_map == NULL);
+	ASSERT(tok.pair_rank_map == NULL);
 
 	/* Verify byte tokens are initialized */
 	ASSERT(tok.vocab[0] != NULL);
