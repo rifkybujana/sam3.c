@@ -19,6 +19,7 @@
 
 #include "vl_combiner.h"
 #include "graph_helpers.h"
+#include "util/log.h"
 
 enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 				      struct sam3_arena *arena)
@@ -57,7 +58,7 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	vl->text_enc.width = 1024;
 	vl->text_enc.n_heads = 16;
 	vl->text_enc.n_layers = 24;
-	vl->text_enc.context_len = 77;
+	vl->text_enc.context_len = 32;
 	vl->text_enc.vocab_size = 49408;
 
 	/* Precompute 2D sinusoidal position encoding for ViT grid */
@@ -101,23 +102,46 @@ void sam3_vl_backbone_free(struct sam3_vl_backbone *vl)
 struct sam3_tensor *sam3_vl_backbone_build_vision(
 	struct sam3_vl_backbone *vl,
 	struct sam3_graph *g,
+	struct sam3_backend *be,
 	struct sam3_tensor *image,
 	struct sam3_tensor *out_features[],
-	struct sam3_arena *arena)
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist)
 {
-	/* Run ViT: image -> patch features [n_patches, embed_dim] */
+	/*
+	 * Run ViT per-block: evaluates internally, returns
+	 * materialized output in persist arena.
+	 */
 	struct sam3_tensor *vit_out;
 
-	vit_out = sam3_vit_build(&vl->vit, g, image, arena);
-	if (!vit_out)
+	vit_out = sam3_vit_build(&vl->vit, be, image, scratch, persist);
+	if (!vit_out) {
+		sam3_log_error("vl_backbone: vit_build returned NULL");
 		return NULL;
+	}
 
-	/* Run neck: patch features -> multi-scale feature maps */
+	sam3_log_debug("vl_backbone: vit done, scratch %zu/%zu, persist %zu/%zu",
+		       scratch->offset, scratch->size,
+		       persist->offset, persist->size);
+
+	/*
+	 * Reset scratch and build neck graph. The caller will
+	 * evaluate this graph after we return.
+	 */
+	sam3_arena_reset(scratch);
+	sam3_graph_init(g);
+
 	enum sam3_error err;
 
-	err = sam3_neck_build(&vl->neck, g, vit_out, out_features, arena);
-	if (err != SAM3_OK)
+	err = sam3_neck_build(&vl->neck, g, vit_out, out_features, scratch);
+	if (err != SAM3_OK) {
+		sam3_log_error("vl_backbone: neck_build failed, scratch %zu/%zu",
+			       scratch->offset, scratch->size);
 		return NULL;
+	}
+
+	sam3_log_debug("vl_backbone: neck built, scratch %zu/%zu, %d nodes",
+		       scratch->offset, scratch->size, g->n_nodes);
 
 	return vit_out;
 }

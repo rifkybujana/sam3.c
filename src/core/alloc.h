@@ -29,8 +29,11 @@ struct sam3_arena {
 /* Create an arena with the given capacity. Returns SAM3_OK or SAM3_ENOMEM. */
 enum sam3_error sam3_arena_init(struct sam3_arena *arena, size_t capacity);
 
-/* Allocate nbytes from the arena (16-byte aligned). Returns NULL if full. */
+/* Allocate nbytes from the arena (16-byte aligned, zero-filled). Returns NULL if full. */
 void *sam3_arena_alloc(struct sam3_arena *arena, size_t nbytes);
+
+/* Allocate nbytes from the arena (16-byte aligned, uninitialized). Returns NULL if full. */
+void *sam3_arena_alloc_raw(struct sam3_arena *arena, size_t nbytes);
 
 /* Reset the arena (frees all allocations but keeps the backing memory). */
 void sam3_arena_reset(struct sam3_arena *arena);

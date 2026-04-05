@@ -380,6 +380,57 @@ wrap_maxpool2d(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_maxpool2d(node, pool);
 }
 
+static enum sam3_error
+wrap_sdpa(const struct sam3_node *node, struct sam3_arena *scratch,
+	  struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_sdpa(node, pool);
+}
+
+static enum sam3_error
+wrap_groupnorm(const struct sam3_node *node, struct sam3_arena *scratch,
+	       struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_groupnorm(node, pool);
+}
+
+/*
+ * wrap_bias_add - NCHW bias add: x[N,C,H,W] + bias[C].
+ */
+static enum sam3_error
+wrap_bias_add(const struct sam3_node *node, struct sam3_arena *scratch,
+	      struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	(void)pool;
+
+	const struct sam3_tensor *x = node->inputs[0];
+	const struct sam3_tensor *bias = node->inputs[1];
+	struct sam3_tensor *out = node->output;
+	const float *xd = (const float *)x->data;
+	const float *bd = (const float *)bias->data;
+	float *od = (float *)out->data;
+
+	int N = x->dims[0];
+	int C = x->dims[1];
+	int H = x->dims[2];
+	int W = x->dims[3];
+	int spatial = H * W;
+
+	for (int n = 0; n < N; n++) {
+		for (int c = 0; c < C; c++) {
+			float b = bd[c];
+			int off = (n * C + c) * spatial;
+			for (int i = 0; i < spatial; i++)
+				od[off + i] = xd[off + i] + b;
+		}
+	}
+
+	return SAM3_OK;
+}
+
 /* ── Dispatch table ────────────────────────────────────────────────── */
 
 /*
@@ -489,6 +540,15 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_MAXPOOL2D] = {
 		[SAM3_DTYPE_F32]  = wrap_maxpool2d,
+	},
+	[SAM3_OP_SDPA] = {
+		[SAM3_DTYPE_F32]  = wrap_sdpa,
+	},
+	[SAM3_OP_BIAS_ADD] = {
+		[SAM3_DTYPE_F32]  = wrap_bias_add,
+	},
+	[SAM3_OP_GROUPNORM] = {
+		[SAM3_DTYPE_F32]  = wrap_groupnorm,
 	},
 };
 

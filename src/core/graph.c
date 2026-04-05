@@ -68,6 +68,9 @@ const char *sam3_op_str(enum sam3_op op)
 		[SAM3_OP_SILU]            = "SILU",
 		[SAM3_OP_CONV_TRANSPOSE2D] = "CONV_TRANSPOSE2D",
 		[SAM3_OP_MAXPOOL2D]       = "MAXPOOL2D",
+		[SAM3_OP_SDPA]            = "SDPA",
+		[SAM3_OP_BIAS_ADD]        = "BIAS_ADD",
+		[SAM3_OP_GROUPNORM]       = "GROUPNORM",
 	};
 	if (op >= 0 && op < SAM3_OP_COUNT)
 		return names[op];

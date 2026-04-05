@@ -90,6 +90,7 @@ struct sam3_result {
 	int    n_masks;
 	int    mask_height;
 	int    mask_width;
+	int    iou_valid;    /* 1 if iou_scores are model-predicted, 0 if placeholder */
 };
 
 /* Model configuration loaded from weights file. */

@@ -104,7 +104,7 @@ static enum sam3_error cpu_alloc_tensor(struct sam3_backend *be,
 	nbytes = (size_t)sam3_tensor_nelems(t) * elem_size;
 	t->data = sam3_arena_alloc(&cpu->arena, nbytes);
 	if (!t->data) {
-		sam3_log_warn("CPU alloc_tensor: OOM (%zu bytes requested, "
+		sam3_log_error("CPU alloc_tensor: OOM (%zu bytes requested, "
 			      "%zu / %zu used)", nbytes,
 			      cpu->arena.offset, cpu->arena.size);
 		return SAM3_ENOMEM;

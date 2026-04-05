@@ -30,6 +30,9 @@
  *
  * Input: [C, H, W]
  * Output: [C*KH*KW, OH*OW] (column-major patches)
+ *
+ * Splits oh/ow iteration into boundary (needs padding) and interior
+ * (no bounds check) regions.  Interior rows with stride=1 use memcpy.
  */
 static void im2col_f32(const float *in, float *col,
 		       int C, int H, int W,
@@ -37,29 +40,80 @@ static void im2col_f32(const float *in, float *col,
 		       int stride, int pad,
 		       int OH, int OW)
 {
-	int col_rows = C * KH * KW;
 	int col_cols = OH * OW;
 
 	for (int c = 0; c < C; c++) {
+		const float *in_c = in + c * H * W;
 		for (int kh = 0; kh < KH; kh++) {
 			for (int kw = 0; kw < KW; kw++) {
-				int col_row = c * KH * KW + kh * KW + kw;
-				for (int oh = 0; oh < OH; oh++) {
-					for (int ow = 0; ow < OW; ow++) {
-						int ih = oh * stride + kh - pad;
-						int iw = ow * stride + kw - pad;
-						int col_idx = col_row * col_cols + oh * OW + ow;
-						if (ih >= 0 && ih < H && iw >= 0 && iw < W)
-							col[col_idx] = in[c * H * W + ih * W + iw];
-						else
-							col[col_idx] = 0.0f;
+				int col_row = (c * KH + kh) * KW + kw;
+				float *dst_row = col + col_row * col_cols;
+
+				/* oh range where ih = oh*stride+kh-pad is in [0,H) */
+				int oh_start = 0;
+				int oh_end = OH;
+				if (kh - pad < 0)
+					oh_start = (-kh + pad + stride - 1) / stride;
+				if (kh - pad + (OH - 1) * stride >= H)
+					oh_end = (H - kh + pad + stride - 1) / stride;
+				if (oh_end > OH)
+					oh_end = OH;
+				if (oh_start > OH)
+					oh_start = OH;
+
+				/* ow range where iw = ow*stride+kw-pad is in [0,W) */
+				int ow_start = 0;
+				int ow_end = OW;
+				if (kw - pad < 0)
+					ow_start = (-kw + pad + stride - 1) / stride;
+				if (kw - pad + (OW - 1) * stride >= W)
+					ow_end = (W - kw + pad + stride - 1) / stride;
+				if (ow_end > OW)
+					ow_end = OW;
+				if (ow_start > OW)
+					ow_start = OW;
+
+				/* Top boundary rows: all zeros */
+				for (int oh = 0; oh < oh_start; oh++)
+					memset(dst_row + oh * OW, 0,
+					       (size_t)OW * sizeof(float));
+
+				/* Interior rows */
+				for (int oh = oh_start; oh < oh_end; oh++) {
+					int ih = oh * stride + kh - pad;
+					float *dst = dst_row + oh * OW;
+
+					/* Left pad */
+					if (ow_start > 0)
+						memset(dst, 0,
+						       (size_t)ow_start * sizeof(float));
+
+					/* Interior: no bounds check needed */
+					int iw_base = ow_start * stride + kw - pad;
+					if (stride == 1) {
+						memcpy(dst + ow_start,
+						       in_c + ih * W + iw_base,
+						       (size_t)(ow_end - ow_start) * sizeof(float));
+					} else {
+						for (int ow = ow_start; ow < ow_end; ow++) {
+							int iw = ow * stride + kw - pad;
+							dst[ow] = in_c[ih * W + iw];
+						}
 					}
+
+					/* Right pad */
+					if (ow_end < OW)
+						memset(dst + ow_end, 0,
+						       (size_t)(OW - ow_end) * sizeof(float));
 				}
+
+				/* Bottom boundary rows: all zeros */
+				for (int oh = oh_end; oh < OH; oh++)
+					memset(dst_row + oh * OW, 0,
+					       (size_t)OW * sizeof(float));
 			}
 		}
 	}
-
-	(void)col_rows;
 }
 
 struct conv2d_matmul_ctx {

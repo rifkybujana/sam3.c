@@ -283,32 +283,27 @@ static void test_seg_head_pipeline(void)
 {
 	enum sam3_error err;
 
-	/* Use smaller grid for seg head to keep dimensions reasonable */
-	int seg_grid_h = 2;
-	int seg_grid_w = 2;
-	int seg_n_pixels = seg_grid_h * seg_grid_w; /* 4 */
+	/*
+	 * Use small spatial dims: enc=2×2 (0.5x), then FPN stages
+	 * produce 4×4, 8×8, 16×16.
+	 */
+	int seg_enc_h = 2;
+	int seg_enc_w = 2;
+	int seg_enc_pixels = seg_enc_h * seg_enc_w;
 
 	struct sam3_seg_head head;
-	err = sam3_seg_head_init(&head, SMOKE_D_MODEL);
+	err = sam3_seg_head_init(&head, SMOKE_D_MODEL, SMOKE_N_HEADS);
 	ASSERT_EQ(err, SAM3_OK);
 
 	err = sam3_seg_head_load(&head, NULL, &g_cpu.arena);
 	ASSERT_EQ(err, SAM3_OK);
 
-	/*
-	 * Set layernorm gamma to 1.0 and conv weights to small identity-like
-	 * values for numerical stability with zero-init.
-	 */
-	for (int i = 0; i < SAM3_SEG_UPSAMPLE_STAGES; i++) {
-		set_ones(head.pixel_dec.stages[i].ln_w);
+	/* Set GroupNorm gamma to 1.0 for numerical stability */
+	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++)
+		set_ones(head.fpn[i].gn_w);
 
-		/* Set conv weights to small identity-like values */
-		float *cw = (float *)head.pixel_dec.stages[i].conv_w->data;
-		int d = SMOKE_D_MODEL;
-		for (int r = 0; r < d; r++)
-			for (int c = 0; c < d; c++)
-				cw[r * d + c] = (r == c) ? 0.1f : 0.0f;
-	}
+	/* Set prompt cross-attn norm gamma to 1.0 */
+	set_ones(head.pxattn_norm_w);
 
 	/* Create dummy query embeddings [n_queries, d_model] */
 	int q_dims[] = {SMOKE_N_QUERIES, SMOKE_D_MODEL};
@@ -318,13 +313,33 @@ static void test_seg_head_pipeline(void)
 	ASSERT(query_embed != NULL);
 	fill_small_values(query_embed, 7);
 
-	/* Create dummy pixel features [n_pixels, d_model] */
-	int pix_dims[] = {seg_n_pixels, SMOKE_D_MODEL};
-	struct sam3_tensor *pixel_features;
-	pixel_features = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
-					  2, pix_dims);
-	ASSERT(pixel_features != NULL);
-	fill_small_values(pixel_features, 13);
+	/* Create dummy encoder states [enc_pixels, d_model] */
+	int enc_dims[] = {seg_enc_pixels, SMOKE_D_MODEL};
+	struct sam3_tensor *enc_states;
+	enc_states = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				       2, enc_dims);
+	ASSERT(enc_states != NULL);
+	fill_small_values(enc_states, 13);
+
+	/* Create backbone features at each scale (NCHW) */
+	int d = SMOKE_D_MODEL;
+	int f1_dims[] = {1, d, seg_enc_h * 2, seg_enc_w * 2};  /* 1x */
+	int f2_dims[] = {1, d, seg_enc_h * 4, seg_enc_w * 4};  /* 2x */
+	int f4_dims[] = {1, d, seg_enc_h * 8, seg_enc_w * 8};  /* 4x */
+
+	struct sam3_tensor *feat_1x, *feat_2x, *feat_4x;
+	feat_1x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				    4, f1_dims);
+	feat_2x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				    4, f2_dims);
+	feat_4x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				    4, f4_dims);
+	ASSERT(feat_1x != NULL);
+	ASSERT(feat_2x != NULL);
+	ASSERT(feat_4x != NULL);
+	fill_small_values(feat_1x, 17);
+	fill_small_values(feat_2x, 19);
+	fill_small_values(feat_4x, 23);
 
 	/* Build seg head graph */
 	struct sam3_graph graph;
@@ -332,29 +347,23 @@ static void test_seg_head_pipeline(void)
 
 	struct sam3_tensor *masks;
 	masks = sam3_seg_head_build(&head, &graph, query_embed,
-				     pixel_features, seg_grid_h,
-				     seg_grid_w, &g_cpu.arena);
+				     enc_states, feat_1x, feat_2x,
+				     feat_4x, seg_enc_h, seg_enc_w,
+				     &g_cpu.arena);
 	ASSERT(masks != NULL);
 
-	/* Output shape: [n_queries, grid_h*8 * grid_w*8] */
-	int expected_hw = (seg_grid_h * 8) * (seg_grid_w * 8);
-	ASSERT_EQ(masks->n_dims, 2);
+	/* Output shape: [n_queries, feat_4x_h, feat_4x_w] */
+	ASSERT_EQ(masks->n_dims, 3);
 	ASSERT_EQ(masks->dims[0], SMOKE_N_QUERIES);
-	ASSERT_EQ(masks->dims[1], expected_hw);
+	ASSERT_EQ(masks->dims[1], seg_enc_h * 8);
+	ASSERT_EQ(masks->dims[2], seg_enc_w * 8);
 
 	/* Evaluate on CPU */
 	err = g_cpu.base.ops->graph_eval(&g_cpu.base, &graph);
 	ASSERT_EQ(err, SAM3_OK);
 
-	/* Verify finite values (sigmoid outputs should be in [0, 1]) */
+	/* Verify finite values (raw logits, not sigmoid) */
 	check_finite(masks, "seg_head_masks");
-
-	float *md = (float *)masks->data;
-	int n = sam3_tensor_nelems(masks);
-	for (int i = 0; i < n; i++) {
-		ASSERT(md[i] >= 0.0f);
-		ASSERT(md[i] <= 1.0f);
-	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -398,12 +407,12 @@ static void test_full_pipeline(void)
 	ASSERT_EQ(err, SAM3_OK);
 
 	struct sam3_seg_head seg;
-	err = sam3_seg_head_init(&seg, SMOKE_D_MODEL);
+	err = sam3_seg_head_init(&seg, SMOKE_D_MODEL, SMOKE_N_HEADS);
 	ASSERT_EQ(err, SAM3_OK);
 	err = sam3_seg_head_load(&seg, NULL, &g_cpu.arena);
 	ASSERT_EQ(err, SAM3_OK);
 
-	/* --- Set layernorm gamma to 1.0 everywhere --- */
+	/* --- Set layernorm/groupnorm gamma to 1.0 everywhere --- */
 
 	for (int i = 0; i < SMOKE_N_LAYERS; i++) {
 		set_ones(genc.layers[i].ca_ln_w);
@@ -418,16 +427,9 @@ static void test_full_pipeline(void)
 		set_ones(dec.layers[i].ffn_ln_w);
 	}
 
-	for (int i = 0; i < SAM3_SEG_UPSAMPLE_STAGES; i++) {
-		set_ones(seg.pixel_dec.stages[i].ln_w);
-
-		/* Identity-like conv weights for stability */
-		float *cw = (float *)seg.pixel_dec.stages[i].conv_w->data;
-		int d = SMOKE_D_MODEL;
-		for (int r = 0; r < d; r++)
-			for (int c = 0; c < d; c++)
-				cw[r * d + c] = (r == c) ? 0.1f : 0.0f;
-	}
+	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++)
+		set_ones(seg.fpn[i].gn_w);
+	set_ones(seg.pxattn_norm_w);
 
 	/* --- Create dummy inputs --- */
 
@@ -451,6 +453,26 @@ static void test_full_pipeline(void)
 					 2, txt_dims);
 	ASSERT(text_features != NULL);
 	fill_small_values(text_features, 13);
+
+	/* Backbone features (NCHW) at each FPN scale */
+	int d = SMOKE_D_MODEL;
+	int f1_dims[] = {1, d, full_grid_h * 2, full_grid_w * 2};  /* 1x */
+	int f2_dims[] = {1, d, full_grid_h * 4, full_grid_w * 4};  /* 2x */
+	int f4_dims[] = {1, d, full_grid_h * 8, full_grid_w * 8};  /* 4x */
+
+	struct sam3_tensor *feat_1x, *feat_2x, *feat_4x;
+	feat_1x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				    4, f1_dims);
+	feat_2x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				    4, f2_dims);
+	feat_4x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
+				    4, f4_dims);
+	ASSERT(feat_1x != NULL);
+	ASSERT(feat_2x != NULL);
+	ASSERT(feat_4x != NULL);
+	fill_small_values(feat_1x, 29);
+	fill_small_values(feat_2x, 31);
+	fill_small_values(feat_4x, 37);
 
 	/* --- Build full pipeline graph --- */
 
@@ -506,18 +528,19 @@ static void test_full_pipeline(void)
 
 	/*
 	 * Stage 4: Segmentation head.
-	 * queries + fused -> masks [n_queries, H*W]
+	 * queries + fused + backbone features -> masks [n_q, H, W]
 	 */
 	struct sam3_tensor *masks;
 	masks = sam3_seg_head_build(&seg, &graph, queries,
-				     fused, full_grid_h, full_grid_w,
-				     &g_cpu.arena);
+				     fused, feat_1x, feat_2x,
+				     feat_4x, full_grid_h,
+				     full_grid_w, &g_cpu.arena);
 	ASSERT(masks != NULL);
 
-	int expected_hw = (full_grid_h * 8) * (full_grid_w * 8);
-	ASSERT_EQ(masks->n_dims, 2);
+	ASSERT_EQ(masks->n_dims, 3);
 	ASSERT_EQ(masks->dims[0], SMOKE_N_QUERIES);
-	ASSERT_EQ(masks->dims[1], expected_hw);
+	ASSERT_EQ(masks->dims[1], full_grid_h * 8);
+	ASSERT_EQ(masks->dims[2], full_grid_w * 8);
 
 	/* --- Evaluate entire pipeline on CPU --- */
 
@@ -531,14 +554,6 @@ static void test_full_pipeline(void)
 	check_finite(queries, "full_queries");
 	check_finite(boxes, "full_boxes");
 	check_finite(masks, "full_masks");
-
-	/* Mask outputs should be in [0, 1] (sigmoid) */
-	float *md = (float *)masks->data;
-	int n = sam3_tensor_nelems(masks);
-	for (int i = 0; i < n; i++) {
-		ASSERT(md[i] >= 0.0f);
-		ASSERT(md[i] <= 1.0f);
-	}
 
 	/* Box outputs should be in [0, 1] (sigmoid) */
 	float *bd = (float *)boxes->data;

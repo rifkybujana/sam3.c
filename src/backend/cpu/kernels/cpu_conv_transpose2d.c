@@ -84,18 +84,28 @@ static void conv_transpose2d_parallel_fn(void *arg, int task_id, int n_tasks)
 				(size_t)co * KH * KW;
 
 			for (int ih = 0; ih < H; ih++) {
+				int oh_base = ih * stride - pad;
+				int kh_start = -oh_base > 0 ? -oh_base : 0;
+				int kh_end = OH - oh_base < KH
+					? OH - oh_base : KH;
+
 				for (int iw = 0; iw < W; iw++) {
 					float val = in_plane[ih * W + iw];
-					for (int kh = 0; kh < KH; kh++) {
-						int oh = ih * stride + kh - pad;
-						if (oh < 0 || oh >= OH)
-							continue;
-						for (int kw = 0; kw < KW; kw++) {
-							int ow = iw * stride + kw - pad;
-							if (ow < 0 || ow >= OW)
-								continue;
-							out_plane[oh * OW + ow] +=
-								val * kern[kh * KW + kw];
+					int ow_base = iw * stride - pad;
+					int kw_start = -ow_base > 0
+						? -ow_base : 0;
+					int kw_end = OW - ow_base < KW
+						? OW - ow_base : KW;
+
+					for (int kh = kh_start; kh < kh_end; kh++) {
+						int oh = oh_base + kh;
+						float *out_row =
+							out_plane + oh * OW;
+						const float *kern_row =
+							kern + kh * KW;
+						for (int kw = kw_start; kw < kw_end; kw++) {
+							out_row[ow_base + kw] +=
+								val * kern_row[kw];
 						}
 					}
 				}

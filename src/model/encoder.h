@@ -1,9 +1,9 @@
 /*
  * src/model/encoder.h - Transformer encoder fusion (6-layer)
  *
- * Defines the transformer encoder that fuses image features with text
- * features through alternating self-attention and cross-attention layers.
- * Each of the 6 layers applies: (1) pre-norm self-attention on image
+ * Defines the DETR encoder (detector_model.detr_encoder) that fuses image
+ * features with text features through alternating self-attention and
+ * cross-attention layers. Each of the 6 layers applies: (1) pre-norm self-attention on image
  * features with residual, (2) pre-norm cross-attention where image
  * features attend to text features with residual, (3) pre-norm FFN
  * with residual.
@@ -49,6 +49,9 @@ struct sam3_encoder_fusion {
 		struct sam3_tensor *ffn_fc2_w, *ffn_fc2_b;
 		struct sam3_tensor *ffn_ln_w,  *ffn_ln_b;
 	} layers[SAM3_ENC_FUSION_MAX_LAYERS];
+
+	/* Final layer norm applied after all layers */
+	struct sam3_tensor *final_ln_w, *final_ln_b;
 };
 
 /*
@@ -101,6 +104,28 @@ struct sam3_tensor *sam3_encoder_fusion_build(
 	struct sam3_graph *g,
 	struct sam3_tensor *image_features,
 	struct sam3_tensor *text_features,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_encoder_fusion_build_layer - Build a single encoder layer.
+ *
+ * Used for per-layer evaluation to avoid MLX shared-buffer issues.
+ */
+struct sam3_tensor *sam3_encoder_fusion_build_layer(
+	struct sam3_encoder_fusion *enc,
+	int layer_idx,
+	struct sam3_graph *g,
+	struct sam3_tensor *x,
+	struct sam3_tensor *text_features,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_encoder_fusion_build_final - Apply final layer norm.
+ */
+struct sam3_tensor *sam3_encoder_fusion_build_final(
+	struct sam3_encoder_fusion *enc,
+	struct sam3_graph *g,
+	struct sam3_tensor *x,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_ENCODER_H */

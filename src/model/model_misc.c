@@ -1,15 +1,15 @@
 /*
- * src/model/model_misc.c - Dot-product scorer implementation
+ * src/model/model_misc.c - Objectness scorer implementation
  *
- * Implements the dot-product scorer that computes text-query confidence.
- * The scorer works by computing a dot product between each query and text
- * features for similarity, then passes the query features through a
- * 2-layer MLP (linear -> relu -> linear) to produce a per-query
- * confidence score.
+ * Implements the objectness scorer matching SAM3's pred_obj_score_head.
+ * The scorer computes a dot product between each query and text features
+ * for similarity, then passes query features through a 3-layer MLP
+ * (proj_in -> relu -> hidden -> relu -> proj_out) to produce a
+ * per-query confidence score.
  *
  * Key types:  sam3_dot_scorer
  * Depends on: model_misc.h, graph_helpers.h
- * Used by:    decoder.c, sam3.c
+ * Used by:    sam3_image.c
  *
  * Copyright (c) 2026
  * SPDX-License-Identifier: MIT
@@ -21,6 +21,8 @@
 #include "model_misc.h"
 #include "graph_helpers.h"
 
+#define SCORE_PREFIX "tracker_model.mask_decoder.pred_obj_score_head."
+
 enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
 				     const struct sam3_weight_file *wf,
 				     struct sam3_arena *arena)
@@ -28,30 +30,49 @@ enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
 	int in = ds->input_dim;
 	int hid = ds->hidden_dim;
 
-	/* fc1: [hidden_dim, input_dim] / [hidden_dim] */
-	int fc1_w_dims[] = {hid, in};
-	ds->fc1_w = gh_load_or_alloc(wf, "dot_scorer.fc1.weight",
-				   arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
-	if (!ds->fc1_w)
+	/* proj_in: [hidden, input] / [hidden] */
+	int pi_w_dims[] = {hid, in};
+	ds->proj_in_w = gh_load_or_alloc(wf,
+		SCORE_PREFIX "proj_in.weight",
+		arena, SAM3_DTYPE_F32, 2, pi_w_dims);
+	if (!ds->proj_in_w)
 		return SAM3_ENOMEM;
 
-	int fc1_b_dims[] = {hid};
-	ds->fc1_b = gh_load_or_alloc(wf, "dot_scorer.fc1.bias",
-				   arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
-	if (!ds->fc1_b)
+	int pi_b_dims[] = {hid};
+	ds->proj_in_b = gh_load_or_alloc(wf,
+		SCORE_PREFIX "proj_in.bias",
+		arena, SAM3_DTYPE_F32, 1, pi_b_dims);
+	if (!ds->proj_in_b)
 		return SAM3_ENOMEM;
 
-	/* fc2: [1, hidden_dim] / [1] */
-	int fc2_w_dims[] = {1, hid};
-	ds->fc2_w = gh_load_or_alloc(wf, "dot_scorer.fc2.weight",
-				   arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
-	if (!ds->fc2_w)
+	/* hidden (layers.0): [hidden, hidden] / [hidden] */
+	int h_w_dims[] = {hid, hid};
+	ds->hidden_w = gh_load_or_alloc(wf,
+		SCORE_PREFIX "layers.0.weight",
+		arena, SAM3_DTYPE_F32, 2, h_w_dims);
+	if (!ds->hidden_w)
 		return SAM3_ENOMEM;
 
-	int fc2_b_dims[] = {1};
-	ds->fc2_b = gh_load_or_alloc(wf, "dot_scorer.fc2.bias",
-				   arena, SAM3_DTYPE_F32, 1, fc2_b_dims);
-	if (!ds->fc2_b)
+	int h_b_dims[] = {hid};
+	ds->hidden_b = gh_load_or_alloc(wf,
+		SCORE_PREFIX "layers.0.bias",
+		arena, SAM3_DTYPE_F32, 1, h_b_dims);
+	if (!ds->hidden_b)
+		return SAM3_ENOMEM;
+
+	/* proj_out: [1, hidden] / [1] */
+	int po_w_dims[] = {1, hid};
+	ds->proj_out_w = gh_load_or_alloc(wf,
+		SCORE_PREFIX "proj_out.weight",
+		arena, SAM3_DTYPE_F32, 2, po_w_dims);
+	if (!ds->proj_out_w)
+		return SAM3_ENOMEM;
+
+	int po_b_dims[] = {1};
+	ds->proj_out_b = gh_load_or_alloc(wf,
+		SCORE_PREFIX "proj_out.bias",
+		arena, SAM3_DTYPE_F32, 1, po_b_dims);
+	if (!ds->proj_out_b)
 		return SAM3_ENOMEM;
 
 	return SAM3_OK;
@@ -78,13 +99,12 @@ struct sam3_tensor *sam3_dot_scorer_build(struct sam3_dot_scorer *ds,
 	(void)dots; /* similarity available for downstream use */
 
 	/*
-	 * MLP on query features for confidence.
-	 * linear1 -> relu -> linear2
-	 * queries: [n_queries, input_dim]
-	 * -> [n_queries, hidden_dim] -> relu -> [n_queries, 1]
+	 * 3-layer MLP on query features for objectness confidence.
+	 * proj_in -> relu -> hidden -> relu -> proj_out
+	 * queries: [n_queries, 256] -> [n_queries, 256] -> [n_queries, 1]
 	 */
 	struct sam3_tensor *h;
-	h = gh_linear(g, arena, queries, ds->fc1_w, ds->fc1_b);
+	h = gh_linear(g, arena, queries, ds->proj_in_w, ds->proj_in_b);
 	if (!h)
 		return NULL;
 
@@ -92,9 +112,17 @@ struct sam3_tensor *sam3_dot_scorer_build(struct sam3_dot_scorer *ds,
 	if (!h)
 		return NULL;
 
-	h = gh_linear(g, arena, h, ds->fc2_w, ds->fc2_b);
+	h = gh_linear(g, arena, h, ds->hidden_w, ds->hidden_b);
 	if (!h)
 		return NULL;
 
-	return h; /* [n_queries, 1] -- squeeze in caller */
+	h = gh_relu(g, arena, h);
+	if (!h)
+		return NULL;
+
+	h = gh_linear(g, arena, h, ds->proj_out_w, ds->proj_out_b);
+	if (!h)
+		return NULL;
+
+	return h; /* [n_queries, 1] -- caller applies sigmoid */
 }

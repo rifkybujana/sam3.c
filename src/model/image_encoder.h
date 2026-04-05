@@ -24,6 +24,7 @@
 #include "core/graph.h"
 #include "core/alloc.h"
 #include "core/weight.h"
+#include "backend/backend.h"
 
 #define SAM3_VIT_MAX_LAYERS      32
 #define SAM3_VIT_N_GLOBAL_BLOCKS 4
@@ -49,6 +50,10 @@ struct sam3_vit {
 
 	/* Windowed attention mask */
 	struct sam3_tensor *window_mask; /* [n_patches, n_patches] */
+
+	/* Final layer norm (applied after last transformer block) */
+	struct sam3_tensor *ln_final_w; /* [embed_dim] */
+	struct sam3_tensor *ln_final_b; /* [embed_dim] */
 
 	/* Per-layer weights */
 	struct {
@@ -102,18 +107,26 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 			       struct sam3_arena *arena);
 
 /*
- * sam3_vit_build - Build ViT compute graph.
+ * sam3_vit_build - Evaluate ViT one transformer block at a time.
  *
- * @vit:   Initialized and loaded ViT
- * @g:     Graph to add nodes to
- * @image: Input image tensor [3, img_size, img_size] (F32, normalized)
- * @arena: Arena for intermediate tensors
+ * Evaluates the ViT per-block, resetting the scratch arena between
+ * blocks. Only the block output ([n_patches, embed_dim]) persists
+ * between blocks in a buffer allocated from the persist arena.
+ * This reduces peak memory from ~55 GB to ~2.5 GB.
  *
- * Returns output features [n_patches, embed_dim] or NULL on error.
+ * @vit:     Initialized and loaded ViT
+ * @be:      Backend for per-block graph evaluation
+ * @image:   Input image tensor [3, img_size, img_size] (F32, normalized)
+ * @scratch: Arena for per-block intermediate tensors (reset between blocks)
+ * @persist: Arena for the output buffer that survives across blocks
+ *
+ * Returns output features [n_patches, embed_dim] allocated from
+ * persist arena, or NULL on error.
  */
 struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
-				    struct sam3_graph *g,
+				    struct sam3_backend *be,
 				    struct sam3_tensor *image,
-				    struct sam3_arena *arena);
+				    struct sam3_arena *scratch,
+				    struct sam3_arena *persist);
 
 #endif /* SAM3_MODEL_IMAGE_ENCODER_H */

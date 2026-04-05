@@ -307,9 +307,6 @@ static int lookup_pair_rank(const struct tok_hash_table *ranks,
 static const int32_t eot_pad[SAM3_TOKENIZER_CONTEXT_LEN] = {
 	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
 	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
-	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
-	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
-	E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,E_,
 };
 #undef E_
 

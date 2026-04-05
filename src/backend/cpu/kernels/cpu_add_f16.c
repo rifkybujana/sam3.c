@@ -88,10 +88,13 @@ static void add_f16_scalar(const uint16_t *a, const uint16_t *b,
 				fp16_to_f32(a[i]) + fp16_to_f32(b[i]));
 		}
 	} else {
-		for (int i = start; i < end; i++) {
-			out[i] = f32_to_fp16(
-				fp16_to_f32(a[i]) +
-				fp16_to_f32(b[i % broadcast_n]));
+		for (int r = start; r < end; r++) {
+			int base = r * broadcast_n;
+			for (int j = 0; j < broadcast_n; j++) {
+				out[base + j] = f32_to_fp16(
+					fp16_to_f32(a[base + j]) +
+					fp16_to_f32(b[j]));
+			}
 		}
 	}
 }

@@ -39,7 +39,7 @@ enum sam3_error sam3_arena_init(struct sam3_arena *arena, size_t capacity)
 	return SAM3_OK;
 }
 
-void *sam3_arena_alloc(struct sam3_arena *arena, size_t nbytes)
+void *sam3_arena_alloc_raw(struct sam3_arena *arena, size_t nbytes)
 {
 	size_t aligned = (arena->offset + SAM3_ARENA_ALIGN - 1)
 			 & ~(size_t)(SAM3_ARENA_ALIGN - 1);
@@ -50,7 +50,14 @@ void *sam3_arena_alloc(struct sam3_arena *arena, size_t nbytes)
 	void *ptr = (char *)arena->base + aligned;
 	arena->offset = aligned + nbytes;
 	SAM3_PROF_MEM(g_alloc_profiler, nbytes);
-	memset(ptr, 0, nbytes);
+	return ptr;
+}
+
+void *sam3_arena_alloc(struct sam3_arena *arena, size_t nbytes)
+{
+	void *ptr = sam3_arena_alloc_raw(arena, nbytes);
+	if (ptr)
+		memset(ptr, 0, nbytes);
 	return ptr;
 }
 

@@ -51,13 +51,546 @@
 
 ## Model Implementation
 
-Depends on all Priority 1 ground systems.
+> Step-by-step guide for implementing SAM3 (Segment Anything with Concepts) image and video inference.
+> Reference repo: `github.com/facebookresearch/sam3`. All File, Class, and Asset reference is relative to the original sam3 repository by facebook.
+>
+> **Status:** Phase 1-2 (image inference) complete. Phases 3-9 (video, tracking, multiplex) not started.
+> Items marked N/A are training-only or PyTorch-specific features not applicable to the C inference engine.
 
-- [ ] **Image encoder** — Hiera backbone with multi-scale feature maps
-- [ ] **Prompt encoder** — point/box/mask → sparse + dense embeddings
-- [ ] **Mask decoder** — two-way cross-attention transformer, upscaling, IoU head
-- [ ] **Memory attention** — cross-attention with memory bank (video tracking)
-- [ ] **Top-level API** — wire `sam3_load_model`, `sam3_set_image`, `sam3_segment`
+---
+
+## Phase 1: Core Infrastructure
+
+### 1.1 Tokenizer
+- **File:** `sam3/model/tokenizer_ve.py`
+- **Class:** `SimpleTokenizer`
+- **Asset:** `sam3/assets/bpe_simple_vocab_16e6.txt.gz`
+- **Impl:** `src/model/tokenizer.c/.h`
+- [x] Implement BPE tokenizer with byte-pair encoding vocabulary
+- [x] Support encoding text prompts to token IDs
+- [ ] Support decoding token IDs back to text
+
+### 1.2 Text Encoder
+- **File:** `sam3/model/text_encoder_ve.py`
+- **Class:** `VETextEncoder`
+- **Config:** `d_model=256`, `width=1024`, `heads=16`, `layers=24`
+- **Impl:** `src/model/text_encoder.c/.h`
+- [x] Implement transformer-based text encoder
+- [x] Produce per-token text embeddings
+- [x] Produce pooled text features (used for image-text fusion)
+
+### 1.3 Position Encoding
+- **File:** `sam3/model/position_encoding.py`
+- **Class:** `PositionEmbeddingSine`
+- **Config:** `num_pos_feats=256`, `normalize=True`, `temperature=10000`
+- **Impl:** `src/model/position_encoding.c/.h`
+- [x] Implement 2D sinusoidal position embeddings
+- [x] Support optional `precompute_resolution` for caching (e.g., 1008)
+
+### 1.4 Vision Backbone (ViT)
+- **File:** `sam3/model/vitdet.py`
+- **Class:** `ViT`
+- **Config:** `img_size=1008`, `patch_size=14`, `embed_dim=1024`, `depth=32`, `num_heads=16`
+- **Impl:** `src/model/image_encoder.c/.h`
+- [x] Implement ViT with windowed attention (`window_size=24`)
+- [x] Add global attention at blocks `(7, 15, 23, 31)`
+- [x] Implement RoPE (Rotary Position Embeddings) with interpolation
+- [x] Support `mlp_ratio=4.625`, `drop_path_rate=0.1`, `qkv_bias=True`
+- N/A `torch.compile` support (C inference engine, not applicable)
+- N/A FlashAttention 3 support (uses Metal/NEON optimized attention)
+
+### 1.5 Feature Pyramid Neck
+- **File:** `sam3/model/necks.py`
+- **Classes:** `Sam3DualViTDetNeck`, `Sam3TriViTDetNeck`
+- **Config:** `d_model=256`, `scale_factors=[4.0, 2.0, 1.0, 0.5]`
+- **Impl:** `src/model/necks.c/.h`
+- [x] `Sam3DualViTDetNeck` — multi-scale feature maps from ViT output
+- [ ] Optional SAM2-style neck (`add_sam2_neck`) for instance interactivity
+- [ ] `Sam3TriViTDetNeck` — tri-head variant for multiplex/SAM 3.1 (`scale_factors=[4.0, 2.0, 1.0]`)
+
+### 1.6 Vision-Language Backbone
+- **File:** `sam3/model/vl_combiner.py`
+- **Classes:** `SAM3VLBackbone`, `SAM3VLBackboneTri`, `TriHeadVisionOnly`
+- **Impl:** `src/model/vl_combiner.c/.h`
+- [x] `SAM3VLBackbone` — combines visual neck + text encoder (`scalp=1`)
+- [x] Output both visual feature pyramid and text embeddings
+- [ ] `SAM3VLBackboneTri` — variant for multiplex with tri-head neck
+- [ ] `TriHeadVisionOnly` — vision-only variant for multiplex tracker backbone
+
+---
+
+## Phase 2: Detector (Image Model)
+
+### 2.1 Transformer Encoder
+- **File:** `sam3/model/encoder.py`
+- **Classes:** `TransformerEncoderLayer`, `TransformerEncoderFusion`
+- **Impl:** `src/model/encoder.c/.h`
+- [x] `TransformerEncoderLayer` — self-attention + cross-attention with configurable position encoding injection
+- [x] `TransformerEncoderFusion` — 6-layer encoder
+  - [x] Fuse image and text features
+  - [x] Pool text with mask (`pool_text_with_mask=True`)
+  - N/A Activation checkpointing (training-only, not needed for inference)
+  - [x] Single feature level (`num_feature_levels=1`)
+
+### 2.2 Transformer Decoder
+- **File:** `sam3/model/decoder.py`
+- **Classes:** `TransformerDecoderLayer`, `TransformerDecoder`
+- **Impl:** `src/model/decoder.c/.h`
+- [x] `TransformerDecoderLayer`
+  - [x] Self-attention + cross-attention (`n_heads=8`, `d_model=256`, `dim_feedforward=2048`)
+  - [x] Text cross-attention (`use_text_cross_attention=True`)
+- [x] `TransformerDecoder`
+  - [x] 6 layers, 200 queries
+  - [x] Iterative box refinement (`box_refine=True`)
+  - [ ] DAC — Deformable Anchor Conditioning (`dac=True`)
+  - [ ] Box RPB — Relative Position Bias (`boxRPB="log"`)
+  - [ ] Presence token (`presence_token=True`)
+  - N/A Return intermediate outputs for auxiliary losses (training-only)
+  - N/A Activation checkpointing (training-only)
+
+### 2.3 Utility Modules
+- **File:** `sam3/model/model_misc.py`
+- **Classes:** `TransformerWrapper`, `MLP`, `MultiheadAttentionWrapper`, `DotProductScoring`
+- **Impl:** `src/model/model_misc.c/.h`, `src/model/graph_helpers.c/.h`
+- [x] `TransformerWrapper` — wraps encoder + decoder (integrated into sam3_image.c)
+- [x] `MLP` — configurable multi-layer perceptron (via `gh_linear` + activations in graph_helpers)
+- [x] `MultiheadAttentionWrapper` — multihead attention (via `gh_multihead_attention_rope` in graph_helpers)
+- [x] `DotProductScoring` — text-query scoring with 2-layer MLP (`input_dim=256`, `hidden_dim=2048`)
+
+### 2.4 Geometry Encoder
+- **File:** `sam3/model/geometry_encoders.py`
+- **Class:** `SequenceGeometryEncoder`
+- **Config:** `d_model=256`, `num_layers=3`
+- **Impl:** `src/model/prompt_encoder.c/.h`
+- [x] Encode point prompts (direct projection + pooling + position encoding)
+- [x] Encode box prompts (direct projection + pooling + position encoding)
+- [x] 3 cross-attention layers for prompt-to-image feature interaction
+- [x] CLS token aggregation (`add_cls=True`)
+- [x] Post-encode projection (`add_post_encode_proj=True`)
+- N/A Activation checkpointing (training-only)
+
+### 2.5 Segmentation Head
+- **File:** `sam3/model/maskformer_segmentation.py`
+- **Classes:** `PixelDecoder`, `UniversalSegmentationHead`
+- **Impl:** `src/model/segmentation.c/.h`
+- [x] `PixelDecoder` — 3-stage nearest-neighbor upsampling (`hidden_dim=256`)
+- [x] `UniversalSegmentationHead`
+  - [x] Dot-product between query embeddings and upsampled pixel features
+  - [ ] Cross-attention to prompt embeddings (`cross_attend_prompt`)
+  - N/A Activation checkpointing (training-only)
+  - N/A `torch.compile` support (C inference engine)
+
+### 2.6 SAM3 Image Model
+- **File:** `sam3/model/sam3_image.py`
+- **Classes:** `Sam3Image`, `Sam3ImageOnVideoMultiGPU`
+- **Impl:** `src/model/sam3_image.c/.h`
+- [x] `Sam3Image`
+  - [x] Forward: backbone → transformer → segmentation head
+  - [x] Text prompt conditioning
+  - [x] Geometry prompt conditioning
+  - [x] Multi-mask output support
+  - [x] Dot product scoring for detection confidence
+  - [ ] Optional instance interactive predictor
+- [ ] `Sam3ImageOnVideoMultiGPU` — variant for video pipeline (shared backbone with tracker)
+
+### 2.7 Image Processor (High-Level API)
+- **File:** `sam3/model/sam3_image_processor.py`
+- **Class:** `Sam3Processor`
+- **Impl:** `src/model/sam3_processor.c/.h`
+- [x] `set_image(image)` — preprocess and encode image, return inference state
+- [ ] `set_image_batch(images)` — batched image encoding
+- [x] `set_text_prompt(prompt, state)` — run detection with text prompt
+- [x] `add_geometric_prompt(box, label, state)` — add positive/negative box prompt
+- [x] `set_confidence_threshold(threshold, state)` — filter results by score
+- [x] `reset_all_prompts(state)` — clear all prompts
+- [x] Return masks, boxes, scores in the inference state dict
+
+### 2.8 Box & Mask Operations
+- **File:** `sam3/model/box_ops.py`
+- **Impl:** `src/model/box_ops.c/.h`
+- [x] `box_xyxy_to_xywh`, `box_xywh_to_xyxy`, `box_cxcywh_to_xyxy`, etc.
+- [x] Generalized IoU (`generalized_box_iou`)
+- [x] NMS utilities
+- **File:** `sam3/train/masks_ops.py`
+- [ ] `rle_encode` — run-length encoding for binary masks
+- [ ] Mask-to-box conversion
+
+---
+
+## Phase 3: Instance Interactivity (SAM1-Style Tasks)
+
+### 3.1 SAM Mask Decoder
+- **Inherited from SAM2 architecture within the tracker module**
+- **Impl:** `src/model/mask_decoder.c/.h` (stub only — empty build function)
+- [ ] Point/box prompt → multi-mask prediction (3 masks)
+- [ ] IoU score prediction per mask
+- [ ] Dynamic multimask selection via stability scoring
+
+### 3.2 Interactive Image Predictor
+- **File:** `sam3/model/sam1_task_predictor.py`
+- **Class:** `SAM3InteractiveImagePredictor`
+- [ ] Wrap the tracker's mask decoder for single-image use
+- [ ] `predict_inst(state, point_coords, point_labels, box, mask_input, multimask_output)`
+- [ ] `predict_inst_batch(state, pts_batch, labels_batch, box_batch, multimask_output)`
+- [ ] Return masks, scores, logits
+
+---
+
+## Phase 4: Tracker (Video Model)
+
+### 4.1 Memory Components
+- **File:** `sam3/model/memory.py`
+- **Classes:** `SimpleMaskDownSampler`, `CXBlock`, `SimpleFuser`, `SimpleMaskEncoder`
+- [ ] `SimpleMaskDownSampler` — downsample masks (`kernel_size=3`, `stride=2`, `interpol_size=[1152, 1152]`)
+- [ ] `CXBlock` — depthwise conv block (`dim=256`, `kernel_size=7`, `layer_scale_init_value=1e-6`)
+- [ ] `SimpleFuser` — 2-layer CXBlock stack
+- [ ] `SimpleMaskEncoder`
+  - [ ] Mask downsampling → concatenation with visual features → fusion → project to `out_dim=64`
+  - [ ] Position encoding integration
+
+### 4.2 RoPE Attention for Tracker
+- **File:** `sam3/sam/transformer.py`
+- **Class:** `RoPEAttention`
+- **Config:** `embedding_dim=256`, `num_heads=1`, `feat_sizes=[72, 72]`, `rope_theta=10000`
+- [ ] Self-attention variant (same key/value dim)
+- [ ] Cross-attention variant (`kv_in_dim=64`, `rope_k_repeat=True`)
+- [ ] FlashAttention 3 support
+
+### 4.3 Tracker Transformer
+- **File:** `sam3/model/decoder.py`
+- **Classes:** `TransformerDecoderLayerv2`, `TransformerEncoderCrossAttention`
+- **Impl:** `src/model/memory_attn.c/.h` (stub only — empty build function)
+- [ ] `TransformerDecoderLayerv2` — self-attention (RoPE) + cross-attention (RoPE) for memory reading
+- [ ] `TransformerEncoderCrossAttention` — 4-layer memory attention encoder
+  - [ ] Configurable cross-attention layer removal
+  - [ ] Position encoding at input
+
+### 4.4 Tracker Predictor
+- **File:** `sam3/model/sam3_tracking_predictor.py`
+- **Class:** `Sam3TrackerPredictor`
+- **Config:** `image_size=1008`, `num_maskmem=7`, `backbone_stride=14`
+- [ ] `init_state(video_path)` — load video frames, initialize memory bank
+- [ ] `add_new_points(state, frame_idx, obj_id, points, labels)` — point prompt
+- [ ] `add_new_points_or_box(state, frame_idx, obj_id, points, labels, box)` — point + box prompt
+- [ ] `add_new_mask(state, frame_idx, obj_id, mask)` — direct mask prompt
+- [ ] `propagate_in_video(state, start_frame_idx, max_frame_num, reverse)` — propagate masks through video
+- [ ] `clear_all_points_in_video(state)` — reset all prompts
+- [ ] Memory bank management (conditional frames, max 4 in attention)
+- [ ] Multi-mask output for tracking with stability-based selection
+- [ ] Memory selection for temporal disambiguation
+
+---
+
+## Phase 5: Video Inference Pipeline
+
+### 5.1 Video Inference with Detection + Tracking
+- **File:** `sam3/model/sam3_video_inference.py`
+- **Class:** `Sam3VideoInferenceWithInstanceInteractivity`
+- [ ] Image preprocessing (resize to 1008, normalize `mean=0.5`, `std=0.5`)
+- [ ] Per-frame detection via text prompts
+- [ ] Detection-to-track association (IoU matching, `assoc_iou_thresh=0.1`)
+- [ ] Detection NMS (`det_nms_thresh=0.1`)
+- [ ] New detection threshold (`new_det_thresh=0.7`)
+- [ ] Track lifecycle management:
+  - [ ] Hotstart delay (`hotstart_delay=15`)
+  - [ ] Unmatch/duplicate thresholds (`hotstart_unmatch_thresh=8`, `hotstart_dup_thresh=8`)
+  - [ ] Keep-alive counters (`max_trk_keep_alive=30`, `init_trk_keep_alive=30`)
+  - [ ] Occlusion-based suppression (`threshold=0.7`)
+  - [ ] Boundary detection suppression (optional)
+- [ ] Reconditioning every Nth frame (`recondition_every_nth_frame=16`)
+- [ ] Masklet confirmation (optional)
+- [ ] Hole filling (`fill_hole_area=16`)
+- [ ] `torch.compile` support
+
+### 5.2 Video Predictor (Session API)
+- **File:** `sam3/model/sam3_video_predictor.py`
+- **Class:** `Sam3VideoPredictorMultiGPU`
+- [ ] Session management (create, reset, close, expiration)
+- [ ] `handle_request(request)` — single request handler
+  - [ ] `type: "start_session"` — load video, initialize state
+  - [ ] `type: "add_prompt"` — add text/point/box prompt on a frame
+  - [ ] `type: "remove_object"` — remove a tracked object by ID
+  - [ ] `type: "reset_session"` — clear all prompts and tracks
+  - [ ] `type: "close_session"` — free resources
+- [ ] `handle_stream_request(request)` — streaming response handler
+  - [ ] `type: "propagate_in_video"` — yield per-frame outputs
+- [ ] Multi-GPU support (optional)
+- [ ] Async frame loading (`async_loading_frames`)
+
+---
+
+## Phase 6: SAM 3.1 — Object Multiplex
+
+### 6.1 Multiplex Controller
+- **File:** `sam3/model/multiplex_utils.py`
+- **Class:** `MultiplexController`
+- **Config:** `multiplex_count=16`
+- [ ] Bucket objects into fixed-capacity groups (16 per bucket)
+- [ ] Dynamic object assignment
+- [ ] Configurable eval multiplex count
+
+### 6.2 Multiplex Memory Encoder
+- **File:** `sam3/model/memory.py` (extended)
+- [ ] `SimpleMaskDownSampler` with `multiplex_count=16`, `starting_out_chan=4`, `input_channel_multiplier=2`
+- [ ] Per-object mask channels in memory encoding
+- [ ] Output dim upgraded to `out_dim=256` (from 64)
+
+### 6.3 Decoupled Transformer for Multiplex
+- **File:** `sam3/model/decoder.py`
+- **Classes:** `SimpleRoPEAttention`, `DecoupledTransformerDecoderLayerv2`, `TransformerEncoderDecoupledCrossAttention`
+- [ ] `SimpleRoPEAttention` — `d_model=256`, `num_heads=8`, `feat_sizes=[72, 72]`
+- [ ] `DecoupledTransformerDecoderLayerv2` — decoupled self + cross attention with GELU activation
+- [ ] `TransformerEncoderDecoupledCrossAttention` — 4-layer encoder for multiplex memory
+
+### 6.4 Multiplex Tracking Model
+- **File:** `sam3/model/video_tracking_multiplex.py`
+- **Class:** `VideoTrackingDynamicMultiplex`
+- [ ] Joint multi-object tracking with shared memory
+- [ ] Object pointer support (`max_obj_ptrs_in_encoder=16`)
+- [ ] Temporal position encoding (sincos)
+- [ ] Object conditional embeddings
+- [ ] Output suppression embeddings
+- [ ] Batched postprocessing
+- [ ] Memory selection (disabled for multiplex)
+- [ ] High-res features in SAM decoder
+- [ ] Sigmoid scaling for memory encoder (`scale=2.0`, `bias=-1.0`)
+- [ ] `torch.compile` support for all components
+
+### 6.5 Multiplex Demo Model
+- **File:** `sam3/model/video_tracking_multiplex_demo.py`
+- **Class:** `Sam3VideoTrackingMultiplexDemo`
+- [ ] `init_state(video_path)` — session initialization
+- [ ] Demo-specific methods for interactive use
+
+### 6.6 Multiplex Detector
+- **File:** `sam3/model/sam3_multiplex_detector.py`
+- **Class:** `Sam3MultiplexDetector`
+- [ ] Detector adapted for multiplex pipeline
+- [ ] Batched grounding (`batched_grounding_batch_size=16`)
+- [ ] Joint box score supervision
+
+### 6.7 Multiplex Predictor Wrapper
+- **File:** `sam3/model/sam3_multiplex_base.py`
+- **Class:** `Sam3MultiplexPredictorWrapper`
+- [ ] Wrap multiplex tracker for use in the pipeline
+- [ ] Per-object vs. joint inference toggle
+- [ ] Hole filling
+
+### 6.8 Multiplex Tracking Pipeline
+- **File:** `sam3/model/sam3_multiplex_tracking.py`
+- **Class:** `Sam3MultiplexTrackingWithInteractivity`
+- [ ] Full detect + track + lifecycle pipeline for multiplex
+- [ ] Detection score threshold (`score_threshold_detection=0.4`)
+- [ ] IoM-based NMS (`det_nms_use_iom=True`)
+- [ ] IoM-based reconditioning (`iom_thresh_recondition=0.5`)
+- [ ] Masklet confirmation enabled
+- [ ] Batched grounding
+- [ ] Max objects cap (`max_num_objects=16`)
+- [ ] Batched postprocessing (`postprocess_batch_size=16`)
+- [ ] Boundary suppression enabled
+
+### 6.9 Multiplex Video Predictor
+- **File:** `sam3/model/sam3_multiplex_video_predictor.py`
+- **Class:** `Sam3MultiplexVideoPredictor`
+- [ ] Session API (same interface as SAM 3 predictor)
+- [ ] `handle_request()` / `handle_stream_request()`
+- [ ] Session expiration (`session_expiration_sec=1200`)
+- [ ] Default output probability threshold (`default_output_prob_thresh=0.5`)
+- [ ] Async frame loading
+- [ ] Optional warm-up compilation pass
+
+---
+
+## Phase 7: Model Builder & Entrypoints
+
+### 7.1 Model Builder
+- **File:** `sam3/model_builder.py`
+- [ ] `build_sam3_image_model()` — assemble image detector
+  - [ ] Create vision backbone, text encoder, VL backbone
+  - [ ] Create transformer (encoder + decoder)
+  - [ ] Create geometry encoder, segmentation head, dot product scoring
+  - [ ] Optional instance interactivity predictor
+  - [ ] Load checkpoint (local or HuggingFace)
+- [ ] `build_sam3_video_model()` — assemble SAM 3 video model
+  - [ ] Build detector + tracker
+  - [ ] Wire shared backbone
+  - [ ] Configure tracking heuristics
+  - [ ] Load checkpoint
+- [ ] `build_sam3_multiplex_video_predictor()` — assemble SAM 3.1 multiplex stack
+  - [ ] Build multiplex tracker model
+  - [ ] Build multiplex detector
+  - [ ] Assemble `Sam3MultiplexTrackingWithInteractivity`
+  - [ ] Checkpoint key remapping (internal → OSS naming)
+  - [ ] Wrap in `Sam3MultiplexVideoPredictor`
+- [ ] `build_sam3_predictor(version="sam3"|"sam3.1")` — unified entry point
+- [ ] `download_ckpt_from_hf(version)` — download from `facebook/sam3` or `facebook/sam3.1`
+- [ ] `_setup_tf32()` — enable TensorFloat-32 for Ampere GPUs
+
+### 7.2 Package Init
+- **File:** `sam3/__init__.py`
+- [ ] Export `build_sam3_image_model`, `build_sam3_predictor`
+- [ ] Version string (`__version__ = "0.1.0"`)
+
+### 7.3 Logger
+- **File:** `sam3/logger.py`
+- [ ] `ColoredFormatter` — colored console output per log level
+- [ ] `get_logger(name, level)` — configurable via `LOG_LEVEL` env var
+
+---
+
+## Phase 8: Visualization & Utilities
+
+### 8.1 Visualization Utils
+- **File:** `sam3/visualization_utils.py`
+- [ ] `generate_colors()` — perceptually uniform color palette via KMeans in LAB space
+- [ ] `plot_bbox()`, `plot_mask()`, `show_points()`, `show_box()`, `show_mask()`
+- [ ] `visualize_frame_output()` — single frame with boxes + masks
+- [ ] `visualize_formatted_frame_output()` — side-by-side comparison with prompt overlay
+- [ ] `render_masklet_frame()` — overlay masks + boxes on a frame (returns numpy)
+- [ ] `save_masklet_video()` — render full video with overlays (ffmpeg re-encode)
+- [ ] `save_masklet_image()` — single frame overlay to file
+- [ ] `prepare_masks_for_visualization()` — reformat pipeline outputs to `{frame_idx: {obj_id: mask}}`
+- [ ] `convert_coco_to_masklet_format()` — COCO annotation → pipeline format
+- [ ] `load_frame()` — unified frame loader (numpy / PIL / file path)
+- [ ] `get_annot_dfs()` — load SA-Co annotation JSONs into DataFrames
+
+---
+
+## Phase 9: Agent (Optional — MLLM Integration)
+
+### 9.1 Agent Core
+- **File:** `sam3/agent/agent_core.py`
+- [ ] `agent_inference()` — agentic loop: MLLM plans → SAM3 executes → MLLM verifies
+- [ ] Tool dispatch: `segment_phrase`, `examine_each_mask`, `select_masks_and_return`, `report_no_mask`
+- [ ] Message pruning between rounds (max 2 images in context)
+- [ ] Duplicate prompt tracking
+
+### 9.2 LLM Client
+- **File:** `sam3/agent/client_llm.py`
+- [ ] `send_generate_request()` — OpenAI-compatible API client (vLLM or external)
+- [ ] `send_direct_request()` — direct vLLM inference (no server)
+- [ ] Image → base64 conversion for multimodal messages
+
+### 9.3 SAM3 Client
+- **File:** `sam3/agent/client_sam3.py`
+- [ ] `sam3_inference()` — run SAM3 image model and format outputs
+- [ ] `call_sam_service()` — full pipeline: inference → overlap removal → visualization → save
+
+### 9.4 Agent Visualization
+- **File:** `sam3/agent/viz.py`
+- [ ] `visualize()` — render all masks or zoom-in on a single mask
+- **File:** `sam3/agent/helpers/visualizer.py`
+- [ ] `Visualizer` — overlay instances with boxes, masks, labels
+- **File:** `sam3/agent/helpers/zoom_in.py`
+- [ ] `render_zoom_in()` — crop and zoom into a single mask region
+- **File:** `sam3/agent/helpers/mask_overlap_removal.py`
+- [ ] `remove_overlapping_masks()` — post-process overlapping predictions
+
+### 9.5 Agent System Prompts
+- **Directory:** `sam3/agent/system_prompts/`
+- [ ] `system_prompt.txt` — main agent system prompt
+- [ ] `system_prompt_iterative_checking.txt` — per-mask verification prompt
+
+---
+
+## Dependency Graph (Critical Path)
+
+```
+tokenizer_ve.py
+    └─► text_encoder_ve.py
+            │
+position_encoding.py
+    │
+vitdet.py (ViT)
+    └─► necks.py (Sam3DualViTDetNeck)
+            └─► vl_combiner.py (SAM3VLBackbone) ◄── text_encoder_ve.py
+                    │
+model_misc.py (MLP, MultiheadAttention, DotProductScoring)
+    │
+encoder.py (TransformerEncoderFusion)
+    │
+decoder.py (TransformerDecoder)
+    │
+model_misc.py (TransformerWrapper) ◄── encoder.py + decoder.py
+    │
+geometry_encoders.py (SequenceGeometryEncoder)
+    │
+maskformer_segmentation.py (PixelDecoder, UniversalSegmentationHead)
+    │
+sam3_image.py (Sam3Image) ◄── all above
+    │
+sam3_image_processor.py (Sam3Processor) ◄── Sam3Image
+    │
+    ├─► [IMAGE INFERENCE READY]
+    │
+memory.py (SimpleMaskEncoder, CXBlock, SimpleFuser)
+    │
+sam/transformer.py (RoPEAttention)
+    │
+decoder.py (TransformerDecoderLayerv2, TransformerEncoderCrossAttention)
+    │
+sam3_tracking_predictor.py (Sam3TrackerPredictor) ◄── memory + RoPE + decoder
+    │
+sam3_video_inference.py (Sam3VideoInferenceWithInstanceInteractivity)
+    │                         ◄── Sam3Image + Sam3TrackerPredictor
+    │
+sam3_video_predictor.py (Sam3VideoPredictorMultiGPU)
+    │
+    ├─► [SAM 3 VIDEO INFERENCE READY]
+    │
+multiplex_utils.py (MultiplexController)
+    │
+decoder.py (DecoupledTransformerDecoderLayerv2, SimpleRoPEAttention)
+    │
+video_tracking_multiplex.py (VideoTrackingDynamicMultiplex)
+    │
+sam3_multiplex_*.py (detector, base, tracking, video_predictor)
+    │
+    └─► [SAM 3.1 MULTIPLEX VIDEO INFERENCE READY]
+```
+
+---
+
+## Checkpoint & Model Info
+
+| Model   | Params | HuggingFace Repo       | Checkpoint File         |
+|---------|--------|------------------------|-------------------------|
+| SAM 3   | 848M   | `facebook/sam3`        | `sam3.pt`               |
+| SAM 3.1 | —      | `facebook/sam3.1`      | `sam3.1_multiplex.pt`   |
+
+**Requirements:**
+- Python ≥ 3.12
+- PyTorch ≥ 2.7
+- CUDA ≥ 12.6
+- Image size: 1008×1008 (model input resolution)
+- Normalization: `mean=(0.5, 0.5, 0.5)`, `std=(0.5, 0.5, 0.5)`
+
+---
+
+## Quick Reference — API Usage
+
+### Image Inference
+```python
+from sam3.model_builder import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
+
+model = build_sam3_image_model()
+processor = Sam3Processor(model)
+state = processor.set_image(image)
+state = processor.set_text_prompt("your prompt", state)
+masks, boxes, scores = state["masks"], state["boxes"], state["scores"]
+```
+
+### Video Inference (SAM 3.1)
+```python
+from sam3.model_builder import build_sam3_multiplex_video_predictor
+
+predictor = build_sam3_multiplex_video_predictor()
+resp = predictor.handle_request({"type": "start_session", "resource_path": video_path})
+predictor.handle_request({"type": "add_prompt", "session_id": resp["session_id"], "frame_index": 0, "text": "person"})
+for out in predictor.handle_stream_request({"type": "propagate_in_video", "session_id": resp["session_id"]}):
+    frame_masks = out["outputs"]
+```
 
 ## Done
 
@@ -79,3 +612,18 @@ Depends on all Priority 1 ground systems.
 - [x] Backend graph evaluator (`src/backend/cpu/cpu_backend.c`)
 - [x] Metal backend via MLX-C (`src/backend/metal/metal_backend.c`)
 - [x] Backend factory (`src/backend/backend.c`)
+- [x] Graph helper library — 20+ tensor ops (`src/model/graph_helpers.c/.h`)
+- [x] Tokenizer — BPE with CLIP vocab (`src/model/tokenizer.c/.h`)
+- [x] Text encoder — 24-layer transformer (`src/model/text_encoder.c/.h`)
+- [x] Position encoding — 2D sinusoidal (`src/model/position_encoding.c/.h`)
+- [x] Vision backbone — 32-block ViT with RoPE + windowed attn (`src/model/image_encoder.c/.h`)
+- [x] Feature pyramid neck — 4-scale FPN (`src/model/necks.c/.h`)
+- [x] Vision-language backbone (`src/model/vl_combiner.c/.h`)
+- [x] Transformer encoder — 6-layer image-text fusion (`src/model/encoder.c/.h`)
+- [x] Transformer decoder — 6-layer, 200 queries, box refinement (`src/model/decoder.c/.h`)
+- [x] Dot product scoring (`src/model/model_misc.c/.h`)
+- [x] Geometry/prompt encoder — 3-layer cross-attn (`src/model/prompt_encoder.c/.h`)
+- [x] Segmentation head — pixel decoder + mask head (`src/model/segmentation.c/.h`)
+- [x] SAM3 image model — full pipeline composite (`src/model/sam3_image.c/.h`)
+- [x] Image processor — high-level C API (`src/model/sam3_processor.c/.h`)
+- [x] Box operations — format conversion, IoU, NMS (`src/model/box_ops.c/.h`)

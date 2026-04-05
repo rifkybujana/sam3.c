@@ -45,6 +45,19 @@ enum sam3_op {
 	SAM3_OP_SILU,            /* x * sigmoid(x)          */
 	SAM3_OP_CONV_TRANSPOSE2D, /* params[0]=stride, [1]=padding */
 	SAM3_OP_MAXPOOL2D,       /* params[0]=kernel, [1]=stride  */
+	SAM3_OP_SDPA,            /* Fused scaled dot-product attention.
+				  * inputs: Q[seq,hd], K[seq,hd], V[seq,hd],
+				  *         mask[seq,seq] (optional).
+				  * params[0]=head_dim (scale=1/sqrt(hd)).
+				  * output: [seq, head_dim].              */
+	SAM3_OP_BIAS_ADD,        /* NCHW bias add: x[N,C,H,W] + bias[C].
+				  * inputs[0]=x, inputs[1]=bias.
+				  * output: same shape as x.              */
+	SAM3_OP_GROUPNORM,      /* GroupNorm on NCHW input.
+				  * inputs[0]=x[N,C,H,W],
+				  * inputs[1]=gamma[C], inputs[2]=beta[C].
+				  * params[0]=num_groups.
+				  * output: same shape as x.              */
 	SAM3_OP_COUNT,  /* must be last */
 };
 

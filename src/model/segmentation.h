@@ -1,18 +1,20 @@
 /*
- * src/model/segmentation.h - SAM3 segmentation head (pixel decoder + mask prediction)
+ * src/model/segmentation.h - SAM3 UniversalSegmentationHead
  *
- * Defines the segmentation head that converts decoder output tokens and
- * image features into final segmentation masks. The pixel decoder applies
- * three stages of nearest-neighbor 2x upsampling with 1x1 conv, layernorm,
- * and ReLU to produce high-resolution pixel features. Mask logits are then
- * computed via dot product between query embeddings and upsampled features,
- * followed by sigmoid activation.
+ * Implements the MaskFormer-style segmentation head used for text/box
+ * prompts. Contains an FPN PixelDecoder (interpolate + skip add + 3×3
+ * conv + GroupNorm(8) + ReLU), instance projection (1×1 conv), mask
+ * embedder (3-layer MLP), and optional prompt cross-attention. Mask
+ * logits are computed via dot product of embedded queries and instance
+ * pixel features.
  *
- * Key types:  sam3_seg_head, sam3_pixel_decoder
+ * Weight prefix: detector_model.mask_decoder.*
+ *
+ * Key types:  sam3_seg_head
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h, core/weight.h
- * Used by:    sam3.c (top-level inference pipeline)
+ * Used by:    sam3_image.c
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
@@ -24,46 +26,61 @@
 #include "core/alloc.h"
 #include "core/weight.h"
 
-#define SAM3_SEG_UPSAMPLE_STAGES 3
-
-struct sam3_pixel_decoder {
-	int hidden_dim;  /* 256 */
-
-	/* 3 upsample stages: each has conv + layernorm */
-	struct {
-		struct sam3_tensor *conv_w, *conv_b;
-		struct sam3_tensor *ln_w, *ln_b;
-	} stages[SAM3_SEG_UPSAMPLE_STAGES];
-};
+#define SAM3_SEG_FPN_STAGES       3
+#define SAM3_SEG_MASK_MLP_LAYERS  3
+#define SAM3_SEG_GN_GROUPS        8
 
 struct sam3_seg_head {
-	struct sam3_pixel_decoder pixel_dec;
-	int d_model;  /* 256 */
+	int d_model;       /* 256 */
+	int n_attn_heads;  /* 8 for prompt cross-attention */
+
+	/* PixelDecoder FPN: 3 stages of 3×3 conv + GroupNorm(8) + ReLU */
+	struct {
+		struct sam3_tensor *conv_w; /* [d, d, 3, 3] */
+		struct sam3_tensor *conv_b; /* [d] */
+		struct sam3_tensor *gn_w;   /* [d] */
+		struct sam3_tensor *gn_b;   /* [d] */
+	} fpn[SAM3_SEG_FPN_STAGES];
+
+	/* Instance projection: 1×1 conv [d → d] after pixel decoder */
+	struct sam3_tensor *inst_proj_w; /* [d, d, 1, 1] */
+	struct sam3_tensor *inst_proj_b; /* [d] */
+
+	/* Mask embedder: 3-layer MLP on query embeddings */
+	struct {
+		struct sam3_tensor *w; /* [d, d] */
+		struct sam3_tensor *b; /* [d] */
+	} mask_mlp[SAM3_SEG_MASK_MLP_LAYERS];
+
+	/* Prompt cross-attention: separate Q/K/V/O projections */
+	struct sam3_tensor *pxattn_q_w, *pxattn_q_b;
+	struct sam3_tensor *pxattn_k_w, *pxattn_k_b;
+	struct sam3_tensor *pxattn_v_w, *pxattn_v_b;
+	struct sam3_tensor *pxattn_o_w, *pxattn_o_b;
+	struct sam3_tensor *pxattn_norm_w, *pxattn_norm_b;
+
+	/* Debug: intermediate tensors (valid after build, data after eval) */
+	struct sam3_tensor *_debug_pixel_embed; /* FPN output [1,d,H,W] */
+	struct sam3_tensor *_debug_inst;        /* inst proj [1,d,H,W] */
+	struct sam3_tensor *_debug_mask_embed;  /* MLP output [nq,d] */
+	struct sam3_tensor *_debug_enc_nchw;    /* encoder NCHW [1,d,h,w] */
 };
 
 /*
- * sam3_seg_head_init - Initialize segmentation head with configuration.
+ * sam3_seg_head_init - Initialize segmentation head.
  *
- * @head:    Seg head struct (caller-allocated, zeroed)
- * @d_model: Model dimension (256)
- *
- * Returns SAM3_OK on success, SAM3_EINVAL if d_model <= 0.
+ * @head:         Seg head struct (caller-allocated)
+ * @d_model:      Model dimension (256)
+ * @n_attn_heads: Number of heads for prompt cross-attention (8)
  */
-enum sam3_error sam3_seg_head_init(struct sam3_seg_head *head, int d_model);
+enum sam3_error sam3_seg_head_init(struct sam3_seg_head *head,
+				   int d_model, int n_attn_heads);
 
 /*
- * sam3_seg_head_load - Load segmentation head weights from weight file.
+ * sam3_seg_head_load - Load weights from weight file.
  *
- * @head:  Initialized seg head struct
- * @wf:    Open weight file (may be NULL for zero-init fallback)
- * @arena: Arena for weight tensor allocation
- *
- * Looks up weight tensors by name (seg_head.pixel_dec.stages.N.conv.*,
- * seg_head.pixel_dec.stages.N.ln.*) and populates the struct. When a
- * weight is not found (or wf is NULL), a zero-initialized tensor of
- * the correct shape is allocated as a fallback.
- *
- * Returns SAM3_OK on success, SAM3_ENOMEM if the arena is full.
+ * Weight prefix: detector_model.mask_decoder.*
+ * Falls back to zero-initialized tensors when weights are missing.
  */
 enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 				   const struct sam3_weight_file *wf,
@@ -72,29 +89,98 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 /*
  * sam3_seg_head_build - Build segmentation head compute graph.
  *
- * @head:           Initialized and loaded seg head
+ * @head:           Loaded seg head
  * @g:              Graph to add nodes to
- * @query_embed:    Decoder output [n_queries, d_model]
- * @pixel_features: Image features [n_pixels, d_model] (reshaped to 4D)
- * @grid_h:         Spatial height for reshape
- * @grid_w:         Spatial width for reshape
+ * @queries:        DETR decoder output [n_queries, d_model]
+ * @encoder_states: Encoder output [seq, d_model] (seq = enc_h * enc_w)
+ * @feat_1x:        Backbone feature at 1× [1, d, H1, W1]
+ * @feat_2x:        Backbone feature at 2× [1, d, H2, W2]
+ * @feat_4x:        Backbone feature at 4× [1, d, H4, W4]
+ * @enc_h, enc_w:   Spatial dims of encoder output
+ * @text_features:  Text encoder output [n_text, d_model], or NULL
  * @arena:          Arena for intermediate tensors
  *
  * Pipeline:
- *  1. Reshape pixel_features to [1, d_model, grid_h, grid_w]
- *  2. 3 stages: upsample 2x -> 1x1 conv -> layernorm -> ReLU
- *  3. Flatten to [H*W, d_model]
- *  4. Dot product: query_embed @ pixel_features^T -> [n_queries, H*W]
- *  5. Sigmoid -> final mask probabilities
+ *  1. (Optional) prompt cross-attention on encoder_states
+ *  2. Reshape encoder_states to [1, d, enc_h, enc_w]
+ *  3. FPN: interpolate + skip add + 3×3 conv + GroupNorm(8) + ReLU (×3)
+ *  4. Instance projection: 1×1 conv on pixel features
+ *  5. Mask embedder: 3-layer MLP on queries
+ *  6. Dot product: mask_embed @ instance_features → mask logits
  *
- * Returns mask logits [n_queries, grid_h*8 * grid_w*8], or NULL on error.
+ * Returns mask logits [n_queries, final_h, final_w], or NULL on error.
  */
 struct sam3_tensor *sam3_seg_head_build(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
-	struct sam3_tensor *query_embed,
-	struct sam3_tensor *pixel_features,
-	int grid_h, int grid_w,
+	struct sam3_tensor *queries,
+	struct sam3_tensor *encoder_states,
+	struct sam3_tensor *feat_1x,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	int enc_h, int enc_w,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_cross_attn - Build prompt cross-attention graph.
+ *
+ * Must be evaluated as a separate graph before calling seg_head_build,
+ * because seg_head_build does a manual NCHW transpose that reads
+ * materialized tensor data.
+ *
+ * @head:           Loaded seg head
+ * @g:              Graph to add nodes to
+ * @encoder_states: Encoder output [seq, d_model]
+ * @text_features:  Text encoder output [n_text, d_model]
+ * @arena:          Arena for intermediate tensors
+ *
+ * Returns cross-attended encoder states [seq, d_model], or NULL on error.
+ */
+struct sam3_tensor *sam3_seg_head_build_cross_attn(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *encoder_states,
+	struct sam3_tensor *text_features,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_fpn - Build FPN pixel decoder + instance projection.
+ *
+ * Must be evaluated and persisted before building the dot product.
+ *
+ * @head:     Loaded seg head
+ * @g:        Graph to add nodes to
+ * @enc_nchw: Encoder output in NCHW [1, d, enc_h, enc_w]
+ * @feat_1x:  Backbone feature at 1× [1, d, H1, W1]
+ * @feat_2x:  Backbone feature at 2× [1, d, H2, W2]
+ * @feat_4x:  Backbone feature at 4× [1, d, H4, W4]
+ * @arena:    Arena for intermediate tensors
+ *
+ * Returns instance-projected pixel features [1, d, H4, W4].
+ */
+struct sam3_tensor *sam3_seg_head_build_fpn(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *feat_1x,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_mask_embed - Build mask embedder MLP on queries.
+ *
+ * @head:    Loaded seg head
+ * @g:       Graph to add nodes to
+ * @queries: DETR decoder output [n_queries, d_model]
+ * @arena:   Arena for intermediate tensors
+ *
+ * Returns mask embeddings [n_queries, d_model].
+ */
+struct sam3_tensor *sam3_seg_head_build_mask_embed(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *queries,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_SEGMENTATION_H */

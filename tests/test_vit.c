@@ -20,6 +20,7 @@
 #include "model/graph_helpers.h"
 #include "backend/cpu/cpu_backend.h"
 #include "backend/backend.h"
+#include "core/alloc.h"
 #include "core/graph.h"
 #include "core/tensor.h"
 
@@ -37,6 +38,8 @@
 #define TEST_N_PATCHES    (TEST_GRID_SIZE * TEST_GRID_SIZE)   /* 4 */
 
 static struct sam3_cpu_backend g_cpu;
+static struct sam3_arena g_scratch;
+static struct sam3_arena g_persist;
 
 static void setup(void)
 {
@@ -45,11 +48,16 @@ static void setup(void)
 	g_cpu.base.ops = sam3_cpu_backend_ops();
 	g_cpu.arena_capacity = 128 * 1024 * 1024; /* 128 MiB */
 	g_cpu.base.ops->init(&g_cpu.base);
+
+	sam3_arena_init(&g_scratch, 64 * 1024 * 1024); /* 64 MiB */
+	sam3_arena_init(&g_persist, 16 * 1024 * 1024); /* 16 MiB */
 }
 
 static void teardown(void)
 {
 	g_cpu.base.ops->free(&g_cpu.base);
+	sam3_arena_free(&g_scratch);
+	sam3_arena_free(&g_persist);
 }
 
 /*
@@ -199,6 +207,17 @@ static void test_vit_build_shapes(void)
 	err = sam3_vit_load(&vit, NULL, &g_cpu.arena);
 	ASSERT_EQ(err, SAM3_OK);
 
+	/* Set layernorm gamma to 1.0 for numerical stability */
+	for (int l = 0; l < TEST_DEPTH; l++) {
+		float *w;
+		w = (float *)vit.layers[l].ln1_w->data;
+		for (int i = 0; i < TEST_EMBED_DIM; i++)
+			w[i] = 1.0f;
+		w = (float *)vit.layers[l].ln2_w->data;
+		for (int i = 0; i < TEST_EMBED_DIM; i++)
+			w[i] = 1.0f;
+	}
+
 	/* Create dummy input image [3, img_size, img_size] */
 	int img_dims[] = {3, TEST_IMG_SIZE, TEST_IMG_SIZE};
 	struct sam3_tensor *image;
@@ -206,12 +225,13 @@ static void test_vit_build_shapes(void)
 				 3, img_dims);
 	ASSERT(image != NULL);
 
-	/* Build graph */
-	struct sam3_graph graph;
-	sam3_graph_init(&graph);
+	/* Per-block eval: evaluates internally, returns output */
+	sam3_arena_reset(&g_scratch);
+	sam3_arena_reset(&g_persist);
 
 	struct sam3_tensor *out;
-	out = sam3_vit_build(&vit, &graph, image, &g_cpu.arena);
+	out = sam3_vit_build(&vit, &g_cpu.base, image,
+			      &g_scratch, &g_persist);
 	ASSERT(out != NULL);
 
 	/* Output shape: [n_patches, embed_dim] */
@@ -267,19 +287,16 @@ static void test_vit_eval(void)
 	for (int i = 0; i < img_elems; i++)
 		img_data[i] = 0.01f * (float)(i % 17);
 
-	/* Build graph */
-	struct sam3_graph graph;
-	sam3_graph_init(&graph);
+	/* Per-block eval: evaluates internally */
+	sam3_arena_reset(&g_scratch);
+	sam3_arena_reset(&g_persist);
 
 	struct sam3_tensor *out;
-	out = sam3_vit_build(&vit, &graph, image, &g_cpu.arena);
+	out = sam3_vit_build(&vit, &g_cpu.base, image,
+			      &g_scratch, &g_persist);
 	ASSERT(out != NULL);
 
-	/* Evaluate on CPU backend */
-	err = g_cpu.base.ops->graph_eval(&g_cpu.base, &graph);
-	ASSERT_EQ(err, SAM3_OK);
-
-	/* Verify output is finite */
+	/* Verify output is finite (already evaluated by vit_build) */
 	int n_out = TEST_N_PATCHES * TEST_EMBED_DIM;
 	float *od = (float *)out->data;
 	for (int i = 0; i < n_out; i++) {
@@ -395,12 +412,13 @@ static void test_vit_windowed_attention(void)
 	for (int i = 0; i < img_elems; i++)
 		img_data[i] = 0.01f * (float)(i % 17);
 
-	/* Build graph */
-	struct sam3_graph graph;
-	sam3_graph_init(&graph);
+	/* Per-block eval: evaluates internally */
+	sam3_arena_reset(&g_scratch);
+	sam3_arena_reset(&g_persist);
 
 	struct sam3_tensor *out;
-	out = sam3_vit_build(&vit, &graph, image, &g_cpu.arena);
+	out = sam3_vit_build(&vit, &g_cpu.base, image,
+			      &g_scratch, &g_persist);
 	ASSERT(out != NULL);
 
 	/* Output shape: [n_patches, embed_dim] */
@@ -408,11 +426,7 @@ static void test_vit_windowed_attention(void)
 	ASSERT_EQ(out->dims[0], n_patches);
 	ASSERT_EQ(out->dims[1], embed_dim);
 
-	/* Evaluate on CPU backend */
-	err = g_cpu.base.ops->graph_eval(&g_cpu.base, &graph);
-	ASSERT_EQ(err, SAM3_OK);
-
-	/* Verify output is finite */
+	/* Verify output is finite (already evaluated by vit_build) */
 	int n_out = n_patches * embed_dim;
 	float *od = (float *)out->data;
 	for (int i = 0; i < n_out; i++) {

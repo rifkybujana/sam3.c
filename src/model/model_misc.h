@@ -22,12 +22,17 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 
-/* Dot-product scoring: text-query confidence via 2-layer MLP */
+/*
+ * Objectness scorer: 3-layer MLP matching SAM3's pred_obj_score_head.
+ * Architecture: proj_in -> relu -> hidden -> relu -> proj_out
+ * All hidden dims are 256; output is [n_queries, 1].
+ */
 struct sam3_dot_scorer {
-	struct sam3_tensor *fc1_w, *fc1_b; /* [hidden_dim, input_dim] / [hidden_dim] */
-	struct sam3_tensor *fc2_w, *fc2_b; /* [1, hidden_dim] / [1] */
+	struct sam3_tensor *proj_in_w, *proj_in_b;  /* [hidden, input] / [hidden] */
+	struct sam3_tensor *hidden_w, *hidden_b;    /* [hidden, hidden] / [hidden] */
+	struct sam3_tensor *proj_out_w, *proj_out_b; /* [1, hidden] / [1] */
 	int input_dim;  /* 256 */
-	int hidden_dim; /* 2048 */
+	int hidden_dim; /* 256 */
 };
 
 /*
@@ -47,8 +52,8 @@ enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
  * sam3_dot_scorer_build - Build dot scorer compute graph.
  *
  * Score query embeddings against text features. Computes a dot product
- * between queries and text, then runs a 2-layer MLP (relu activation)
- * on the query features for confidence.
+ * between queries and text, then runs a 3-layer MLP (relu activations)
+ * on the query features for per-query objectness confidence.
  *
  * @ds:            Loaded dot scorer
  * @g:             Graph to add nodes to

@@ -23,6 +23,7 @@
 
 #include "core/quant.h"
 #include "core/half.h"
+#include <math.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -50,28 +51,60 @@ static int metal_map_dtype(enum sam3_dtype dt, mlx_dtype *out)
 /* ── Q8_0 dequantization to F16 ───────────────────────────────────── */
 
 /*
- * metal_dequant_q8_to_f16 - Dequantize Q8_0 blocks to F16 buffer.
+ * metal_dequant_q8_to_f16 - Dequantize Q8_0 blocks directly to F16.
  *
- * @src:     Q8 block array
- * @dst:     Destination F16 buffer (caller-allocated, nelems * 2 bytes)
- * @nelems:  Number of elements
- * @scratch: Scratch arena for F32 temporary buffer
+ * Single-pass: converts Q8 blocks to fp16 without an intermediate
+ * f32 buffer. NEON-accelerated on aarch64, scalar fallback otherwise.
+ *
+ * @src:    Q8 block array
+ * @dst:    Destination F16 buffer (caller-allocated, nelems * 2 bytes)
+ * @nelems: Number of elements
  */
 static void metal_dequant_q8_to_f16(const struct sam3_q8_block *src,
-				     uint16_t *dst, int nelems,
-				     struct sam3_arena *scratch)
+				     uint16_t *dst, int nelems)
 {
-	float *tmp = sam3_arena_alloc(scratch, (size_t)nelems * sizeof(float));
-	if (!tmp) {
-		sam3_log_error("metal: scratch OOM for Q8 dequant (%d elems)",
-			       nelems);
-		return;
+	int nblocks = nelems / SAM3_Q8_BLOCK_SIZE;
+	int tail = nelems % SAM3_Q8_BLOCK_SIZE;
+
+#if defined(SAM3_HAS_NEON) || \
+	(defined(__aarch64__) && defined(__ARM_NEON))
+	for (int b = 0; b < nblocks; b++) {
+		const struct sam3_q8_block *blk = &src[b];
+		uint16_t *out = &dst[b * SAM3_Q8_BLOCK_SIZE];
+		float32x4_t vscale = vdupq_n_f32(blk->scale);
+
+		for (int i = 0; i < SAM3_Q8_BLOCK_SIZE; i += 8) {
+			int8x8_t d8 = vld1_s8(&blk->data[i]);
+			int16x8_t d16 = vmovl_s8(d8);
+			float32x4_t flo = vmulq_f32(
+				vcvtq_f32_s32(
+					vmovl_s16(vget_low_s16(d16))),
+				vscale);
+			float32x4_t fhi = vmulq_f32(
+				vcvtq_f32_s32(
+					vmovl_s16(vget_high_s16(d16))),
+				vscale);
+			f32x4x2_to_fp16x8(&out[i], flo, fhi);
+		}
 	}
+#else
+	for (int b = 0; b < nblocks; b++) {
+		const struct sam3_q8_block *blk = &src[b];
+		uint16_t *out = &dst[b * SAM3_Q8_BLOCK_SIZE];
+		float scale = blk->scale;
 
-	sam3_q8_dequantize(src, tmp, nelems);
+		for (int i = 0; i < SAM3_Q8_BLOCK_SIZE; i++)
+			out[i] = f32_to_fp16((float)blk->data[i] * scale);
+	}
+#endif
 
-	for (int i = 0; i < nelems; i++)
-		dst[i] = f32_to_fp16(tmp[i]);
+	if (tail > 0) {
+		const struct sam3_q8_block *blk = &src[nblocks];
+		uint16_t *out = &dst[nblocks * SAM3_Q8_BLOCK_SIZE];
+		float scale = blk->scale;
+		for (int i = 0; i < tail; i++)
+			out[i] = f32_to_fp16((float)blk->data[i] * scale);
+	}
 }
 
 /* ── Tensor-to-mlx_array lookup table ─────────────────────────────── */
@@ -207,7 +240,7 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 		}
 		metal_dequant_q8_to_f16(
 			(const struct sam3_q8_block *)t->data,
-			fp16_buf, nelems, &mtl->scratch);
+			fp16_buf, nelems);
 		data = fp16_buf;
 	}
 
@@ -304,15 +337,51 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 	}
 
 	case SAM3_OP_CONV2D: {
-		int sh = node->params[0] ? node->params[0] : 1;
-		int sw = node->params[1] ? node->params[1] : 1;
-		int ph = node->params[2];
-		int pw = node->params[3];
-		rc = mlx_conv2d(&result, inputs[0], inputs[1],
-				sh, sw, ph, pw,
+		/*
+		 * SAM3 uses NCHW (input) and OIHW (weight).
+		 * MLX conv2d expects NHWC (input) and OHWI (weight).
+		 * Transpose before conv, transpose result back.
+		 *
+		 * params[0] = stride (same for H and W)
+		 * params[1] = padding (same for H and W)
+		 */
+		int stride = node->params[0] ? node->params[0] : 1;
+		int pad = node->params[1];
+
+		/* Input NCHW -> NHWC: perm [0,2,3,1] */
+		int in_perm[] = {0, 2, 3, 1};
+		mlx_array in_nhwc = mlx_array_new();
+		rc = mlx_transpose_axes(&in_nhwc, inputs[0],
+					in_perm, 4, stream);
+		if (rc) { mlx_array_free(in_nhwc); break; }
+
+		/* Weight OIHW -> OHWI: perm [0,2,3,1] */
+		int wt_perm[] = {0, 2, 3, 1};
+		mlx_array wt_ohwi = mlx_array_new();
+		rc = mlx_transpose_axes(&wt_ohwi, inputs[1],
+					wt_perm, 4, stream);
+		if (rc) {
+			mlx_array_free(in_nhwc);
+			mlx_array_free(wt_ohwi);
+			break;
+		}
+
+		/* Conv2d in NHWC layout */
+		mlx_array conv_out = mlx_array_new();
+		rc = mlx_conv2d(&conv_out, in_nhwc, wt_ohwi,
+				stride, stride, pad, pad,
 				1, 1,  /* dilation */
 				1,     /* groups */
 				stream);
+		mlx_array_free(in_nhwc);
+		mlx_array_free(wt_ohwi);
+		if (rc) { mlx_array_free(conv_out); break; }
+
+		/* Result NHWC -> NCHW: perm [0,3,1,2] */
+		int out_perm[] = {0, 3, 1, 2};
+		rc = mlx_transpose_axes(&result, conv_out,
+					out_perm, 4, stream);
+		mlx_array_free(conv_out);
 		break;
 	}
 
@@ -590,15 +659,282 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		break;
 	}
 
-	case SAM3_OP_CONV_TRANSPOSE2D:
-		sam3_log_warn("metal: conv_transpose2d not yet implemented");
-		mlx_array_free(result);
-		return SAM3_EINVAL;
+	case SAM3_OP_SDPA: {
+		/*
+		 * Fused scaled dot-product attention via MLX.
+		 * inputs: Q[n_q,hd], K[n_kv,hd], V[n_kv,hd], mask?
+		 * MLX expects 4D: [batch, n_heads, seq, head_dim].
+		 * Per-head: batch=1, n_heads=1.
+		 * Q and K/V may have different seq lengths (cross-attn).
+		 */
+		int hd = node->params[0];
+		float scale = 1.0f / sqrtf((float)hd);
+		int seq_q = node->inputs[0]->dims[0];
+		int seq_kv = node->inputs[1]->dims[0];
 
-	case SAM3_OP_MAXPOOL2D:
-		sam3_log_warn("metal: maxpool2d not yet implemented");
-		mlx_array_free(result);
-		return SAM3_EINVAL;
+		/* Reshape 2D -> 4D [1, 1, seq, hd] */
+		int q_shape[] = {1, 1, seq_q, hd};
+		int kv_shape[] = {1, 1, seq_kv, hd};
+		mlx_array q4d = mlx_array_new();
+		mlx_array k4d = mlx_array_new();
+		mlx_array v4d = mlx_array_new();
+		rc = mlx_reshape(&q4d, inputs[0], q_shape, 4, stream);
+		if (!rc)
+			rc = mlx_reshape(&k4d, inputs[1], kv_shape, 4,
+					  stream);
+		if (!rc)
+			rc = mlx_reshape(&v4d, inputs[2], kv_shape, 4,
+					  stream);
+		if (rc) {
+			mlx_array_free(q4d);
+			mlx_array_free(k4d);
+			mlx_array_free(v4d);
+			break;
+		}
+
+		/* Prepare mask: [n_q, n_kv] -> [1, 1, n_q, n_kv] */
+		mlx_array mask4d = (mlx_array){0};
+		const char *mask_mode = "";
+		if (node->n_inputs > 3 && node->inputs[3]) {
+			mask4d = mlx_array_new();
+			int mshape[] = {1, 1, seq_q, seq_kv};
+			rc = mlx_reshape(&mask4d, inputs[3], mshape, 4,
+					  stream);
+			if (rc) {
+				mlx_array_free(q4d);
+				mlx_array_free(k4d);
+				mlx_array_free(v4d);
+				mlx_array_free(mask4d);
+				break;
+			}
+			mask_mode = "array";
+		}
+
+		mlx_array sdpa_out = mlx_array_new();
+		mlx_array no_sinks = (mlx_array){0};
+		rc = mlx_fast_scaled_dot_product_attention(
+			&sdpa_out, q4d, k4d, v4d, scale,
+			mask_mode, mask4d, no_sinks, stream);
+
+		mlx_array_free(q4d);
+		mlx_array_free(k4d);
+		mlx_array_free(v4d);
+		if (mask4d.ctx)
+			mlx_array_free(mask4d);
+
+		if (rc) {
+			mlx_array_free(sdpa_out);
+			break;
+		}
+
+		/* Reshape 4D [1, 1, seq_q, hd] -> 2D [seq_q, hd] */
+		int shape2d[] = {seq_q, hd};
+		rc = mlx_reshape(&result, sdpa_out, shape2d, 2, stream);
+		mlx_array_free(sdpa_out);
+		break;
+	}
+
+	case SAM3_OP_CONV_TRANSPOSE2D: {
+		/*
+		 * SAM3: NCHW input, IOHW weight [C_in, C_out, KH, KW].
+		 * MLX:  NHWC input, OHWI weight [C_out, KH, KW, C_in].
+		 */
+		int stride = node->params[0] ? node->params[0] : 1;
+		int pad = node->params[1];
+
+		/* Input NCHW -> NHWC: perm [0,2,3,1] */
+		int ct_in_perm[] = {0, 2, 3, 1};
+		mlx_array ct_in_nhwc = mlx_array_new();
+		rc = mlx_transpose_axes(&ct_in_nhwc, inputs[0],
+					ct_in_perm, 4, stream);
+		if (rc) { mlx_array_free(ct_in_nhwc); break; }
+
+		/* Weight IOHW -> OHWI: perm [1,2,3,0] */
+		int ct_wt_perm[] = {1, 2, 3, 0};
+		mlx_array ct_wt_ohwi = mlx_array_new();
+		rc = mlx_transpose_axes(&ct_wt_ohwi, inputs[1],
+					ct_wt_perm, 4, stream);
+		if (rc) {
+			mlx_array_free(ct_in_nhwc);
+			mlx_array_free(ct_wt_ohwi);
+			break;
+		}
+
+		/* Debug: print shapes going into conv_transpose2d */
+		{
+			size_t in_ndim = mlx_array_ndim(ct_in_nhwc);
+			size_t wt_ndim = mlx_array_ndim(ct_wt_ohwi);
+			const int *in_sh = mlx_array_shape(ct_in_nhwc);
+			const int *wt_sh = mlx_array_shape(ct_wt_ohwi);
+			sam3_log_debug("convT2d: in_nhwc [%d,%d,%d,%d] "
+				"wt_ohwi [%d,%d,%d,%d] s=%d p=%d",
+				in_sh[0], in_sh[1], in_sh[2], in_sh[3],
+				wt_sh[0], wt_sh[1], wt_sh[2], wt_sh[3],
+				stride, pad);
+		}
+
+		/* ConvTranspose2d in NHWC layout */
+		mlx_array ct_conv_out = mlx_array_new();
+		rc = mlx_conv_transpose2d(&ct_conv_out, ct_in_nhwc,
+					   ct_wt_ohwi,
+					   stride, stride,
+					   pad, pad,
+					   1, 1,  /* dilation */
+					   0, 0,  /* output_padding */
+					   1,     /* groups */
+					   stream);
+		mlx_array_free(ct_in_nhwc);
+		mlx_array_free(ct_wt_ohwi);
+		if (rc) { mlx_array_free(ct_conv_out); break; }
+
+		/* Debug: print output shape before transpose */
+		{
+			const int *out_sh = mlx_array_shape(ct_conv_out);
+			sam3_log_debug("convT2d: out_nhwc [%d,%d,%d,%d]",
+				out_sh[0], out_sh[1], out_sh[2], out_sh[3]);
+		}
+
+		/* Result NHWC -> NCHW: perm [0,3,1,2] */
+		int ct_out_perm[] = {0, 3, 1, 2};
+		rc = mlx_transpose_axes(&result, ct_conv_out,
+					ct_out_perm, 4, stream);
+		mlx_array_free(ct_conv_out);
+		break;
+	}
+
+	case SAM3_OP_MAXPOOL2D: {
+		/*
+		 * MaxPool2d for non-overlapping case (stride == kernel_size).
+		 * NCHW [N, C, H, W] -> reshape [N, C, H/k, k, W/k, k]
+		 * then max over k-dims (axes 3, 5) -> [N, C, H/k, W/k].
+		 */
+		int mp_k = node->params[0];
+		int mp_s = node->params[1];
+		const struct sam3_tensor *mp_in = node->inputs[0];
+		int mp_N = mp_in->dims[0];
+		int mp_C = mp_in->dims[1];
+		int mp_H = mp_in->dims[2];
+		int mp_W = mp_in->dims[3];
+
+		if (mp_s != mp_k || mp_H % mp_k != 0 || mp_W % mp_k != 0) {
+			sam3_log_error("metal: maxpool2d only supports "
+				       "stride==kernel, even dims");
+			mlx_array_free(result);
+			return SAM3_EINVAL;
+		}
+
+		/* Reshape to [N, C, H/k, k, W/k, k] */
+		int mp_shape[] = {mp_N, mp_C, mp_H / mp_k, mp_k,
+				  mp_W / mp_k, mp_k};
+		mlx_array mp_reshaped = mlx_array_new();
+		rc = mlx_reshape(&mp_reshaped, inputs[0],
+				 mp_shape, 6, stream);
+		if (rc) { mlx_array_free(mp_reshaped); break; }
+
+		/* Max over axis 5 (last k-dim) */
+		mlx_array mp_tmp = mlx_array_new();
+		rc = mlx_max_axis(&mp_tmp, mp_reshaped, 5, false, stream);
+		mlx_array_free(mp_reshaped);
+		if (rc) { mlx_array_free(mp_tmp); break; }
+
+		/* Max over axis 3 (remaining k-dim, now shifted) */
+		rc = mlx_max_axis(&result, mp_tmp, 3, false, stream);
+		mlx_array_free(mp_tmp);
+		break;
+	}
+
+	case SAM3_OP_GROUPNORM: {
+		/*
+		 * GroupNorm(num_groups) on NCHW input.
+		 * inputs[0]=x[N,C,H,W], inputs[1]=gamma[C], inputs[2]=beta[C].
+		 * params[0]=num_groups.
+		 *
+		 * Strategy: reshape [N,C,H,W] -> [N,G,C/G,H*W], normalize
+		 * over last 2 dims via layer_norm (no affine), reshape back,
+		 * then apply per-channel gamma/beta.
+		 */
+		int gn_groups = node->params[0];
+		const struct sam3_tensor *gn_in = node->inputs[0];
+		int gn_N = gn_in->dims[0];
+		int gn_C = gn_in->dims[1];
+		int gn_H = gn_in->dims[2];
+		int gn_W = gn_in->dims[3];
+		int gn_cpg = gn_C / gn_groups;
+		int gn_hw = gn_H * gn_W;
+
+		/* Reshape to [N, G, C/G * H * W] for layer_norm over last dim */
+		int gn_shape3[] = {gn_N, gn_groups, gn_cpg * gn_hw};
+		mlx_array gn_x3 = mlx_array_new();
+		rc = mlx_reshape(&gn_x3, inputs[0], gn_shape3, 3, stream);
+		if (rc) { mlx_array_free(gn_x3); break; }
+
+		/* Layer norm over last dim (no affine) */
+		mlx_array gn_no_w = (mlx_array){0};
+		mlx_array gn_no_b = (mlx_array){0};
+		mlx_array gn_normed3 = mlx_array_new();
+		rc = mlx_fast_layer_norm(&gn_normed3, gn_x3,
+					 gn_no_w, gn_no_b, 1e-5f, stream);
+		mlx_array_free(gn_x3);
+		if (rc) { mlx_array_free(gn_normed3); break; }
+
+		/* Reshape back to [N, C, H, W] */
+		int gn_shape4[] = {gn_N, gn_C, gn_H, gn_W};
+		mlx_array gn_normed4 = mlx_array_new();
+		rc = mlx_reshape(&gn_normed4, gn_normed3,
+				 gn_shape4, 4, stream);
+		mlx_array_free(gn_normed3);
+		if (rc) { mlx_array_free(gn_normed4); break; }
+
+		/* Apply per-channel gamma and beta: x * gamma[1,C,1,1] + beta[1,C,1,1] */
+		if (node->n_inputs > 1 && node->inputs[1]) {
+			int gn_aff_shape[] = {1, gn_C, 1, 1};
+			mlx_array gn_gamma4 = mlx_array_new();
+			mlx_reshape(&gn_gamma4, inputs[1],
+				    gn_aff_shape, 4, stream);
+			mlx_array gn_scaled = mlx_array_new();
+			rc = mlx_multiply(&gn_scaled, gn_normed4,
+					  gn_gamma4, stream);
+			mlx_array_free(gn_gamma4);
+			mlx_array_free(gn_normed4);
+			if (rc) { mlx_array_free(gn_scaled); break; }
+			gn_normed4 = gn_scaled;
+		}
+
+		if (node->n_inputs > 2 && node->inputs[2]) {
+			int gn_aff_shape[] = {1, gn_C, 1, 1};
+			mlx_array gn_beta4 = mlx_array_new();
+			mlx_reshape(&gn_beta4, inputs[2],
+				    gn_aff_shape, 4, stream);
+			mlx_array gn_biased = mlx_array_new();
+			rc = mlx_add(&gn_biased, gn_normed4,
+				     gn_beta4, stream);
+			mlx_array_free(gn_beta4);
+			mlx_array_free(gn_normed4);
+			if (rc) { mlx_array_free(gn_biased); break; }
+			gn_normed4 = gn_biased;
+		}
+
+		result = gn_normed4;
+		rc = 0;
+		break;
+	}
+
+	case SAM3_OP_BIAS_ADD: {
+		/*
+		 * NCHW bias add: x[N,C,H,W] + bias[C].
+		 * Reshape bias to [1,C,1,1] for MLX broadcast.
+		 */
+		int ba_C = node->inputs[1]->dims[0];
+		int ba_shape[] = {1, ba_C, 1, 1};
+		mlx_array ba_bias4d = mlx_array_new();
+		rc = mlx_reshape(&ba_bias4d, inputs[1],
+				 ba_shape, 4, stream);
+		if (rc) { mlx_array_free(ba_bias4d); break; }
+
+		rc = mlx_add(&result, inputs[0], ba_bias4d, stream);
+		mlx_array_free(ba_bias4d);
+		break;
+	}
 
 	default:
 		sam3_log_error("metal: unsupported op %d", node->op);
@@ -717,6 +1053,12 @@ static enum sam3_error metal_alloc_tensor(struct sam3_backend *be,
 	return SAM3_OK;
 }
 
+/* Hash set entry for intermediate output detection in graph_eval. */
+struct metal_imap_entry {
+	const struct sam3_tensor *key;
+	int idx;
+};
+
 static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 					struct sam3_graph *g)
 {
@@ -734,12 +1076,88 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 		}
 	}
 
-	/* Phase 2: collect outputs and eval in one batch */
+	/*
+	 * Phase 1.5: detect intermediate outputs in O(n * max_inputs).
+	 *
+	 * Build a pointer→node-index hash set, then scan all inputs
+	 * to mark producing nodes as intermediate. Only final outputs
+	 * are materialized by mlx_eval, letting MLX optimize its graph.
+	 *
+	 * Scratch reset is safe here: mlx_array_new_data() copies data
+	 * eagerly, so Q8 dequant buffers are no longer referenced.
+	 */
+	bool is_intermediate[SAM3_GRAPH_MAX_NODES];
+	memset(is_intermediate, 0, (size_t)g->n_nodes * sizeof(bool));
+
+	{
+		sam3_arena_reset(&mtl->scratch);
+
+		int imap_cap = 1;
+		while (imap_cap < g->n_nodes * 2)
+			imap_cap <<= 1;
+		unsigned imap_mask = (unsigned)(imap_cap - 1);
+
+		struct metal_imap_entry *imap = sam3_arena_alloc(
+			&mtl->scratch,
+			(size_t)imap_cap * sizeof(struct metal_imap_entry));
+		if (!imap) {
+			sam3_log_error("metal_graph_eval: scratch OOM");
+			return SAM3_ENOMEM;
+		}
+		memset(imap, 0,
+		       (size_t)imap_cap * sizeof(struct metal_imap_entry));
+
+		/* Insert all node output pointers */
+		for (int i = 0; i < g->n_nodes; i++) {
+			uintptr_t v = (uintptr_t)g->nodes[i].output;
+			unsigned s = (unsigned)((v >> 4) ^ (v >> 16))
+				& imap_mask;
+			while (imap[s].key)
+				s = (s + 1) & imap_mask;
+			imap[s].key = g->nodes[i].output;
+			imap[s].idx = i;
+		}
+
+		/* Mark outputs consumed as inputs to other nodes */
+		for (int i = 0; i < g->n_nodes; i++) {
+			for (int j = 0; j < g->nodes[i].n_inputs; j++) {
+				const struct sam3_tensor *inp =
+					g->nodes[i].inputs[j];
+				uintptr_t v = (uintptr_t)inp;
+				unsigned s = (unsigned)((v >> 4) ^ (v >> 16))
+					& imap_mask;
+				while (imap[s].key) {
+					if (imap[s].key == inp) {
+						is_intermediate[imap[s].idx]
+							= true;
+						break;
+					}
+					s = (s + 1) & imap_mask;
+				}
+			}
+		}
+	}
+
+	/* Phase 2: collect only final outputs and eval in one batch */
 	mlx_vector_array outputs = mlx_vector_array_new();
-	for (int i = 0; i < g->n_nodes; i++) {
-		mlx_array *out = metal_map_get(mtl, g->nodes[i].output);
-		if (out)
-			mlx_vector_array_append_value(outputs, *out);
+	{
+		int n_inter = 0, n_final = 0, n_nomap = 0;
+		for (int i = 0; i < g->n_nodes; i++) {
+			if (is_intermediate[i]) {
+				n_inter++;
+				continue;
+			}
+			mlx_array *out = metal_map_get(mtl, g->nodes[i].output);
+			if (out) {
+				mlx_vector_array_append_value(outputs, *out);
+				n_final++;
+			} else {
+				n_nomap++;
+			}
+		}
+		sam3_log_debug("metal_eval: %d nodes, %d intermediate, "
+			"%d final, %d nomap",
+			g->n_nodes, n_inter, n_final, n_nomap);
 	}
 
 	int rc = mlx_eval(outputs);
@@ -750,63 +1168,59 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 		return SAM3_EBACKEND;
 	}
 
-	/* Phase 2.5: detect intermediate outputs (consumed by later nodes) */
-	bool is_intermediate[SAM3_GRAPH_MAX_NODES];
-	memset(is_intermediate, 0, sizeof(is_intermediate));
+	/* Phase 3: copy only final results back to host tensors */
+	{
+		int n_copied = 0, n_skip_inter = 0, n_skip_nodata = 0;
+		for (int i = 0; i < g->n_nodes; i++) {
+			struct sam3_tensor *out_t = g->nodes[i].output;
+			mlx_array *out_a = metal_map_get(mtl, out_t);
+			if (!out_a || !out_t->data) {
+				n_skip_nodata++;
+				goto evict;
+			}
 
-	for (int i = 0; i < g->n_nodes; i++) {
-		for (int j = 0; j < g->nodes[i].n_inputs; j++) {
-			const struct sam3_tensor *inp = g->nodes[i].inputs[j];
-			for (int k = 0; k < g->n_nodes; k++) {
-				if (g->nodes[k].output == inp) {
-					is_intermediate[k] = true;
+			if (is_intermediate[i]) {
+				n_skip_inter++;
+				goto evict;
+			}
+
+			{
+				const void *src = NULL;
+				mlx_dtype mtype = mlx_array_dtype(*out_a);
+
+				switch (mtype) {
+				case MLX_FLOAT32:
+					src = mlx_array_data_float32(*out_a);
+					break;
+				case MLX_FLOAT16:
+					src = mlx_array_data_float16(*out_a);
+					break;
+				case MLX_BFLOAT16:
+					src = mlx_array_data_bfloat16(*out_a);
+					break;
+				case MLX_INT32:
+					src = mlx_array_data_int32(*out_a);
+					break;
+				case MLX_INT8:
+					src = mlx_array_data_int8(*out_a);
+					break;
+				default:
+					sam3_log_error("metal: unsupported output dtype");
 					break;
 				}
-			}
-		}
-	}
 
-	/* Phase 3: copy only non-intermediate results back */
-	for (int i = 0; i < g->n_nodes; i++) {
-		struct sam3_tensor *out_t = g->nodes[i].output;
-		mlx_array *out_a = metal_map_get(mtl, out_t);
-		if (!out_a || !out_t->data)
-			goto evict;
-
-		if (is_intermediate[i])
-			goto evict;
-
-		{
-			const void *src = NULL;
-			mlx_dtype mtype = mlx_array_dtype(*out_a);
-
-			switch (mtype) {
-			case MLX_FLOAT32:
-				src = mlx_array_data_float32(*out_a);
-				break;
-			case MLX_FLOAT16:
-				src = mlx_array_data_float16(*out_a);
-				break;
-			case MLX_BFLOAT16:
-				src = mlx_array_data_bfloat16(*out_a);
-				break;
-			case MLX_INT32:
-				src = mlx_array_data_int32(*out_a);
-				break;
-			case MLX_INT8:
-				src = mlx_array_data_int8(*out_a);
-				break;
-			default:
-				sam3_log_error("metal: unsupported output dtype");
-				break;
+				if (src) {
+					memcpy(out_t->data, src, out_t->nbytes);
+					n_copied++;
+				}
 			}
 
-			if (src)
-				memcpy(out_t->data, src, out_t->nbytes);
+		evict:
+			metal_map_evict(mtl, out_t);
 		}
-
-	evict:
-		metal_map_evict(mtl, out_t);
+		sam3_log_debug("metal_eval: phase3 copied=%d "
+			"skip_inter=%d skip_nodata=%d",
+			n_copied, n_skip_inter, n_skip_nodata);
 	}
 
 	return SAM3_OK;

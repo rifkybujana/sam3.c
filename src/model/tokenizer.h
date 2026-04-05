@@ -20,7 +20,7 @@
 #include "sam3/sam3_types.h"
 #include <stdint.h>
 
-#define SAM3_TOKENIZER_CONTEXT_LEN 77	/* max sequence length */
+#define SAM3_TOKENIZER_CONTEXT_LEN 32	/* max sequence length (SAM3 text encoder) */
 
 #define SAM3_BPE_CACHE_SIZE 256	/* word cache entries (power of 2) */
 #define SAM3_BPE_CACHE_MAX_IDS 16	/* max token IDs cached per word */

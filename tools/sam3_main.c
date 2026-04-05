@@ -129,6 +129,7 @@ static void print_usage(const char *prog)
 	printf("  -m <path>          Model weights file (.sam3)\n");
 	printf("  -i <path>          Input image (PNG/JPEG/BMP)\n");
 	printf("\nPrompts (at least one required):\n");
+	printf("  -t <text>          Text prompt\n");
 	printf("  -p x,y,label       Point prompt (repeatable, "
 	       "label: 1=fg, 0=bg)\n");
 	printf("  -b x1,y1,x2,y2    Box prompt (repeatable)\n");
@@ -191,6 +192,22 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 				return 1;
 			}
 			args->output_dir = argv[i];
+		} else if (strcmp(argv[i], "-t") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: -t requires text\n");
+				return 1;
+			}
+			if (args->n_prompts >= MAX_PROMPTS) {
+				fprintf(stderr,
+					"error: too many prompts "
+					"(max %d)\n", MAX_PROMPTS);
+				return 1;
+			}
+			args->prompts[args->n_prompts].type =
+				SAM3_PROMPT_TEXT;
+			args->prompts[args->n_prompts].text = argv[i];
+			args->n_prompts++;
 		} else if (strcmp(argv[i], "-p") == 0) {
 			if (++i >= argc) {
 				fprintf(stderr,
@@ -604,9 +621,35 @@ int main(int argc, char **argv)
 	/* Print results summary */
 	printf("Results: %d mask(s), %dx%d\n",
 	       result.n_masks, result.mask_width, result.mask_height);
-	for (int i = 0; i < result.n_masks; i++) {
-		printf("  mask %d: IoU = %.4f\n",
-		       i, result.iou_scores[i]);
+	{
+		int mask_pixels = result.mask_width * result.mask_height;
+
+		for (int i = 0; i < result.n_masks; i++) {
+			if (result.iou_valid)
+				printf("  mask %d: IoU = %.4f\n",
+				       i, result.iou_scores[i]);
+			else
+				printf("  mask %d: IoU = N/A "
+				       "(no scorer input)\n", i);
+
+			/* Debug: per-mask statistics */
+			if (args.verbose) {
+				const float *md = result.masks +
+						  i * mask_pixels;
+				float mn = md[0], mx = md[0], sum = 0.0f;
+
+				for (int j = 0; j < mask_pixels; j++) {
+					if (md[j] < mn) mn = md[j];
+					if (md[j] > mx) mx = md[j];
+					sum += md[j];
+				}
+				sam3_log_debug("  mask %d stats: "
+					       "min=%.4f max=%.4f "
+					       "mean=%.4f",
+					       i, mn, mx,
+					       sum / mask_pixels);
+			}
+		}
 	}
 
 	/* Write outputs */

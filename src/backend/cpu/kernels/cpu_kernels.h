@@ -175,4 +175,19 @@ enum sam3_error cpu_kernel_conv_transpose2d(const struct sam3_node *node,
 enum sam3_error cpu_kernel_maxpool2d(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
+/*
+ * Tiled scaled dot-product attention.
+ * inputs: Q[seq,hd], K[seq,hd], V[seq,hd], mask[seq,seq]?
+ * params[0]=head_dim. Uses online softmax, never materializes [seq,seq].
+ */
+enum sam3_error cpu_kernel_sdpa(const struct sam3_node *node,
+				struct sam3_threadpool *pool);
+
+/* Group normalization on NCHW input.
+ * inputs[0]=x[N,C,H,W], inputs[1]=gamma[C], inputs[2]=beta[C].
+ * params[0]=num_groups. eps=1e-5.
+ */
+enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */

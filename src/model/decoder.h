@@ -35,6 +35,9 @@ struct sam3_decoder {
 
 	struct sam3_tensor *query_embed; /* [n_queries, d_model] */
 
+	/* Output layer norm applied after all layers */
+	struct sam3_tensor *output_ln_w, *output_ln_b;
+
 	struct {
 		/* Self-attention */
 		struct sam3_tensor *sa_qkv_w, *sa_qkv_b;
@@ -116,6 +119,51 @@ struct sam3_tensor *sam3_decoder_build(
 	struct sam3_tensor *enc_features,
 	struct sam3_tensor *text_features,
 	struct sam3_tensor **box_out,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_layer - Build a single decoder layer.
+ *
+ * Builds self-attention, vision cross-attention, text cross-attention,
+ * FFN, and box refinement for layer @layer_idx. Caller must evaluate
+ * the graph and persist results between layers to avoid MLX buffer reuse.
+ *
+ * @dec:           Initialized and loaded decoder
+ * @layer_idx:     Layer index (0 to n_layers-1)
+ * @g:             Graph to add nodes to
+ * @q:             Query embeddings [n_queries, d_model]
+ * @enc_features:  Encoder output [n_pixels, d_model]
+ * @text_features: Text embeddings [seq_len, d_model]
+ * @boxes:         Box accumulator [n_queries, 4] (updated in place)
+ * @arena:         Arena for intermediate tensors
+ *
+ * Returns updated queries [n_queries, d_model], or NULL on error.
+ * @boxes is updated to include this layer's refinement.
+ */
+struct sam3_tensor *sam3_decoder_build_layer(
+	struct sam3_decoder *dec,
+	int layer_idx,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_tensor *enc_features,
+	struct sam3_tensor *text_features,
+	struct sam3_tensor **boxes,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_final - Apply output layer norm after all layers.
+ *
+ * @dec:   Initialized and loaded decoder
+ * @g:     Graph to add nodes to
+ * @q:     Query embeddings [n_queries, d_model]
+ * @arena: Arena for intermediate tensors
+ *
+ * Returns normalized queries [n_queries, d_model], or NULL on error.
+ */
+struct sam3_tensor *sam3_decoder_build_final(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_DECODER_H */

@@ -22,6 +22,53 @@
 #include "text_encoder.h"
 #include "graph_helpers.h"
 
+/*
+ * Weight name prefixes for CLIP text encoder weights in the .sam3 file.
+ * Original PyTorch: detector_model.text_encoder.text_model.*
+ */
+#define TE_P "detector_model.text_encoder.text_model."
+#define TE_L TE_P "encoder.layers."
+
+/*
+ * text_load_fuse_qkv - Load separate Q, K, V weights and fuse into [3*w, w].
+ */
+static struct sam3_tensor *text_load_fuse_qkv(
+	const struct sam3_weight_file *wf,
+	struct sam3_arena *arena,
+	const char *q_name,
+	const char *k_name,
+	const char *v_name,
+	int n_dims, const int *single_dims)
+{
+	struct sam3_tensor *q_t, *k_t, *v_t, *fused;
+
+	q_t = gh_load_or_alloc(wf, q_name, arena,
+			       SAM3_DTYPE_F32, n_dims, single_dims);
+	k_t = gh_load_or_alloc(wf, k_name, arena,
+			       SAM3_DTYPE_F32, n_dims, single_dims);
+	v_t = gh_load_or_alloc(wf, v_name, arena,
+			       SAM3_DTYPE_F32, n_dims, single_dims);
+	if (!q_t || !k_t || !v_t)
+		return NULL;
+
+	size_t single_bytes = q_t->nbytes;
+	int fused_dims[4];
+	for (int i = 0; i < n_dims; i++)
+		fused_dims[i] = single_dims[i];
+	fused_dims[0] *= 3;
+
+	fused = gh_alloc_tensor(arena, SAM3_DTYPE_F32, n_dims, fused_dims);
+	if (!fused)
+		return NULL;
+
+	memcpy((char *)fused->data, q_t->data, single_bytes);
+	memcpy((char *)fused->data + single_bytes, k_t->data, single_bytes);
+	memcpy((char *)fused->data + 2 * single_bytes,
+	       v_t->data, single_bytes);
+
+	return fused;
+}
+
 enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 				       const struct sam3_weight_file *wf,
 				       struct sam3_arena *arena)
@@ -29,41 +76,42 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 	int w = te->width;
 	int d = te->d_model;
 	int h4 = w * 4;
-	int w3 = w * 3;
-	char name[128];
+	char name[128], q_name[128], k_name[128], v_name[128];
 
 	/* Embeddings */
 	int tok_dims[] = {te->vocab_size, w};
-	te->token_embedding = gh_load_or_alloc(wf, "text.token_embedding",
-					     arena, SAM3_DTYPE_F32,
-					     2, tok_dims);
+	te->token_embedding = gh_load_or_alloc(wf,
+		TE_P "embeddings.token_embedding.weight",
+		arena, SAM3_DTYPE_F32, 2, tok_dims);
 	if (!te->token_embedding)
 		return SAM3_ENOMEM;
 
 	int pos_dims[] = {te->context_len, w};
-	te->pos_embedding = gh_load_or_alloc(wf, "text.pos_embedding",
-					   arena, SAM3_DTYPE_F32,
-					   2, pos_dims);
+	te->pos_embedding = gh_load_or_alloc(wf,
+		TE_P "embeddings.position_embedding.weight",
+		arena, SAM3_DTYPE_F32, 2, pos_dims);
 	if (!te->pos_embedding)
 		return SAM3_ENOMEM;
 
 	/* Final layer norm */
 	int w_dims[] = {w};
-	te->ln_final_w = gh_load_or_alloc(wf, "text.ln_final.weight",
-					arena, SAM3_DTYPE_F32, 1, w_dims);
+	te->ln_final_w = gh_load_or_alloc(wf,
+		TE_P "final_layer_norm.weight",
+		arena, SAM3_DTYPE_F32, 1, w_dims);
 	if (!te->ln_final_w)
 		return SAM3_ENOMEM;
 
-	te->ln_final_b = gh_load_or_alloc(wf, "text.ln_final.bias",
-					arena, SAM3_DTYPE_F32, 1, w_dims);
+	te->ln_final_b = gh_load_or_alloc(wf,
+		TE_P "final_layer_norm.bias",
+		arena, SAM3_DTYPE_F32, 1, w_dims);
 	if (!te->ln_final_b)
 		return SAM3_ENOMEM;
 
-	/* Text projection */
-	int proj_dims[] = {w, d};
-	te->text_projection = gh_load_or_alloc(wf, "text.text_projection",
-					     arena, SAM3_DTYPE_F32,
-					     2, proj_dims);
+	/* Text projection: detector_model.text_projection.weight */
+	int proj_dims[] = {d, w};
+	te->text_projection = gh_load_or_alloc(wf,
+		"detector_model.text_projection.weight",
+		arena, SAM3_DTYPE_F32, 2, proj_dims);
 	if (!te->text_projection)
 		return SAM3_ENOMEM;
 
@@ -71,7 +119,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 	for (int i = 0; i < te->n_layers; i++) {
 		/* ln1 */
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.ln1.weight", i);
+			 TE_L "%d.layer_norm1.weight", i);
 		te->layers[i].ln1_w = gh_load_or_alloc(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
@@ -79,41 +127,51 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.ln1.bias", i);
+			 TE_L "%d.layer_norm1.bias", i);
 		te->layers[i].ln1_b = gh_load_or_alloc(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
 		if (!te->layers[i].ln1_b)
 			return SAM3_ENOMEM;
 
-		/* Attention QKV */
-		int qkv_w_dims[] = {w3, w};
-		snprintf(name, sizeof(name),
-			 "text.layers.%d.attn.qkv.weight", i);
-		te->layers[i].attn_qkv_w = gh_load_or_alloc(
-			wf, name, arena, SAM3_DTYPE_F32, 2, qkv_w_dims);
+		/* Attention QKV: fuse from separate Q, K, V */
+		int single_w_dims[] = {w, w};
+		snprintf(q_name, sizeof(q_name),
+			 TE_L "%d.self_attn.q_proj.weight", i);
+		snprintf(k_name, sizeof(k_name),
+			 TE_L "%d.self_attn.k_proj.weight", i);
+		snprintf(v_name, sizeof(v_name),
+			 TE_L "%d.self_attn.v_proj.weight", i);
+		te->layers[i].attn_qkv_w = text_load_fuse_qkv(
+			wf, arena, q_name, k_name, v_name,
+			2, single_w_dims);
 		if (!te->layers[i].attn_qkv_w)
 			return SAM3_ENOMEM;
 
-		int qkv_b_dims[] = {w3};
-		snprintf(name, sizeof(name),
-			 "text.layers.%d.attn.qkv.bias", i);
-		te->layers[i].attn_qkv_b = gh_load_or_alloc(
-			wf, name, arena, SAM3_DTYPE_F32, 1, qkv_b_dims);
+		int single_b_dims[] = {w};
+		snprintf(q_name, sizeof(q_name),
+			 TE_L "%d.self_attn.q_proj.bias", i);
+		snprintf(k_name, sizeof(k_name),
+			 TE_L "%d.self_attn.k_proj.bias", i);
+		snprintf(v_name, sizeof(v_name),
+			 TE_L "%d.self_attn.v_proj.bias", i);
+		te->layers[i].attn_qkv_b = text_load_fuse_qkv(
+			wf, arena, q_name, k_name, v_name,
+			1, single_b_dims);
 		if (!te->layers[i].attn_qkv_b)
 			return SAM3_ENOMEM;
 
 		/* Attention output projection */
 		int out_w_dims[] = {w, w};
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.attn.out.weight", i);
+			 TE_L "%d.self_attn.out_proj.weight", i);
 		te->layers[i].attn_out_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 2, out_w_dims);
 		if (!te->layers[i].attn_out_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.attn.out.bias", i);
+			 TE_L "%d.self_attn.out_proj.bias", i);
 		te->layers[i].attn_out_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
 		if (!te->layers[i].attn_out_b)
@@ -121,7 +179,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 
 		/* ln2 */
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.ln2.weight", i);
+			 TE_L "%d.layer_norm2.weight", i);
 		te->layers[i].ln2_w = gh_load_or_alloc(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
@@ -129,7 +187,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.ln2.bias", i);
+			 TE_L "%d.layer_norm2.bias", i);
 		te->layers[i].ln2_b = gh_load_or_alloc(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
@@ -139,7 +197,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		/* MLP fc1 */
 		int fc1_w_dims[] = {h4, w};
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.mlp.fc1.weight", i);
+			 TE_L "%d.mlp.fc1.weight", i);
 		te->layers[i].mlp_fc1_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
 		if (!te->layers[i].mlp_fc1_w)
@@ -147,7 +205,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 
 		int fc1_b_dims[] = {h4};
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.mlp.fc1.bias", i);
+			 TE_L "%d.mlp.fc1.bias", i);
 		te->layers[i].mlp_fc1_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
 		if (!te->layers[i].mlp_fc1_b)
@@ -156,14 +214,14 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		/* MLP fc2 */
 		int fc2_w_dims[] = {w, h4};
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.mlp.fc2.weight", i);
+			 TE_L "%d.mlp.fc2.weight", i);
 		te->layers[i].mlp_fc2_w = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
 		if (!te->layers[i].mlp_fc2_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
-			 "text.layers.%d.mlp.fc2.bias", i);
+			 TE_L "%d.mlp.fc2.bias", i);
 		te->layers[i].mlp_fc2_b = gh_load_or_alloc(
 			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
 		if (!te->layers[i].mlp_fc2_b)
@@ -309,10 +367,18 @@ struct sam3_tensor *sam3_text_encoder_build(
 		return NULL;
 
 	/*
+	 * Transpose text_projection: file stores [d_model, width],
+	 * matmul needs [width, d_model].
+	 */
+	struct sam3_tensor *proj_t = gh_transpose(g, arena,
+						   te->text_projection);
+	if (!proj_t)
+		return NULL;
+
+	/*
 	 * Step 6: Pooled output (from last token / EOT position).
 	 * Slice the last row: [1, width].
-	 * Project through text_projection: matmul([1, width], [width, d_model])
-	 *   -> [1, d_model].
+	 * Project: matmul([1, width], [width, d_model]) -> [1, d_model].
 	 * Reshape to [d_model].
 	 */
 	if (pooled_out) {
@@ -321,14 +387,11 @@ struct sam3_tensor *sam3_text_encoder_build(
 				     seq_len - 1, seq_len);
 		if (!last_tok)
 			return NULL;
-		/* last_tok is [1, width] */
 
 		struct sam3_tensor *projected;
-		projected = gh_matmul(g, arena, last_tok,
-				       te->text_projection);
+		projected = gh_matmul(g, arena, last_tok, proj_t);
 		if (!projected)
 			return NULL;
-		/* projected is [1, d_model] */
 
 		int pool_dims[] = {te->d_model};
 		*pooled_out = gh_reshape(g, arena, projected,
@@ -340,10 +403,10 @@ struct sam3_tensor *sam3_text_encoder_build(
 	/*
 	 * Step 7: Project all per-token embeddings to d_model.
 	 * x is [seq_len, width].
-	 * matmul(x, text_projection) -> [seq_len, d_model].
+	 * matmul(x, proj_t) -> [seq_len, d_model].
 	 */
 	struct sam3_tensor *out;
-	out = gh_matmul(g, arena, x, te->text_projection);
+	out = gh_matmul(g, arena, x, proj_t);
 
 	return out;
 }

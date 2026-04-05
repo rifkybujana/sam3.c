@@ -221,6 +221,42 @@ static void compute_conv_dims(struct sam3_neck *neck, int i, int j,
 	}
 }
 
+/*
+ * Weight name prefix for neck weights in the .sam3 file.
+ * Original PyTorch: detector_model.vision_encoder.neck.fpn_layers.*
+ */
+#define NECK_P "detector_model.vision_encoder.neck.fpn_layers."
+
+/*
+ * neck_weight_name - Build correct weight name for a neck conv layer.
+ *
+ * Maps internal (stage, conv_idx) to PyTorch naming convention:
+ *   - ConvTranspose2d layers → scale_layers.{seq_idx}
+ *   - Last two Conv2d layers → proj1 and proj2
+ */
+static void neck_weight_name(char *buf, size_t buflen,
+			     struct sam3_neck *neck,
+			     int stage, int j, const char *suffix)
+{
+	int n = neck->stages[stage].n_convs;
+
+	if (neck->stages[stage].is_transpose[j]) {
+		/* Scale layers: ConvTranspose2d for upsampling */
+		int seq = neck->stages[stage].seq_idx[j];
+		snprintf(buf, buflen,
+			 NECK_P "%d.scale_layers.%d.%s",
+			 stage, seq, suffix);
+	} else if (j == n - 2) {
+		/* Second-to-last non-transpose conv → proj1 (1x1) */
+		snprintf(buf, buflen,
+			 NECK_P "%d.proj1.%s", stage, suffix);
+	} else {
+		/* Last conv → proj2 (3x3) */
+		snprintf(buf, buflen,
+			 NECK_P "%d.proj2.%s", stage, suffix);
+	}
+}
+
 enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			       const struct sam3_weight_file *wf,
 			       struct sam3_arena *arena)
@@ -246,10 +282,8 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			w_dims[2] = kh;
 			w_dims[3] = kw;
 
-			int seq = neck->stages[i].seq_idx[j];
-
-			snprintf(name, sizeof(name),
-				 "neck.convs.%d.%d.weight", i, seq);
+			neck_weight_name(name, sizeof(name),
+					 neck, i, j, "weight");
 			neck->stages[i].conv_w[j] = gh_load_or_alloc(
 				wf, name, arena, SAM3_DTYPE_F32,
 				4, w_dims);
@@ -257,8 +291,8 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 				return SAM3_ENOMEM;
 
 			int b_dims[] = {c_out};
-			snprintf(name, sizeof(name),
-				 "neck.convs.%d.%d.bias", i, seq);
+			neck_weight_name(name, sizeof(name),
+					 neck, i, j, "bias");
 			neck->stages[i].conv_b[j] = gh_load_or_alloc(
 				wf, name, arena, SAM3_DTYPE_F32,
 				1, b_dims);
@@ -283,25 +317,10 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 static struct sam3_tensor *build_stage(struct sam3_neck *neck,
 					int stage,
 					struct sam3_graph *g,
-					struct sam3_tensor *flat_in,
+					struct sam3_tensor *nchw_in,
 					struct sam3_arena *arena)
 {
-	int b = neck->backbone_dim;
-	int gs = neck->grid_size;
-
-	/*
-	 * Reshape [n_patches, backbone_dim] to [1, backbone_dim, gs, gs].
-	 * Transpose: [n_patches, backbone_dim] -> [backbone_dim, n_patches]
-	 * Reshape:   [backbone_dim, n_patches] -> [1, backbone_dim, gs, gs]
-	 */
-	struct sam3_tensor *x = gh_transpose(g, arena, flat_in);
-	if (!x)
-		return NULL;
-
-	int nchw_dims[] = {1, b, gs, gs};
-	x = gh_reshape(g, arena, x, 4, nchw_dims);
-	if (!x)
-		return NULL;
+	struct sam3_tensor *x = nchw_in;
 
 	/* Optional MaxPool before convs */
 	if (neck->stages[stage].has_maxpool) {
@@ -348,9 +367,22 @@ enum sam3_error sam3_neck_build(struct sam3_neck *neck,
 	if (!neck || !g || !vit_features || !out_features || !arena)
 		return SAM3_EINVAL;
 
+	/*
+	 * Shared NCHW reshape: [n_patches, backbone_dim] ->
+	 * [1, backbone_dim, gs, gs]. Done once, reused by all stages.
+	 */
+	struct sam3_tensor *nchw = gh_transpose(g, arena, vit_features);
+	if (!nchw)
+		return SAM3_ENOMEM;
+
+	int nchw_dims[] = {1, neck->backbone_dim, neck->grid_size,
+			   neck->grid_size};
+	nchw = gh_reshape(g, arena, nchw, 4, nchw_dims);
+	if (!nchw)
+		return SAM3_ENOMEM;
+
 	for (int i = 0; i < neck->n_scales; i++) {
-		out_features[i] = build_stage(neck, i, g,
-					       vit_features, arena);
+		out_features[i] = build_stage(neck, i, g, nchw, arena);
 		if (!out_features[i])
 			return SAM3_ENOMEM;
 	}

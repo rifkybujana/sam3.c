@@ -4,7 +4,7 @@
  * 2D convolution for bf16 tensors using im2col + matrix multiply. All
  * arithmetic is done in f32 since bf16 has no native arithmetic. NEON
  * path uses 4-wide float32x4_t with bf16<->f32 conversion helpers from
- * core/half.h. Scratch arena for im2col buffer.
+ * core/half.h. Scratch arena for im2col buffer and f32 accumulation.
  *
  * Key types:  sam3_node, sam3_tensor, sam3_arena
  * Depends on: cpu_kernels.h, cpu_simd.h, core/half.h, core/tensor.h, core/alloc.h
@@ -29,46 +29,107 @@
  *
  * Input:  [C, H, W] as uint16_t*
  * Output: [C*KH*KW, OH*OW] column-major patches, kept as bf16.
+ *
+ * Pre-computes valid oh/ow ranges to eliminate per-element bounds checks.
+ * Uses memcpy for contiguous interior when stride==1, memset for padding.
  */
 static void im2col_bf16(const uint16_t *in, uint16_t *col,
 			 int C, int H, int W, int KH, int KW,
 			 int stride, int pad, int OH, int OW)
 {
 	int col_cols = OH * OW;
-	uint16_t zero_bf16 = f32_to_bf16(0.0f);
 
 	for (int c = 0; c < C; c++) {
+		const uint16_t *in_c = in + c * H * W;
 		for (int kh = 0; kh < KH; kh++) {
+			/* Valid oh range: ih = oh*stride+kh-pad in [0,H) */
+			int oh_s = (pad > kh)
+				 ? (pad - kh + stride - 1) / stride : 0;
+			int oh_e = (H + pad - kh - 1 >= 0)
+				 ? (H + pad - kh - 1) / stride + 1 : 0;
+			if (oh_e > OH) oh_e = OH;
+			if (oh_s > oh_e) oh_s = oh_e;
+
 			for (int kw = 0; kw < KW; kw++) {
-				int col_row = c * KH * KW + kh * KW + kw;
-				for (int oh = 0; oh < OH; oh++) {
-					for (int ow = 0; ow < OW; ow++) {
-						int ih = oh * stride + kh - pad;
-						int iw = ow * stride + kw - pad;
-						int idx = col_row * col_cols
-							  + oh * OW + ow;
-						if (ih >= 0 && ih < H &&
-						    iw >= 0 && iw < W)
-							col[idx] = in[
-								c * H * W
-								+ ih * W + iw];
-						else
-							col[idx] = zero_bf16;
+				int col_row = c * KH * KW
+					    + kh * KW + kw;
+				uint16_t *dst = col
+					      + col_row * col_cols;
+
+				/* Valid ow range */
+				int ow_s = (pad > kw)
+					 ? (pad - kw + stride - 1)
+					   / stride : 0;
+				int ow_e = (W + pad - kw - 1 >= 0)
+					 ? (W + pad - kw - 1)
+					   / stride + 1 : 0;
+				if (ow_e > OW) ow_e = OW;
+				if (ow_s > ow_e) ow_s = ow_e;
+
+				/* Top padding rows */
+				if (oh_s > 0)
+					memset(dst, 0,
+					       (size_t)oh_s * OW
+					       * sizeof(uint16_t));
+
+				for (int oh = oh_s; oh < oh_e; oh++) {
+					int ih = oh * stride + kh - pad;
+					uint16_t *row = dst + oh * OW;
+
+					if (ow_s > 0)
+						memset(row, 0,
+						       ow_s
+						       * sizeof(uint16_t));
+
+					int nv = ow_e - ow_s;
+					if (nv > 0) {
+						int iw0 = ow_s * stride
+							 + kw - pad;
+						if (stride == 1) {
+							memcpy(row + ow_s,
+							       in_c + ih * W
+							       + iw0,
+							       nv * sizeof(
+							       uint16_t));
+						} else {
+							for (int ow = ow_s;
+							     ow < ow_e;
+							     ow++) {
+								int iw = ow * stride
+									 + kw - pad;
+								row[ow] = in_c[
+									ih * W
+									+ iw];
+							}
+						}
 					}
+
+					if (ow_e < OW)
+						memset(row + ow_e, 0,
+						       (OW - ow_e)
+						       * sizeof(uint16_t));
 				}
+
+				/* Bottom padding rows */
+				if (oh_e < OH)
+					memset(dst + (size_t)oh_e * OW,
+					       0,
+					       (size_t)(OH - oh_e) * OW
+					       * sizeof(uint16_t));
 			}
 		}
 	}
 }
 
-/* --- NEON bf16 matmul path (f32 arithmetic, 4-wide) --- */
+/* --- NEON bf16 matmul path (f32 accumulation, 4-wide) --- */
 
 #if SAM3_HAS_NEON
 
 struct conv2d_matmul_ctx_bf16 {
-	const uint16_t *a;  /* weight [OC, C*KH*KW] */
-	const uint16_t *b;  /* col    [C*KH*KW, OH*OW] */
-	uint16_t       *c;  /* output [OC, OH*OW] */
+	const uint16_t *a;   /* weight [OC, C*KH*KW] */
+	const uint16_t *b;   /* col    [C*KH*KW, OH*OW] */
+	uint16_t       *c;   /* output [OC, OH*OW] */
+	float          *acc; /* f32 accum [n_tasks, OH*OW] */
 	int             M;
 	int             K;
 	int             N;
@@ -85,44 +146,48 @@ static void conv2d_matmul_bf16_fn(void *arg, int task_id, int n_tasks)
 	if (m_start >= m_end)
 		return;
 
-	/* Zero output — uint16_t zero is bf16 +0.0 */
-	memset(ctx->c + (size_t)m_start * ctx->N, 0,
-	       (size_t)(m_end - m_start) * ctx->N * sizeof(uint16_t));
+	float *acc = ctx->acc + (size_t)task_id * ctx->N;
 
 	for (int i = m_start; i < m_end; i++) {
+		memset(acc, 0, ctx->N * sizeof(float));
+
 		for (int k = 0; k < ctx->K; k++) {
-			float aik = bf16_to_f32(ctx->a[i * ctx->K + k]);
+			float aik = bf16_to_f32(
+				ctx->a[i * ctx->K + k]);
 			float32x4_t va = vdupq_n_f32(aik);
 			int j = 0;
 			for (; j + 4 <= ctx->N; j += 4) {
-				float32x4_t vc = bf16x4_to_f32x4(
-					ctx->c + i * ctx->N + j);
+				float32x4_t vc = vld1q_f32(acc + j);
 				float32x4_t vb = bf16x4_to_f32x4(
 					ctx->b + k * ctx->N + j);
-				f32x4_to_bf16x4(
-					ctx->c + i * ctx->N + j,
-					vfmaq_f32(vc, va, vb));
+				vst1q_f32(acc + j,
+					  vfmaq_f32(vc, va, vb));
 			}
-			for (; j < ctx->N; j++) {
-				float cur = bf16_to_f32(
-					ctx->c[i * ctx->N + j]);
-				float bkj = bf16_to_f32(
+			for (; j < ctx->N; j++)
+				acc[j] += aik * bf16_to_f32(
 					ctx->b[k * ctx->N + j]);
-				ctx->c[i * ctx->N + j] =
-					f32_to_bf16(cur + aik * bkj);
-			}
 		}
+
+		/* Convert f32 accumulator -> bf16 output once */
+		uint16_t *out_row = ctx->c + (size_t)i * ctx->N;
+		int j = 0;
+		for (; j + 4 <= ctx->N; j += 4)
+			f32x4_to_bf16x4(out_row + j,
+					 vld1q_f32(acc + j));
+		for (; j < ctx->N; j++)
+			out_row[j] = f32_to_bf16(acc[j]);
 	}
 }
 
 #else /* !SAM3_HAS_NEON */
 
-/* --- Scalar fallback path --- */
+/* --- Scalar fallback path (f32 accumulation) --- */
 
 struct conv2d_matmul_ctx_bf16 {
-	const uint16_t *a;  /* weight [OC, C*KH*KW] */
-	const uint16_t *b;  /* col    [C*KH*KW, OH*OW] */
-	uint16_t       *c;  /* output [OC, OH*OW] */
+	const uint16_t *a;   /* weight [OC, C*KH*KW] */
+	const uint16_t *b;   /* col    [C*KH*KW, OH*OW] */
+	uint16_t       *c;   /* output [OC, OH*OW] */
+	float          *acc; /* f32 accum [n_tasks, OH*OW] */
 	int             M;
 	int             K;
 	int             N;
@@ -139,22 +204,22 @@ static void conv2d_matmul_bf16_fn(void *arg, int task_id, int n_tasks)
 	if (m_start >= m_end)
 		return;
 
-	/* Zero output — uint16_t zero is bf16 +0.0 */
-	memset(ctx->c + (size_t)m_start * ctx->N, 0,
-	       (size_t)(m_end - m_start) * ctx->N * sizeof(uint16_t));
+	float *acc = ctx->acc + (size_t)task_id * ctx->N;
 
 	for (int i = m_start; i < m_end; i++) {
+		memset(acc, 0, ctx->N * sizeof(float));
+
 		for (int k = 0; k < ctx->K; k++) {
-			float aik = bf16_to_f32(ctx->a[i * ctx->K + k]);
-			for (int j = 0; j < ctx->N; j++) {
-				float cur = bf16_to_f32(
-					ctx->c[i * ctx->N + j]);
-				float bkj = bf16_to_f32(
+			float aik = bf16_to_f32(
+				ctx->a[i * ctx->K + k]);
+			for (int j = 0; j < ctx->N; j++)
+				acc[j] += aik * bf16_to_f32(
 					ctx->b[k * ctx->N + j]);
-				ctx->c[i * ctx->N + j] =
-					f32_to_bf16(cur + aik * bkj);
-			}
 		}
+
+		uint16_t *out_row = ctx->c + (size_t)i * ctx->N;
+		for (int j = 0; j < ctx->N; j++)
+			out_row[j] = f32_to_bf16(acc[j]);
 	}
 }
 
@@ -165,7 +230,8 @@ static void conv2d_matmul_bf16_fn(void *arg, int task_id, int n_tasks)
  *
  * @node:    Node with n_inputs>=2: input [N,C,H,W] and weight [OC,C,KH,KW],
  *           both SAM3_DTYPE_BF16. node->params[0]=stride, params[1]=padding.
- * @scratch: Scratch arena for im2col temp buffer. Offset is saved/restored.
+ * @scratch: Scratch arena for im2col temp buffer and f32 accumulation.
+ *           Offset is saved/restored.
  * @pool:    Thread pool for parallel matmul over output channels.
  *
  * Returns SAM3_OK on success, SAM3_EINVAL on bad inputs, SAM3_ENOMEM if
@@ -222,12 +288,13 @@ enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
 
 	int OH = (H + 2 * pad - KH) / stride + 1;
 	int OW = (W + 2 * pad - KW) / stride + 1;
+	int N_out = OH * OW;
 
 	/* Save scratch offset for restore */
 	size_t saved_offset = scratch->offset;
 
 	/* Allocate im2col buffer: [C*KH*KW, OH*OW] in bf16 */
-	size_t col_size = (size_t)(C * KH * KW) * (OH * OW)
+	size_t col_size = (size_t)(C * KH * KW) * N_out
 			  * sizeof(uint16_t);
 	void *col_buf = sam3_arena_alloc(scratch, col_size);
 	if (!col_buf) {
@@ -241,6 +308,16 @@ enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
 	if (n_tasks < 1)
 		n_tasks = 1;
 
+	/* Allocate f32 accumulation buffer: one row per thread */
+	size_t acc_size = (size_t)n_tasks * N_out * sizeof(float);
+	float *acc_buf = (float *)sam3_arena_alloc(scratch, acc_size);
+	if (!acc_buf) {
+		sam3_log_error("conv2d_bf16: scratch OOM for acc "
+			       "(%zu bytes)", acc_size);
+		scratch->offset = saved_offset;
+		return SAM3_ENOMEM;
+	}
+
 	const uint16_t *w_data = (const uint16_t *)weight->data;
 	uint16_t       *col    = (uint16_t *)col_buf;
 
@@ -248,24 +325,25 @@ enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
 		const uint16_t *in_n = (const uint16_t *)input->data
 				       + (size_t)n * C * H * W;
 		uint16_t *out_n = (uint16_t *)output->data
-				  + (size_t)n * OC * OH * OW;
+				  + (size_t)n * OC * N_out;
 
 		im2col_bf16(in_n, col, C, H, W, KH, KW,
 			    stride, pad, OH, OW);
 
 		struct conv2d_matmul_ctx_bf16 mctx = {
-			.a = w_data,
-			.b = col,
-			.c = out_n,
-			.M = OC,
-			.K = C * KH * KW,
-			.N = OH * OW,
+			.a   = w_data,
+			.b   = col,
+			.c   = out_n,
+			.acc = acc_buf,
+			.M   = OC,
+			.K   = C * KH * KW,
+			.N   = N_out,
 		};
 		sam3_threadpool_parallel_for(pool, conv2d_matmul_bf16_fn,
 					     &mctx, n_tasks);
 	}
 
-	/* Restore scratch offset — frees the im2col buffer */
+	/* Restore scratch offset — frees im2col + acc buffers */
 	scratch->offset = saved_offset;
 
 	return SAM3_OK;

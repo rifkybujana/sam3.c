@@ -25,6 +25,7 @@
 #include "decoder.h"
 #include "prompt_encoder.h"
 #include "segmentation.h"
+#include "mask_decoder.h"
 #include "model_misc.h"
 #include "core/graph.h"
 #include "core/alloc.h"
@@ -36,11 +37,16 @@ struct sam3_image_model {
 	struct sam3_decoder decoder;
 	struct sam3_geometry_encoder geom_enc;
 	struct sam3_seg_head seg_head;
+	struct sam3_mask_decoder mask_dec;
 	struct sam3_dot_scorer scorer;
 
 	/* Cached image features after encoding */
-	struct sam3_tensor *cached_image_features; /* [n_pixels, d_model] */
+	struct sam3_tensor *cached_image_features; /* [1, d_model, H, W] */
 	struct sam3_tensor *cached_text_features;  /* [seq_len, d_model] */
+	/* Multi-scale backbone features for FPN pixel decoder */
+	struct sam3_tensor *cached_feat_s0;  /* [1, d_model, 2H, 2W] 2x */
+	struct sam3_tensor *cached_feat_s1;  /* [1, d_model, H, W]   1x */
+	struct sam3_tensor *cached_feat_4x;  /* [1, d_model, 4H, 4W] 4x */
 	int image_encoded;
 };
 
@@ -91,51 +97,59 @@ void sam3_image_model_free(struct sam3_image_model *model);
 /*
  * sam3_image_model_encode - Encode image: run vision backbone + cache.
  *
- * Builds the vision pipeline graph (ViT + feature pyramid neck),
- * evaluates it on the backend, and caches the resulting image features
- * for subsequent segment calls.
+ * Evaluates the ViT per-block (resetting scratch between blocks),
+ * then builds and evaluates the neck graph. Caches the resulting
+ * image features for subsequent segment calls.
  *
- * @model: Initialized and loaded image model
- * @g:     Graph to build vision pipeline into
- * @be:    Backend for graph evaluation
- * @image: Input image [3, img_size, img_size] normalized F32 tensor
- * @arena: Arena for intermediate tensors
+ * @model:   Initialized and loaded image model
+ * @be:      Backend for graph evaluation
+ * @image:   Input image [3, img_size, img_size] normalized F32 tensor
+ * @scratch: Arena for per-block/stage intermediate tensors
+ * @persist: Arena for persistent outputs (ViT buffer, cached features)
  *
  * Returns SAM3_OK on success. Sets model->image_encoded = 1 on success.
  */
 enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
-					struct sam3_graph *g,
 					struct sam3_backend *be,
 					struct sam3_tensor *image,
-					struct sam3_arena *arena);
+					struct sam3_arena *scratch,
+					struct sam3_arena *persist);
 
 /*
- * sam3_image_model_segment - Build segmentation graph from prompts.
+ * sam3_image_model_segment - Run segmentation pipeline per-stage.
  *
  * Requires image already encoded via sam3_image_model_encode().
- * Builds the geometry encoder, encoder fusion, decoder, and
- * segmentation head subgraphs. Does NOT evaluate the graph --
- * caller must call be->ops->graph_eval() after this returns.
+ * Evaluates each stage (geometry encoder, encoder fusion, decoder,
+ * segmentation head) independently, resetting the scratch arena
+ * between stages to keep peak memory bounded.
  *
  * @model:          Initialized, loaded, and image-encoded model
- * @g:              Graph to add segmentation nodes to
- * @be:             Backend (unused, reserved for future use)
+ * @be:             Backend for graph evaluation
  * @prompt_tokens:  [N, d_model] pre-projected prompt embeddings, or NULL
+ *                  (must be materialized, i.e. already evaluated)
  * @text_features:  [seq_len, d_model] text encoder output, or NULL
- * @arena:          Arena for intermediate tensors
+ *                  (must be materialized, i.e. already evaluated)
+ * @scratch:        Arena for per-stage intermediate tensors (reset between)
+ * @persist:        Arena for inter-stage data (offset saved/restored)
+ * @out_masks:      Receives mask logits tensor (allocated from scratch)
+ * @out_scores:     Receives scorer output [n_queries, 1] after sigmoid,
+ *                  or NULL if text_features is NULL. May be NULL if caller
+ *                  does not need scores.
  *
  * At least one of prompt_tokens or text_features must be non-NULL.
- * When both are provided, their features are concatenated along the
- * sequence dimension for encoder fusion and decoder cross-attention.
+ * Input tensors must have their data in persist or model_arena (NOT
+ * scratch), since scratch is reset between stages.
  *
- * Returns mask logits tensor, or NULL on error.
+ * Returns SAM3_OK on success, error code otherwise.
  */
-struct sam3_tensor *sam3_image_model_segment(
+enum sam3_error sam3_image_model_segment(
 	struct sam3_image_model *model,
-	struct sam3_graph *g,
 	struct sam3_backend *be,
 	struct sam3_tensor *prompt_tokens,
 	struct sam3_tensor *text_features,
-	struct sam3_arena *arena);
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_tensor **out_masks,
+	struct sam3_tensor **out_scores);
 
 #endif /* SAM3_MODEL_SAM3_IMAGE_H */

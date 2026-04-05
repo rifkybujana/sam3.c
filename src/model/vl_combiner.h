@@ -72,23 +72,30 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 void sam3_vl_backbone_free(struct sam3_vl_backbone *vl);
 
 /*
- * sam3_vl_backbone_build_vision - Build vision pipeline graph.
+ * sam3_vl_backbone_build_vision - Run vision pipeline with per-block eval.
+ *
+ * Evaluates the ViT per-block (resetting scratch between blocks),
+ * then resets scratch and builds the neck graph for the caller to
+ * evaluate.
  *
  * @vl:           Initialized and loaded backbone
- * @g:            Graph to add nodes to
+ * @g:            Graph to build neck into (caller evaluates)
+ * @be:           Backend for per-block ViT evaluation
  * @image:        Input image [3, img_size, img_size] normalized F32
  * @out_features: Array of 4 pointers filled with multi-scale features
- * @arena:        Arena for intermediate tensors
+ * @scratch:      Arena for intermediate tensors (reset between stages)
+ * @persist:      Arena for persistent ViT output buffer
  *
- * Runs ViT -> neck -> produces multi-scale feature maps.
  * Returns the raw ViT features [n_patches, embed_dim], or NULL on error.
  */
 struct sam3_tensor *sam3_vl_backbone_build_vision(
 	struct sam3_vl_backbone *vl,
 	struct sam3_graph *g,
+	struct sam3_backend *be,
 	struct sam3_tensor *image,
 	struct sam3_tensor *out_features[],
-	struct sam3_arena *arena);
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist);
 
 /*
  * sam3_vl_backbone_build_text - Build text pipeline graph.

@@ -38,6 +38,26 @@ struct sam3_tensor *gh_alloc_tensor(struct sam3_arena *arena,
 				    int n_dims, const int *dims);
 
 /*
+ * gh_tensor_wrap - Create a tensor struct pointing to an external buffer.
+ *
+ * @arena:  Arena to allocate the tensor struct from
+ * @dtype:  Data type for the tensor
+ * @n_dims: Number of dimensions (1-4)
+ * @dims:   Array of dimension sizes
+ * @data:   External data buffer (not allocated from arena)
+ *
+ * Allocates only the sam3_tensor struct from the arena and sets its
+ * data pointer to the provided buffer. No data allocation is performed.
+ * Used for per-block ViT evaluation where the persistent buffer lives
+ * in a separate arena from the scratch intermediates.
+ * Returns NULL if the arena is full.
+ */
+struct sam3_tensor *gh_tensor_wrap(struct sam3_arena *arena,
+				   enum sam3_dtype dtype,
+				   int n_dims, const int *dims,
+				   void *data);
+
+/*
  * gh_load_or_alloc - Load a weight tensor by name, or allocate zeroed.
  *
  * When wf is NULL or the tensor is not found, allocates a
@@ -170,6 +190,28 @@ struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
 			     struct sam3_tensor *sin_f);
 
 /*
+ * gh_sdpa - Fused scaled dot-product attention.
+ *
+ * Computes: softmax(Q @ K^T / sqrt(head_dim) + mask) @ V
+ * as a single graph node. The backend implements this without
+ * materializing the full [seq, seq] attention matrix.
+ *
+ * @g:        Graph to add the SDPA node to
+ * @a:        Arena for output tensor allocation
+ * @Q:        Query  [seq, head_dim]
+ * @K:        Key    [seq, head_dim]
+ * @V:        Value  [seq, head_dim]
+ * @mask:     Additive attention mask [seq, seq], or NULL
+ * @head_dim: Head dimension (used to compute scale = 1/sqrt(head_dim))
+ *
+ * Returns output tensor [seq, head_dim], or NULL on error.
+ */
+struct sam3_tensor *gh_sdpa(struct sam3_graph *g, struct sam3_arena *a,
+			    struct sam3_tensor *Q, struct sam3_tensor *K,
+			    struct sam3_tensor *V, struct sam3_tensor *mask,
+			    int head_dim);
+
+/*
  * gh_multihead_attention_rope - Multi-head attention with optional RoPE
  *                               and causal mask.
  *
@@ -274,6 +316,22 @@ struct sam3_tensor *gh_mlp(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *fc1_w, struct sam3_tensor *fc1_b,
 			   struct sam3_tensor *fc2_w, struct sam3_tensor *fc2_b,
 			   enum sam3_op activation);
+
+/*
+ * gh_groupnorm - Group normalization on NCHW tensor.
+ *
+ * @input:      [N, C, H, W] tensor
+ * @gamma:      Per-channel scale [C], or NULL
+ * @beta:       Per-channel bias [C], or NULL
+ * @num_groups: Number of groups (C must be divisible)
+ *
+ * Returns normalized tensor, same shape as input.
+ */
+struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
+				 struct sam3_tensor *input,
+				 struct sam3_tensor *gamma,
+				 struct sam3_tensor *beta,
+				 int num_groups);
 
 /*
  * gh_conv2d - 2D convolution with optional bias.

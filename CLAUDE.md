@@ -4,6 +4,15 @@
 
 SAM3 is a pure C11 inference engine for Facebook's Segment Anything Model 3.
 Metal backend first, extensible to CUDA/Vulkan. Modeled after ggml/llama.cpp.
+Upstream reference: https://github.com/facebookresearch/sam3
+
+### CRITICAL: This is SAM3, not SAM2
+
+- **Always refer to this project as SAM3** (Segment Anything Model 3).
+- **Never use "SAM2", "sam2", or "Segment Anything Model 2"** in code,
+  comments, commit messages, or conversation. The upstream repo is `sam3`.
+- All prefixes are `sam3_`, all macros are `SAM3_`, all paths use `sam3/`.
+- If referencing the upstream Python repo, it is `facebookresearch/sam3`.
 
 ## Build
 

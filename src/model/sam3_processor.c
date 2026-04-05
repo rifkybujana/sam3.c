@@ -22,38 +22,53 @@
 #include "sam3_processor.h"
 #include "graph_helpers.h"
 #include "core/weight.h"
+#include "backend/backend.h"
 #include "backend/cpu/cpu_backend.h"
+#include "util/log.h"
 
 enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 {
-	struct sam3_cpu_backend *cpu;
 	enum sam3_error err;
 
 	memset(proc, 0, sizeof(*proc));
 
-	/* Create CPU backend with 512 MiB arena for graph evaluation */
-	cpu = calloc(1, sizeof(*cpu));
-	if (!cpu)
-		return SAM3_ENOMEM;
-
-	cpu->base.type = SAM3_BACKEND_CPU;
-	cpu->base.ops = sam3_cpu_backend_ops();
-	cpu->arena_capacity = 512UL * 1024 * 1024;
-
-	err = cpu->base.ops->init(&cpu->base);
-	if (err != SAM3_OK) {
-		free(cpu);
-		return err;
+	/*
+	 * Try Metal first (lazy eval, no pre-allocation of intermediates),
+	 * fall back to CPU with large arena if unavailable.
+	 */
+#ifdef SAM3_HAS_METAL
+	proc->backend = sam3_backend_init(SAM3_BACKEND_METAL);
+#endif
+	if (!proc->backend) {
+		struct sam3_cpu_backend *cpu = calloc(1, sizeof(*cpu));
+		if (!cpu)
+			return SAM3_ENOMEM;
+		cpu->base.type = SAM3_BACKEND_CPU;
+		cpu->base.ops = sam3_cpu_backend_ops();
+		cpu->arena_capacity = 512UL * 1024 * 1024;
+		err = cpu->base.ops->init(&cpu->base);
+		if (err != SAM3_OK) {
+			free(cpu);
+			return err;
+		}
+		proc->backend = &cpu->base;
 	}
-	proc->backend = &cpu->base;
 
-	/* Model arena: 256 MiB for weights and cached features */
-	err = sam3_arena_init(&proc->model_arena, 256UL * 1024 * 1024);
+	/* Model arena: 4.5 GiB for weights, cached features, ViT persist buf.
+	 * QKV fusion for ViT (32 layers) + text encoder adds ~800 MiB of
+	 * temporary Q/K/V tensors that cannot be freed from the arena. */
+	err = sam3_arena_init(&proc->model_arena, 4608UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_backend;
 
-	/* Scratch arena: 128 MiB for per-inference temporaries */
-	err = sam3_arena_init(&proc->scratch_arena, 128UL * 1024 * 1024);
+	/*
+	 * Scratch arena: 3 GiB. Per-stage evaluation keeps peak memory
+	 * bounded to the largest single stage. The encoder fusion is
+	 * the most expensive at ~1.9 GiB (6 self-attention + cross-
+	 * attention layers). The segmentation head is ~2 GiB with
+	 * 3-stage upsampling to 288x288 + mask logits.
+	 */
+	err = sam3_arena_init(&proc->scratch_arena, 3072UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_model_arena;
 
@@ -117,7 +132,6 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 					 int width, int height)
 {
 	struct sam3_tensor *image;
-	struct sam3_graph graph;
 	enum sam3_error err;
 	int dims[3];
 	int c, y, x;
@@ -153,11 +167,10 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 		}
 	}
 
-	/* Build and evaluate vision encoder graph */
-	sam3_graph_init(&graph);
-	err = sam3_image_model_encode(&proc->model, &graph,
-				      proc->backend, image,
-				      &proc->scratch_arena);
+	/* Run per-block ViT evaluation + neck */
+	err = sam3_image_model_encode(&proc->model, proc->backend, image,
+				      &proc->scratch_arena,
+				      &proc->model_arena);
 	if (err != SAM3_OK)
 		return err;
 
@@ -311,8 +324,9 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	struct sam3_tensor *prompt_tokens = NULL;
 	struct sam3_tensor *text_features = NULL;
 	struct sam3_tensor *mask_logits;
+	struct sam3_tensor *score_logits = NULL;
 	enum sam3_error err;
-	size_t mask_bytes;
+	size_t mask_bytes, persist_save;
 	int nelems;
 	const char *text;
 
@@ -324,45 +338,131 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 
 	memset(result, 0, sizeof(*result));
 
-	/* Reset scratch arena for this segment pass */
-	sam3_arena_reset(&proc->scratch_arena);
+	/*
+	 * Save model arena offset so we can roll back inter-stage
+	 * data after segmentation completes.
+	 */
+	persist_save = proc->model_arena.offset;
 
-	sam3_graph_init(&graph);
-
-	/* Encode text prompt if present */
+	/*
+	 * Stage A: Encode text prompt. Build the text encoder graph,
+	 * evaluate it, and copy the result to the model arena so it
+	 * survives scratch resets between segmentation stages.
+	 */
 	text = find_text_prompt(prompts, n_prompts);
 	if (text) {
+		struct sam3_tensor *tf_persist;
+
+		sam3_arena_reset(&proc->scratch_arena);
+		sam3_graph_init(&graph);
+
 		text_features = sam3_vl_backbone_build_text(
 			&proc->model.backbone, &graph,
 			text, NULL, &proc->scratch_arena);
-		if (!text_features)
-			return SAM3_ENOMEM;
+		if (!text_features) {
+			sam3_log_error("segment: text encode build "
+				       "failed, scratch %zu/%zu",
+				       proc->scratch_arena.offset,
+				       proc->scratch_arena.size);
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = proc->backend->ops->graph_eval(proc->backend,
+						      &graph);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment: text eval failed: %d",
+				       err);
+			goto fail;
+		}
+
+		/* Copy materialized text features to model arena */
+		tf_persist = gh_alloc_tensor(
+			&proc->model_arena, text_features->dtype,
+			text_features->n_dims, text_features->dims);
+		if (!tf_persist) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		memcpy(tf_persist->data, text_features->data,
+		       text_features->nbytes);
+		text_features = tf_persist;
+
+		sam3_log_debug("segment: text encoded, %d×%d",
+			       text_features->dims[0],
+			       text_features->dims[1]);
 	}
 
-	/* Project geometric prompt coordinates to d_model embeddings */
-	prompt_tokens = project_prompts(&proc->model, &graph, prompts,
-					n_prompts, &proc->scratch_arena);
+	/*
+	 * Stage B: Project geometric prompt coordinates. Build a
+	 * small graph, evaluate, copy result to model arena.
+	 */
+	{
+		int n_points, n_boxes;
+
+		count_prompts_by_type(prompts, n_prompts,
+				      &n_points, &n_boxes);
+		if (n_points > 0 || n_boxes > 0) {
+			struct sam3_tensor *pt_persist;
+
+			sam3_arena_reset(&proc->scratch_arena);
+			sam3_graph_init(&graph);
+
+			prompt_tokens = project_prompts(
+				&proc->model, &graph, prompts,
+				n_prompts, &proc->scratch_arena);
+			if (!prompt_tokens) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+
+			err = proc->backend->ops->graph_eval(
+				proc->backend, &graph);
+			if (err != SAM3_OK) {
+				sam3_log_error("segment: prompt proj "
+					       "eval failed: %d", err);
+				goto fail;
+			}
+
+			pt_persist = gh_alloc_tensor(
+				&proc->model_arena,
+				prompt_tokens->dtype,
+				prompt_tokens->n_dims,
+				prompt_tokens->dims);
+			if (!pt_persist) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			memcpy(pt_persist->data, prompt_tokens->data,
+			       prompt_tokens->nbytes);
+			prompt_tokens = pt_persist;
+		}
+	}
 
 	/* At least one of text or geometry must be present */
-	if (!prompt_tokens && !text_features)
-		return SAM3_EINVAL;
-
-	/* Build segmentation graph */
-	mask_logits = sam3_image_model_segment(&proc->model, &graph,
-					       proc->backend, prompt_tokens,
-					       text_features,
-					       &proc->scratch_arena);
-	if (!mask_logits)
-		return SAM3_ENOMEM;
-
-	/* Evaluate the segmentation graph */
-	err = proc->backend->ops->graph_eval(proc->backend, &graph);
-	if (err != SAM3_OK)
-		return err;
+	if (!prompt_tokens && !text_features) {
+		err = SAM3_EINVAL;
+		goto fail;
+	}
 
 	/*
-	 * Copy mask logits to result. The mask tensor is expected to be
-	 * [n_masks, H, W] from the segmentation head.
+	 * Run per-stage segmentation: geometry encoder, encoder
+	 * fusion, decoder, segmentation head — each evaluated
+	 * independently with scratch reset between stages.
+	 */
+	err = sam3_image_model_segment(&proc->model, proc->backend,
+				       prompt_tokens, text_features,
+				       &proc->scratch_arena,
+				       &proc->model_arena,
+				       &mask_logits, &score_logits);
+	if (err != SAM3_OK) {
+		sam3_log_error("segment: pipeline failed: %d", err);
+		goto fail;
+	}
+
+	/*
+	 * Copy mask logits to result. The mask tensor is expected to
+	 * be [n_masks, H, W] from the segmentation head.
 	 */
 	if (mask_logits->n_dims == 3) {
 		result->n_masks = mask_logits->dims[0];
@@ -373,25 +473,58 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 		result->mask_height = mask_logits->dims[0];
 		result->mask_width = mask_logits->dims[1];
 	} else {
-		return SAM3_EINVAL;
+		err = SAM3_EINVAL;
+		goto fail;
 	}
 
 	nelems = result->n_masks * result->mask_height * result->mask_width;
 	mask_bytes = (size_t)nelems * sizeof(float);
 
 	result->masks = malloc(mask_bytes);
-	if (!result->masks)
-		return SAM3_ENOMEM;
+	if (!result->masks) {
+		err = SAM3_ENOMEM;
+		goto fail;
+	}
 
 	memcpy(result->masks, mask_logits->data, mask_bytes);
 
-	/* Allocate IoU scores (one per mask), zero-initialized for now */
-	result->iou_scores = calloc((size_t)result->n_masks, sizeof(float));
+	/* Allocate IoU scores (one per mask), zero-initialized */
+	result->iou_scores = calloc((size_t)result->n_masks,
+				     sizeof(float));
 	if (!result->iou_scores) {
 		free(result->masks);
 		result->masks = NULL;
-		return SAM3_ENOMEM;
+		err = SAM3_ENOMEM;
+		goto fail;
 	}
 
+	/*
+	 * Copy scorer output into iou_scores. The scorer produces
+	 * [n_queries, 1] with sigmoid already applied (0-1 range).
+	 * Copy min(n_masks, n_scores) entries.
+	 */
+	if (score_logits) {
+		int n_scores = score_logits->dims[0];
+		int n_copy = n_scores < result->n_masks
+			     ? n_scores : result->n_masks;
+		const float *sdata = (const float *)score_logits->data;
+
+		for (int i = 0; i < n_copy; i++)
+			result->iou_scores[i] = sdata[i];
+
+		result->iou_valid = 1;
+		sam3_log_info("segment: %d IoU scores computed", n_copy);
+	} else {
+		result->iou_valid = 0;
+		sam3_log_warn("segment: IoU scores unavailable "
+			      "(no text features for scorer)");
+	}
+
+	/* Roll back inter-stage persist data */
+	proc->model_arena.offset = persist_save;
 	return SAM3_OK;
+
+fail:
+	proc->model_arena.offset = persist_save;
+	return err;
 }
