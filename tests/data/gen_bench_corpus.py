@@ -16,7 +16,7 @@ import argparse
 import random
 from pathlib import Path
 
-ARTICLES = ["a", "the", "an"]
+ARTICLES = ["a/an", "the", "a/an"]  # weight indefinite articles 2x
 
 ADJECTIVES = [
     "small", "large", "bright", "dark", "red", "blue", "green", "yellow",
@@ -53,7 +53,7 @@ TEMPLATES = [
     "a detailed photo of {article} {adj} {noun} {prep} {context}",
     "{article} high quality image of {article} {adj} {noun}",
     "a picture showing {article} {adj} {noun}",
-    "{article} {adj} {adj} {noun} {prep} {context}",
+    "{article} {adj} {adj2} {noun} {prep} {context}",
     "a close up of {article} {adj} {noun}",
     "{article} {noun} and {article} {adj} {noun}",
 ]
@@ -67,12 +67,23 @@ def generate(count: int, seed: int) -> list[str]:
         caption = template.format(
             article=rng.choice(ARTICLES),
             adj=rng.choice(ADJECTIVES),
+            adj2=rng.choice(ADJECTIVES),
             noun=rng.choice(NOUNS),
             prep=rng.choice(PREPOSITIONS),
             context=rng.choice(CONTEXTS),
         )
-        out.append(caption)
+        out.append(fix_articles(caption))
     return out
+
+
+def fix_articles(caption: str) -> str:
+    """Resolve 'a/an' sentinel tokens to the correct English article."""
+    words = caption.split(" ")
+    for i, w in enumerate(words):
+        if w == "a/an":
+            nxt = words[i + 1] if i + 1 < len(words) else ""
+            words[i] = "an" if nxt and nxt[0].lower() in "aeiou" else "a"
+    return " ".join(words)
 
 
 def main() -> None:
@@ -87,7 +98,8 @@ def main() -> None:
     args = parser.parse_args()
 
     lines = generate(args.count, args.seed)
-    args.output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    text = "\n".join(lines) + ("\n" if lines else "")
+    args.output.write_text(text, encoding="utf-8")
     size = args.output.stat().st_size
     print(f"Wrote {args.count} lines ({size} bytes) to {args.output}")
 
