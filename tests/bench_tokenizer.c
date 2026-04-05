@@ -227,24 +227,21 @@ int main(int argc, char **argv)
 	if (err != SAM3_OK) {
 		printf("  (skipped — BPE vocab not found at %s)\n",
 		       BPE_VOCAB_PATH);
-		sam3_tokenizer_free(&tok);
-		printf("\nDone.\n");
-		return 0;
+	} else {
+		printf("  Vocab loaded in %.1f ms (%d tokens, %d merges)\n\n",
+		       t1 - t0, tok.vocab_size, tok.n_merges);
+
+		printf("  %-15s | %9s | %7s | %10s | %16s | %13s\n",
+		       "Input", "Length", "Tokens", "Latency",
+		       "Throughput", "Bandwidth");
+		printf("  %-15s-+-%9s-+-%7s-+-%10s-+-%16s-+-%13s\n",
+		       "---------------", "---------", "-------",
+		       "----------", "----------------", "-------------");
+
+		for (int i = 0; i < N_INPUTS; i++)
+			bench_encode(&tok, test_inputs[i].label,
+				     test_inputs[i].text, "bpe");
 	}
-
-	printf("  Vocab loaded in %.1f ms (%d tokens, %d merges)\n\n",
-	       t1 - t0, tok.vocab_size, tok.n_merges);
-
-	printf("  %-15s | %9s | %7s | %10s | %16s | %13s\n",
-	       "Input", "Length", "Tokens", "Latency",
-	       "Throughput", "Bandwidth");
-	printf("  %-15s-+-%9s-+-%7s-+-%10s-+-%16s-+-%13s\n",
-	       "---------------", "---------", "-------",
-	       "----------", "----------------", "-------------");
-
-	for (int i = 0; i < N_INPUTS; i++)
-		bench_encode(&tok, test_inputs[i].label,
-			     test_inputs[i].text, "bpe");
 
 	sam3_tokenizer_free(&tok);
 
