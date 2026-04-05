@@ -264,11 +264,11 @@ int main(int argc, char **argv)
 
 	printf("Corpus: %s (%d lines, %ld KB)\n\n",
 	       corpus_path, n_lines, corpus_size / 1024);
-	printf("  %-12s | %10s | %12s | %12s | %8s\n",
+	printf("  %-12s | %10s | %12s | %12s | %11s\n",
 	       "Mode", "Total", "Lines/sec", "Tokens/sec", "MB/s");
-	printf("  %-12s-+-%10s-+-%12s-+-%12s-+-%8s\n",
+	printf("  %-12s-+-%10s-+-%12s-+-%12s-+-%11s\n",
 	       "------------", "----------", "------------",
-	       "------------", "--------");
+	       "------------", "-----------");
 
 	#define PASSES 3
 	for (int mode = 0; mode < 2; mode++) {
