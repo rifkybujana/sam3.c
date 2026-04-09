@@ -19,6 +19,7 @@
 
 #include "backend/backend.h"
 #include "core/alloc.h"
+#include <stdbool.h>
 
 #ifdef SAM3_HAS_METAL
 #include "mlx/c/mlx.h"
@@ -44,6 +45,7 @@ struct sam3_metal_backend {
 	const struct sam3_tensor *map_keys[SAM3_METAL_MAP_SIZE];
 	mlx_array                 map_vals[SAM3_METAL_MAP_SIZE];
 	int                       map_count;
+	bool                      use_f16;   /* Cast F32 -> F16 for compute */
 #endif
 };
 

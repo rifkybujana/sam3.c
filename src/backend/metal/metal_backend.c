@@ -245,6 +245,21 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 	}
 
 	mlx_array arr = mlx_array_new_data(data, t->dims, t->n_dims, mtype);
+
+	/* Cast F32 -> F16 for reduced Metal memory bandwidth */
+	if (mtl->use_f16 && t->dtype == SAM3_DTYPE_F32) {
+		mlx_array f16 = mlx_array_new();
+		int cast_rc = mlx_astype(&f16, arr, MLX_FLOAT16,
+					  mtl->stream);
+		if (cast_rc == 0) {
+			mlx_array_free(arr);
+			arr = f16;
+		} else {
+			mlx_array_free(f16);
+			/* Fall through with F32 on cast failure */
+		}
+	}
+
 	if (metal_map_put(mtl, t, arr) < 0)
 		sam3_log_warn("metal: wrap_tensor: map full, array not cached");
 	return arr;
@@ -1049,6 +1064,8 @@ static enum sam3_error metal_init(struct sam3_backend *be)
 		return err;
 	}
 
+	mtl->use_f16 = true;
+
 	mtl->device = mlx_device_new_type(MLX_GPU, 0);
 	mtl->stream = mlx_default_gpu_stream_new();
 	metal_map_init(mtl);
@@ -1272,6 +1289,32 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 
 				const void *src = NULL;
 				mlx_dtype mtype = mlx_array_dtype(contig);
+
+				/*
+				 * If Metal computed in F16 but SAM3 tensor
+				 * expects F32, cast back for host readback.
+				 */
+				if (mtype == MLX_FLOAT16
+				    && out_t->dtype == SAM3_DTYPE_F32) {
+					mlx_array f32 = mlx_array_new();
+					int cast_rc = mlx_astype(
+						&f32, contig, MLX_FLOAT32,
+						mtl->stream);
+					if (cast_rc == 0) {
+						mlx_array_free(contig);
+						contig = f32;
+						mtype = MLX_FLOAT32;
+						/* Eval the F16->F32 cast */
+						mlx_vector_array va2 =
+							mlx_vector_array_new();
+						mlx_vector_array_append_value(
+							va2, contig);
+						mlx_eval(va2);
+						mlx_vector_array_free(va2);
+					} else {
+						mlx_array_free(f32);
+					}
+				}
 
 				switch (mtype) {
 				case MLX_FLOAT32:
