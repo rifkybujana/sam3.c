@@ -557,13 +557,12 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 		}
 	}
 
-	/* Step 2: Batched block evaluation (4 blocks per graph_eval) */
+	/* Step 2: Batched block evaluation (up to 4 blocks per graph_eval) */
 	{
-		int batch_size = 4;
+		int max_batch = 4;
 
-		for (int base = 0; base < te->n_layers;
-		     base += batch_size) {
-			int end = base + batch_size;
+		for (int base = 0; base < te->n_layers; ) {
+			int end = base + max_batch;
 			if (end > te->n_layers)
 				end = te->n_layers;
 
@@ -584,7 +583,11 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 			if (!mask_wrap)
 				return NULL;
 
+			int actually_built = 0;
+
 			for (int i = base; i < end; i++) {
+				size_t pre = scratch->offset;
+
 				/* Pre-norm for attention */
 				struct sam3_tensor *x_norm;
 				x_norm = gh_layernorm(&g, scratch, x,
@@ -643,6 +646,16 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 				x = gh_add(&g, scratch, x, ff);
 				if (!x)
 					return NULL;
+
+				actually_built++;
+
+				size_t block_cost = scratch->offset - pre;
+				size_t remaining = scratch->size
+					- scratch->offset;
+
+				if (i + 1 < end
+				    && remaining < block_cost)
+					break;
 			}
 
 			err = be->ops->graph_eval(be, &g);
@@ -650,10 +663,11 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 				return NULL;
 
 			memcpy(x_buf, x->data, x_bytes);
+			base += actually_built;
 
 #ifdef SAM3_DEBUG_DUMP
-			if (end == te->n_layers
-			    || base + batch_size >= te->n_layers) {
+			if (base >= te->n_layers
+			    || base + max_batch >= te->n_layers) {
 				char path[64];
 				snprintf(path, sizeof(path),
 					 "/tmp/dbg_te_block_%02d.bin",

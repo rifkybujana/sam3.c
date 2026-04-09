@@ -645,10 +645,10 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	 */
 	SAM3_PROF_BEGIN(profiler, "vit_blocks");
 	{
-		int batch_size = 4;
+		int max_batch = 4;
 
-		for (int base = 0; base < vit->depth; base += batch_size) {
-			int end = base + batch_size;
+		for (int base = 0; base < vit->depth; ) {
+			int end = base + max_batch;
 			if (end > vit->depth)
 				end = vit->depth;
 
@@ -662,8 +662,12 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 			if (!x)
 				return NULL;
 
-			/* Build N blocks into one graph */
+			int actually_built = 0;
+
+			/* Build up to max_batch blocks into one graph */
 			for (int i = base; i < end; i++) {
+				size_t pre = scratch->offset;
+
 				/* Pre-norm for attention */
 				struct sam3_tensor *x_norm;
 				x_norm = gh_layernorm(&g, scratch, x,
@@ -744,8 +748,28 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 				if (!x)
 					return NULL;
 
-				sam3_log_debug("vit: block %d/%d built",
-					       i + 1, vit->depth);
+				actually_built++;
+
+				size_t block_cost = scratch->offset - pre;
+				size_t remaining = scratch->size
+					- scratch->offset;
+
+				sam3_log_debug("vit: block %d/%d built "
+					"(arena +%zu, %zu left)",
+					i + 1, vit->depth,
+					block_cost, remaining);
+
+				/*
+				 * Stop batching if the next block
+				 * would likely overflow the arena.
+				 */
+				if (i + 1 < end
+				    && remaining < block_cost) {
+					sam3_log_debug("vit: arena low, "
+						"flushing batch at %d "
+						"blocks", actually_built);
+					break;
+				}
 			}
 
 			/* Evaluate batch */
@@ -756,10 +780,15 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 			memcpy(x_buf, x->data, x_bytes);
 
 			sam3_log_debug("vit: blocks %d-%d/%d evaluated",
-				       base + 1, end, vit->depth);
+				       base + 1,
+				       base + actually_built,
+				       vit->depth);
+
+			base += actually_built;
 
 #ifdef SAM3_DEBUG_DUMP
-			for (int i = base; i < end; i++) {
+			for (int i = base - actually_built;
+			     i < base; i++) {
 				if (i == 0 || i == 1 || i == 7
 				    || i == 15 || i == 23
 				    || i == 31) {
