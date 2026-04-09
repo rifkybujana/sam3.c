@@ -726,55 +726,40 @@ struct sam3_tensor *gh_multihead_attention_rope_sep(
 	sam3_log_debug("mha_sep: pre-SDPA arena %zu/%zu, n_heads=%d",
 		       a->offset, a->size, n_heads);
 
-	/* Per-head fused SDPA */
-	struct sam3_tensor *head_outs[SAM3_MAX_DIMS * 16];
-	for (int h = 0; h < n_heads; h++) {
-		int hstart = h * head_dim;
-		int hend = hstart + head_dim;
+	/*
+	 * Batched multi-head SDPA.
+	 */
+	int qkv_4d[] = {batch, n_heads, seq, head_dim};
+	struct sam3_tensor *sq_4d = gh_reshape(g, a, sq, 4, qkv_4d);
+	struct sam3_tensor *sk_4d = gh_reshape(g, a, sk, 4, qkv_4d);
+	struct sam3_tensor *sv_4d = gh_reshape(g, a, sv, 4, qkv_4d);
+	if (!sq_4d || !sk_4d || !sv_4d) {
+		sam3_log_error("mha_sep: 4D reshape fail "
+			       "(arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
 
-		struct sam3_tensor *hq = gh_slice(g, a, sq, 1,
-						   hstart, hend);
-		struct sam3_tensor *hk = gh_slice(g, a, sk, 1,
-						   hstart, hend);
-		struct sam3_tensor *hv = gh_slice(g, a, sv, 1,
-						   hstart, hend);
-		if (!hq || !hk || !hv) {
-			sam3_log_error("mha_sep: head %d slice fail "
-				       "(arena %zu/%zu)", h,
-				       a->offset, a->size);
-			return NULL;
-		}
+	struct sam3_tensor *attn_4d = gh_sdpa(g, a, sq_4d, sk_4d, sv_4d,
+					       attn_mask, head_dim);
+	if (!attn_4d) {
+		sam3_log_error("mha_sep: batched SDPA fail "
+			       "(arena %zu/%zu, nodes %d/%d)",
+			       a->offset, a->size,
+			       g->n_nodes, SAM3_GRAPH_MAX_NODES);
+		return NULL;
+	}
 
-		struct sam3_tensor *ho = gh_sdpa(g, a, hq, hk, hv,
-						 attn_mask, head_dim);
-		if (!ho) {
-			sam3_log_error("mha_sep: head %d SDPA fail "
-				       "(arena %zu/%zu, nodes %d/%d)",
-				       h, a->offset, a->size,
-				       g->n_nodes,
-				       SAM3_GRAPH_MAX_NODES);
-			return NULL;
-		}
-
-		head_outs[h] = ho;
+	struct sam3_tensor *merged = gh_reshape(g, a, attn_4d, 2, flat_dims);
+	if (!merged) {
+		sam3_log_error("mha_sep: merge reshape fail "
+			       "(arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
 	}
 
 	sam3_log_debug("mha_sep: post-SDPA arena %zu/%zu",
 		       a->offset, a->size);
-
-	/* Concatenate heads */
-	struct sam3_tensor *merged;
-	if (n_heads == 1) {
-		merged = head_outs[0];
-	} else {
-		merged = gh_concat(g, a, head_outs, n_heads, 1);
-		if (!merged) {
-			sam3_log_error("mha_sep: concat fail "
-				       "(arena %zu/%zu)",
-				       a->offset, a->size);
-			return NULL;
-		}
-	}
 
 	struct sam3_tensor *out = gh_linear(g, a, merged, out_w, out_b);
 	if (!out) {
