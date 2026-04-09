@@ -25,6 +25,7 @@
 #include "util/image.h"
 #include "util/log.h"
 #include "util/error.h"
+#include "util/time.h"
 
 /* Suppress warnings in vendored stb header (declarations only) */
 #ifdef __clang__
@@ -589,12 +590,15 @@ int main(int argc, char **argv)
 
 	/* Load model */
 	printf("Loading model: %s\n", args.model_path);
+	uint64_t t0 = sam3_time_ns();
 	err = sam3_load_model(ctx, args.model_path);
+	uint64_t t1 = sam3_time_ns();
 	if (err != SAM3_OK) {
 		fprintf(stderr, "error: failed to load model '%s': %s\n",
 			args.model_path, sam3_error_str(err));
 		goto cleanup;
 	}
+	printf("  model loaded in %.1fms\n", (double)(t1 - t0) / 1e6);
 
 	/* Load original image for overlay/cutout */
 	if (args.write_overlay || args.write_cutout) {
@@ -610,22 +614,29 @@ int main(int argc, char **argv)
 
 	/* Encode image */
 	printf("Encoding image: %s\n", args.image_path);
+	t0 = sam3_time_ns();
 	err = sam3_set_image_file(ctx, args.image_path);
+	t1 = sam3_time_ns();
 	if (err != SAM3_OK) {
 		fprintf(stderr,
 			"error: failed to encode image '%s': %s\n",
 			args.image_path, sam3_error_str(err));
 		goto cleanup;
 	}
+	printf("  image encoded in %.1fms\n", (double)(t1 - t0) / 1e6);
 
 	/* Run segmentation */
 	printf("Segmenting with %d prompt(s)...\n", args.n_prompts);
+	t0 = sam3_time_ns();
 	err = sam3_segment(ctx, args.prompts, args.n_prompts, &result);
+	t1 = sam3_time_ns();
 	if (err != SAM3_OK) {
 		fprintf(stderr, "error: segmentation failed: %s\n",
 			sam3_error_str(err));
 		goto cleanup;
 	}
+	printf("  segmentation completed in %.1fms\n",
+	       (double)(t1 - t0) / 1e6);
 
 	/* Post-process: greedy mask NMS. kept_buf and tmp_scores
 	 * are sized to match the 512-mask cap enforced by
