@@ -22,12 +22,16 @@
 #include "backend/backend.h"
 #include "sam3/sam3_types.h"
 
+/* Forward declaration — only used as an opaque pointer here. */
+struct sam3_profiler;
+
 struct sam3_processor {
 	struct sam3_image_model model;
 	struct sam3_backend *backend;
 	struct sam3_arena model_arena;    /* weights + cached features */
 	struct sam3_arena scratch_arena;  /* per-inference temp */
 	int image_loaded;
+	struct sam3_profiler *profiler;   /* NULL when profiling disabled */
 };
 
 /*

@@ -147,6 +147,10 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	if (err != SAM3_OK)
 		return err;
 
+#ifdef SAM3_HAS_PROFILE
+	ctx->proc.profiler = ctx->profiler;
+#endif
+
 	err = sam3_processor_load(&ctx->proc, path, vocab);
 	if (err != SAM3_OK) {
 		sam3_processor_free(&ctx->proc);
@@ -245,6 +249,8 @@ enum sam3_error sam3_profile_enable(sam3_ctx *ctx)
 			return SAM3_ENOMEM;
 	}
 	sam3_profiler_enable(ctx->profiler);
+	if (ctx->proc_ready)
+		ctx->proc.profiler = ctx->profiler;
 	return SAM3_OK;
 #else
 	(void)ctx;
