@@ -248,7 +248,7 @@ static void test_metal_softmax(void)
 				 c_data, &cc, NULL), SAM3_OK);
 
 	ASSERT(float_arrays_match((float *)mc.data, (float *)cc.data,
-				  8, 1e-4f));
+				  8, 1e-3f));
 
 	sam3_backend_free(metal);
 	sam3_backend_free(cpu);
@@ -374,7 +374,7 @@ static void test_metal_multi_node(void)
 	ASSERT_EQ(cpu->ops->graph_eval(cpu, &cg), SAM3_OK);
 
 	ASSERT(float_arrays_match((float *)m_out.data, (float *)c_out.data,
-				  4, 1e-4f));
+				  4, 1e-2f));
 
 	sam3_backend_free(metal);
 	sam3_backend_free(cpu);

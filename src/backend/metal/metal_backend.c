@@ -209,9 +209,23 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 		/* Validate cached array matches current tensor shape + dtype */
 		mlx_dtype expected_mtype;
 		metal_map_dtype(t->dtype, &expected_mtype);
+		mlx_dtype actual_mtype = mlx_array_dtype(*existing);
 		bool valid = ((int)mlx_array_ndim(*existing) == t->n_dims);
-		if (valid)
-			valid = (mlx_array_dtype(*existing) == expected_mtype);
+		if (valid) {
+			/*
+			 * With F16 compute, intermediate results are F16
+			 * even though the sam3 tensor says F32. Accept
+			 * either F16 or F32 when use_f16 is active.
+			 */
+			if (actual_mtype == expected_mtype)
+				; /* exact match */
+			else if (mtl->use_f16
+				 && expected_mtype == MLX_FLOAT32
+				 && actual_mtype == MLX_FLOAT16)
+				; /* F16 intermediate from F16 compute */
+			else
+				valid = false;
+		}
 		for (int i = 0; valid && i < t->n_dims; i++) {
 			if (mlx_array_dim(*existing, i) != t->dims[i])
 				valid = false;
