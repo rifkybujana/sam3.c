@@ -501,7 +501,6 @@ struct sam3_tensor *gh_sdpa(struct sam3_graph *g, struct sam3_arena *a,
 {
 	struct sam3_tensor *inputs[4];
 	int n_inputs = 3;
-	int out_dims[2];
 	struct sam3_tensor *output;
 
 	inputs[0] = Q;
@@ -512,10 +511,8 @@ struct sam3_tensor *gh_sdpa(struct sam3_graph *g, struct sam3_arena *a,
 		n_inputs = 4;
 	}
 
-	/* Output has same shape as Q: [seq, head_dim] */
-	out_dims[0] = Q->dims[0];
-	out_dims[1] = Q->dims[1];
-	output = gh_alloc_tensor(a, Q->dtype, 2, out_dims);
+	/* Output has same shape as Q: [seq, hd] or [batch, n_heads, seq, hd] */
+	output = gh_alloc_tensor(a, Q->dtype, Q->n_dims, Q->dims);
 	if (!output)
 		return NULL;
 

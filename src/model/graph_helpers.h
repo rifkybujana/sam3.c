@@ -207,17 +207,22 @@ struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
  *
  * Computes: softmax(Q @ K^T / sqrt(head_dim) + mask) @ V
  * as a single graph node. The backend implements this without
- * materializing the full [seq, seq] attention matrix.
+ * materializing the full attention score matrix.
+ *
+ * Accepts either single-head 2D or batched multi-head 4D inputs:
+ *   2D: Q[seq_q, hd], K[seq_k, hd], V[seq_k, hd] -> [seq_q, hd]
+ *   4D: Q[B, H, seq_q, hd], K[B, H, seq_k, hd], V[B, H, seq_k, hd]
+ *       -> [B, H, seq_q, hd]
  *
  * @g:        Graph to add the SDPA node to
  * @a:        Arena for output tensor allocation
- * @Q:        Query  [seq, head_dim]
- * @K:        Key    [seq, head_dim]
- * @V:        Value  [seq, head_dim]
- * @mask:     Additive attention mask [seq, seq], or NULL
+ * @Q:        Query tensor (2D or 4D)
+ * @K:        Key tensor (same ndims as Q)
+ * @V:        Value tensor (same ndims as Q)
+ * @mask:     Additive attention mask [seq_q, seq_k], or NULL
  * @head_dim: Head dimension (used to compute scale = 1/sqrt(head_dim))
  *
- * Returns output tensor [seq, head_dim], or NULL on error.
+ * Returns output tensor matching Q's shape, or NULL on error.
  */
 struct sam3_tensor *gh_sdpa(struct sam3_graph *g, struct sam3_arena *a,
 			    struct sam3_tensor *Q, struct sam3_tensor *K,
