@@ -28,6 +28,7 @@
 #include "image_encoder.h"
 #include "graph_helpers.h"
 #include "util/log.h"
+#include "util/profile.h"
 
 /* Global attention block indices */
 static const int global_blocks[] = {7, 15, 23, 31};
@@ -266,6 +267,47 @@ static struct sam3_tensor *tile_pos_embed(
 	return out;
 }
 
+/*
+ * fuse_3 - Load 3 separate [d, d_in] weights and fuse into [3*d, d_in].
+ */
+static struct sam3_tensor *fuse_3(const struct sam3_weight_file *wf,
+				   const char *name_a,
+				   const char *name_b,
+				   const char *name_c,
+				   struct sam3_arena *arena,
+				   int d, int n_dims, const int *part_dims)
+{
+	struct sam3_tensor *a, *b, *c, *out;
+	int fused_dims[2];
+
+	a = gh_load_mmap(wf, name_a, arena, SAM3_DTYPE_F32,
+			      n_dims, part_dims);
+	b = gh_load_mmap(wf, name_b, arena, SAM3_DTYPE_F32,
+			      n_dims, part_dims);
+	c = gh_load_mmap(wf, name_c, arena, SAM3_DTYPE_F32,
+			      n_dims, part_dims);
+	if (!a || !b || !c)
+		return NULL;
+
+	if (n_dims == 2) {
+		fused_dims[0] = 3 * d;
+		fused_dims[1] = part_dims[1];
+	} else {
+		fused_dims[0] = 3 * d;
+	}
+
+	out = gh_alloc_tensor(arena, SAM3_DTYPE_F32, n_dims, fused_dims);
+	if (!out)
+		return NULL;
+
+	memcpy(out->data, a->data, a->nbytes);
+	memcpy((char *)out->data + a->nbytes, b->data, b->nbytes);
+	memcpy((char *)out->data + a->nbytes + b->nbytes,
+	       c->data, c->nbytes);
+
+	return out;
+}
+
 enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 			       const struct sam3_weight_file *wf,
 			       struct sam3_arena *arena)
@@ -347,54 +389,33 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		if (!vit->layers[i].ln1_b)
 			return SAM3_ENOMEM;
 
-		/* Attention Q/K/V: separate weights (no fusion) */
-		snprintf(name, sizeof(name),
-			 VIT_P "layers.%d.attention.q_proj.weight", i);
-		vit->layers[i].q_w = gh_load_mmap(wf, name, arena,
-						    SAM3_DTYPE_F32,
-						    2, single_w_dims);
-		if (!vit->layers[i].q_w)
-			return SAM3_ENOMEM;
+		/* Attention QKV: fuse Q/K/V into [3*e, e] / [3*e] */
+		{
+			char q_name[128], k_name[128], v_name[128];
+			snprintf(q_name, sizeof(q_name),
+				 VIT_P "layers.%d.attention.q_proj.weight", i);
+			snprintf(k_name, sizeof(k_name),
+				 VIT_P "layers.%d.attention.k_proj.weight", i);
+			snprintf(v_name, sizeof(v_name),
+				 VIT_P "layers.%d.attention.v_proj.weight", i);
+			vit->layers[i].qkv_w = fuse_3(wf, q_name, k_name,
+						       v_name, arena, e,
+						       2, single_w_dims);
+			if (!vit->layers[i].qkv_w)
+				return SAM3_ENOMEM;
 
-		snprintf(name, sizeof(name),
-			 VIT_P "layers.%d.attention.q_proj.bias", i);
-		vit->layers[i].q_b = gh_load_mmap(wf, name, arena,
-						    SAM3_DTYPE_F32,
-						    1, single_b_dims);
-		if (!vit->layers[i].q_b)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 VIT_P "layers.%d.attention.k_proj.weight", i);
-		vit->layers[i].k_w = gh_load_mmap(wf, name, arena,
-						    SAM3_DTYPE_F32,
-						    2, single_w_dims);
-		if (!vit->layers[i].k_w)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 VIT_P "layers.%d.attention.k_proj.bias", i);
-		vit->layers[i].k_b = gh_load_mmap(wf, name, arena,
-						    SAM3_DTYPE_F32,
-						    1, single_b_dims);
-		if (!vit->layers[i].k_b)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 VIT_P "layers.%d.attention.v_proj.weight", i);
-		vit->layers[i].v_w = gh_load_mmap(wf, name, arena,
-						    SAM3_DTYPE_F32,
-						    2, single_w_dims);
-		if (!vit->layers[i].v_w)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 VIT_P "layers.%d.attention.v_proj.bias", i);
-		vit->layers[i].v_b = gh_load_mmap(wf, name, arena,
-						    SAM3_DTYPE_F32,
-						    1, single_b_dims);
-		if (!vit->layers[i].v_b)
-			return SAM3_ENOMEM;
+			snprintf(q_name, sizeof(q_name),
+				 VIT_P "layers.%d.attention.q_proj.bias", i);
+			snprintf(k_name, sizeof(k_name),
+				 VIT_P "layers.%d.attention.k_proj.bias", i);
+			snprintf(v_name, sizeof(v_name),
+				 VIT_P "layers.%d.attention.v_proj.bias", i);
+			vit->layers[i].qkv_b = fuse_3(wf, q_name, k_name,
+						       v_name, arena, e,
+						       1, single_b_dims);
+			if (!vit->layers[i].qkv_b)
+				return SAM3_ENOMEM;
+		}
 
 		/* Attention output projection */
 		snprintf(name, sizeof(name),
@@ -522,7 +543,8 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 				    struct sam3_backend *be,
 				    struct sam3_tensor *image,
 				    struct sam3_arena *scratch,
-				    struct sam3_arena *persist)
+				    struct sam3_arena *persist,
+				    struct sam3_profiler *profiler)
 {
 	int gs = vit->grid_size;
 	int e = vit->embed_dim;
@@ -533,7 +555,9 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 
 	/* Lazy-init RoPE, window mask, and tiled pos_embed on first build */
 	if (!vit->precomputed) {
+		SAM3_PROF_BEGIN(profiler, "vit_precompute");
 		err = vit_lazy_precompute(vit);
+		SAM3_PROF_END(profiler, "vit_precompute");
 		if (err != SAM3_OK)
 			return NULL;
 	}
@@ -553,6 +577,7 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	 * → add pos_embed → layernorm. The Metal backend's Phase 3 uses
 	 * mlx_contiguous to ensure correct data layout for transposed views.
 	 */
+	SAM3_PROF_BEGIN(profiler, "vit_patch_embed");
 	sam3_graph_init(&g);
 
 	int img4d_dims[] = {1, 3, vit->img_size, vit->img_size};
@@ -610,6 +635,7 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 		      "(%d patches)", np);
 	sam3_log_info("vit: scratch arena: %zu / %zu bytes used",
 		       scratch->offset, scratch->size);
+	SAM3_PROF_END(profiler, "vit_patch_embed");
 
 	/*
 	 * Step 2: Per-block transformer evaluation.
@@ -617,123 +643,142 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	 * For each layer, reset scratch, build one block's graph
 	 * using x_buf as input, evaluate, and copy the result back.
 	 */
-	for (int i = 0; i < vit->depth; i++) {
-		sam3_graph_init(&g);
-		sam3_arena_reset(scratch);
+	SAM3_PROF_BEGIN(profiler, "vit_blocks");
+	{
+		int batch_size = 4;
 
-		/* Wrap persistent buffer as input tensor in scratch */
-		int x_dims[] = {np, e};
-		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
-				    2, x_dims, x_buf);
-		if (!x)
-			return NULL;
+		for (int base = 0; base < vit->depth; base += batch_size) {
+			int end = base + batch_size;
+			if (end > vit->depth)
+				end = vit->depth;
 
-		/* Pre-norm for attention */
-		struct sam3_tensor *x_norm;
-		x_norm = gh_layernorm(&g, scratch, x,
-				       vit->layers[i].ln1_w,
-				       vit->layers[i].ln1_b);
-		if (!x_norm)
-			return NULL;
+			sam3_graph_init(&g);
+			sam3_arena_reset(scratch);
 
-		/* Reshape to 3D for multihead attention */
-		int attn_dims[] = {1, np, e};
-		struct sam3_tensor *x3d;
-		x3d = gh_reshape(&g, scratch, x_norm, 3, attn_dims);
-		if (!x3d)
-			return NULL;
+			/* Wrap persistent buffer as input */
+			int x_dims[] = {np, e};
+			x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+					    2, x_dims, x_buf);
+			if (!x)
+				return NULL;
 
-		/*
-		 * Self-attention with RoPE and optional window mask.
-		 * Window blocks use window RoPE (576 positions).
-		 * Global blocks use global RoPE (5184 positions).
-		 */
-		int is_global = vit->layers[i].is_global;
-		struct sam3_tensor *mask = is_global
+			/* Build N blocks into one graph */
+			for (int i = base; i < end; i++) {
+				/* Pre-norm for attention */
+				struct sam3_tensor *x_norm;
+				x_norm = gh_layernorm(&g, scratch, x,
+						       vit->layers[i].ln1_w,
+						       vit->layers[i].ln1_b);
+				if (!x_norm)
+					return NULL;
+
+				/* Reshape to 3D for MHA */
+				int attn_dims[] = {1, np, e};
+				struct sam3_tensor *x3d;
+				x3d = gh_reshape(&g, scratch, x_norm,
+						  3, attn_dims);
+				if (!x3d)
+					return NULL;
+
+				/* Self-attention with RoPE */
+				int is_global = vit->layers[i].is_global;
+				struct sam3_tensor *mask = is_global
 					? NULL : vit->window_mask;
-		struct sam3_tensor *rope_cos = is_global
+				struct sam3_tensor *rope_cos = is_global
 					? vit->rope_glo_cos
 					: vit->rope_win_cos;
-		struct sam3_tensor *rope_sin = is_global
+				struct sam3_tensor *rope_sin = is_global
 					? vit->rope_glo_sin
 					: vit->rope_win_sin;
 
-		struct sam3_tensor *attn;
-		attn = gh_multihead_attention_rope_sep(
-			&g, scratch,
-			x3d,
-			vit->layers[i].q_w, vit->layers[i].q_b,
-			vit->layers[i].k_w, vit->layers[i].k_b,
-			vit->layers[i].v_w, vit->layers[i].v_b,
-			vit->layers[i].proj_w,
-			vit->layers[i].proj_b,
-			vit->n_heads,
-			rope_cos,
-			rope_sin,
-			mask);
-		if (!attn) {
-			sam3_log_error("vit: block %d attention OOM "
-				       "(scratch %zu / %zu)",
-				       i, scratch->offset, scratch->size);
-			return NULL;
-		}
+				struct sam3_tensor *attn;
+				attn = gh_multihead_attention_rope(
+					&g, scratch,
+					x3d, NULL, NULL,
+					vit->layers[i].qkv_w,
+					vit->layers[i].qkv_b,
+					vit->layers[i].proj_w,
+					vit->layers[i].proj_b,
+					vit->n_heads,
+					rope_cos, rope_sin, mask);
+				if (!attn) {
+					sam3_log_error("vit: block %d "
+						"attention OOM "
+						"(scratch %zu / %zu)",
+						i, scratch->offset,
+						scratch->size);
+					return NULL;
+				}
 
-		/* Residual: x + attn */
-		x = gh_add(&g, scratch, x, attn);
-		if (!x)
-			return NULL;
+				/* Residual: x + attn */
+				x = gh_add(&g, scratch, x, attn);
+				if (!x)
+					return NULL;
 
-		/* Pre-norm for MLP */
-		x_norm = gh_layernorm(&g, scratch, x,
-				       vit->layers[i].ln2_w,
-				       vit->layers[i].ln2_b);
-		if (!x_norm)
-			return NULL;
+				/* Pre-norm for MLP */
+				x_norm = gh_layernorm(&g, scratch, x,
+						       vit->layers[i].ln2_w,
+						       vit->layers[i].ln2_b);
+				if (!x_norm)
+					return NULL;
 
-		/* MLP: fc1 -> GELU -> fc2 */
-		struct sam3_tensor *ff;
-		ff = gh_mlp(&g, scratch, x_norm,
-			     vit->layers[i].mlp_fc1_w,
-			     vit->layers[i].mlp_fc1_b,
-			     vit->layers[i].mlp_fc2_w,
-			     vit->layers[i].mlp_fc2_b,
-			     SAM3_OP_GELU);
-		if (!ff) {
-			sam3_log_error("vit: block %d MLP OOM "
-				       "(scratch %zu / %zu)",
-				       i, scratch->offset, scratch->size);
-			return NULL;
-		}
+				/* MLP: fc1 -> GELU -> fc2 */
+				struct sam3_tensor *ff;
+				ff = gh_mlp(&g, scratch, x_norm,
+					     vit->layers[i].mlp_fc1_w,
+					     vit->layers[i].mlp_fc1_b,
+					     vit->layers[i].mlp_fc2_w,
+					     vit->layers[i].mlp_fc2_b,
+					     SAM3_OP_GELU);
+				if (!ff) {
+					sam3_log_error("vit: block %d "
+						"MLP OOM "
+						"(scratch %zu / %zu)",
+						i, scratch->offset,
+						scratch->size);
+					return NULL;
+				}
 
-		/* Residual: x + ff */
-		x = gh_add(&g, scratch, x, ff);
-		if (!x)
-			return NULL;
+				/* Residual: x + ff */
+				x = gh_add(&g, scratch, x, ff);
+				if (!x)
+					return NULL;
 
-		/* Evaluate this block */
-		err = be->ops->graph_eval(be, &g);
-		if (err != SAM3_OK)
-			return NULL;
-
-		/* Save result to persistent buffer */
-		memcpy(x_buf, x->data, x_bytes);
-
-		sam3_log_debug("vit: block %d/%d evaluated", i + 1,
-			       vit->depth);
-
-		/* Dump output of key blocks for fixture comparison */
-		if (i == 0 || i == 1 || i == 7 || i == 15
-		    || i == 23 || i == 31) {
-			char path[64];
-			snprintf(path, sizeof(path),
-				 "/tmp/dbg_vit_block_%02d.bin", i);
-			FILE *dfp = fopen(path, "wb");
-			if (dfp) {
-				fwrite(x_buf, 1, x_bytes, dfp);
-				fclose(dfp);
+				sam3_log_debug("vit: block %d/%d built",
+					       i + 1, vit->depth);
 			}
+
+			/* Evaluate batch */
+			err = be->ops->graph_eval(be, &g);
+			if (err != SAM3_OK)
+				return NULL;
+
+			memcpy(x_buf, x->data, x_bytes);
+
+			sam3_log_debug("vit: blocks %d-%d/%d evaluated",
+				       base + 1, end, vit->depth);
+
+#ifdef SAM3_DEBUG_DUMP
+			for (int i = base; i < end; i++) {
+				if (i == 0 || i == 1 || i == 7
+				    || i == 15 || i == 23
+				    || i == 31) {
+					char path[64];
+					snprintf(path, sizeof(path),
+						 "/tmp/dbg_vit_block_%02d.bin",
+						 i);
+					FILE *dfp = fopen(path, "wb");
+					if (dfp) {
+						fwrite(x_buf, 1,
+						       x_bytes, dfp);
+						fclose(dfp);
+					}
+				}
+			}
+#endif
 		}
 	}
+	SAM3_PROF_END(profiler, "vit_blocks");
 
 	sam3_log_info("vit: all %d blocks evaluated (no post-norm, "
 		      "ln_post=Identity)", vit->depth);
