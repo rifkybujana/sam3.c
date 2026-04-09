@@ -29,6 +29,47 @@
 #define TE_P "detector_model.text_encoder.text_model."
 #define TE_L TE_P "encoder.layers."
 
+/*
+ * fuse_3 - Load 3 separate [d, d_in] weights and fuse into [3*d, d_in].
+ */
+static struct sam3_tensor *fuse_3(const struct sam3_weight_file *wf,
+				   const char *name_a,
+				   const char *name_b,
+				   const char *name_c,
+				   struct sam3_arena *arena,
+				   int d, int n_dims, const int *part_dims)
+{
+	struct sam3_tensor *a, *b, *c, *out;
+	int fused_dims[2];
+
+	a = gh_load_mmap(wf, name_a, arena, SAM3_DTYPE_F32,
+			      n_dims, part_dims);
+	b = gh_load_mmap(wf, name_b, arena, SAM3_DTYPE_F32,
+			      n_dims, part_dims);
+	c = gh_load_mmap(wf, name_c, arena, SAM3_DTYPE_F32,
+			      n_dims, part_dims);
+	if (!a || !b || !c)
+		return NULL;
+
+	if (n_dims == 2) {
+		fused_dims[0] = 3 * d;
+		fused_dims[1] = part_dims[1];
+	} else {
+		fused_dims[0] = 3 * d;
+	}
+
+	out = gh_alloc_tensor(arena, SAM3_DTYPE_F32, n_dims, fused_dims);
+	if (!out)
+		return NULL;
+
+	memcpy(out->data, a->data, a->nbytes);
+	memcpy((char *)out->data + a->nbytes, b->data, b->nbytes);
+	memcpy((char *)out->data + a->nbytes + b->nbytes,
+	       c->data, c->nbytes);
+
+	return out;
+}
+
 enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 				       const struct sam3_weight_file *wf,
 				       struct sam3_arena *arena)
@@ -101,49 +142,34 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		if (!te->layers[i].ln1_b)
 			return SAM3_ENOMEM;
 
-		/* Attention Q/K/V projections (separate weights) */
-		int qkv_w_dims[] = {w, w};
-		snprintf(name, sizeof(name),
-			 TE_L "%d.self_attn.q_proj.weight", i);
-		te->layers[i].attn_q_w = gh_load_mmap(
-			wf, name, arena, SAM3_DTYPE_F32, 2, qkv_w_dims);
-		if (!te->layers[i].attn_q_w)
-			return SAM3_ENOMEM;
+		/* Attention QKV: fuse Q/K/V into [3*w, w] / [3*w] */
+		{
+			char q_name[128], k_name[128], v_name[128];
+			int qkv_w_dims[] = {w, w};
+			snprintf(q_name, sizeof(q_name),
+				 TE_L "%d.self_attn.q_proj.weight", i);
+			snprintf(k_name, sizeof(k_name),
+				 TE_L "%d.self_attn.k_proj.weight", i);
+			snprintf(v_name, sizeof(v_name),
+				 TE_L "%d.self_attn.v_proj.weight", i);
+			te->layers[i].qkv_w = fuse_3(wf, q_name, k_name,
+						       v_name, arena, w,
+						       2, qkv_w_dims);
+			if (!te->layers[i].qkv_w)
+				return SAM3_ENOMEM;
 
-		snprintf(name, sizeof(name),
-			 TE_L "%d.self_attn.q_proj.bias", i);
-		te->layers[i].attn_q_b = gh_load_mmap(
-			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
-		if (!te->layers[i].attn_q_b)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 TE_L "%d.self_attn.k_proj.weight", i);
-		te->layers[i].attn_k_w = gh_load_mmap(
-			wf, name, arena, SAM3_DTYPE_F32, 2, qkv_w_dims);
-		if (!te->layers[i].attn_k_w)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 TE_L "%d.self_attn.k_proj.bias", i);
-		te->layers[i].attn_k_b = gh_load_mmap(
-			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
-		if (!te->layers[i].attn_k_b)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 TE_L "%d.self_attn.v_proj.weight", i);
-		te->layers[i].attn_v_w = gh_load_mmap(
-			wf, name, arena, SAM3_DTYPE_F32, 2, qkv_w_dims);
-		if (!te->layers[i].attn_v_w)
-			return SAM3_ENOMEM;
-
-		snprintf(name, sizeof(name),
-			 TE_L "%d.self_attn.v_proj.bias", i);
-		te->layers[i].attn_v_b = gh_load_mmap(
-			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
-		if (!te->layers[i].attn_v_b)
-			return SAM3_ENOMEM;
+			snprintf(q_name, sizeof(q_name),
+				 TE_L "%d.self_attn.q_proj.bias", i);
+			snprintf(k_name, sizeof(k_name),
+				 TE_L "%d.self_attn.k_proj.bias", i);
+			snprintf(v_name, sizeof(v_name),
+				 TE_L "%d.self_attn.v_proj.bias", i);
+			te->layers[i].qkv_b = fuse_3(wf, q_name, k_name,
+						       v_name, arena, w,
+						       1, w_dims);
+			if (!te->layers[i].qkv_b)
+				return SAM3_ENOMEM;
+		}
 
 		/* Attention output projection */
 		int out_w_dims[] = {w, w};
@@ -295,19 +321,17 @@ struct sam3_tensor *sam3_text_encoder_build(
 		if (!x3d)
 			return NULL;
 
-		/* Self-attention with separate Q/K/V and causal mask */
+		/* Self-attention with fused QKV and causal mask */
 		struct sam3_tensor *attn;
-		attn = gh_multihead_attention_sep(
-			g, arena, x3d,
-			te->layers[i].attn_q_w,
-			te->layers[i].attn_q_b,
-			te->layers[i].attn_k_w,
-			te->layers[i].attn_k_b,
-			te->layers[i].attn_v_w,
-			te->layers[i].attn_v_b,
+		attn = gh_multihead_attention_rope(
+			g, arena,
+			x3d, NULL, NULL,
+			te->layers[i].qkv_w,
+			te->layers[i].qkv_b,
 			te->layers[i].attn_out_w,
 			te->layers[i].attn_out_b,
 			te->n_heads,
+			NULL, NULL,
 			causal_mask);
 		if (!attn)
 			return NULL;
@@ -439,6 +463,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 	if (!x_buf)
 		return NULL;
 
+#ifdef SAM3_DEBUG_DUMP
 	/* Dump token IDs for verification */
 	{
 		FILE *fp = fopen("/tmp/dbg_te_token_ids.bin", "wb");
@@ -448,6 +473,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 			fclose(fp);
 		}
 	}
+#endif
 
 	/* Step 1a: Token embedding only (for fixture comparison) */
 	{
@@ -463,6 +489,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 		if (err != SAM3_OK)
 			return NULL;
 
+#ifdef SAM3_DEBUG_DUMP
 		/* Dump token embedding only (no pos) */
 		{
 			FILE *fp = fopen("/tmp/dbg_te_tok_only.bin", "wb");
@@ -472,6 +499,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 				fclose(fp);
 			}
 		}
+#endif
 	}
 
 	/* Step 1b: Token embedding + positional embedding */
@@ -500,6 +528,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 
 		memcpy(x_buf, x->data, x_bytes);
 
+#ifdef SAM3_DEBUG_DUMP
 		/* Dump token+pos embedding */
 		{
 			FILE *fp = fopen("/tmp/dbg_te_token_embed.bin", "wb");
@@ -509,6 +538,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 				fclose(fp);
 			}
 		}
+#endif
 	}
 
 	/* Build causal mask (persistent across blocks) */
@@ -527,101 +557,116 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 		}
 	}
 
-	/* Step 2: Per-block evaluation */
-	for (int i = 0; i < te->n_layers; i++) {
-		sam3_arena_reset(scratch);
-		sam3_graph_init(&g);
+	/* Step 2: Batched block evaluation (4 blocks per graph_eval) */
+	{
+		int batch_size = 4;
 
-		int x_dims[] = {seq_len, w};
-		struct sam3_tensor *x;
-		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, 2,
-				    x_dims, x_buf);
-		if (!x)
-			return NULL;
+		for (int base = 0; base < te->n_layers;
+		     base += batch_size) {
+			int end = base + batch_size;
+			if (end > te->n_layers)
+				end = te->n_layers;
 
-		struct sam3_tensor *mask_wrap;
-		mask_wrap = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, 2,
-					    mask_dims, causal_mask->data);
-		if (!mask_wrap)
-			return NULL;
+			sam3_arena_reset(scratch);
+			sam3_graph_init(&g);
 
-		/* Pre-norm for attention */
-		struct sam3_tensor *x_norm;
-		x_norm = gh_layernorm(&g, scratch, x,
-				       te->layers[i].ln1_w,
-				       te->layers[i].ln1_b);
-		if (!x_norm)
-			return NULL;
+			int x_dims[] = {seq_len, w};
+			struct sam3_tensor *x;
+			x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+					    2, x_dims, x_buf);
+			if (!x)
+				return NULL;
 
-		/* Reshape to 3D for multihead attention */
-		int attn_dims[] = {1, seq_len, w};
-		struct sam3_tensor *x3d;
-		x3d = gh_reshape(&g, scratch, x_norm, 3, attn_dims);
-		if (!x3d)
-			return NULL;
+			struct sam3_tensor *mask_wrap;
+			mask_wrap = gh_tensor_wrap(scratch,
+				SAM3_DTYPE_F32, 2,
+				mask_dims, causal_mask->data);
+			if (!mask_wrap)
+				return NULL;
 
-		/* Self-attention with separate Q/K/V and causal mask */
-		struct sam3_tensor *attn;
-		attn = gh_multihead_attention_sep(
-			&g, scratch, x3d,
-			te->layers[i].attn_q_w,
-			te->layers[i].attn_q_b,
-			te->layers[i].attn_k_w,
-			te->layers[i].attn_k_b,
-			te->layers[i].attn_v_w,
-			te->layers[i].attn_v_b,
-			te->layers[i].attn_out_w,
-			te->layers[i].attn_out_b,
-			te->n_heads,
-			mask_wrap);
-		if (!attn)
-			return NULL;
+			for (int i = base; i < end; i++) {
+				/* Pre-norm for attention */
+				struct sam3_tensor *x_norm;
+				x_norm = gh_layernorm(&g, scratch, x,
+					te->layers[i].ln1_w,
+					te->layers[i].ln1_b);
+				if (!x_norm)
+					return NULL;
 
-		/* Residual */
-		x = gh_add(&g, scratch, x, attn);
-		if (!x)
-			return NULL;
+				/* Reshape to 3D for MHA */
+				int attn_dims[] = {1, seq_len, w};
+				struct sam3_tensor *x3d;
+				x3d = gh_reshape(&g, scratch, x_norm,
+						  3, attn_dims);
+				if (!x3d)
+					return NULL;
 
-		/* Pre-norm for MLP */
-		x_norm = gh_layernorm(&g, scratch, x,
-				       te->layers[i].ln2_w,
-				       te->layers[i].ln2_b);
-		if (!x_norm)
-			return NULL;
+				/* Self-attention with causal mask */
+				struct sam3_tensor *attn;
+				attn = gh_multihead_attention_rope(
+					&g, scratch,
+					x3d, NULL, NULL,
+					te->layers[i].qkv_w,
+					te->layers[i].qkv_b,
+					te->layers[i].attn_out_w,
+					te->layers[i].attn_out_b,
+					te->n_heads,
+					NULL, NULL,
+					mask_wrap);
+				if (!attn)
+					return NULL;
 
-		/* MLP: fc1 -> GELU -> fc2 */
-		struct sam3_tensor *ff;
-		ff = gh_mlp(&g, scratch, x_norm,
-			     te->layers[i].mlp_fc1_w,
-			     te->layers[i].mlp_fc1_b,
-			     te->layers[i].mlp_fc2_w,
-			     te->layers[i].mlp_fc2_b,
-			     SAM3_OP_GELU);
-		if (!ff)
-			return NULL;
+				/* Residual */
+				x = gh_add(&g, scratch, x, attn);
+				if (!x)
+					return NULL;
 
-		/* Residual */
-		x = gh_add(&g, scratch, x, ff);
-		if (!x)
-			return NULL;
+				/* Pre-norm for MLP */
+				x_norm = gh_layernorm(&g, scratch, x,
+					te->layers[i].ln2_w,
+					te->layers[i].ln2_b);
+				if (!x_norm)
+					return NULL;
 
-		err = be->ops->graph_eval(be, &g);
-		if (err != SAM3_OK)
-			return NULL;
+				/* MLP: fc1 -> GELU -> fc2 */
+				struct sam3_tensor *ff;
+				ff = gh_mlp(&g, scratch, x_norm,
+					te->layers[i].mlp_fc1_w,
+					te->layers[i].mlp_fc1_b,
+					te->layers[i].mlp_fc2_w,
+					te->layers[i].mlp_fc2_b,
+					SAM3_OP_GELU);
+				if (!ff)
+					return NULL;
 
-		memcpy(x_buf, x->data, x_bytes);
-
-		/* Dump per-block output */
-		{
-			char path[64];
-			snprintf(path, sizeof(path),
-				 "/tmp/dbg_te_block_%02d.bin", i);
-			FILE *fp = fopen(path, "wb");
-			if (fp) {
-				fwrite(x_buf, sizeof(float),
-				       (size_t)seq_len * (size_t)w, fp);
-				fclose(fp);
+				/* Residual */
+				x = gh_add(&g, scratch, x, ff);
+				if (!x)
+					return NULL;
 			}
+
+			err = be->ops->graph_eval(be, &g);
+			if (err != SAM3_OK)
+				return NULL;
+
+			memcpy(x_buf, x->data, x_bytes);
+
+#ifdef SAM3_DEBUG_DUMP
+			if (end == te->n_layers
+			    || base + batch_size >= te->n_layers) {
+				char path[64];
+				snprintf(path, sizeof(path),
+					 "/tmp/dbg_te_block_%02d.bin",
+					 end - 1);
+				FILE *fp = fopen(path, "wb");
+				if (fp) {
+					fwrite(x_buf, sizeof(float),
+					       (size_t)seq_len
+					       * (size_t)w, fp);
+					fclose(fp);
+				}
+			}
+#endif
 		}
 	}
 
@@ -642,8 +687,9 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 		if (!x)
 			return NULL;
 
-		/* Dump ln_final output */
+#ifdef SAM3_DEBUG_DUMP
 		struct sam3_tensor *ln_out = x;
+#endif
 
 		struct sam3_tensor *proj_t;
 		proj_t = gh_transpose(&g, scratch, te->text_projection);
@@ -663,6 +709,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 		if (err != SAM3_OK)
 			return NULL;
 
+#ifdef SAM3_DEBUG_DUMP
 		/* Dump ln_final */
 		{
 			FILE *fp = fopen("/tmp/dbg_te_ln_final.bin", "wb");
@@ -672,6 +719,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 				fclose(fp);
 			}
 		}
+#endif
 
 		/* Copy result to persist arena */
 		int out_dims[] = {seq_len, te->d_model};
