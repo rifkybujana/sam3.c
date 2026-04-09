@@ -817,40 +817,32 @@ struct sam3_tensor *gh_cross_attention(
 		return NULL;
 
 	/*
-	 * Per-head attention using 2D ops.
-	 * Each head: slice columns, compute scaled dot-product attention.
+	 * Batched multi-head cross-attention.
+	 * Q: [n_q, d_model] -> [1, n_heads, n_q, head_dim]
+	 * K/V: [n_kv, d_model] -> [1, n_heads, n_kv, head_dim]
 	 */
-	struct sam3_tensor *head_outs[64]; /* up to 64 heads */
-	for (int h = 0; h < n_heads; h++) {
-		int hstart = h * head_dim;
-		int hend = hstart + head_dim;
+	int n_q = q->dims[0];
+	int n_kv = k->dims[0];
+	int q_4d[] = {1, n_heads, n_q, head_dim};
+	int kv_4d[] = {1, n_heads, n_kv, head_dim};
 
-		/* Slice head columns: [n_q/n_kv, head_dim] */
-		struct sam3_tensor *hq, *hk, *hv;
-		hq = gh_slice(g, arena, q, 1, hstart, hend);
-		hk = gh_slice(g, arena, k, 1, hstart, hend);
-		hv = gh_slice(g, arena, v, 1, hstart, hend);
-		if (!hq || !hk || !hv)
-			return NULL;
+	struct sam3_tensor *q4 = gh_reshape(g, arena, q, 4, q_4d);
+	struct sam3_tensor *k4 = gh_reshape(g, arena, k, 4, kv_4d);
+	struct sam3_tensor *v4 = gh_reshape(g, arena, v, 4, kv_4d);
+	if (!q4 || !k4 || !v4)
+		return NULL;
 
-		/* Fused scaled dot-product attention */
-		struct sam3_tensor *ho = gh_sdpa(g, arena, hq, hk, hv,
-						 NULL, head_dim);
-		if (!ho)
-			return NULL;
+	struct sam3_tensor *attn_4d = gh_sdpa(g, arena, q4, k4, v4,
+					       NULL, head_dim);
+	if (!attn_4d)
+		return NULL;
 
-		head_outs[h] = ho;
-	}
-
-	/* Concatenate heads: [n_q, d_model] */
-	struct sam3_tensor *merged;
-	if (n_heads == 1) {
-		merged = head_outs[0];
-	} else {
-		merged = gh_concat(g, arena, head_outs, n_heads, 1);
-		if (!merged)
-			return NULL;
-	}
+	/* Reshape back: [1, n_heads, n_q, head_dim] -> [n_q, d_model] */
+	int merged_dims[] = {n_q, d_model};
+	struct sam3_tensor *merged = gh_reshape(g, arena, attn_4d,
+						 2, merged_dims);
+	if (!merged)
+		return NULL;
 
 	/* Output projection */
 	return gh_linear(g, arena, merged, out_w, out_b);
@@ -892,36 +884,30 @@ struct sam3_tensor *gh_cross_attention_sep(
 	if (!q || !k || !v)
 		return NULL;
 
-	/* Per-head attention */
-	struct sam3_tensor *head_outs[64];
-	for (int h = 0; h < n_heads; h++) {
-		int hstart = h * head_dim;
-		int hend = hstart + head_dim;
+	/*
+	 * Batched multi-head cross-attention.
+	 */
+	int n_q = q->dims[0];
+	int n_kv = k->dims[0];
+	int q_4d[] = {1, n_heads, n_q, head_dim};
+	int kv_4d[] = {1, n_heads, n_kv, head_dim};
 
-		struct sam3_tensor *hq, *hk, *hv;
-		hq = gh_slice(g, arena, q, 1, hstart, hend);
-		hk = gh_slice(g, arena, k, 1, hstart, hend);
-		hv = gh_slice(g, arena, v, 1, hstart, hend);
-		if (!hq || !hk || !hv)
-			return NULL;
+	struct sam3_tensor *q4 = gh_reshape(g, arena, q, 4, q_4d);
+	struct sam3_tensor *k4 = gh_reshape(g, arena, k, 4, kv_4d);
+	struct sam3_tensor *v4 = gh_reshape(g, arena, v, 4, kv_4d);
+	if (!q4 || !k4 || !v4)
+		return NULL;
 
-		struct sam3_tensor *ho = gh_sdpa(g, arena, hq, hk, hv,
-						 NULL, head_dim);
-		if (!ho)
-			return NULL;
+	struct sam3_tensor *attn_4d = gh_sdpa(g, arena, q4, k4, v4,
+					       NULL, head_dim);
+	if (!attn_4d)
+		return NULL;
 
-		head_outs[h] = ho;
-	}
-
-	/* Concatenate heads */
-	struct sam3_tensor *merged;
-	if (n_heads == 1) {
-		merged = head_outs[0];
-	} else {
-		merged = gh_concat(g, arena, head_outs, n_heads, 1);
-		if (!merged)
-			return NULL;
-	}
+	int merged_dims[] = {n_q, d_model};
+	struct sam3_tensor *merged = gh_reshape(g, arena, attn_4d,
+						 2, merged_dims);
+	if (!merged)
+		return NULL;
 
 	/* Output projection */
 	return gh_linear(g, arena, merged, out_w, out_b);
