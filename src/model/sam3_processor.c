@@ -28,6 +28,9 @@
 #include "util/log.h"
 
 #include "sam3/internal/processor_normalize.h"
+#include "sam3/internal/mask_select.h"
+#include "sam3/internal/mask_boxes.h"
+#include "mask_decoder.h"
 
 void sam3_normalize_rgb_chw(const uint8_t *src, float *dst,
 			    int width, int height)
@@ -758,6 +761,48 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 		result->iou_valid = 0;
 		sam3_log_warn("segment: IoU scores unavailable "
 			      "(no text features for scorer)");
+	}
+
+	/*
+	 * Post-processing: stability-based mask selection.
+	 * When the mask decoder produces a small number of masks
+	 * (typically 4), apply the stability algorithm to select
+	 * the best one. Segmentation head output (200 queries)
+	 * is filtered by NMS in the caller instead.
+	 */
+	result->best_mask = -1;
+	if (result->n_masks > 1 &&
+	    result->n_masks <= SAM3_MASK_DEC_MASKS &&
+	    result->iou_valid) {
+		result->best_mask = sam3_mask_select_best(
+			result->masks, result->iou_scores,
+			result->n_masks,
+			result->mask_height, result->mask_width,
+			SAM3_STABILITY_DELTA,
+			SAM3_STABILITY_THRESH);
+		if (result->best_mask >= 0)
+			sam3_log_info("segment: stability selected "
+				      "mask %d (of %d)",
+				      result->best_mask,
+				      result->n_masks);
+	}
+
+	/*
+	 * Post-processing: extract bounding boxes from masks.
+	 * Boxes are in xyxy format with exclusive upper bounds.
+	 */
+	result->boxes = calloc((size_t)result->n_masks * 4,
+			       sizeof(float));
+	if (result->boxes) {
+		sam3_masks_to_boxes(result->masks, result->n_masks,
+				    result->mask_height,
+				    result->mask_width,
+				    result->boxes);
+		result->boxes_valid = 1;
+	} else {
+		result->boxes_valid = 0;
+		sam3_log_warn("segment: box extraction skipped "
+			      "(alloc failed)");
 	}
 
 	/* Roll back inter-stage persist data */

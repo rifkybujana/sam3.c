@@ -21,6 +21,7 @@
 
 #include "sam3/sam3.h"
 #include "sam3/internal/mask_nms.h"
+#include "sam3/internal/mask_resize.h"
 #include "util/image.h"
 #include "util/log.h"
 #include "util/error.h"
@@ -396,28 +397,6 @@ static int write_mask_png(const char *path, const float *data,
 }
 
 /*
- * resize_mask_nn - Nearest-neighbor resize of a float mask.
- *
- * @src:    Source mask data (src_h * src_w)
- * @src_w:  Source width
- * @src_h:  Source height
- * @dst:    Output buffer (dst_h * dst_w floats, caller-allocated)
- * @dst_w:  Target width
- * @dst_h:  Target height
- */
-static void resize_mask_nn(const float *src, int src_w, int src_h,
-			   float *dst, int dst_w, int dst_h)
-{
-	for (int y = 0; y < dst_h; y++) {
-		int sy = y * src_h / dst_h;
-		for (int x = 0; x < dst_w; x++) {
-			int sx = x * src_w / dst_w;
-			dst[y * dst_w + x] = src[sy * src_w + sx];
-		}
-	}
-}
-
-/*
  * write_overlay - Write a color overlay PNG on the original image.
  *
  * Overlays a semi-transparent blue (30, 144, 255) at 50% alpha on
@@ -451,8 +430,8 @@ static int write_overlay(const char *path, const float *mask,
 				"error: out of memory for overlay\n");
 			return 1;
 		}
-		resize_mask_nn(mask, mask_w, mask_h,
-			       resized, w, h);
+		sam3_mask_resize_bilinear(mask, mask_w, mask_h,
+					 resized, w, h);
 		m = resized;
 	}
 
@@ -526,8 +505,8 @@ static int write_cutout(const char *path, const float *mask,
 				"error: out of memory for cutout\n");
 			return 1;
 		}
-		resize_mask_nn(mask, mask_w, mask_h,
-			       resized, w, h);
+		sam3_mask_resize_bilinear(mask, mask_w, mask_h,
+					 resized, w, h);
 		m = resized;
 	}
 
@@ -716,16 +695,26 @@ int main(int argc, char **argv)
 	/* Print results summary */
 	printf("Results: %d mask(s), %dx%d\n",
 	       result.n_masks, result.mask_width, result.mask_height);
+	if (result.best_mask >= 0)
+		printf("  best mask: %d (stability-selected)\n",
+		       result.best_mask);
 	{
 		int mask_pixels = result.mask_width * result.mask_height;
 
 		for (int i = 0; i < result.n_masks; i++) {
 			if (result.iou_valid)
-				printf("  mask %d: IoU = %.4f\n",
+				printf("  mask %d: IoU = %.4f",
 				       i, result.iou_scores[i]);
 			else
-				printf("  mask %d: IoU = N/A "
-				       "(no scorer input)\n", i);
+				printf("  mask %d: IoU = N/A",
+				       i);
+
+			if (result.boxes_valid) {
+				const float *b = result.boxes + i * 4;
+				printf("  box=[%.0f,%.0f,%.0f,%.0f]",
+				       b[0], b[1], b[2], b[3]);
+			}
+			printf("\n");
 
 			/* Debug: per-mask statistics */
 			if (args.verbose) {
