@@ -31,6 +31,7 @@
 #include "sam3/internal/mask_select.h"
 #include "sam3/internal/mask_boxes.h"
 #include "mask_decoder.h"
+#include "util/profile.h"
 
 void sam3_normalize_rgb_chw(const uint8_t *src, float *dst,
 			    int width, int height)
@@ -179,12 +180,16 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 		return SAM3_ENOMEM;
 
 	dst = (float *)image->data;
+	SAM3_PROF_BEGIN(proc->profiler, "image_normalize");
 	sam3_normalize_rgb_chw(pixels, dst, width, height);
+	SAM3_PROF_END(proc->profiler, "image_normalize");
 
 	/* Run per-block ViT evaluation + neck */
+	SAM3_PROF_BEGIN(proc->profiler, "image_encode");
 	err = sam3_image_model_encode(&proc->model, proc->backend, image,
 				      &proc->scratch_arena,
 				      &proc->model_arena);
+	SAM3_PROF_END(proc->profiler, "image_encode");
 	if (err != SAM3_OK)
 		return err;
 
@@ -578,6 +583,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	}
 
 	if (text) {
+		SAM3_PROF_BEGIN(proc->profiler, "text_encode");
 		/*
 		 * Use per-block text encoder evaluation for debugging.
 		 * This dumps /tmp/dbg_te_block_XX.bin for each block.
@@ -654,6 +660,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				      text_features->dims[0] - n_tokens);
 			text_features = trunc;
 		}
+		SAM3_PROF_END(proc->profiler, "text_encode");
 	}
 
 	/*
@@ -671,9 +678,11 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 			 * [0,1], linear projection, add label embedding.
 			 * No graph/Metal needed for tiny prompt tensors.
 			 */
+			SAM3_PROF_BEGIN(proc->profiler, "prompt_project");
 			prompt_tokens = project_prompts(
 				&proc->model, prompts,
 				n_prompts, &proc->model_arena);
+			SAM3_PROF_END(proc->profiler, "prompt_project");
 			if (!prompt_tokens) {
 				err = SAM3_ENOMEM;
 				goto fail;
@@ -692,11 +701,13 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	 * fusion, decoder, segmentation head — each evaluated
 	 * independently with scratch reset between stages.
 	 */
+	SAM3_PROF_BEGIN(proc->profiler, "mask_decode");
 	err = sam3_image_model_segment(&proc->model, proc->backend,
 				       prompt_tokens, text_features,
 				       &proc->scratch_arena,
 				       &proc->model_arena,
 				       &mask_logits, &score_logits);
+	SAM3_PROF_END(proc->profiler, "mask_decode");
 	if (err != SAM3_OK) {
 		sam3_log_error("segment: pipeline failed: %d", err);
 		goto fail;
@@ -770,6 +781,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	 * the best one. Segmentation head output (200 queries)
 	 * is filtered by NMS in the caller instead.
 	 */
+	SAM3_PROF_BEGIN(proc->profiler, "postprocess");
 	result->best_mask = -1;
 	if (result->n_masks > 1 &&
 	    result->n_masks <= SAM3_MASK_DEC_MASKS &&
@@ -804,6 +816,8 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 		sam3_log_warn("segment: box extraction skipped "
 			      "(alloc failed)");
 	}
+
+	SAM3_PROF_END(proc->profiler, "postprocess");
 
 	/* Roll back inter-stage persist data */
 	proc->model_arena.offset = persist_save;
