@@ -62,72 +62,72 @@ enum sam3_error sam3_geometry_encoder_load(
 	int ffn_fc2_w_dims[] = {d, d_ffn};
 
 	/* Point projection */
-	enc->point_proj_w = gh_load_or_alloc(wf,
+	enc->point_proj_w = gh_load_mmap(wf,
 		"geom_enc.point_proj.weight", arena,
 		SAM3_DTYPE_F32, 2, point_w_dims);
 	if (!enc->point_proj_w)
 		return SAM3_ENOMEM;
 
-	enc->point_proj_b = gh_load_or_alloc(wf,
+	enc->point_proj_b = gh_load_mmap(wf,
 		"geom_enc.point_proj.bias", arena,
 		SAM3_DTYPE_F32, 1, point_b_dims);
 	if (!enc->point_proj_b)
 		return SAM3_ENOMEM;
 
 	/* Box projection */
-	enc->box_proj_w = gh_load_or_alloc(wf,
+	enc->box_proj_w = gh_load_mmap(wf,
 		"geom_enc.box_proj.weight", arena,
 		SAM3_DTYPE_F32, 2, box_w_dims);
 	if (!enc->box_proj_w)
 		return SAM3_ENOMEM;
 
-	enc->box_proj_b = gh_load_or_alloc(wf,
+	enc->box_proj_b = gh_load_mmap(wf,
 		"geom_enc.box_proj.bias", arena,
 		SAM3_DTYPE_F32, 1, box_b_dims);
 	if (!enc->box_proj_b)
 		return SAM3_ENOMEM;
 
 	/* CLS token */
-	enc->cls_token = gh_load_or_alloc(wf,
+	enc->cls_token = gh_load_mmap(wf,
 		"geom_enc.cls_token", arena,
 		SAM3_DTYPE_F32, 2, cls_dims);
 	if (!enc->cls_token)
 		return SAM3_ENOMEM;
 
 	/* Pool projection: Linear(d_model, d_model) for grid-sampled features */
-	enc->pool_proj_w = gh_load_or_alloc(wf,
+	enc->pool_proj_w = gh_load_mmap(wf,
 		"geom_enc.points_pool_project.weight", arena,
 		SAM3_DTYPE_F32, 2, proj_w_dims);
 	if (!enc->pool_proj_w)
 		return SAM3_ENOMEM;
 
-	enc->pool_proj_b = gh_load_or_alloc(wf,
+	enc->pool_proj_b = gh_load_mmap(wf,
 		"geom_enc.points_pool_project.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->pool_proj_b)
 		return SAM3_ENOMEM;
 
 	/* Pos enc projection: Linear(d_model, d_model) for sinusoidal encoding */
-	enc->posenc_proj_w = gh_load_or_alloc(wf,
+	enc->posenc_proj_w = gh_load_mmap(wf,
 		"geom_enc.points_pos_enc_project.weight", arena,
 		SAM3_DTYPE_F32, 2, proj_w_dims);
 	if (!enc->posenc_proj_w)
 		return SAM3_ENOMEM;
 
-	enc->posenc_proj_b = gh_load_or_alloc(wf,
+	enc->posenc_proj_b = gh_load_mmap(wf,
 		"geom_enc.points_pos_enc_project.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->posenc_proj_b)
 		return SAM3_ENOMEM;
 
 	/* Image pre-norm: LayerNorm(d_model) for pool projection */
-	enc->img_pre_norm_w = gh_load_or_alloc(wf,
+	enc->img_pre_norm_w = gh_load_mmap(wf,
 		"geom_enc.img_pre_norm.weight", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->img_pre_norm_w)
 		return SAM3_ENOMEM;
 
-	enc->img_pre_norm_b = gh_load_or_alloc(wf,
+	enc->img_pre_norm_b = gh_load_mmap(wf,
 		"geom_enc.img_pre_norm.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->img_pre_norm_b)
@@ -137,7 +137,7 @@ enum sam3_error sam3_geometry_encoder_load(
 	{
 		int label_dims[] = {2, d};
 		enc->n_labels = 2;
-		enc->label_embed = gh_load_or_alloc(wf,
+		enc->label_embed = gh_load_mmap(wf,
 			"geom_enc.label_embed.weight", arena,
 			SAM3_DTYPE_F32, 2, label_dims);
 		if (!enc->label_embed)
@@ -149,14 +149,14 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* Self-attention pre-norm (norm1) */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.norm1.weight", i);
-		enc->layers[i].norm1_w = gh_load_or_alloc(
+		enc->layers[i].norm1_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!enc->layers[i].norm1_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.norm1.bias", i);
-		enc->layers[i].norm1_b = gh_load_or_alloc(
+		enc->layers[i].norm1_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!enc->layers[i].norm1_b)
 			return SAM3_ENOMEM;
@@ -164,7 +164,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* Self-attention fused QKV [3d, d] */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.self_attn.in_proj_weight", i);
-		enc->layers[i].sa_qkv_w = gh_load_or_alloc(
+		enc->layers[i].sa_qkv_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, sa_qkv_w_dims);
 		if (!enc->layers[i].sa_qkv_w)
@@ -172,7 +172,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.self_attn.in_proj_bias", i);
-		enc->layers[i].sa_qkv_b = gh_load_or_alloc(
+		enc->layers[i].sa_qkv_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, sa_qkv_b_dims);
 		if (!enc->layers[i].sa_qkv_b)
@@ -181,7 +181,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* Self-attention output projection */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.self_attn.out_proj.weight", i);
-		enc->layers[i].sa_out_w = gh_load_or_alloc(
+		enc->layers[i].sa_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!enc->layers[i].sa_out_w)
@@ -189,7 +189,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.self_attn.out_proj.bias", i);
-		enc->layers[i].sa_out_b = gh_load_or_alloc(
+		enc->layers[i].sa_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].sa_out_b)
@@ -198,7 +198,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* Cross-attention pre-norm (norm2 = ca_ln) */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_ln.weight", i);
-		enc->layers[i].ca_ln_w = gh_load_or_alloc(
+		enc->layers[i].ca_ln_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_ln_w)
@@ -206,7 +206,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_ln.bias", i);
-		enc->layers[i].ca_ln_b = gh_load_or_alloc(
+		enc->layers[i].ca_ln_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_ln_b)
@@ -215,7 +215,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* Cross-attention Q projection */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_q.weight", i);
-		enc->layers[i].ca_q_w = gh_load_or_alloc(
+		enc->layers[i].ca_q_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!enc->layers[i].ca_q_w)
@@ -223,7 +223,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_q.bias", i);
-		enc->layers[i].ca_q_b = gh_load_or_alloc(
+		enc->layers[i].ca_q_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_q_b)
@@ -232,7 +232,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* Cross-attention KV projection (packed) */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_kv.weight", i);
-		enc->layers[i].ca_kv_w = gh_load_or_alloc(
+		enc->layers[i].ca_kv_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, ca_kv_w_dims);
 		if (!enc->layers[i].ca_kv_w)
@@ -240,7 +240,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_kv.bias", i);
-		enc->layers[i].ca_kv_b = gh_load_or_alloc(
+		enc->layers[i].ca_kv_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, ca_kv_b_dims);
 		if (!enc->layers[i].ca_kv_b)
@@ -249,7 +249,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* Cross-attention output projection */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_out.weight", i);
-		enc->layers[i].ca_out_w = gh_load_or_alloc(
+		enc->layers[i].ca_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!enc->layers[i].ca_out_w)
@@ -257,7 +257,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.ca_out.bias", i);
-		enc->layers[i].ca_out_b = gh_load_or_alloc(
+		enc->layers[i].ca_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ca_out_b)
@@ -266,7 +266,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* FFN pre-norm (norm3) */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.norm3.weight", i);
-		enc->layers[i].norm3_w = gh_load_or_alloc(
+		enc->layers[i].norm3_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].norm3_w)
@@ -274,7 +274,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.norm3.bias", i);
-		enc->layers[i].norm3_b = gh_load_or_alloc(
+		enc->layers[i].norm3_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].norm3_b)
@@ -283,7 +283,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* FFN linear1 [2048, d] */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.linear1.weight", i);
-		enc->layers[i].ffn_fc1_w = gh_load_or_alloc(
+		enc->layers[i].ffn_fc1_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, ffn_fc1_w_dims);
 		if (!enc->layers[i].ffn_fc1_w)
@@ -291,7 +291,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.linear1.bias", i);
-		enc->layers[i].ffn_fc1_b = gh_load_or_alloc(
+		enc->layers[i].ffn_fc1_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, ffn_fc1_b_dims);
 		if (!enc->layers[i].ffn_fc1_b)
@@ -300,7 +300,7 @@ enum sam3_error sam3_geometry_encoder_load(
 		/* FFN linear2 [d, 2048] */
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.linear2.weight", i);
-		enc->layers[i].ffn_fc2_w = gh_load_or_alloc(
+		enc->layers[i].ffn_fc2_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, ffn_fc2_w_dims);
 		if (!enc->layers[i].ffn_fc2_w)
@@ -308,7 +308,7 @@ enum sam3_error sam3_geometry_encoder_load(
 
 		snprintf(name, sizeof(name),
 			 "geom_enc.layers.%d.linear2.bias", i);
-		enc->layers[i].ffn_fc2_b = gh_load_or_alloc(
+		enc->layers[i].ffn_fc2_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!enc->layers[i].ffn_fc2_b)
@@ -316,39 +316,39 @@ enum sam3_error sam3_geometry_encoder_load(
 	}
 
 	/* Pre-encoder projection (final_proj in Python, applied BEFORE layers) */
-	enc->post_proj_w = gh_load_or_alloc(wf,
+	enc->post_proj_w = gh_load_mmap(wf,
 		"geom_enc.post_proj.weight", arena,
 		SAM3_DTYPE_F32, 2, proj_w_dims);
 	if (!enc->post_proj_w)
 		return SAM3_ENOMEM;
 
-	enc->post_proj_b = gh_load_or_alloc(wf,
+	enc->post_proj_b = gh_load_mmap(wf,
 		"geom_enc.post_proj.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->post_proj_b)
 		return SAM3_ENOMEM;
 
 	/* Pre-encoder LayerNorm (norm in Python, paired with final_proj) */
-	enc->norm_w = gh_load_or_alloc(wf,
+	enc->norm_w = gh_load_mmap(wf,
 		"geom_enc.norm.weight", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->norm_w)
 		return SAM3_ENOMEM;
 
-	enc->norm_b = gh_load_or_alloc(wf,
+	enc->norm_b = gh_load_mmap(wf,
 		"geom_enc.norm.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->norm_b)
 		return SAM3_ENOMEM;
 
 	/* Post-encoder LayerNorm (encode_norm in Python) */
-	enc->encode_norm_w = gh_load_or_alloc(wf,
+	enc->encode_norm_w = gh_load_mmap(wf,
 		"geom_enc.encode_norm.weight", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->encode_norm_w)
 		return SAM3_ENOMEM;
 
-	enc->encode_norm_b = gh_load_or_alloc(wf,
+	enc->encode_norm_b = gh_load_mmap(wf,
 		"geom_enc.encode_norm.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->encode_norm_b)

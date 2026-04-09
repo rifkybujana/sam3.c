@@ -103,11 +103,11 @@ static struct sam3_tensor *fuse_3(const struct sam3_weight_file *wf,
 	struct sam3_tensor *a, *b, *c, *out;
 	int fused_dims[2];
 
-	a = gh_load_or_alloc(wf, name_a, arena, SAM3_DTYPE_F32,
+	a = gh_load_mmap(wf, name_a, arena, SAM3_DTYPE_F32,
 			      n_dims, part_dims);
-	b = gh_load_or_alloc(wf, name_b, arena, SAM3_DTYPE_F32,
+	b = gh_load_mmap(wf, name_b, arena, SAM3_DTYPE_F32,
 			      n_dims, part_dims);
-	c = gh_load_or_alloc(wf, name_c, arena, SAM3_DTYPE_F32,
+	c = gh_load_mmap(wf, name_c, arena, SAM3_DTYPE_F32,
 			      n_dims, part_dims);
 	if (!a || !b || !c)
 		return NULL;
@@ -145,9 +145,9 @@ static struct sam3_tensor *fuse_2(const struct sam3_weight_file *wf,
 	struct sam3_tensor *a, *b, *out;
 	int fused_dims[2];
 
-	a = gh_load_or_alloc(wf, name_a, arena, SAM3_DTYPE_F32,
+	a = gh_load_mmap(wf, name_a, arena, SAM3_DTYPE_F32,
 			      n_dims, part_dims);
-	b = gh_load_or_alloc(wf, name_b, arena, SAM3_DTYPE_F32,
+	b = gh_load_mmap(wf, name_b, arena, SAM3_DTYPE_F32,
 			      n_dims, part_dims);
 	if (!a || !b)
 		return NULL;
@@ -180,7 +180,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 	/* Learned query embeddings: [n_queries, d_model] */
 	int qe_dims[] = {nq, d};
-	dec->query_embed = gh_load_or_alloc(wf,
+	dec->query_embed = gh_load_mmap(wf,
 		DEC_PREFIX "query_embed.weight",
 		arena, SAM3_DTYPE_F32, 2, qe_dims);
 	if (!dec->query_embed)
@@ -207,34 +207,34 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 	struct sam3_tensor *box_fc2_w, *box_fc2_b;
 	struct sam3_tensor *box_fc3_w, *box_fc3_b;
 
-	box_fc1_w = gh_load_or_alloc(wf,
+	box_fc1_w = gh_load_mmap(wf,
 		DEC_PREFIX "box_head.layer1.weight",
 		arena, SAM3_DTYPE_F32, 2, box_fc1_w_dims);
 	if (!box_fc1_w)
 		return SAM3_ENOMEM;
-	box_fc1_b = gh_load_or_alloc(wf,
+	box_fc1_b = gh_load_mmap(wf,
 		DEC_PREFIX "box_head.layer1.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!box_fc1_b)
 		return SAM3_ENOMEM;
 
-	box_fc2_w = gh_load_or_alloc(wf,
+	box_fc2_w = gh_load_mmap(wf,
 		DEC_PREFIX "box_head.layer2.weight",
 		arena, SAM3_DTYPE_F32, 2, box_fc2_w_dims);
 	if (!box_fc2_w)
 		return SAM3_ENOMEM;
-	box_fc2_b = gh_load_or_alloc(wf,
+	box_fc2_b = gh_load_mmap(wf,
 		DEC_PREFIX "box_head.layer2.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!box_fc2_b)
 		return SAM3_ENOMEM;
 
-	box_fc3_w = gh_load_or_alloc(wf,
+	box_fc3_w = gh_load_mmap(wf,
 		DEC_PREFIX "box_head.layer3.weight",
 		arena, SAM3_DTYPE_F32, 2, box_fc3_w_dims);
 	if (!box_fc3_w)
 		return SAM3_ENOMEM;
-	box_fc3_b = gh_load_or_alloc(wf,
+	box_fc3_b = gh_load_mmap(wf,
 		DEC_PREFIX "box_head.layer3.bias",
 		arena, SAM3_DTYPE_F32, 1, box_fc3_b_dims);
 	if (!box_fc3_b)
@@ -272,7 +272,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Self-attention output projection */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.self_attn.o_proj.weight", i);
-		dec->layers[i].sa_out_w = gh_load_or_alloc(
+		dec->layers[i].sa_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].sa_out_w)
@@ -280,7 +280,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.self_attn.o_proj.bias", i);
-		dec->layers[i].sa_out_b = gh_load_or_alloc(
+		dec->layers[i].sa_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].sa_out_b)
@@ -289,7 +289,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Self-attention layer norm */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.self_attn_layer_norm.weight", i);
-		dec->layers[i].sa_ln_w = gh_load_or_alloc(
+		dec->layers[i].sa_ln_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].sa_ln_w)
@@ -297,7 +297,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.self_attn_layer_norm.bias", i);
-		dec->layers[i].sa_ln_b = gh_load_or_alloc(
+		dec->layers[i].sa_ln_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].sa_ln_b)
@@ -306,7 +306,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Vision cross-attention: Q separate, K+V fused */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.vision_cross_attn.q_proj.weight", i);
-		dec->layers[i].ca_q_w = gh_load_or_alloc(
+		dec->layers[i].ca_q_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].ca_q_w)
@@ -314,7 +314,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.vision_cross_attn.q_proj.bias", i);
-		dec->layers[i].ca_q_b = gh_load_or_alloc(
+		dec->layers[i].ca_q_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_q_b)
@@ -343,7 +343,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Vision cross-attention output */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.vision_cross_attn.o_proj.weight", i);
-		dec->layers[i].ca_out_w = gh_load_or_alloc(
+		dec->layers[i].ca_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].ca_out_w)
@@ -351,7 +351,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.vision_cross_attn.o_proj.bias", i);
-		dec->layers[i].ca_out_b = gh_load_or_alloc(
+		dec->layers[i].ca_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_out_b)
@@ -360,7 +360,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Vision cross-attention layer norm */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.vision_cross_attn_layer_norm.weight", i);
-		dec->layers[i].ca_ln_w = gh_load_or_alloc(
+		dec->layers[i].ca_ln_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_ln_w)
@@ -368,7 +368,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.vision_cross_attn_layer_norm.bias", i);
-		dec->layers[i].ca_ln_b = gh_load_or_alloc(
+		dec->layers[i].ca_ln_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ca_ln_b)
@@ -377,7 +377,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Text cross-attention: Q separate, K+V fused */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.text_cross_attn.q_proj.weight", i);
-		dec->layers[i].tca_q_w = gh_load_or_alloc(
+		dec->layers[i].tca_q_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].tca_q_w)
@@ -385,7 +385,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.text_cross_attn.q_proj.bias", i);
-		dec->layers[i].tca_q_b = gh_load_or_alloc(
+		dec->layers[i].tca_q_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_q_b)
@@ -414,7 +414,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Text cross-attention output */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.text_cross_attn.o_proj.weight", i);
-		dec->layers[i].tca_out_w = gh_load_or_alloc(
+		dec->layers[i].tca_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, proj_w_dims);
 		if (!dec->layers[i].tca_out_w)
@@ -422,7 +422,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.text_cross_attn.o_proj.bias", i);
-		dec->layers[i].tca_out_b = gh_load_or_alloc(
+		dec->layers[i].tca_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_out_b)
@@ -431,7 +431,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* Text cross-attention layer norm */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.text_cross_attn_layer_norm.weight", i);
-		dec->layers[i].tca_ln_w = gh_load_or_alloc(
+		dec->layers[i].tca_ln_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_ln_w)
@@ -439,7 +439,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.text_cross_attn_layer_norm.bias", i);
-		dec->layers[i].tca_ln_b = gh_load_or_alloc(
+		dec->layers[i].tca_ln_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].tca_ln_b)
@@ -448,7 +448,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* FFN fc1 */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.mlp.fc1.weight", i);
-		dec->layers[i].ffn_fc1_w = gh_load_or_alloc(
+		dec->layers[i].ffn_fc1_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, fc1_w_dims);
 		if (!dec->layers[i].ffn_fc1_w)
@@ -456,7 +456,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.mlp.fc1.bias", i);
-		dec->layers[i].ffn_fc1_b = gh_load_or_alloc(
+		dec->layers[i].ffn_fc1_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, fc1_b_dims);
 		if (!dec->layers[i].ffn_fc1_b)
@@ -465,7 +465,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* FFN fc2 */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.mlp.fc2.weight", i);
-		dec->layers[i].ffn_fc2_w = gh_load_or_alloc(
+		dec->layers[i].ffn_fc2_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, fc2_w_dims);
 		if (!dec->layers[i].ffn_fc2_w)
@@ -473,7 +473,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.mlp.fc2.bias", i);
-		dec->layers[i].ffn_fc2_b = gh_load_or_alloc(
+		dec->layers[i].ffn_fc2_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ffn_fc2_b)
@@ -482,7 +482,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 		/* FFN layer norm */
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.mlp_layer_norm.weight", i);
-		dec->layers[i].ffn_ln_w = gh_load_or_alloc(
+		dec->layers[i].ffn_ln_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ffn_ln_w)
@@ -490,7 +490,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 		snprintf(name, sizeof(name),
 			 DEC_PREFIX "layers.%d.mlp_layer_norm.bias", i);
-		dec->layers[i].ffn_ln_b = gh_load_or_alloc(
+		dec->layers[i].ffn_ln_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, d_dims);
 		if (!dec->layers[i].ffn_ln_b)
@@ -506,13 +506,13 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 	}
 
 	/* Output layer norm applied after all decoder layers */
-	dec->output_ln_w = gh_load_or_alloc(wf,
+	dec->output_ln_w = gh_load_mmap(wf,
 		DEC_PREFIX "output_layer_norm.weight",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->output_ln_w)
 		return SAM3_ENOMEM;
 
-	dec->output_ln_b = gh_load_or_alloc(wf,
+	dec->output_ln_b = gh_load_mmap(wf,
 		DEC_PREFIX "output_layer_norm.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->output_ln_b)
@@ -526,7 +526,7 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 	 * ref_point_head: MLP(512, 256, 256, 2) = linear→relu→linear
 	 */
 	int rp_dims[] = {nq, 4};
-	dec->reference_points = gh_load_or_alloc(wf,
+	dec->reference_points = gh_load_mmap(wf,
 		DEC_PREFIX "reference_points.weight",
 		arena, SAM3_DTYPE_F32, 2, rp_dims);
 	if (!dec->reference_points)
@@ -534,26 +534,26 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 
 	/* ref_point_head layer1: Linear(2*d_model, d_model) */
 	int rph_fc1_w_dims[] = {d, 2 * d};
-	dec->rph_fc1_w = gh_load_or_alloc(wf,
+	dec->rph_fc1_w = gh_load_mmap(wf,
 		DEC_PREFIX "ref_point_head.layer1.weight",
 		arena, SAM3_DTYPE_F32, 2, rph_fc1_w_dims);
 	if (!dec->rph_fc1_w)
 		return SAM3_ENOMEM;
 
-	dec->rph_fc1_b = gh_load_or_alloc(wf,
+	dec->rph_fc1_b = gh_load_mmap(wf,
 		DEC_PREFIX "ref_point_head.layer1.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->rph_fc1_b)
 		return SAM3_ENOMEM;
 
 	/* ref_point_head layer2: Linear(d_model, d_model) */
-	dec->rph_fc2_w = gh_load_or_alloc(wf,
+	dec->rph_fc2_w = gh_load_mmap(wf,
 		DEC_PREFIX "ref_point_head.layer2.weight",
 		arena, SAM3_DTYPE_F32, 2, proj_w_dims);
 	if (!dec->rph_fc2_w)
 		return SAM3_ENOMEM;
 
-	dec->rph_fc2_b = gh_load_or_alloc(wf,
+	dec->rph_fc2_b = gh_load_mmap(wf,
 		DEC_PREFIX "ref_point_head.layer2.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->rph_fc2_b)

@@ -23,8 +23,9 @@
 /* Default arena capacity: 256 MiB — enough for SAM3 inference. */
 #define SAM3_CPU_ARENA_DEFAULT_CAPACITY (256UL * 1024 * 1024)
 
-/* Default scratch arena: 64 MiB for conv2d im2col temp buffers. */
-#define SAM3_CPU_SCRATCH_DEFAULT_CAPACITY (64UL * 1024 * 1024)
+/* Default scratch arena: 128 MiB for conv2d im2col temp buffers.
+ * SAM3 neck conv2d on 72x72 patches needs ~85 MiB for im2col. */
+#define SAM3_CPU_SCRATCH_DEFAULT_CAPACITY (128UL * 1024 * 1024)
 
 struct sam3_profiler;   /* Forward declaration */
 struct sam3_threadpool; /* Forward declaration */

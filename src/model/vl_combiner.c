@@ -62,16 +62,16 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	vl->text_enc.vocab_size = 49408;
 
 	/*
-	 * Precompute 2D sinusoidal position encoding for ViT grid.
+	 * Lazy 2D sinusoidal position encoding for ViT grid.
 	 * Python: num_pos_feats = input // 2 = 256 // 2 = 128.
 	 * Output is [H, W, 128*2] = [72, 72, 256] matching d_model.
+	 * Actual computation deferred to first sam3_pos_encoding_get().
 	 */
-	err = sam3_pos_encoding_precompute(&vl->pos_enc,
-					    vl->vit.grid_size,
-					    vl->vit.grid_size,
-					    128, arena);
-	if (err != SAM3_OK)
-		return err;
+	vl->pos_enc.height = vl->vit.grid_size;
+	vl->pos_enc.width = vl->vit.grid_size;
+	vl->pos_enc.num_pos_feats = 128;
+	vl->pos_enc.temperature = 10000.0f;
+	vl->pos_enc.arena = arena;
 
 	return SAM3_OK;
 }

@@ -32,14 +32,14 @@ enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
 
 	/* prompt_mlp.fc1: [d_ffn, d_model] / [d_ffn] */
 	int fc1_w_dims[] = {ffn, d};
-	ds->mlp_fc1_w = gh_load_or_alloc(wf,
+	ds->mlp_fc1_w = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_mlp.fc1.weight",
 		arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
 	if (!ds->mlp_fc1_w)
 		return SAM3_ENOMEM;
 
 	int fc1_b_dims[] = {ffn};
-	ds->mlp_fc1_b = gh_load_or_alloc(wf,
+	ds->mlp_fc1_b = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_mlp.fc1.bias",
 		arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
 	if (!ds->mlp_fc1_b)
@@ -47,14 +47,14 @@ enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
 
 	/* prompt_mlp.fc2: [d_model, d_ffn] / [d_model] */
 	int fc2_w_dims[] = {d, ffn};
-	ds->mlp_fc2_w = gh_load_or_alloc(wf,
+	ds->mlp_fc2_w = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_mlp.fc2.weight",
 		arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
 	if (!ds->mlp_fc2_w)
 		return SAM3_ENOMEM;
 
 	int fc2_b_dims[] = {d};
-	ds->mlp_fc2_b = gh_load_or_alloc(wf,
+	ds->mlp_fc2_b = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_mlp.fc2.bias",
 		arena, SAM3_DTYPE_F32, 1, fc2_b_dims);
 	if (!ds->mlp_fc2_b)
@@ -62,13 +62,13 @@ enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
 
 	/* prompt_mlp.out_norm: LayerNorm [d_model] */
 	int norm_dims[] = {d};
-	ds->mlp_norm_w = gh_load_or_alloc(wf,
+	ds->mlp_norm_w = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_mlp.out_norm.weight",
 		arena, SAM3_DTYPE_F32, 1, norm_dims);
 	if (!ds->mlp_norm_w)
 		return SAM3_ENOMEM;
 
-	ds->mlp_norm_b = gh_load_or_alloc(wf,
+	ds->mlp_norm_b = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_mlp.out_norm.bias",
 		arena, SAM3_DTYPE_F32, 1, norm_dims);
 	if (!ds->mlp_norm_b)
@@ -76,14 +76,14 @@ enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
 
 	/* prompt_proj: Linear(d_model, d_proj) */
 	int pp_w_dims[] = {proj, d};
-	ds->prompt_proj_w = gh_load_or_alloc(wf,
+	ds->prompt_proj_w = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_proj.weight",
 		arena, SAM3_DTYPE_F32, 2, pp_w_dims);
 	if (!ds->prompt_proj_w)
 		return SAM3_ENOMEM;
 
 	int pp_b_dims[] = {proj};
-	ds->prompt_proj_b = gh_load_or_alloc(wf,
+	ds->prompt_proj_b = gh_load_mmap(wf,
 		SCORE_PREFIX "prompt_proj.bias",
 		arena, SAM3_DTYPE_F32, 1, pp_b_dims);
 	if (!ds->prompt_proj_b)
@@ -91,14 +91,14 @@ enum sam3_error sam3_dot_scorer_load(struct sam3_dot_scorer *ds,
 
 	/* hs_proj: Linear(d_model, d_proj) */
 	int hp_w_dims[] = {proj, d};
-	ds->hs_proj_w = gh_load_or_alloc(wf,
+	ds->hs_proj_w = gh_load_mmap(wf,
 		SCORE_PREFIX "hs_proj.weight",
 		arena, SAM3_DTYPE_F32, 2, hp_w_dims);
 	if (!ds->hs_proj_w)
 		return SAM3_ENOMEM;
 
 	int hp_b_dims[] = {proj};
-	ds->hs_proj_b = gh_load_or_alloc(wf,
+	ds->hs_proj_b = gh_load_mmap(wf,
 		SCORE_PREFIX "hs_proj.bias",
 		arena, SAM3_DTYPE_F32, 1, hp_b_dims);
 	if (!ds->hs_proj_b)

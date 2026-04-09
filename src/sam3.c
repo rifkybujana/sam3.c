@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/mman.h>
 
 #include "sam3/sam3.h"
 #include "core/weight.h"
@@ -163,7 +164,7 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->proc.profiler = ctx->profiler;
 #endif
 
-	err = sam3_processor_load(&ctx->proc, path, vocab);
+	err = sam3_processor_load(&ctx->proc, &ctx->weights, vocab);
 	if (err != SAM3_OK) {
 		sam3_processor_free(&ctx->proc);
 #ifdef SAM3_HAS_PROFILE
@@ -172,6 +173,9 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 		return err;
 	}
 	ctx->proc_ready = 1;
+
+	/* Switch to random access hint for inference-time reads */
+	sam3_weight_madvise(&ctx->weights, MADV_RANDOM);
 
 #ifdef SAM3_HAS_PROFILE
 	SAM3_PROF_END(ctx->profiler, "model_load");

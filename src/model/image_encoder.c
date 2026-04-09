@@ -192,42 +192,9 @@ enum sam3_error sam3_vit_init(struct sam3_vit *vit,
 		}
 	}
 
-	int head_dim = embed_dim / n_heads;
-	float theta = 10000.0f;
-	enum sam3_error err;
+	vit->model_arena = arena;
 
-	/*
-	 * Window RoPE: 5184 positions (72x72 grid), tiled local coords.
-	 *
-	 * In Python, window blocks partition to 24x24 and use local
-	 * positions 0..23 with scale=1.0. Since the C code uses
-	 * mask-based windowing (no physical partition), we create a
-	 * 5184-entry table where each patch uses (py % ws, px % ws)
-	 * as its position — equivalent to tiling the 24x24 RoPE.
-	 */
-	err = precompute_rope_table(arena, vit->n_patches, vit->grid_size,
-				    head_dim, 1.0f, theta,
-				    &vit->rope_win_cos,
-				    &vit->rope_win_sin,
-				    window_size);
-	if (err != SAM3_OK)
-		return err;
-
-	/*
-	 * Global RoPE: 5184 positions (72x72), scale=1/3.
-	 * Matches Python: input_size=(72,72), rope_pt_size=(24,24),
-	 * rope_interp=True → scale = 24/72 = 1/3.
-	 */
-	float global_scale = (float)window_size / (float)vit->grid_size;
-	err = precompute_rope_table(arena, vit->n_patches, vit->grid_size,
-				    head_dim, global_scale, theta,
-				    &vit->rope_glo_cos,
-				    &vit->rope_glo_sin,
-				    0);
-	if (err != SAM3_OK)
-		return err;
-
-	return precompute_window_mask(vit, arena);
+	return SAM3_OK;
 }
 
 /*
@@ -235,53 +202,6 @@ enum sam3_error sam3_vit_init(struct sam3_vit *vit,
  * Original PyTorch: detector_model.vision_encoder.backbone.*
  */
 #define VIT_P "detector_model.vision_encoder.backbone."
-
-/*
- * load_fuse_qkv - Load separate Q, K, V weights and fuse into [3*dim, dim].
- *
- * The .sam3 file stores Q, K, V as separate [dim, dim] tensors, but
- * the ViT compute graph expects a fused [3*dim, dim] for efficiency.
- */
-static struct sam3_tensor *load_fuse_qkv(
-	const struct sam3_weight_file *wf,
-	struct sam3_arena *arena,
-	int dim,
-	const char *q_name,
-	const char *k_name,
-	const char *v_name,
-	int n_dims, const int *single_dims)
-{
-	struct sam3_tensor *q_t, *k_t, *v_t, *fused;
-	size_t single_bytes;
-
-	q_t = gh_load_or_alloc(wf, q_name, arena,
-			       SAM3_DTYPE_F32, n_dims, single_dims);
-	k_t = gh_load_or_alloc(wf, k_name, arena,
-			       SAM3_DTYPE_F32, n_dims, single_dims);
-	v_t = gh_load_or_alloc(wf, v_name, arena,
-			       SAM3_DTYPE_F32, n_dims, single_dims);
-	if (!q_t || !k_t || !v_t)
-		return NULL;
-
-	single_bytes = q_t->nbytes;
-
-	/* Allocate fused tensor: first dim is tripled */
-	int fused_dims[4];
-	for (int i = 0; i < n_dims; i++)
-		fused_dims[i] = single_dims[i];
-	fused_dims[0] *= 3;
-
-	fused = gh_alloc_tensor(arena, SAM3_DTYPE_F32, n_dims, fused_dims);
-	if (!fused)
-		return NULL;
-
-	memcpy((char *)fused->data, q_t->data, single_bytes);
-	memcpy((char *)fused->data + single_bytes, k_t->data, single_bytes);
-	memcpy((char *)fused->data + 2 * single_bytes,
-	       v_t->data, single_bytes);
-
-	return fused;
-}
 
 /*
  * tile_pos_embed - Tile pretrain positional embedding to inference resolution.
@@ -353,11 +273,11 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	int e = vit->embed_dim;
 	int m = vit->mlp_dim;
 	int ps = vit->patch_size;
-	char name[128], q_name[128], k_name[128], v_name[128];
+	char name[128];
 
 	/* Patch embedding: conv2d weight [embed_dim, 3, ps, ps] */
 	int pe_w_dims[] = {e, 3, ps, ps};
-	vit->patch_embed_w = gh_load_or_alloc(wf,
+	vit->patch_embed_w = gh_load_mmap(wf,
 		VIT_P "embeddings.patch_embeddings.projection.weight",
 		arena, SAM3_DTYPE_F32, 4, pe_w_dims);
 	if (!vit->patch_embed_w)
@@ -365,7 +285,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 	/* Patch embedding bias [embed_dim] — may not exist (bias_patch_embed=False) */
 	int pe_b_dims[] = {e};
-	vit->patch_embed_b = gh_load_or_alloc(wf,
+	vit->patch_embed_b = gh_load_mmap(wf,
 		VIT_P "embeddings.patch_embeddings.projection.bias",
 		arena, SAM3_DTYPE_F32, 1, pe_b_dims);
 	if (!vit->patch_embed_b)
@@ -379,30 +299,23 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	int pretrain_grid = 24; /* pretrain_img_size=336, patch_size=14 */
 	int n_pretrain_with_cls = pretrain_grid * pretrain_grid + 1;
 	int pos_dims[] = {1, n_pretrain_with_cls, e};
-	struct sam3_tensor *raw_pos = gh_load_or_alloc(wf,
+	struct sam3_tensor *raw_pos = gh_load_mmap(wf,
 		VIT_P "embeddings.position_embedding.weight",
 		arena, SAM3_DTYPE_F32, 3, pos_dims);
 	if (!raw_pos)
 		return SAM3_ENOMEM;
 
-	vit->pos_embed = tile_pos_embed(arena, raw_pos,
-					pretrain_grid, vit->grid_size, e);
-	if (!vit->pos_embed)
-		return SAM3_ENOMEM;
-
-	sam3_log_info("vit: pos_embed tiled from %dx%d to %dx%d",
-		      pretrain_grid, pretrain_grid,
-		      vit->grid_size, vit->grid_size);
+	vit->raw_pos_embed = raw_pos;
 
 	/* ln_pre (pre-block layer norm) */
 	int e_dims[] = {e};
-	vit->ln_pre_w = gh_load_or_alloc(wf,
+	vit->ln_pre_w = gh_load_mmap(wf,
 		VIT_P "layer_norm.weight",
 		arena, SAM3_DTYPE_F32, 1, e_dims);
 	if (!vit->ln_pre_w)
 		return SAM3_ENOMEM;
 
-	vit->ln_pre_b = gh_load_or_alloc(wf,
+	vit->ln_pre_b = gh_load_mmap(wf,
 		VIT_P "layer_norm.bias",
 		arena, SAM3_DTYPE_F32, 1, e_dims);
 	if (!vit->ln_pre_b)
@@ -420,7 +333,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* Layer norm 1 */
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.layer_norm1.weight", i);
-		vit->layers[i].ln1_w = gh_load_or_alloc(wf, name, arena,
+		vit->layers[i].ln1_w = gh_load_mmap(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln1_w)
@@ -428,39 +341,65 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.layer_norm1.bias", i);
-		vit->layers[i].ln1_b = gh_load_or_alloc(wf, name, arena,
+		vit->layers[i].ln1_b = gh_load_mmap(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln1_b)
 			return SAM3_ENOMEM;
 
-		/* Attention QKV: fuse from separate Q, K, V */
-		snprintf(q_name, sizeof(q_name),
+		/* Attention Q/K/V: separate weights (no fusion) */
+		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.attention.q_proj.weight", i);
-		snprintf(k_name, sizeof(k_name),
-			 VIT_P "layers.%d.attention.k_proj.weight", i);
-		snprintf(v_name, sizeof(v_name),
-			 VIT_P "layers.%d.attention.v_proj.weight", i);
-		vit->layers[i].qkv_w = load_fuse_qkv(wf, arena, e,
-			q_name, k_name, v_name, 2, single_w_dims);
-		if (!vit->layers[i].qkv_w)
+		vit->layers[i].q_w = gh_load_mmap(wf, name, arena,
+						    SAM3_DTYPE_F32,
+						    2, single_w_dims);
+		if (!vit->layers[i].q_w)
 			return SAM3_ENOMEM;
 
-		snprintf(q_name, sizeof(q_name),
+		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.attention.q_proj.bias", i);
-		snprintf(k_name, sizeof(k_name),
+		vit->layers[i].q_b = gh_load_mmap(wf, name, arena,
+						    SAM3_DTYPE_F32,
+						    1, single_b_dims);
+		if (!vit->layers[i].q_b)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 VIT_P "layers.%d.attention.k_proj.weight", i);
+		vit->layers[i].k_w = gh_load_mmap(wf, name, arena,
+						    SAM3_DTYPE_F32,
+						    2, single_w_dims);
+		if (!vit->layers[i].k_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.attention.k_proj.bias", i);
-		snprintf(v_name, sizeof(v_name),
+		vit->layers[i].k_b = gh_load_mmap(wf, name, arena,
+						    SAM3_DTYPE_F32,
+						    1, single_b_dims);
+		if (!vit->layers[i].k_b)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 VIT_P "layers.%d.attention.v_proj.weight", i);
+		vit->layers[i].v_w = gh_load_mmap(wf, name, arena,
+						    SAM3_DTYPE_F32,
+						    2, single_w_dims);
+		if (!vit->layers[i].v_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.attention.v_proj.bias", i);
-		vit->layers[i].qkv_b = load_fuse_qkv(wf, arena, e,
-			q_name, k_name, v_name, 1, single_b_dims);
-		if (!vit->layers[i].qkv_b)
+		vit->layers[i].v_b = gh_load_mmap(wf, name, arena,
+						    SAM3_DTYPE_F32,
+						    1, single_b_dims);
+		if (!vit->layers[i].v_b)
 			return SAM3_ENOMEM;
 
 		/* Attention output projection */
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.attention.o_proj.weight", i);
-		vit->layers[i].proj_w = gh_load_or_alloc(wf, name, arena,
+		vit->layers[i].proj_w = gh_load_mmap(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       2, proj_w_dims);
 		if (!vit->layers[i].proj_w)
@@ -468,7 +407,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.attention.o_proj.bias", i);
-		vit->layers[i].proj_b = gh_load_or_alloc(wf, name, arena,
+		vit->layers[i].proj_b = gh_load_mmap(wf, name, arena,
 						       SAM3_DTYPE_F32,
 						       1, e_dims);
 		if (!vit->layers[i].proj_b)
@@ -477,7 +416,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* Layer norm 2 */
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.layer_norm2.weight", i);
-		vit->layers[i].ln2_w = gh_load_or_alloc(wf, name, arena,
+		vit->layers[i].ln2_w = gh_load_mmap(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln2_w)
@@ -485,7 +424,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.layer_norm2.bias", i);
-		vit->layers[i].ln2_b = gh_load_or_alloc(wf, name, arena,
+		vit->layers[i].ln2_b = gh_load_mmap(wf, name, arena,
 						      SAM3_DTYPE_F32,
 						      1, e_dims);
 		if (!vit->layers[i].ln2_b)
@@ -494,14 +433,14 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* MLP fc1 */
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.mlp.fc1.weight", i);
-		vit->layers[i].mlp_fc1_w = gh_load_or_alloc(
+		vit->layers[i].mlp_fc1_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
 		if (!vit->layers[i].mlp_fc1_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.mlp.fc1.bias", i);
-		vit->layers[i].mlp_fc1_b = gh_load_or_alloc(
+		vit->layers[i].mlp_fc1_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
 		if (!vit->layers[i].mlp_fc1_b)
 			return SAM3_ENOMEM;
@@ -509,19 +448,73 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 		/* MLP fc2 */
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.mlp.fc2.weight", i);
-		vit->layers[i].mlp_fc2_w = gh_load_or_alloc(
+		vit->layers[i].mlp_fc2_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
 		if (!vit->layers[i].mlp_fc2_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 VIT_P "layers.%d.mlp.fc2.bias", i);
-		vit->layers[i].mlp_fc2_b = gh_load_or_alloc(
+		vit->layers[i].mlp_fc2_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, e_dims);
 		if (!vit->layers[i].mlp_fc2_b)
 			return SAM3_ENOMEM;
 	}
 
+	return SAM3_OK;
+}
+
+/*
+ * vit_lazy_precompute - Compute RoPE tables, window mask, and pos tiling.
+ *
+ * Deferred from init/load to first sam3_vit_build() call so that
+ * model loading does not pay the cost of these CPU-bound computations.
+ */
+static enum sam3_error vit_lazy_precompute(struct sam3_vit *vit)
+{
+	struct sam3_arena *arena = vit->model_arena;
+	int head_dim = vit->embed_dim / vit->n_heads;
+	float theta = 10000.0f;
+	enum sam3_error err;
+
+	/* Window RoPE */
+	err = precompute_rope_table(arena, vit->n_patches, vit->grid_size,
+				    head_dim, 1.0f, theta,
+				    &vit->rope_win_cos,
+				    &vit->rope_win_sin,
+				    vit->window_size);
+	if (err != SAM3_OK)
+		return err;
+
+	/* Global RoPE */
+	float global_scale = (float)vit->window_size /
+			     (float)vit->grid_size;
+	err = precompute_rope_table(arena, vit->n_patches, vit->grid_size,
+				    head_dim, global_scale, theta,
+				    &vit->rope_glo_cos,
+				    &vit->rope_glo_sin,
+				    0);
+	if (err != SAM3_OK)
+		return err;
+
+	/* Window mask */
+	err = precompute_window_mask(vit, arena);
+	if (err != SAM3_OK)
+		return err;
+
+	/* Tile position embedding if raw is available */
+	if (vit->raw_pos_embed && !vit->pos_embed) {
+		vit->pos_embed = tile_pos_embed(arena,
+						vit->raw_pos_embed,
+						24, vit->grid_size,
+						vit->embed_dim);
+		if (!vit->pos_embed)
+			return SAM3_ENOMEM;
+		sam3_log_info("vit: pos_embed tiled to %dx%d (lazy)",
+			      vit->grid_size, vit->grid_size);
+	}
+
+	vit->precomputed = 1;
 	return SAM3_OK;
 }
 
@@ -537,6 +530,13 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	size_t x_bytes = (size_t)np * e * sam3_dtype_size(SAM3_DTYPE_F32);
 	struct sam3_graph g;
 	enum sam3_error err;
+
+	/* Lazy-init RoPE, window mask, and tiled pos_embed on first build */
+	if (!vit->precomputed) {
+		err = vit_lazy_precompute(vit);
+		if (err != SAM3_OK)
+			return NULL;
+	}
 
 	/*
 	 * Allocate persistent buffer for the block output that
@@ -659,11 +659,12 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 					: vit->rope_win_sin;
 
 		struct sam3_tensor *attn;
-		attn = gh_multihead_attention_rope(
+		attn = gh_multihead_attention_rope_sep(
 			&g, scratch,
-			x3d, x3d, x3d,
-			vit->layers[i].qkv_w,
-			vit->layers[i].qkv_b,
+			x3d,
+			vit->layers[i].q_w, vit->layers[i].q_b,
+			vit->layers[i].k_w, vit->layers[i].k_b,
+			vit->layers[i].v_w, vit->layers[i].v_b,
 			vit->layers[i].proj_w,
 			vit->layers[i].proj_b,
 			vit->n_heads,

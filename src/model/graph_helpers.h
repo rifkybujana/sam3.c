@@ -69,6 +69,19 @@ struct sam3_tensor *gh_load_or_alloc(const struct sam3_weight_file *wf,
 				      enum sam3_dtype dtype,
 				      int n_dims, const int *dims);
 
+/*
+ * gh_load_mmap - Load a weight tensor by name, pointing data at the mmap region.
+ *
+ * Allocates only the sam3_tensor struct from the arena and sets its
+ * data pointer directly into the weight file's mmap region. No memcpy.
+ * Falls back to gh_alloc_tensor (zeroed) if wf is NULL or tensor not found.
+ */
+struct sam3_tensor *gh_load_mmap(const struct sam3_weight_file *wf,
+				  const char *name,
+				  struct sam3_arena *arena,
+				  enum sam3_dtype dtype,
+				  int n_dims, const int *dims);
+
 /* --- Unary activation ops (output shape = input shape) --- */
 
 struct sam3_tensor *gh_gelu(struct sam3_graph *g, struct sam3_arena *a,
@@ -248,6 +261,42 @@ struct sam3_tensor *gh_multihead_attention_rope(
 	struct sam3_tensor *attn_mask);
 
 /*
+ * gh_multihead_attention_rope_sep - MHA with separate Q/K/V weights and RoPE.
+ *
+ * Like gh_multihead_attention_rope but takes separate Q, K, V weight
+ * and bias tensors instead of a packed [3*d_model, d_model] QKV tensor.
+ * Avoids the fused QKV allocation during weight loading.
+ *
+ * @x:        Input [batch, seq, d_model]
+ * @q_w:      Query weight [d_model, d_model]
+ * @q_b:      Query bias [d_model] or NULL
+ * @k_w:      Key weight [d_model, d_model]
+ * @k_b:      Key bias [d_model] or NULL
+ * @v_w:      Value weight [d_model, d_model]
+ * @v_b:      Value bias [d_model] or NULL
+ * @out_w:    Output projection weight [d_model, d_model]
+ * @out_b:    Output projection bias [d_model] or NULL
+ * @n_heads:  Number of attention heads
+ * @rope_cos: Precomputed RoPE cosine [seq, head_dim/2] or NULL
+ * @rope_sin: Precomputed RoPE sine [seq, head_dim/2] or NULL
+ * @attn_mask: Additive attention mask [seq, seq] or NULL
+ *
+ * Returns output tensor [batch*seq, d_model].
+ */
+struct sam3_tensor *gh_multihead_attention_rope_sep(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *x,
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
+	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
+	struct sam3_tensor *out_w,
+	struct sam3_tensor *out_b,
+	int n_heads,
+	struct sam3_tensor *rope_cos,
+	struct sam3_tensor *rope_sin,
+	struct sam3_tensor *attn_mask);
+
+/*
  * gh_multihead_attention - Full multi-head attention from primitives.
  *
  * @q:       Query  [batch, seq_q, d_model]
@@ -277,6 +326,22 @@ struct sam3_tensor *gh_multihead_attention(
 	int n_heads);
 
 /*
+ * gh_multihead_attention_sep - MHA with separate Q/K/V weights (no RoPE).
+ *
+ * Convenience wrapper around gh_multihead_attention_rope_sep with
+ * NULL RoPE and mask. Used by text encoder and encoder fusion.
+ */
+struct sam3_tensor *gh_multihead_attention_sep(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *x,
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
+	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int n_heads,
+	struct sam3_tensor *attn_mask);
+
+/*
  * gh_cross_attention - Multi-head cross-attention with separate Q and KV.
  *
  * Q is projected from q_src, K and V are projected from kv_src.
@@ -303,6 +368,22 @@ struct sam3_tensor *gh_cross_attention(
 	struct sam3_tensor *kv_src,
 	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
 	struct sam3_tensor *kv_w, struct sam3_tensor *kv_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int n_heads);
+
+/*
+ * gh_cross_attention_sep - Cross-attention with separate K and V weights.
+ *
+ * Like gh_cross_attention but takes separate K and V weight/bias tensors
+ * instead of a packed [2*d_model, d_model] KV tensor.
+ */
+struct sam3_tensor *gh_cross_attention_sep(
+	struct sam3_graph *g, struct sam3_arena *arena,
+	struct sam3_tensor *q_src,
+	struct sam3_tensor *kv_src,
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
+	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
 	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
 	int n_heads);
 

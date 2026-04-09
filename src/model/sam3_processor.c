@@ -79,10 +79,10 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 		proc->backend = &cpu->base;
 	}
 
-	/* Model arena: 4.5 GiB for weights, cached features, ViT persist buf.
-	 * QKV fusion for ViT (32 layers) + text encoder adds ~800 MiB of
-	 * temporary Q/K/V tensors that cannot be freed from the arena. */
-	err = sam3_arena_init(&proc->model_arena, 4608UL * 1024 * 1024);
+	/* Model arena: 1 GiB for tensor structs, QKV fused weights, tiled
+	 * pos embed, precomputed tables, and cached features. Weight data
+	 * lives in the mmap region, not the arena. */
+	err = sam3_arena_init(&proc->model_arena, 1024UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_backend;
 
@@ -116,23 +116,11 @@ cleanup_backend:
 }
 
 enum sam3_error sam3_processor_load(struct sam3_processor *proc,
-				    const char *model_path,
+				    const struct sam3_weight_file *wf,
 				    const char *vocab_path)
 {
-	struct sam3_weight_file wf;
-	enum sam3_error err;
-
-	memset(&wf, 0, sizeof(wf));
-
-	err = sam3_weight_open(&wf, model_path);
-	if (err != SAM3_OK)
-		return err;
-
-	err = sam3_image_model_load(&proc->model, &wf, vocab_path,
-				    &proc->model_arena);
-	sam3_weight_close(&wf);
-
-	return err;
+	return sam3_image_model_load(&proc->model, wf, vocab_path,
+				     &proc->model_arena);
 }
 
 void sam3_processor_free(struct sam3_processor *proc)

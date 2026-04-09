@@ -31,6 +31,17 @@ static size_t align_up(size_t val, size_t align)
 	return (val + align - 1) & ~(align - 1);
 }
 
+static uint32_t fnv1a(const char *s)
+{
+	uint32_t h = 0x811c9dc5;
+
+	while (*s) {
+		h ^= (uint8_t)*s++;
+		h *= 0x01000193;
+	}
+	return h;
+}
+
 /* ── Writer ────────────────────────────────────────────────────────── */
 
 enum sam3_error sam3_weight_write(const char *output_path,
@@ -97,7 +108,7 @@ enum sam3_error sam3_weight_write(const char *output_path,
 			descs[i].dims[d] = info.dims[d];
 		descs[i].data_offset = data_offset;
 		descs[i].data_size   = info.nbytes;
-		descs[i].reserved    = 0;
+		descs[i].reserved    = (uint64_t)fnv1a(descs[i].name);
 
 		sam3_log_debug("tensor[%d] \"%s\": %zu bytes @ offset %zu",
 			       i, descs[i].name,
@@ -203,17 +214,6 @@ cleanup:
 
 /* ── Loader ────────────────────────────────────────────────────────── */
 
-static uint32_t fnv1a(const char *s)
-{
-	uint32_t h = 0x811c9dc5;
-
-	while (*s) {
-		h ^= (uint8_t)*s++;
-		h *= 0x01000193;
-	}
-	return h;
-}
-
 static uint32_t next_pow2(uint32_t v)
 {
 	v--;
@@ -247,7 +247,12 @@ static int build_hash_table(struct sam3_weight_file *wf)
 	uint32_t mask = cap - 1;
 
 	for (uint32_t i = 0; i < n; i++) {
-		uint32_t slot = fnv1a(wf->tensors[i].name) & mask;
+		uint32_t hash;
+		if (wf->tensors[i].reserved != 0)
+			hash = (uint32_t)wf->tensors[i].reserved;
+		else
+			hash = fnv1a(wf->tensors[i].name);
+		uint32_t slot = hash & mask;
 		while (wf->hash_table[slot] != SAM3_WEIGHT_HASH_EMPTY)
 			slot = (slot + 1) & mask;
 		wf->hash_table[slot] = i;
@@ -295,6 +300,9 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 		sam3_log_error("weight_open: mmap failed for %s", path);
 		return SAM3_EIO;
 	}
+
+	/* Hint sequential access for initial weight loading pass */
+	madvise(mapped, file_size, MADV_SEQUENTIAL);
 
 	/* Validate header */
 	const struct sam3_weight_header *hdr = mapped;
@@ -387,6 +395,12 @@ void sam3_weight_close(struct sam3_weight_file *wf)
 
 	free(wf->hash_table);
 	memset(wf, 0, sizeof(*wf));
+}
+
+void sam3_weight_madvise(struct sam3_weight_file *wf, int advice)
+{
+	if (wf && wf->mapped && wf->mapped_size > 0)
+		madvise(wf->mapped, wf->mapped_size, advice);
 }
 
 const struct sam3_weight_tensor_desc *sam3_weight_find(

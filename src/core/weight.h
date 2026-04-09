@@ -144,6 +144,16 @@ enum sam3_error sam3_weight_to_tensor(
 	const struct sam3_weight_tensor_desc *desc,
 	struct sam3_tensor *out);
 
+/*
+ * sam3_weight_madvise - Set mmap access pattern hint.
+ *
+ * @wf:     Open weight file
+ * @advice: POSIX madvise advice (e.g. MADV_SEQUENTIAL, MADV_RANDOM)
+ *
+ * Calls madvise() on the mapped region. No-op if wf is not mapped.
+ */
+void sam3_weight_madvise(struct sam3_weight_file *wf, int advice);
+
 /* ── Reader vtable (for conversion from external formats) ───────────── */
 
 struct weight_reader;

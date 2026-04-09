@@ -47,8 +47,9 @@ struct sam3_text_encoder {
 	/* Per-layer weights */
 	struct {
 		struct sam3_tensor *ln1_w, *ln1_b;	/* [width] */
-		struct sam3_tensor *attn_qkv_w;		/* [3*width, width] */
-		struct sam3_tensor *attn_qkv_b;		/* [3*width] */
+		struct sam3_tensor *attn_q_w, *attn_q_b;  /* [width, width] / [width] */
+		struct sam3_tensor *attn_k_w, *attn_k_b;
+		struct sam3_tensor *attn_v_w, *attn_v_b;
 		struct sam3_tensor *attn_out_w;		/* [width, width] */
 		struct sam3_tensor *attn_out_b;		/* [width] */
 		struct sam3_tensor *ln2_w, *ln2_b;	/* [width] */

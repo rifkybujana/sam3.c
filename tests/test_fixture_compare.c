@@ -350,17 +350,28 @@ static void test_end_to_end_fixture_input(void)
 	ASSERT_EQ(msk_ndims, 4);
 	ASSERT_EQ(msk_dims[0], 1);
 
-	/* Initialize processor */
-	err = sam3_processor_init(&proc);
+	/* Open weight file and initialize processor */
+	struct sam3_weight_file wf;
+	memset(&wf, 0, sizeof(wf));
+	err = sam3_weight_open(&wf, MODEL_PATH);
 	ASSERT_EQ(err, SAM3_OK);
 	if (err != SAM3_OK)
 		goto cleanup;
 
-	err = sam3_processor_load(&proc, MODEL_PATH,
+	err = sam3_processor_init(&proc);
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK) {
+		sam3_weight_close(&wf);
+		goto cleanup;
+	}
+
+	err = sam3_processor_load(&proc, &wf,
 				  SAM3_SOURCE_DIR "/models/bpe_simple_vocab_16e6.txt.gz");
 	ASSERT_EQ(err, SAM3_OK);
-	if (err != SAM3_OK)
+	if (err != SAM3_OK) {
+		sam3_weight_close(&wf);
 		goto cleanup;
+	}
 
 	/* Inject fixture's normalized image directly */
 	sam3_arena_reset(&proc.scratch_arena);
@@ -544,6 +555,7 @@ static void test_end_to_end_fixture_input(void)
 cleanup:
 	sam3_result_free(&result);
 	sam3_processor_free(&proc);
+	sam3_weight_close(&wf);
 	free(py_image);
 	free(py_masks);
 }

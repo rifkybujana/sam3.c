@@ -284,7 +284,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 
 			neck_weight_name(name, sizeof(name),
 					 neck, i, j, "weight");
-			neck->stages[i].conv_w[j] = gh_load_or_alloc(
+			neck->stages[i].conv_w[j] = gh_load_mmap(
 				wf, name, arena, SAM3_DTYPE_F32,
 				4, w_dims);
 			if (!neck->stages[i].conv_w[j])
@@ -293,7 +293,7 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			int b_dims[] = {c_out};
 			neck_weight_name(name, sizeof(name),
 					 neck, i, j, "bias");
-			neck->stages[i].conv_b[j] = gh_load_or_alloc(
+			neck->stages[i].conv_b[j] = gh_load_mmap(
 				wf, name, arena, SAM3_DTYPE_F32,
 				1, b_dims);
 			if (!neck->stages[i].conv_b[j])

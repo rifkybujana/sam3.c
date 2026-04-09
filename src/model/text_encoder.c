@@ -29,46 +29,6 @@
 #define TE_P "detector_model.text_encoder.text_model."
 #define TE_L TE_P "encoder.layers."
 
-/*
- * text_load_fuse_qkv - Load separate Q, K, V weights and fuse into [3*w, w].
- */
-static struct sam3_tensor *text_load_fuse_qkv(
-	const struct sam3_weight_file *wf,
-	struct sam3_arena *arena,
-	const char *q_name,
-	const char *k_name,
-	const char *v_name,
-	int n_dims, const int *single_dims)
-{
-	struct sam3_tensor *q_t, *k_t, *v_t, *fused;
-
-	q_t = gh_load_or_alloc(wf, q_name, arena,
-			       SAM3_DTYPE_F32, n_dims, single_dims);
-	k_t = gh_load_or_alloc(wf, k_name, arena,
-			       SAM3_DTYPE_F32, n_dims, single_dims);
-	v_t = gh_load_or_alloc(wf, v_name, arena,
-			       SAM3_DTYPE_F32, n_dims, single_dims);
-	if (!q_t || !k_t || !v_t)
-		return NULL;
-
-	size_t single_bytes = q_t->nbytes;
-	int fused_dims[4];
-	for (int i = 0; i < n_dims; i++)
-		fused_dims[i] = single_dims[i];
-	fused_dims[0] *= 3;
-
-	fused = gh_alloc_tensor(arena, SAM3_DTYPE_F32, n_dims, fused_dims);
-	if (!fused)
-		return NULL;
-
-	memcpy((char *)fused->data, q_t->data, single_bytes);
-	memcpy((char *)fused->data + single_bytes, k_t->data, single_bytes);
-	memcpy((char *)fused->data + 2 * single_bytes,
-	       v_t->data, single_bytes);
-
-	return fused;
-}
-
 enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 				       const struct sam3_weight_file *wf,
 				       struct sam3_arena *arena)
@@ -76,18 +36,18 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 	int w = te->width;
 	int d = te->d_model;
 	int h4 = w * 4;
-	char name[128], q_name[128], k_name[128], v_name[128];
+	char name[128];
 
 	/* Embeddings */
 	int tok_dims[] = {te->vocab_size, w};
-	te->token_embedding = gh_load_or_alloc(wf,
+	te->token_embedding = gh_load_mmap(wf,
 		TE_P "embeddings.token_embedding.weight",
 		arena, SAM3_DTYPE_F32, 2, tok_dims);
 	if (!te->token_embedding)
 		return SAM3_ENOMEM;
 
 	int pos_dims[] = {te->context_len, w};
-	te->pos_embedding = gh_load_or_alloc(wf,
+	te->pos_embedding = gh_load_mmap(wf,
 		TE_P "embeddings.position_embedding.weight",
 		arena, SAM3_DTYPE_F32, 2, pos_dims);
 	if (!te->pos_embedding)
@@ -95,13 +55,13 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 
 	/* Final layer norm */
 	int w_dims[] = {w};
-	te->ln_final_w = gh_load_or_alloc(wf,
+	te->ln_final_w = gh_load_mmap(wf,
 		TE_P "final_layer_norm.weight",
 		arena, SAM3_DTYPE_F32, 1, w_dims);
 	if (!te->ln_final_w)
 		return SAM3_ENOMEM;
 
-	te->ln_final_b = gh_load_or_alloc(wf,
+	te->ln_final_b = gh_load_mmap(wf,
 		TE_P "final_layer_norm.bias",
 		arena, SAM3_DTYPE_F32, 1, w_dims);
 	if (!te->ln_final_b)
@@ -109,14 +69,14 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 
 	/* Text projection (resizer): detector_model.text_projection.* */
 	int proj_dims[] = {d, w};
-	te->text_projection = gh_load_or_alloc(wf,
+	te->text_projection = gh_load_mmap(wf,
 		"detector_model.text_projection.weight",
 		arena, SAM3_DTYPE_F32, 2, proj_dims);
 	if (!te->text_projection)
 		return SAM3_ENOMEM;
 
 	int d_dims[] = {d};
-	te->text_projection_b = gh_load_or_alloc(wf,
+	te->text_projection_b = gh_load_mmap(wf,
 		"detector_model.text_projection.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!te->text_projection_b)
@@ -127,7 +87,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		/* ln1 */
 		snprintf(name, sizeof(name),
 			 TE_L "%d.layer_norm1.weight", i);
-		te->layers[i].ln1_w = gh_load_or_alloc(wf, name, arena,
+		te->layers[i].ln1_w = gh_load_mmap(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
 		if (!te->layers[i].ln1_w)
@@ -135,51 +95,68 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 
 		snprintf(name, sizeof(name),
 			 TE_L "%d.layer_norm1.bias", i);
-		te->layers[i].ln1_b = gh_load_or_alloc(wf, name, arena,
+		te->layers[i].ln1_b = gh_load_mmap(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
 		if (!te->layers[i].ln1_b)
 			return SAM3_ENOMEM;
 
-		/* Attention QKV: fuse from separate Q, K, V */
-		int single_w_dims[] = {w, w};
-		snprintf(q_name, sizeof(q_name),
+		/* Attention Q/K/V projections (separate weights) */
+		int qkv_w_dims[] = {w, w};
+		snprintf(name, sizeof(name),
 			 TE_L "%d.self_attn.q_proj.weight", i);
-		snprintf(k_name, sizeof(k_name),
-			 TE_L "%d.self_attn.k_proj.weight", i);
-		snprintf(v_name, sizeof(v_name),
-			 TE_L "%d.self_attn.v_proj.weight", i);
-		te->layers[i].attn_qkv_w = text_load_fuse_qkv(
-			wf, arena, q_name, k_name, v_name,
-			2, single_w_dims);
-		if (!te->layers[i].attn_qkv_w)
+		te->layers[i].attn_q_w = gh_load_mmap(
+			wf, name, arena, SAM3_DTYPE_F32, 2, qkv_w_dims);
+		if (!te->layers[i].attn_q_w)
 			return SAM3_ENOMEM;
 
-		int single_b_dims[] = {w};
-		snprintf(q_name, sizeof(q_name),
+		snprintf(name, sizeof(name),
 			 TE_L "%d.self_attn.q_proj.bias", i);
-		snprintf(k_name, sizeof(k_name),
+		te->layers[i].attn_q_b = gh_load_mmap(
+			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
+		if (!te->layers[i].attn_q_b)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 TE_L "%d.self_attn.k_proj.weight", i);
+		te->layers[i].attn_k_w = gh_load_mmap(
+			wf, name, arena, SAM3_DTYPE_F32, 2, qkv_w_dims);
+		if (!te->layers[i].attn_k_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
 			 TE_L "%d.self_attn.k_proj.bias", i);
-		snprintf(v_name, sizeof(v_name),
+		te->layers[i].attn_k_b = gh_load_mmap(
+			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
+		if (!te->layers[i].attn_k_b)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 TE_L "%d.self_attn.v_proj.weight", i);
+		te->layers[i].attn_v_w = gh_load_mmap(
+			wf, name, arena, SAM3_DTYPE_F32, 2, qkv_w_dims);
+		if (!te->layers[i].attn_v_w)
+			return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
 			 TE_L "%d.self_attn.v_proj.bias", i);
-		te->layers[i].attn_qkv_b = text_load_fuse_qkv(
-			wf, arena, q_name, k_name, v_name,
-			1, single_b_dims);
-		if (!te->layers[i].attn_qkv_b)
+		te->layers[i].attn_v_b = gh_load_mmap(
+			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
+		if (!te->layers[i].attn_v_b)
 			return SAM3_ENOMEM;
 
 		/* Attention output projection */
 		int out_w_dims[] = {w, w};
 		snprintf(name, sizeof(name),
 			 TE_L "%d.self_attn.out_proj.weight", i);
-		te->layers[i].attn_out_w = gh_load_or_alloc(
+		te->layers[i].attn_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, out_w_dims);
 		if (!te->layers[i].attn_out_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 TE_L "%d.self_attn.out_proj.bias", i);
-		te->layers[i].attn_out_b = gh_load_or_alloc(
+		te->layers[i].attn_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
 		if (!te->layers[i].attn_out_b)
 			return SAM3_ENOMEM;
@@ -187,7 +164,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		/* ln2 */
 		snprintf(name, sizeof(name),
 			 TE_L "%d.layer_norm2.weight", i);
-		te->layers[i].ln2_w = gh_load_or_alloc(wf, name, arena,
+		te->layers[i].ln2_w = gh_load_mmap(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
 		if (!te->layers[i].ln2_w)
@@ -195,7 +172,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 
 		snprintf(name, sizeof(name),
 			 TE_L "%d.layer_norm2.bias", i);
-		te->layers[i].ln2_b = gh_load_or_alloc(wf, name, arena,
+		te->layers[i].ln2_b = gh_load_mmap(wf, name, arena,
 						     SAM3_DTYPE_F32,
 						     1, w_dims);
 		if (!te->layers[i].ln2_b)
@@ -205,7 +182,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		int fc1_w_dims[] = {h4, w};
 		snprintf(name, sizeof(name),
 			 TE_L "%d.mlp.fc1.weight", i);
-		te->layers[i].mlp_fc1_w = gh_load_or_alloc(
+		te->layers[i].mlp_fc1_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
 		if (!te->layers[i].mlp_fc1_w)
 			return SAM3_ENOMEM;
@@ -213,7 +190,7 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		int fc1_b_dims[] = {h4};
 		snprintf(name, sizeof(name),
 			 TE_L "%d.mlp.fc1.bias", i);
-		te->layers[i].mlp_fc1_b = gh_load_or_alloc(
+		te->layers[i].mlp_fc1_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
 		if (!te->layers[i].mlp_fc1_b)
 			return SAM3_ENOMEM;
@@ -222,14 +199,14 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 		int fc2_w_dims[] = {w, h4};
 		snprintf(name, sizeof(name),
 			 TE_L "%d.mlp.fc2.weight", i);
-		te->layers[i].mlp_fc2_w = gh_load_or_alloc(
+		te->layers[i].mlp_fc2_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
 		if (!te->layers[i].mlp_fc2_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 TE_L "%d.mlp.fc2.bias", i);
-		te->layers[i].mlp_fc2_b = gh_load_or_alloc(
+		te->layers[i].mlp_fc2_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, w_dims);
 		if (!te->layers[i].mlp_fc2_b)
 			return SAM3_ENOMEM;
@@ -318,18 +295,20 @@ struct sam3_tensor *sam3_text_encoder_build(
 		if (!x3d)
 			return NULL;
 
-		/* Self-attention (Q=K=V=x_norm) with causal mask */
+		/* Self-attention with separate Q/K/V and causal mask */
 		struct sam3_tensor *attn;
-		attn = gh_multihead_attention_rope(
-			g, arena,
-			x3d, x3d, x3d,
-			te->layers[i].attn_qkv_w,
-			te->layers[i].attn_qkv_b,
+		attn = gh_multihead_attention_sep(
+			g, arena, x3d,
+			te->layers[i].attn_q_w,
+			te->layers[i].attn_q_b,
+			te->layers[i].attn_k_w,
+			te->layers[i].attn_k_b,
+			te->layers[i].attn_v_w,
+			te->layers[i].attn_v_b,
 			te->layers[i].attn_out_w,
 			te->layers[i].attn_out_b,
 			te->n_heads,
-			NULL, NULL,         /* no RoPE */
-			causal_mask);       /* causal attention mask */
+			causal_mask);
 		if (!attn)
 			return NULL;
 
@@ -581,17 +560,19 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 		if (!x3d)
 			return NULL;
 
-		/* Self-attention with causal mask */
+		/* Self-attention with separate Q/K/V and causal mask */
 		struct sam3_tensor *attn;
-		attn = gh_multihead_attention_rope(
-			&g, scratch,
-			x3d, x3d, x3d,
-			te->layers[i].attn_qkv_w,
-			te->layers[i].attn_qkv_b,
+		attn = gh_multihead_attention_sep(
+			&g, scratch, x3d,
+			te->layers[i].attn_q_w,
+			te->layers[i].attn_q_b,
+			te->layers[i].attn_k_w,
+			te->layers[i].attn_k_b,
+			te->layers[i].attn_v_w,
+			te->layers[i].attn_v_b,
 			te->layers[i].attn_out_w,
 			te->layers[i].attn_out_b,
 			te->n_heads,
-			NULL, NULL,
 			mask_wrap);
 		if (!attn)
 			return NULL;

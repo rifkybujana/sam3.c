@@ -54,11 +54,11 @@ static struct sam3_tensor *fuse_3(const struct sam3_weight_file *wf,
 	struct sam3_tensor *ta, *tb, *tc, *out;
 	int fused_dims[2];
 
-	ta = gh_load_or_alloc(wf, a, arena, SAM3_DTYPE_F32,
+	ta = gh_load_mmap(wf, a, arena, SAM3_DTYPE_F32,
 			       n_dims, part_dims);
-	tb = gh_load_or_alloc(wf, b, arena, SAM3_DTYPE_F32,
+	tb = gh_load_mmap(wf, b, arena, SAM3_DTYPE_F32,
 			       n_dims, part_dims);
-	tc = gh_load_or_alloc(wf, c, arena, SAM3_DTYPE_F32,
+	tc = gh_load_mmap(wf, c, arena, SAM3_DTYPE_F32,
 			       n_dims, part_dims);
 	if (!ta || !tb || !tc)
 		return NULL;
@@ -103,38 +103,38 @@ static int load_ca_128(const struct sam3_weight_file *wf,
 	int dm_dims[] = {dm};
 
 	snprintf(name, sizeof(name), "%sq_proj.weight", prefix);
-	*q_w = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*q_w = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				 2, proj_dims);
 	if (!*q_w) return -1;
 	snprintf(name, sizeof(name), "%sq_proj.bias", prefix);
-	*q_b = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*q_b = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				 1, di_dims);
 	if (!*q_b) return -1;
 
 	snprintf(name, sizeof(name), "%sk_proj.weight", prefix);
-	*k_w = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*k_w = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				 2, proj_dims);
 	if (!*k_w) return -1;
 	snprintf(name, sizeof(name), "%sk_proj.bias", prefix);
-	*k_b = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*k_b = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				 1, di_dims);
 	if (!*k_b) return -1;
 
 	snprintf(name, sizeof(name), "%sv_proj.weight", prefix);
-	*v_w = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*v_w = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				 2, proj_dims);
 	if (!*v_w) return -1;
 	snprintf(name, sizeof(name), "%sv_proj.bias", prefix);
-	*v_b = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*v_b = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				 1, di_dims);
 	if (!*v_b) return -1;
 
 	snprintf(name, sizeof(name), "%so_proj.weight", prefix);
-	*out_w = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*out_w = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				   2, out_dims);
 	if (!*out_w) return -1;
 	snprintf(name, sizeof(name), "%so_proj.bias", prefix);
-	*out_b = gh_load_or_alloc(wf, name, arena, SAM3_DTYPE_F32,
+	*out_b = gh_load_mmap(wf, name, arena, SAM3_DTYPE_F32,
 				   1, dm_dims);
 	if (!*out_b) return -1;
 
@@ -154,20 +154,20 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 
 	/* ── Learned tokens ─────────────────────────────────────── */
 	int mt_dims[] = {dec->n_masks, d};
-	dec->mask_tokens = gh_load_or_alloc(wf, P "mask_tokens.weight",
+	dec->mask_tokens = gh_load_mmap(wf, P "mask_tokens.weight",
 					     arena, SAM3_DTYPE_F32,
 					     2, mt_dims);
 	if (!dec->mask_tokens)
 		return SAM3_ENOMEM;
 
 	int tok1_dims[] = {1, d};
-	dec->iou_token = gh_load_or_alloc(wf, P "iou_token.weight",
+	dec->iou_token = gh_load_mmap(wf, P "iou_token.weight",
 					   arena, SAM3_DTYPE_F32,
 					   2, tok1_dims);
 	if (!dec->iou_token)
 		return SAM3_ENOMEM;
 
-	dec->obj_score_token = gh_load_or_alloc(wf,
+	dec->obj_score_token = gh_load_mmap(wf,
 						 P "obj_score_token.weight",
 						 arena, SAM3_DTYPE_F32,
 						 2, tok1_dims);
@@ -210,13 +210,13 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		/* Self-attention output projection */
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.self_attn.o_proj.weight", i);
-		dec->layers[i].sa_out_w = gh_load_or_alloc(
+		dec->layers[i].sa_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, proj_dims);
 		if (!dec->layers[i].sa_out_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.self_attn.o_proj.bias", i);
-		dec->layers[i].sa_out_b = gh_load_or_alloc(
+		dec->layers[i].sa_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].sa_out_b)
 			return SAM3_ENOMEM;
@@ -224,13 +224,13 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		/* Layer norm 1 (after self-attention) */
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm1.weight", i);
-		dec->layers[i].ln1_w = gh_load_or_alloc(
+		dec->layers[i].ln1_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln1_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm1.bias", i);
-		dec->layers[i].ln1_b = gh_load_or_alloc(
+		dec->layers[i].ln1_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln1_b)
 			return SAM3_ENOMEM;
@@ -253,13 +253,13 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		/* Layer norm 2 (after token->image CA) */
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm2.weight", i);
-		dec->layers[i].ln2_w = gh_load_or_alloc(
+		dec->layers[i].ln2_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln2_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm2.bias", i);
-		dec->layers[i].ln2_b = gh_load_or_alloc(
+		dec->layers[i].ln2_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln2_b)
 			return SAM3_ENOMEM;
@@ -267,25 +267,25 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		/* MLP */
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.mlp.proj_in.weight", i);
-		dec->layers[i].mlp_fc1_w = gh_load_or_alloc(
+		dec->layers[i].mlp_fc1_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc1_dims);
 		if (!dec->layers[i].mlp_fc1_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.mlp.proj_in.bias", i);
-		dec->layers[i].mlp_fc1_b = gh_load_or_alloc(
+		dec->layers[i].mlp_fc1_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
 		if (!dec->layers[i].mlp_fc1_b)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.mlp.proj_out.weight", i);
-		dec->layers[i].mlp_fc2_w = gh_load_or_alloc(
+		dec->layers[i].mlp_fc2_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, fc2_dims);
 		if (!dec->layers[i].mlp_fc2_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.mlp.proj_out.bias", i);
-		dec->layers[i].mlp_fc2_b = gh_load_or_alloc(
+		dec->layers[i].mlp_fc2_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].mlp_fc2_b)
 			return SAM3_ENOMEM;
@@ -293,13 +293,13 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		/* Layer norm 3 (after MLP) */
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm3.weight", i);
-		dec->layers[i].ln3_w = gh_load_or_alloc(
+		dec->layers[i].ln3_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln3_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm3.bias", i);
-		dec->layers[i].ln3_b = gh_load_or_alloc(
+		dec->layers[i].ln3_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln3_b)
 			return SAM3_ENOMEM;
@@ -322,13 +322,13 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		/* Layer norm 4 (after image->token CA) */
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm4.weight", i);
-		dec->layers[i].ln4_w = gh_load_or_alloc(
+		dec->layers[i].ln4_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln4_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 TP "layers.%d.layer_norm4.bias", i);
-		dec->layers[i].ln4_b = gh_load_or_alloc(
+		dec->layers[i].ln4_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->layers[i].ln4_b)
 			return SAM3_ENOMEM;
@@ -343,12 +343,12 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 			&dec->final_out_w, &dec->final_out_b))
 		return SAM3_ENOMEM;
 
-	dec->final_ln_w = gh_load_or_alloc(wf,
+	dec->final_ln_w = gh_load_mmap(wf,
 		TP "layer_norm_final_attn.weight",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->final_ln_w)
 		return SAM3_ENOMEM;
-	dec->final_ln_b = gh_load_or_alloc(wf,
+	dec->final_ln_b = gh_load_mmap(wf,
 		TP "layer_norm_final_attn.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->final_ln_b)
@@ -361,34 +361,34 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	int conv2_w_dims[] = {64, 32, 2, 2};
 	int conv2_b_dims[] = {32};
 
-	dec->up_conv1_w = gh_load_or_alloc(wf,
+	dec->up_conv1_w = gh_load_mmap(wf,
 		P "upscale_conv1.weight",
 		arena, SAM3_DTYPE_F32, 4, conv1_w_dims);
 	if (!dec->up_conv1_w)
 		return SAM3_ENOMEM;
-	dec->up_conv1_b = gh_load_or_alloc(wf,
+	dec->up_conv1_b = gh_load_mmap(wf,
 		P "upscale_conv1.bias",
 		arena, SAM3_DTYPE_F32, 1, conv1_b_dims);
 	if (!dec->up_conv1_b)
 		return SAM3_ENOMEM;
 
-	dec->up_ln_w = gh_load_or_alloc(wf,
+	dec->up_ln_w = gh_load_mmap(wf,
 		P "upscale_layer_norm.weight",
 		arena, SAM3_DTYPE_F32, 1, ln64_dims);
 	if (!dec->up_ln_w)
 		return SAM3_ENOMEM;
-	dec->up_ln_b = gh_load_or_alloc(wf,
+	dec->up_ln_b = gh_load_mmap(wf,
 		P "upscale_layer_norm.bias",
 		arena, SAM3_DTYPE_F32, 1, ln64_dims);
 	if (!dec->up_ln_b)
 		return SAM3_ENOMEM;
 
-	dec->up_conv2_w = gh_load_or_alloc(wf,
+	dec->up_conv2_w = gh_load_mmap(wf,
 		P "upscale_conv2.weight",
 		arena, SAM3_DTYPE_F32, 4, conv2_w_dims);
 	if (!dec->up_conv2_w)
 		return SAM3_ENOMEM;
-	dec->up_conv2_b = gh_load_or_alloc(wf,
+	dec->up_conv2_b = gh_load_mmap(wf,
 		P "upscale_conv2.bias",
 		arena, SAM3_DTYPE_F32, 1, conv2_b_dims);
 	if (!dec->up_conv2_b)
@@ -403,14 +403,14 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		snprintf(name, sizeof(name),
 			 P "output_hypernetworks_mlps.%d.proj_in.weight",
 			 i);
-		dec->hyper[i].proj_in_w = gh_load_or_alloc(
+		dec->hyper[i].proj_in_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, hd_dims);
 		if (!dec->hyper[i].proj_in_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 P "output_hypernetworks_mlps.%d.proj_in.bias",
 			 i);
-		dec->hyper[i].proj_in_b = gh_load_or_alloc(
+		dec->hyper[i].proj_in_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->hyper[i].proj_in_b)
 			return SAM3_ENOMEM;
@@ -418,14 +418,14 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		snprintf(name, sizeof(name),
 			 P "output_hypernetworks_mlps.%d.layers.0.weight",
 			 i);
-		dec->hyper[i].hidden_w = gh_load_or_alloc(
+		dec->hyper[i].hidden_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 2, hd_dims);
 		if (!dec->hyper[i].hidden_w)
 			return SAM3_ENOMEM;
 		snprintf(name, sizeof(name),
 			 P "output_hypernetworks_mlps.%d.layers.0.bias",
 			 i);
-		dec->hyper[i].hidden_b = gh_load_or_alloc(
+		dec->hyper[i].hidden_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32, 1, d_dims);
 		if (!dec->hyper[i].hidden_b)
 			return SAM3_ENOMEM;
@@ -433,7 +433,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		snprintf(name, sizeof(name),
 			 P "output_hypernetworks_mlps.%d.proj_out.weight",
 			 i);
-		dec->hyper[i].proj_out_w = gh_load_or_alloc(
+		dec->hyper[i].proj_out_w = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			2, ho_w_dims);
 		if (!dec->hyper[i].proj_out_w)
@@ -441,7 +441,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		snprintf(name, sizeof(name),
 			 P "output_hypernetworks_mlps.%d.proj_out.bias",
 			 i);
-		dec->hyper[i].proj_out_b = gh_load_or_alloc(
+		dec->hyper[i].proj_out_b = gh_load_mmap(
 			wf, name, arena, SAM3_DTYPE_F32,
 			1, ho_b_dims);
 		if (!dec->hyper[i].proj_out_b)
@@ -453,34 +453,34 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	int iou_out_w_dims[] = {dec->n_masks, d};
 	int iou_out_b_dims[] = {dec->n_masks};
 
-	dec->iou_proj_in_w = gh_load_or_alloc(wf,
+	dec->iou_proj_in_w = gh_load_mmap(wf,
 		P "iou_prediction_head.proj_in.weight",
 		arena, SAM3_DTYPE_F32, 2, iou_d_dims);
 	if (!dec->iou_proj_in_w)
 		return SAM3_ENOMEM;
-	dec->iou_proj_in_b = gh_load_or_alloc(wf,
+	dec->iou_proj_in_b = gh_load_mmap(wf,
 		P "iou_prediction_head.proj_in.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->iou_proj_in_b)
 		return SAM3_ENOMEM;
 
-	dec->iou_hidden_w = gh_load_or_alloc(wf,
+	dec->iou_hidden_w = gh_load_mmap(wf,
 		P "iou_prediction_head.layers.0.weight",
 		arena, SAM3_DTYPE_F32, 2, iou_d_dims);
 	if (!dec->iou_hidden_w)
 		return SAM3_ENOMEM;
-	dec->iou_hidden_b = gh_load_or_alloc(wf,
+	dec->iou_hidden_b = gh_load_mmap(wf,
 		P "iou_prediction_head.layers.0.bias",
 		arena, SAM3_DTYPE_F32, 1, d_dims);
 	if (!dec->iou_hidden_b)
 		return SAM3_ENOMEM;
 
-	dec->iou_proj_out_w = gh_load_or_alloc(wf,
+	dec->iou_proj_out_w = gh_load_mmap(wf,
 		P "iou_prediction_head.proj_out.weight",
 		arena, SAM3_DTYPE_F32, 2, iou_out_w_dims);
 	if (!dec->iou_proj_out_w)
 		return SAM3_ENOMEM;
-	dec->iou_proj_out_b = gh_load_or_alloc(wf,
+	dec->iou_proj_out_b = gh_load_mmap(wf,
 		P "iou_prediction_head.proj_out.bias",
 		arena, SAM3_DTYPE_F32, 1, iou_out_b_dims);
 	if (!dec->iou_proj_out_b)
@@ -491,20 +491,20 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		int s0w[] = {32, 256, 1, 1}, s0b[] = {32};
 		int s1w[] = {64, 256, 1, 1}, s1b[] = {64};
 
-		dec->conv_s0_w = gh_load_or_alloc(wf,
+		dec->conv_s0_w = gh_load_mmap(wf,
 			P "conv_s0.weight", arena,
 			SAM3_DTYPE_F32, 4, s0w);
 		if (!dec->conv_s0_w) return SAM3_ENOMEM;
-		dec->conv_s0_b = gh_load_or_alloc(wf,
+		dec->conv_s0_b = gh_load_mmap(wf,
 			P "conv_s0.bias", arena,
 			SAM3_DTYPE_F32, 1, s0b);
 		if (!dec->conv_s0_b) return SAM3_ENOMEM;
 
-		dec->conv_s1_w = gh_load_or_alloc(wf,
+		dec->conv_s1_w = gh_load_mmap(wf,
 			P "conv_s1.weight", arena,
 			SAM3_DTYPE_F32, 4, s1w);
 		if (!dec->conv_s1_w) return SAM3_ENOMEM;
-		dec->conv_s1_b = gh_load_or_alloc(wf,
+		dec->conv_s1_b = gh_load_mmap(wf,
 			P "conv_s1.bias", arena,
 			SAM3_DTYPE_F32, 1, s1b);
 		if (!dec->conv_s1_b) return SAM3_ENOMEM;
@@ -515,13 +515,13 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		int nm_dims[] = {1, d};
 		int pe_dims[] = {2, 128};
 
-		dec->no_mask_embed = gh_load_or_alloc(wf,
+		dec->no_mask_embed = gh_load_mmap(wf,
 			"tracker_model.prompt_encoder.no_mask_embed.weight",
 			arena, SAM3_DTYPE_F32, 2, nm_dims);
 		if (!dec->no_mask_embed)
 			return SAM3_ENOMEM;
 
-		dec->pe_gaussian = gh_load_or_alloc(wf,
+		dec->pe_gaussian = gh_load_mmap(wf,
 			"tracker_model.prompt_encoder.shared_embedding.positional_embedding",
 			arena, SAM3_DTYPE_F32, 2, pe_dims);
 		if (!dec->pe_gaussian)

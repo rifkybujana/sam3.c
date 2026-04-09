@@ -34,8 +34,7 @@ struct sam3_encoder_fusion {
 
 	struct {
 		/* Self-attention on image features */
-		struct sam3_tensor *sa_qkv_w, *sa_qkv_b;
-		struct sam3_tensor *sa_q_w, *sa_q_b;   /* pre-split for pos */
+		struct sam3_tensor *sa_q_w, *sa_q_b;
 		struct sam3_tensor *sa_k_w, *sa_k_b;
 		struct sam3_tensor *sa_v_w, *sa_v_b;
 		struct sam3_tensor *sa_out_w, *sa_out_b;
@@ -43,7 +42,8 @@ struct sam3_encoder_fusion {
 
 		/* Cross-attention: image queries, text keys/values */
 		struct sam3_tensor *ca_q_w,   *ca_q_b;
-		struct sam3_tensor *ca_kv_w,  *ca_kv_b;
+		struct sam3_tensor *ca_k_w,   *ca_k_b;
+		struct sam3_tensor *ca_v_w,   *ca_v_b;
 		struct sam3_tensor *ca_out_w, *ca_out_b;
 		struct sam3_tensor *ca_ln_w,  *ca_ln_b;
 

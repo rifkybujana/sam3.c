@@ -97,11 +97,14 @@ static void test_text_encoder_load(void)
 	for (int i = 0; i < TEST_N_LAYERS; i++) {
 		ASSERT(te.layers[i].ln1_w != NULL);
 		ASSERT(te.layers[i].ln1_b != NULL);
-		ASSERT(te.layers[i].attn_qkv_w != NULL);
-		ASSERT_EQ(te.layers[i].attn_qkv_w->dims[0],
-			  3 * TEST_WIDTH);
-		ASSERT_EQ(te.layers[i].attn_qkv_w->dims[1], TEST_WIDTH);
-		ASSERT(te.layers[i].attn_qkv_b != NULL);
+		ASSERT(te.layers[i].attn_q_w != NULL);
+		ASSERT_EQ(te.layers[i].attn_q_w->dims[0], TEST_WIDTH);
+		ASSERT_EQ(te.layers[i].attn_q_w->dims[1], TEST_WIDTH);
+		ASSERT(te.layers[i].attn_q_b != NULL);
+		ASSERT(te.layers[i].attn_k_w != NULL);
+		ASSERT(te.layers[i].attn_k_b != NULL);
+		ASSERT(te.layers[i].attn_v_w != NULL);
+		ASSERT(te.layers[i].attn_v_b != NULL);
 		ASSERT(te.layers[i].attn_out_w != NULL);
 		ASSERT(te.layers[i].attn_out_b != NULL);
 		ASSERT(te.layers[i].ln2_w != NULL);

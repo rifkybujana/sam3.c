@@ -60,6 +60,11 @@ struct sam3_vit {
 	/* Windowed attention mask */
 	struct sam3_tensor *window_mask; /* [n_patches, n_patches] */
 
+	/* Lazy precompute state */
+	struct sam3_arena *model_arena;	/* stored during init for lazy precompute */
+	int precomputed;		/* 1 after lazy precompute completes */
+	struct sam3_tensor *raw_pos_embed; /* mmap'd [1, 577, embed_dim], tiled on first build */
+
 	/*
 	 * Note: Python ViT has ln_post=Identity (no params), so there is
 	 * no final layer norm. The only ViT-level norm is ln_pre above.
@@ -68,7 +73,9 @@ struct sam3_vit {
 	/* Per-layer weights */
 	struct {
 		struct sam3_tensor *ln1_w, *ln1_b;		/* [embed_dim] */
-		struct sam3_tensor *qkv_w, *qkv_b;		/* [3*embed_dim, embed_dim] / [3*embed_dim] */
+		struct sam3_tensor *q_w, *q_b;			/* [embed_dim, embed_dim] / [embed_dim] */
+		struct sam3_tensor *k_w, *k_b;			/* [embed_dim, embed_dim] / [embed_dim] */
+		struct sam3_tensor *v_w, *v_b;			/* [embed_dim, embed_dim] / [embed_dim] */
 		struct sam3_tensor *proj_w, *proj_b;		/* [embed_dim, embed_dim] / [embed_dim] */
 		struct sam3_tensor *ln2_w, *ln2_b;		/* [embed_dim] */
 		struct sam3_tensor *mlp_fc1_w, *mlp_fc1_b;	/* [mlp_dim, embed_dim] / [mlp_dim] */
@@ -88,10 +95,11 @@ struct sam3_vit {
  * @n_heads:     Number of attention heads (16)
  * @window_size: Window size for windowed attention (24)
  * @mlp_dim:     MLP hidden dimension (4736)
- * @arena:       Arena for RoPE frequency precomputation
+ * @arena:       Model arena (stored for lazy precompute of RoPE/mask)
  *
- * Sets dimensions, marks global attention blocks, precomputes RoPE.
- * Returns SAM3_OK on success, SAM3_ENOMEM if arena is full.
+ * Sets dimensions and marks global attention blocks. RoPE tables,
+ * window mask, and position embed tiling are deferred to first
+ * sam3_vit_build() call. Returns SAM3_OK on success.
  */
 enum sam3_error sam3_vit_init(struct sam3_vit *vit,
 			       int img_size, int patch_size,

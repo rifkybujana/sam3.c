@@ -84,30 +84,17 @@ static void test_vit_init(void)
 	ASSERT_EQ(vit.grid_size, TEST_GRID_SIZE);
 	ASSERT_EQ(vit.n_patches, TEST_N_PATCHES);
 
-	/* RoPE tables should be allocated (window + global) */
-	ASSERT(vit.rope_win_cos != NULL);
-	ASSERT(vit.rope_win_sin != NULL);
-	ASSERT(vit.rope_glo_cos != NULL);
-	ASSERT(vit.rope_glo_sin != NULL);
-
-	int head_dim = TEST_EMBED_DIM / TEST_N_HEADS; /* 8 */
-	int half = head_dim / 2;                       /* 4 */
-
-	/* Both tables have n_patches rows (mask-based windowing) */
-	ASSERT_EQ(vit.rope_win_cos->n_dims, 2);
-	ASSERT_EQ(vit.rope_win_cos->dims[0], TEST_N_PATCHES);
-	ASSERT_EQ(vit.rope_win_cos->dims[1], half);
-	ASSERT_EQ(vit.rope_glo_cos->n_dims, 2);
-	ASSERT_EQ(vit.rope_glo_cos->dims[0], TEST_N_PATCHES);
-	ASSERT_EQ(vit.rope_glo_cos->dims[1], half);
-
-	/* Verify RoPE values are finite */
-	float *cos_data = (float *)vit.rope_win_cos->data;
-	float *sin_data = (float *)vit.rope_win_sin->data;
-	for (int i = 0; i < TEST_N_PATCHES * half; i++) {
-		ASSERT(cos_data[i] == cos_data[i]); /* Not NaN */
-		ASSERT(sin_data[i] == sin_data[i]);
-	}
+	/*
+	 * RoPE tables, window mask, and pos_embed are lazily computed
+	 * on first sam3_vit_build() call, so they should be NULL here.
+	 */
+	ASSERT(vit.rope_win_cos == NULL);
+	ASSERT(vit.rope_win_sin == NULL);
+	ASSERT(vit.rope_glo_cos == NULL);
+	ASSERT(vit.rope_glo_sin == NULL);
+	ASSERT(vit.window_mask == NULL);
+	ASSERT(vit.precomputed == 0);
+	ASSERT(vit.model_arena == &g_cpu.arena);
 
 	/* Check is_global flags: depth=2, so no global blocks */
 	for (int i = 0; i < TEST_DEPTH; i++)
@@ -153,14 +140,23 @@ static void test_vit_load(void)
 		ASSERT(vit.layers[i].ln1_b != NULL);
 		ASSERT_EQ(vit.layers[i].ln1_w->dims[0], TEST_EMBED_DIM);
 
-		ASSERT(vit.layers[i].qkv_w != NULL);
-		ASSERT_EQ(vit.layers[i].qkv_w->dims[0],
-			  3 * TEST_EMBED_DIM);
-		ASSERT_EQ(vit.layers[i].qkv_w->dims[1], TEST_EMBED_DIM);
+		ASSERT(vit.layers[i].q_w != NULL);
+		ASSERT_EQ(vit.layers[i].q_w->dims[0], TEST_EMBED_DIM);
+		ASSERT_EQ(vit.layers[i].q_w->dims[1], TEST_EMBED_DIM);
+		ASSERT(vit.layers[i].q_b != NULL);
+		ASSERT_EQ(vit.layers[i].q_b->dims[0], TEST_EMBED_DIM);
 
-		ASSERT(vit.layers[i].qkv_b != NULL);
-		ASSERT_EQ(vit.layers[i].qkv_b->dims[0],
-			  3 * TEST_EMBED_DIM);
+		ASSERT(vit.layers[i].k_w != NULL);
+		ASSERT_EQ(vit.layers[i].k_w->dims[0], TEST_EMBED_DIM);
+		ASSERT_EQ(vit.layers[i].k_w->dims[1], TEST_EMBED_DIM);
+		ASSERT(vit.layers[i].k_b != NULL);
+		ASSERT_EQ(vit.layers[i].k_b->dims[0], TEST_EMBED_DIM);
+
+		ASSERT(vit.layers[i].v_w != NULL);
+		ASSERT_EQ(vit.layers[i].v_w->dims[0], TEST_EMBED_DIM);
+		ASSERT_EQ(vit.layers[i].v_w->dims[1], TEST_EMBED_DIM);
+		ASSERT(vit.layers[i].v_b != NULL);
+		ASSERT_EQ(vit.layers[i].v_b->dims[0], TEST_EMBED_DIM);
 
 		ASSERT(vit.layers[i].proj_w != NULL);
 		ASSERT_EQ(vit.layers[i].proj_w->dims[0], TEST_EMBED_DIM);
@@ -354,45 +350,8 @@ static void test_vit_windowed_attention(void)
 	vit.layers[0].is_global = 0;
 	vit.layers[1].is_global = 1;
 
-	/* Verify window_mask is allocated with correct shape */
-	ASSERT(vit.window_mask != NULL);
-	ASSERT_EQ(vit.window_mask->n_dims, 2);
-	ASSERT_EQ(vit.window_mask->dims[0], n_patches);
-	ASSERT_EQ(vit.window_mask->dims[1], n_patches);
-
-	/*
-	 * Verify mask values at known positions.
-	 *
-	 * Grid layout (4x4), window_size=2:
-	 *   Patch index = row * grid_size + col
-	 *   Window = (row / ws, col / ws)
-	 *
-	 * Patch (0,0) = index 0:  row=0, col=0 -> window (0,0)
-	 * Patch (0,1) = index 1:  row=0, col=1 -> window (0,0)
-	 * Patch (0,2) = index 2:  row=0, col=2 -> window (0,1)
-	 * Patch (1,0) = index 4:  row=1, col=0 -> window (0,0)
-	 * Patch (1,1) = index 5:  row=1, col=1 -> window (0,0)
-	 */
-	float *mask_data = (float *)vit.window_mask->data;
-
-	/* Patches 0 and 1: same window (0,0) -> 0.0f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 1], 0.0f, 1e-6f);
-
-	/* Patches 0 and 4: same window (0,0) -> 0.0f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 4], 0.0f, 1e-6f);
-
-	/* Patches 0 and 5: same window (0,0) -> 0.0f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 5], 0.0f, 1e-6f);
-
-	/* Patches 0 and 2: different windows (0,0) vs (0,1) -> -1e9f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 2], -1e9f, 1.0f);
-
-	/* Patches 0 and 8: different windows (0,0) vs (1,0) -> -1e9f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 8], -1e9f, 1.0f);
-
-	/* Diagonal: always same window -> 0.0f */
-	for (int i = 0; i < n_patches; i++)
-		ASSERT_NEAR(mask_data[i * n_patches + i], 0.0f, 1e-6f);
+	/* Window mask is lazily computed on first build */
+	ASSERT(vit.window_mask == NULL);
 
 	/* Load weights (zero-init) and build graph */
 	err = sam3_vit_load(&vit, NULL, &g_cpu.arena);
@@ -436,6 +395,45 @@ static void test_vit_windowed_attention(void)
 	out = sam3_vit_build(&vit, &g_cpu.base, image,
 			      &g_scratch, &g_persist);
 	ASSERT(out != NULL);
+
+	/*
+	 * Verify window_mask (lazily computed by first build).
+	 *
+	 * Grid layout (4x4), window_size=2:
+	 *   Patch index = row * grid_size + col
+	 *   Window = (row / ws, col / ws)
+	 *
+	 * Patch (0,0) = index 0:  row=0, col=0 -> window (0,0)
+	 * Patch (0,1) = index 1:  row=0, col=1 -> window (0,0)
+	 * Patch (0,2) = index 2:  row=0, col=2 -> window (0,1)
+	 * Patch (1,0) = index 4:  row=1, col=0 -> window (0,0)
+	 * Patch (1,1) = index 5:  row=1, col=1 -> window (0,0)
+	 */
+	ASSERT(vit.window_mask != NULL);
+	ASSERT_EQ(vit.window_mask->n_dims, 2);
+	ASSERT_EQ(vit.window_mask->dims[0], n_patches);
+	ASSERT_EQ(vit.window_mask->dims[1], n_patches);
+
+	float *mask_data = (float *)vit.window_mask->data;
+
+	/* Patches 0 and 1: same window (0,0) -> 0.0f */
+	ASSERT_NEAR(mask_data[0 * n_patches + 1], 0.0f, 1e-6f);
+
+	/* Patches 0 and 4: same window (0,0) -> 0.0f */
+	ASSERT_NEAR(mask_data[0 * n_patches + 4], 0.0f, 1e-6f);
+
+	/* Patches 0 and 5: same window (0,0) -> 0.0f */
+	ASSERT_NEAR(mask_data[0 * n_patches + 5], 0.0f, 1e-6f);
+
+	/* Patches 0 and 2: different windows (0,0) vs (0,1) -> -1e9f */
+	ASSERT_NEAR(mask_data[0 * n_patches + 2], -1e9f, 1.0f);
+
+	/* Patches 0 and 8: different windows (0,0) vs (1,0) -> -1e9f */
+	ASSERT_NEAR(mask_data[0 * n_patches + 8], -1e9f, 1.0f);
+
+	/* Diagonal: always same window -> 0.0f */
+	for (int i = 0; i < n_patches; i++)
+		ASSERT_NEAR(mask_data[i * n_patches + i], 0.0f, 1e-6f);
 
 	/* Output shape: [n_patches, embed_dim] */
 	ASSERT_EQ(out->n_dims, 2);

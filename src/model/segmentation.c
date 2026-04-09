@@ -55,41 +55,41 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++) {
 		snprintf(name, sizeof(name),
 			 WP "pixel_decoder.conv_layers.%d.weight", i);
-		head->fpn[i].conv_w = gh_load_or_alloc(wf, name, arena,
+		head->fpn[i].conv_w = gh_load_mmap(wf, name, arena,
 			SAM3_DTYPE_F32, 4, conv_w_dims);
 		if (!head->fpn[i].conv_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 WP "pixel_decoder.conv_layers.%d.bias", i);
-		head->fpn[i].conv_b = gh_load_or_alloc(wf, name, arena,
+		head->fpn[i].conv_b = gh_load_mmap(wf, name, arena,
 			SAM3_DTYPE_F32, 1, d_dims);
 		if (!head->fpn[i].conv_b)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 WP "pixel_decoder.norms.%d.weight", i);
-		head->fpn[i].gn_w = gh_load_or_alloc(wf, name, arena,
+		head->fpn[i].gn_w = gh_load_mmap(wf, name, arena,
 			SAM3_DTYPE_F32, 1, d_dims);
 		if (!head->fpn[i].gn_w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 WP "pixel_decoder.norms.%d.bias", i);
-		head->fpn[i].gn_b = gh_load_or_alloc(wf, name, arena,
+		head->fpn[i].gn_b = gh_load_mmap(wf, name, arena,
 			SAM3_DTYPE_F32, 1, d_dims);
 		if (!head->fpn[i].gn_b)
 			return SAM3_ENOMEM;
 	}
 
 	/* Instance projection: 1×1 conv */
-	head->inst_proj_w = gh_load_or_alloc(wf,
+	head->inst_proj_w = gh_load_mmap(wf,
 		WP "instance_projection.weight", arena,
 		SAM3_DTYPE_F32, 4, proj_w_dims);
 	if (!head->inst_proj_w)
 		return SAM3_ENOMEM;
 
-	head->inst_proj_b = gh_load_or_alloc(wf,
+	head->inst_proj_b = gh_load_mmap(wf,
 		WP "instance_projection.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!head->inst_proj_b)
@@ -99,50 +99,50 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 	for (int i = 0; i < SAM3_SEG_MASK_MLP_LAYERS; i++) {
 		snprintf(name, sizeof(name),
 			 WP "mask_embedder.layers.%d.weight", i);
-		head->mask_mlp[i].w = gh_load_or_alloc(wf, name, arena,
+		head->mask_mlp[i].w = gh_load_mmap(wf, name, arena,
 			SAM3_DTYPE_F32, 2, lin_w_dims);
 		if (!head->mask_mlp[i].w)
 			return SAM3_ENOMEM;
 
 		snprintf(name, sizeof(name),
 			 WP "mask_embedder.layers.%d.bias", i);
-		head->mask_mlp[i].b = gh_load_or_alloc(wf, name, arena,
+		head->mask_mlp[i].b = gh_load_mmap(wf, name, arena,
 			SAM3_DTYPE_F32, 1, d_dims);
 		if (!head->mask_mlp[i].b)
 			return SAM3_ENOMEM;
 	}
 
 	/* Prompt cross-attention: separate Q/K/V/O projections */
-	head->pxattn_q_w = gh_load_or_alloc(wf,
+	head->pxattn_q_w = gh_load_mmap(wf,
 		WP "prompt_cross_attn.q_proj.weight", arena,
 		SAM3_DTYPE_F32, 2, lin_w_dims);
-	head->pxattn_q_b = gh_load_or_alloc(wf,
+	head->pxattn_q_b = gh_load_mmap(wf,
 		WP "prompt_cross_attn.q_proj.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
-	head->pxattn_k_w = gh_load_or_alloc(wf,
+	head->pxattn_k_w = gh_load_mmap(wf,
 		WP "prompt_cross_attn.k_proj.weight", arena,
 		SAM3_DTYPE_F32, 2, lin_w_dims);
-	head->pxattn_k_b = gh_load_or_alloc(wf,
+	head->pxattn_k_b = gh_load_mmap(wf,
 		WP "prompt_cross_attn.k_proj.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
-	head->pxattn_v_w = gh_load_or_alloc(wf,
+	head->pxattn_v_w = gh_load_mmap(wf,
 		WP "prompt_cross_attn.v_proj.weight", arena,
 		SAM3_DTYPE_F32, 2, lin_w_dims);
-	head->pxattn_v_b = gh_load_or_alloc(wf,
+	head->pxattn_v_b = gh_load_mmap(wf,
 		WP "prompt_cross_attn.v_proj.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
-	head->pxattn_o_w = gh_load_or_alloc(wf,
+	head->pxattn_o_w = gh_load_mmap(wf,
 		WP "prompt_cross_attn.o_proj.weight", arena,
 		SAM3_DTYPE_F32, 2, lin_w_dims);
-	head->pxattn_o_b = gh_load_or_alloc(wf,
+	head->pxattn_o_b = gh_load_mmap(wf,
 		WP "prompt_cross_attn.o_proj.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 
 	/* Prompt cross-attention norm */
-	head->pxattn_norm_w = gh_load_or_alloc(wf,
+	head->pxattn_norm_w = gh_load_mmap(wf,
 		WP "prompt_cross_attn_norm.weight", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
-	head->pxattn_norm_b = gh_load_or_alloc(wf,
+	head->pxattn_norm_b = gh_load_mmap(wf,
 		WP "prompt_cross_attn_norm.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 

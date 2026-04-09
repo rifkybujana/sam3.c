@@ -25,6 +25,8 @@ struct sam3_pos_encoding {
 	int num_pos_feats;		/* 256 — half of the output channel dim */
 	float temperature;		/* 10000.0f */
 	struct sam3_tensor *cached;	/* precomputed [H, W, num_pos_feats*2] */
+	int height, width;		/* grid dims for lazy computation */
+	struct sam3_arena *arena;	/* arena for lazy computation */
 };
 
 /*

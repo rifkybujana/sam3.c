@@ -48,20 +48,21 @@ struct sam3_processor {
 enum sam3_error sam3_processor_init(struct sam3_processor *proc);
 
 /*
- * sam3_processor_load - Load model weights from file.
+ * sam3_processor_load - Load model weights from an open weight file.
  *
  * @proc:       Initialized processor
- * @model_path: Path to .sam3 weight file
+ * @wf:         Open weight file (caller retains ownership)
  * @vocab_path: Path to BPE vocabulary file, or NULL
  *
- * Opens the weight file, loads all sub-module weights into the model
- * arena, then closes the file. The processor is ready for set_image
- * after this returns.
+ * Loads all sub-module weights into the model arena. The weight file
+ * must remain open for the processor's lifetime since tensor data
+ * points directly into the mmap region. The processor is ready for
+ * set_image after this returns.
  *
  * Returns SAM3_OK on success, or propagates weight/model errors.
  */
 enum sam3_error sam3_processor_load(struct sam3_processor *proc,
-				    const char *model_path,
+				    const struct sam3_weight_file *wf,
 				    const char *vocab_path);
 
 /*

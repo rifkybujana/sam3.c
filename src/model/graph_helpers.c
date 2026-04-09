@@ -109,6 +109,31 @@ struct sam3_tensor *gh_load_or_alloc(const struct sam3_weight_file *wf,
 	return gh_alloc_tensor(arena, dtype, n_dims, dims);
 }
 
+struct sam3_tensor *gh_load_mmap(const struct sam3_weight_file *wf,
+				  const char *name,
+				  struct sam3_arena *arena,
+				  enum sam3_dtype dtype,
+				  int n_dims, const int *dims)
+{
+	if (wf) {
+		const struct sam3_weight_tensor_desc *desc;
+		desc = sam3_weight_find(wf, name);
+		if (desc) {
+			struct sam3_tensor *t = (struct sam3_tensor *)
+				sam3_arena_alloc(arena,
+						 sizeof(struct sam3_tensor));
+			if (!t)
+				return NULL;
+
+			memset(t, 0, sizeof(*t));
+			sam3_weight_to_tensor(wf, desc, t);
+			return t;
+		}
+	}
+	sam3_log_warn("weight not found: %s (using zeros)", name);
+	return gh_alloc_tensor(arena, dtype, n_dims, dims);
+}
+
 /* ── Unary activation ops ────────────────────────────────────────── */
 
 static struct sam3_tensor *gh_unary(struct sam3_graph *g,
@@ -649,6 +674,136 @@ struct sam3_tensor *gh_multihead_attention_rope(
 	return out;
 }
 
+struct sam3_tensor *gh_multihead_attention_rope_sep(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *x,
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
+	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
+	struct sam3_tensor *out_w,
+	struct sam3_tensor *out_b,
+	int n_heads,
+	struct sam3_tensor *rope_cos,
+	struct sam3_tensor *rope_sin,
+	struct sam3_tensor *attn_mask)
+{
+	int batch = x->dims[0];
+	int seq = x->dims[1];
+	int d_model = x->dims[2];
+	int head_dim = d_model / n_heads;
+	int bs = batch * seq;
+
+	/* Flatten to 2D for linear projections */
+	int flat_dims[] = {bs, d_model};
+	struct sam3_tensor *xf = gh_reshape(g, a, x, 2, flat_dims);
+	if (!xf) {
+		sam3_log_error("mha_sep: reshape fail (arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	/* Separate Q, K, V projections */
+	struct sam3_tensor *sq = gh_linear(g, a, xf, q_w, q_b);
+	struct sam3_tensor *sk = gh_linear(g, a, xf, k_w, k_b);
+	struct sam3_tensor *sv = gh_linear(g, a, xf, v_w, v_b);
+	if (!sq || !sk || !sv) {
+		sam3_log_error("mha_sep: QKV linear fail (arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	/* Apply RoPE to Q and K if requested */
+	if (rope_cos && rope_sin) {
+		int rope_4d[] = {batch, seq, n_heads, head_dim};
+
+		struct sam3_tensor *sq_4d;
+		sq_4d = gh_reshape(g, a, sq, 4, rope_4d);
+		if (!sq_4d)
+			return NULL;
+		sq_4d = gh_rope(g, a, sq_4d, rope_cos, rope_sin);
+		if (!sq_4d)
+			return NULL;
+		sq = gh_reshape(g, a, sq_4d, 2, flat_dims);
+		if (!sq)
+			return NULL;
+
+		struct sam3_tensor *sk_4d;
+		sk_4d = gh_reshape(g, a, sk, 4, rope_4d);
+		if (!sk_4d)
+			return NULL;
+		sk_4d = gh_rope(g, a, sk_4d, rope_cos, rope_sin);
+		if (!sk_4d)
+			return NULL;
+		sk = gh_reshape(g, a, sk_4d, 2, flat_dims);
+		if (!sk) {
+			sam3_log_error("mha_sep: rope fail "
+				       "(arena %zu/%zu)",
+				       a->offset, a->size);
+			return NULL;
+		}
+	}
+
+	sam3_log_debug("mha_sep: pre-SDPA arena %zu/%zu, n_heads=%d",
+		       a->offset, a->size, n_heads);
+
+	/* Per-head fused SDPA */
+	struct sam3_tensor *head_outs[SAM3_MAX_DIMS * 16];
+	for (int h = 0; h < n_heads; h++) {
+		int hstart = h * head_dim;
+		int hend = hstart + head_dim;
+
+		struct sam3_tensor *hq = gh_slice(g, a, sq, 1,
+						   hstart, hend);
+		struct sam3_tensor *hk = gh_slice(g, a, sk, 1,
+						   hstart, hend);
+		struct sam3_tensor *hv = gh_slice(g, a, sv, 1,
+						   hstart, hend);
+		if (!hq || !hk || !hv) {
+			sam3_log_error("mha_sep: head %d slice fail "
+				       "(arena %zu/%zu)", h,
+				       a->offset, a->size);
+			return NULL;
+		}
+
+		struct sam3_tensor *ho = gh_sdpa(g, a, hq, hk, hv,
+						 attn_mask, head_dim);
+		if (!ho) {
+			sam3_log_error("mha_sep: head %d SDPA fail "
+				       "(arena %zu/%zu, nodes %d/%d)",
+				       h, a->offset, a->size,
+				       g->n_nodes,
+				       SAM3_GRAPH_MAX_NODES);
+			return NULL;
+		}
+
+		head_outs[h] = ho;
+	}
+
+	sam3_log_debug("mha_sep: post-SDPA arena %zu/%zu",
+		       a->offset, a->size);
+
+	/* Concatenate heads */
+	struct sam3_tensor *merged;
+	if (n_heads == 1) {
+		merged = head_outs[0];
+	} else {
+		merged = gh_concat(g, a, head_outs, n_heads, 1);
+		if (!merged) {
+			sam3_log_error("mha_sep: concat fail "
+				       "(arena %zu/%zu)",
+				       a->offset, a->size);
+			return NULL;
+		}
+	}
+
+	struct sam3_tensor *out = gh_linear(g, a, merged, out_w, out_b);
+	if (!out) {
+		sam3_log_error("mha_sep: out_proj fail (arena %zu/%zu)",
+			       a->offset, a->size);
+	}
+	return out;
+}
+
 struct sam3_tensor *gh_multihead_attention(
 	struct sam3_graph *g, struct sam3_arena *a,
 	struct sam3_tensor *q,
@@ -723,6 +878,77 @@ struct sam3_tensor *gh_cross_attention(
 	}
 
 	/* Concatenate heads: [n_q, d_model] */
+	struct sam3_tensor *merged;
+	if (n_heads == 1) {
+		merged = head_outs[0];
+	} else {
+		merged = gh_concat(g, arena, head_outs, n_heads, 1);
+		if (!merged)
+			return NULL;
+	}
+
+	/* Output projection */
+	return gh_linear(g, arena, merged, out_w, out_b);
+}
+
+struct sam3_tensor *gh_multihead_attention_sep(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *x,
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
+	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int n_heads,
+	struct sam3_tensor *attn_mask)
+{
+	return gh_multihead_attention_rope_sep(g, a, x,
+		q_w, q_b, k_w, k_b, v_w, v_b,
+		out_w, out_b, n_heads,
+		NULL, NULL, attn_mask);
+}
+
+struct sam3_tensor *gh_cross_attention_sep(
+	struct sam3_graph *g, struct sam3_arena *arena,
+	struct sam3_tensor *q_src,
+	struct sam3_tensor *kv_src,
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
+	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int n_heads)
+{
+	int d_model = q_src->dims[1];
+	int head_dim = d_model / n_heads;
+
+	/* Project Q from q_src, K and V separately from kv_src */
+	struct sam3_tensor *q = gh_linear(g, arena, q_src, q_w, q_b);
+	struct sam3_tensor *k = gh_linear(g, arena, kv_src, k_w, k_b);
+	struct sam3_tensor *v = gh_linear(g, arena, kv_src, v_w, v_b);
+	if (!q || !k || !v)
+		return NULL;
+
+	/* Per-head attention */
+	struct sam3_tensor *head_outs[64];
+	for (int h = 0; h < n_heads; h++) {
+		int hstart = h * head_dim;
+		int hend = hstart + head_dim;
+
+		struct sam3_tensor *hq, *hk, *hv;
+		hq = gh_slice(g, arena, q, 1, hstart, hend);
+		hk = gh_slice(g, arena, k, 1, hstart, hend);
+		hv = gh_slice(g, arena, v, 1, hstart, hend);
+		if (!hq || !hk || !hv)
+			return NULL;
+
+		struct sam3_tensor *ho = gh_sdpa(g, arena, hq, hk, hv,
+						 NULL, head_dim);
+		if (!ho)
+			return NULL;
+
+		head_outs[h] = ho;
+	}
+
+	/* Concatenate heads */
 	struct sam3_tensor *merged;
 	if (n_heads == 1) {
 		merged = head_outs[0];

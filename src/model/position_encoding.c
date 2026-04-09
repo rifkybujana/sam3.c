@@ -82,5 +82,14 @@ enum sam3_error sam3_pos_encoding_precompute(
 
 struct sam3_tensor *sam3_pos_encoding_get(struct sam3_pos_encoding *pe)
 {
-	return pe ? pe->cached : NULL;
+	if (!pe)
+		return NULL;
+
+	/* Lazy init: compute on first access */
+	if (!pe->cached && pe->arena) {
+		sam3_pos_encoding_precompute(pe, pe->height, pe->width,
+					     pe->num_pos_feats, pe->arena);
+	}
+
+	return pe->cached;
 }
