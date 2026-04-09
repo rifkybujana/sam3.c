@@ -120,9 +120,17 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 		ctx->loaded = 0;
 	}
 
+#ifdef SAM3_HAS_PROFILE
+	SAM3_PROF_BEGIN(ctx->profiler, "model_load");
+#endif
+
 	enum sam3_error err = sam3_weight_open(&ctx->weights, path);
-	if (err)
+	if (err) {
+#ifdef SAM3_HAS_PROFILE
+		SAM3_PROF_END(ctx->profiler, "model_load");
+#endif
 		return err;
+	}
 
 	/* Copy model config from weight file header */
 	const struct sam3_weight_header *h = ctx->weights.header;
@@ -144,8 +152,12 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 
 	/* Initialize processor and load model weights */
 	err = sam3_processor_init(&ctx->proc);
-	if (err != SAM3_OK)
+	if (err != SAM3_OK) {
+#ifdef SAM3_HAS_PROFILE
+		SAM3_PROF_END(ctx->profiler, "model_load");
+#endif
 		return err;
+	}
 
 #ifdef SAM3_HAS_PROFILE
 	ctx->proc.profiler = ctx->profiler;
@@ -154,9 +166,16 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	err = sam3_processor_load(&ctx->proc, path, vocab);
 	if (err != SAM3_OK) {
 		sam3_processor_free(&ctx->proc);
+#ifdef SAM3_HAS_PROFILE
+		SAM3_PROF_END(ctx->profiler, "model_load");
+#endif
 		return err;
 	}
 	ctx->proc_ready = 1;
+
+#ifdef SAM3_HAS_PROFILE
+	SAM3_PROF_END(ctx->profiler, "model_load");
+#endif
 
 	return SAM3_OK;
 }
