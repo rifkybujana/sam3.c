@@ -25,6 +25,14 @@
 
 #include <string.h>
 
+#ifdef SAM3_HAS_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
+
 /*
  * im2col - Unroll input patches into a column matrix.
  *
@@ -162,6 +170,10 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
+#ifdef SAM3_HAS_BLAS
+	(void)pool;
+#endif
+
 	struct sam3_tensor *input = node->inputs[0];
 	struct sam3_tensor *weight = node->inputs[1];
 	struct sam3_tensor *output = node->output;
@@ -219,6 +231,15 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 
 		im2col_f32(in_n, col, C, H, W, KH, KW, stride, pad, OH, OW);
 
+#ifdef SAM3_HAS_BLAS
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+			    OC, OH * OW, C * KH * KW,
+			    1.0f,
+			    w_data, C * KH * KW,
+			    col, OH * OW,
+			    0.0f,
+			    out_n, OH * OW);
+#else
 		/* Parallel matmul: weight [OC, C*KH*KW] @ col -> out [OC, OH*OW] */
 		struct conv2d_matmul_ctx mctx = {
 			.a = w_data, .b = col, .c = out_n,
@@ -229,6 +250,7 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 			n_tasks = 1;
 		sam3_threadpool_parallel_for(pool, conv2d_matmul_parallel_fn,
 					     &mctx, n_tasks);
+#endif
 	}
 
 	/* Restore scratch offset — frees the im2col buffer */
