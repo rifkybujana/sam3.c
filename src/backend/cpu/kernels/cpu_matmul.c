@@ -21,6 +21,14 @@
 
 #include <string.h>
 
+#ifdef SAM3_HAS_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
+
 #define TILE_M 8
 #define TILE_N 8
 #define TILE_K 64
@@ -220,6 +228,16 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
+#ifdef SAM3_HAS_BLAS
+	(void)pool;
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+		    M, N, K_a,
+		    1.0f,
+		    (const float *)a->data, K_a,
+		    (const float *)b->data, N,
+		    0.0f,
+		    (float *)c->data, N);
+#else
 	struct matmul_par_ctx ctx = {
 		.a = (const float *)a->data,
 		.b = (const float *)b->data,
@@ -233,6 +251,7 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 
 	sam3_threadpool_parallel_for(pool, matmul_parallel_fn, &ctx,
 				     n_tasks);
+#endif
 
 	return SAM3_OK;
 }
