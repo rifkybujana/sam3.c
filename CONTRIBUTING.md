@@ -15,6 +15,22 @@ Before you start, familiarize yourself with the layout:
 * `src/util/` - Logging, error codes
 * `tools/` - CLI binaries (inference, weight conversion)
 * `tests/` - Unit and integration tests
+* `docs/` - Documentation (format specs, reference material)
+
+## .sam3 Weight Format
+
+Model weights use the `.sam3` binary format. See
+[docs/weight-format.md](docs/weight-format.md) for the full specification.
+
+The format is a flat binary container: a 48-byte header with model config,
+followed by an array of 176-byte tensor descriptors, then a page-aligned data
+blob with 64-byte per-tensor alignment. Files are loaded via `mmap()` with
+O(1) tensor lookup using FNV-1a hashing.
+
+Supported data types: F32, F16, BF16, I32, I8, Q8_0 (block-quantized int8).
+
+Format structs are defined in `src/core/weight.h`. The loader and writer live
+in `src/core/weight.c`. Convert from SafeTensors with `sam3_convert`.
 
 ## C Coding Standard
 

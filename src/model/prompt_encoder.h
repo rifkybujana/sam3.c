@@ -2,9 +2,9 @@
  * src/model/prompt_encoder.h - SAM3 geometry encoder
  *
  * Encodes geometric prompts (points, boxes) into dense embeddings via
- * cross-attention to image features. Prepends a learnable CLS token,
- * runs 3 cross-attention layers (prompt Q attends to image KV), then
- * applies a post-projection. Output is [N+1, d_model].
+ * 3-layer transformer encoder with self-attention, cross-attention to
+ * image features, and FFN. Applies pre-encoder projection + LayerNorm,
+ * runs 3 encoder layers, then post-encoder LayerNorm. Output is [N+1, d_model].
  *
  * Key types:  sam3_geometry_encoder
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h, core/weight.h
@@ -33,14 +33,49 @@ struct sam3_geometry_encoder {
 	struct sam3_tensor *box_proj_w, *box_proj_b;      /* [d_model, 4] */
 	struct sam3_tensor *cls_token;                    /* [1, d_model] */
 
+	/* Pool projection: grid_sample from img features + Linear(d, d) */
+	struct sam3_tensor *pool_proj_w, *pool_proj_b;  /* [d_model, d_model] */
+
+	/* Pos enc projection: sinusoidal pos encoding + Linear(d, d) */
+	struct sam3_tensor *posenc_proj_w, *posenc_proj_b;  /* [d_model, d_model] */
+
+	/* Image pre-norm for pool projection (LayerNorm) */
+	struct sam3_tensor *img_pre_norm_w, *img_pre_norm_b;  /* [d_model] */
+
+	/* Label embedding: type_embed added to projected prompts */
+	struct sam3_tensor *label_embed;  /* [n_labels, d_model] */
+	int n_labels;                    /* 2 (pos/neg point labels) */
+
+	int n_heads;   /* 8 */
+
 	struct {
+		/* Self-attention (norm1 → self_attn → residual) */
+		struct sam3_tensor *norm1_w, *norm1_b;	  /* [d_model] */
+		struct sam3_tensor *sa_qkv_w, *sa_qkv_b; /* [3*d, d], [3*d] */
+		struct sam3_tensor *sa_out_w, *sa_out_b;  /* [d, d], [d] */
+
+		/* Cross-attention (norm2/ca_ln → cross_attn → residual) */
 		struct sam3_tensor *ca_q_w, *ca_q_b;
 		struct sam3_tensor *ca_kv_w, *ca_kv_b;
 		struct sam3_tensor *ca_out_w, *ca_out_b;
 		struct sam3_tensor *ca_ln_w, *ca_ln_b;
+
+		/* FFN (norm3 → linear1 → relu → linear2 → residual) */
+		struct sam3_tensor *norm3_w, *norm3_b;	    /* [d_model] */
+		struct sam3_tensor *ffn_fc1_w, *ffn_fc1_b;  /* [2048, d], [2048] */
+		struct sam3_tensor *ffn_fc2_w, *ffn_fc2_b;  /* [d, 2048], [d] */
 	} layers[SAM3_GEOM_ENC_MAX_LAYERS];
 
-	struct sam3_tensor *post_proj_w, *post_proj_b;  /* post-encode */
+	/*
+	 * Pre-encoder projection: final_proj (Linear) + norm (LayerNorm).
+	 * Applied BEFORE encoder layers in Python, despite the C weight
+	 * name "post_proj" (renamed from Python's "final_proj").
+	 */
+	struct sam3_tensor *post_proj_w, *post_proj_b;  /* Linear [d, d] */
+	struct sam3_tensor *norm_w, *norm_b;            /* LayerNorm [d] */
+
+	/* Post-encoder LayerNorm (encode_norm in Python) */
+	struct sam3_tensor *encode_norm_w, *encode_norm_b;  /* [d_model] */
 };
 
 /*
@@ -73,14 +108,16 @@ enum sam3_error sam3_geometry_encoder_load(
 /*
  * sam3_geometry_encoder_build - Build geometry encoder graph.
  *
- * Prepends CLS token to prompt tokens, runs cross-attention layers
- * where prompt tokens (Q) attend to image features (KV), then
- * applies a post-projection.
+ * Prepends CLS token, applies pre-encoder projection + LayerNorm,
+ * runs 3-layer transformer encoder (self-attn + cross-attn + FFN),
+ * then post-encoder LayerNorm. Position encoding is added to
+ * cross-attention keys only (not values).
  *
  * @enc:            Initialized and loaded encoder
  * @g:              Graph to add nodes to
  * @prompt_tokens:  [N, d_model] pre-projected prompt embeddings
  * @image_features: [M, d_model] image feature tokens
+ * @image_pos:      [M, d_model] image position encoding (added to keys)
  * @arena:          Arena for intermediate tensors
  *
  * Returns output tensor [N+1, d_model], or NULL on error.
@@ -90,6 +127,7 @@ struct sam3_tensor *sam3_geometry_encoder_build(
 	struct sam3_graph *g,
 	struct sam3_tensor *prompt_tokens,
 	struct sam3_tensor *image_features,
+	struct sam3_tensor *image_pos,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_PROMPT_ENCODER_H */

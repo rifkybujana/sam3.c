@@ -256,6 +256,7 @@ static void test_geom_enc_pipeline(void)
 	geom_out = sam3_geometry_encoder_build(&genc, &graph,
 						prompt_tokens,
 						image_features,
+						NULL,
 						&g_cpu.arena);
 	ASSERT(geom_out != NULL);
 
@@ -287,8 +288,8 @@ static void test_seg_head_pipeline(void)
 	 * Use small spatial dims: enc=2×2 (0.5x), then FPN stages
 	 * produce 4×4, 8×8, 16×16.
 	 */
-	int seg_enc_h = 2;
-	int seg_enc_w = 2;
+	int seg_enc_h = 4;  /* encoder output at 1× (72×72 in real model) */
+	int seg_enc_w = 4;
 	int seg_enc_pixels = seg_enc_h * seg_enc_w;
 
 	struct sam3_seg_head head;
@@ -321,23 +322,19 @@ static void test_seg_head_pipeline(void)
 	ASSERT(enc_states != NULL);
 	fill_small_values(enc_states, 13);
 
-	/* Create backbone features at each scale (NCHW) */
+	/* Create backbone features at each scale (NCHW).
+	 * FPN only uses feat_2x and feat_4x (2 stages). */
 	int d = SMOKE_D_MODEL;
-	int f1_dims[] = {1, d, seg_enc_h * 2, seg_enc_w * 2};  /* 1x */
-	int f2_dims[] = {1, d, seg_enc_h * 4, seg_enc_w * 4};  /* 2x */
-	int f4_dims[] = {1, d, seg_enc_h * 8, seg_enc_w * 8};  /* 4x */
+	int f2_dims[] = {1, d, seg_enc_h * 2, seg_enc_w * 2};  /* 2x */
+	int f4_dims[] = {1, d, seg_enc_h * 4, seg_enc_w * 4};  /* 4x */
 
-	struct sam3_tensor *feat_1x, *feat_2x, *feat_4x;
-	feat_1x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
-				    4, f1_dims);
+	struct sam3_tensor *feat_2x, *feat_4x;
 	feat_2x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
 				    4, f2_dims);
 	feat_4x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
 				    4, f4_dims);
-	ASSERT(feat_1x != NULL);
 	ASSERT(feat_2x != NULL);
 	ASSERT(feat_4x != NULL);
-	fill_small_values(feat_1x, 17);
 	fill_small_values(feat_2x, 19);
 	fill_small_values(feat_4x, 23);
 
@@ -347,7 +344,7 @@ static void test_seg_head_pipeline(void)
 
 	struct sam3_tensor *masks;
 	masks = sam3_seg_head_build(&head, &graph, query_embed,
-				     enc_states, feat_1x, feat_2x,
+				     enc_states, feat_2x,
 				     feat_4x, seg_enc_h, seg_enc_w,
 				     &g_cpu.arena);
 	ASSERT(masks != NULL);
@@ -355,8 +352,8 @@ static void test_seg_head_pipeline(void)
 	/* Output shape: [n_queries, feat_4x_h, feat_4x_w] */
 	ASSERT_EQ(masks->n_dims, 3);
 	ASSERT_EQ(masks->dims[0], SMOKE_N_QUERIES);
-	ASSERT_EQ(masks->dims[1], seg_enc_h * 8);
-	ASSERT_EQ(masks->dims[2], seg_enc_w * 8);
+	ASSERT_EQ(masks->dims[1], seg_enc_h * 4);
+	ASSERT_EQ(masks->dims[2], seg_enc_w * 4);
 
 	/* Evaluate on CPU */
 	err = g_cpu.base.ops->graph_eval(&g_cpu.base, &graph);
@@ -454,23 +451,18 @@ static void test_full_pipeline(void)
 	ASSERT(text_features != NULL);
 	fill_small_values(text_features, 13);
 
-	/* Backbone features (NCHW) at each FPN scale */
+	/* Backbone features (NCHW) at 2x and 4x scales */
 	int d = SMOKE_D_MODEL;
-	int f1_dims[] = {1, d, full_grid_h * 2, full_grid_w * 2};  /* 1x */
-	int f2_dims[] = {1, d, full_grid_h * 4, full_grid_w * 4};  /* 2x */
-	int f4_dims[] = {1, d, full_grid_h * 8, full_grid_w * 8};  /* 4x */
+	int f2_dims[] = {1, d, full_grid_h * 2, full_grid_w * 2};  /* 2x */
+	int f4_dims[] = {1, d, full_grid_h * 4, full_grid_w * 4};  /* 4x */
 
-	struct sam3_tensor *feat_1x, *feat_2x, *feat_4x;
-	feat_1x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
-				    4, f1_dims);
+	struct sam3_tensor *feat_2x, *feat_4x;
 	feat_2x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
 				    4, f2_dims);
 	feat_4x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
 				    4, f4_dims);
-	ASSERT(feat_1x != NULL);
 	ASSERT(feat_2x != NULL);
 	ASSERT(feat_4x != NULL);
-	fill_small_values(feat_1x, 29);
 	fill_small_values(feat_2x, 31);
 	fill_small_values(feat_4x, 37);
 
@@ -487,6 +479,7 @@ static void test_full_pipeline(void)
 	geom_out = sam3_geometry_encoder_build(&genc, &graph,
 						prompt_tokens,
 						image_features,
+						NULL,
 						&g_cpu.arena);
 	ASSERT(geom_out != NULL);
 	ASSERT_EQ(geom_out->dims[0], SMOKE_N_PROMPTS + 1);
@@ -532,15 +525,15 @@ static void test_full_pipeline(void)
 	 */
 	struct sam3_tensor *masks;
 	masks = sam3_seg_head_build(&seg, &graph, queries,
-				     fused, feat_1x, feat_2x,
-				     feat_4x, full_grid_h,
-				     full_grid_w, &g_cpu.arena);
+				     fused, feat_2x, feat_4x,
+				     full_grid_h, full_grid_w,
+				     &g_cpu.arena);
 	ASSERT(masks != NULL);
 
 	ASSERT_EQ(masks->n_dims, 3);
 	ASSERT_EQ(masks->dims[0], SMOKE_N_QUERIES);
-	ASSERT_EQ(masks->dims[1], full_grid_h * 8);
-	ASSERT_EQ(masks->dims[2], full_grid_w * 8);
+	ASSERT_EQ(masks->dims[1], full_grid_h * 4);
+	ASSERT_EQ(masks->dims[2], full_grid_w * 4);
 
 	/* --- Evaluate entire pipeline on CPU --- */
 

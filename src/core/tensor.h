@@ -26,6 +26,14 @@ struct sam3_tensor {
 	int             strides[SAM3_MAX_DIMS];
 	void           *data;
 	size_t          nbytes;
+	/*
+	 * Set to 1 for tensor headers that wrap external mutable data
+	 * (created by gh_tensor_wrap). Backends must not cache these
+	 * tensors across graph_eval calls: the header address may be
+	 * reused by a subsequent arena allocation while the wrapped
+	 * data contents have changed.
+	 */
+	int             ephemeral;
 };
 
 /* Return the total number of elements in the tensor. */

@@ -69,6 +69,7 @@ struct sam3_tensor *gh_tensor_wrap(struct sam3_arena *arena,
 
 	t->nbytes = (size_t)sam3_tensor_nelems(t) * sam3_dtype_size(dtype);
 	t->data = data;
+	t->ephemeral = 1;
 
 	return t;
 }

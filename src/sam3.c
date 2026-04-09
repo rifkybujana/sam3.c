@@ -15,10 +15,13 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
 #include "sam3/sam3.h"
 #include "core/weight.h"
 #include "util/image.h"
+#include "util/log.h"
 #include "model/sam3_processor.h"
 #ifdef SAM3_HAS_PROFILE
 #include "util/profile.h"
@@ -61,6 +64,53 @@ void sam3_free(sam3_ctx *ctx)
 	free(ctx);
 }
 
+/*
+ * try_bpe_path - Check if a BPE vocab file exists at the given path.
+ *
+ * Returns 1 if the file exists, 0 otherwise.
+ */
+static int try_bpe_path(const char *path)
+{
+	FILE *f = fopen(path, "rb");
+	if (f) {
+		fclose(f);
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * find_bpe_next_to_model - Look for BPE vocab file in the model directory.
+ *
+ * Searches for "bpe_simple_vocab_16e6.txt.gz" in the same directory
+ * as the model file. Writes the path to buf (at most bufsz bytes).
+ * Returns 1 if found, 0 otherwise.
+ */
+static int find_bpe_next_to_model(const char *model_path,
+				   char *buf, size_t bufsz)
+{
+	static const char bpe_name[] = "bpe_simple_vocab_16e6.txt.gz";
+
+	const char *last_sep = strrchr(model_path, '/');
+	size_t dir_len;
+
+	if (last_sep) {
+		dir_len = (size_t)(last_sep - model_path + 1);
+	} else {
+		/* No directory separator — look in current directory */
+		dir_len = 0;
+	}
+
+	if (dir_len + sizeof(bpe_name) > bufsz)
+		return 0;
+
+	if (dir_len > 0)
+		memcpy(buf, model_path, dir_len);
+	memcpy(buf + dir_len, bpe_name, sizeof(bpe_name));
+
+	return try_bpe_path(buf);
+}
+
 enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 {
 	if (!ctx || !path)
@@ -84,12 +134,20 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 
 	ctx->loaded = 1;
 
+	/* Auto-discover BPE vocab file next to model */
+	char bpe_path[1024];
+	const char *vocab = NULL;
+	if (find_bpe_next_to_model(path, bpe_path, sizeof(bpe_path))) {
+		vocab = bpe_path;
+		sam3_log_info("auto-discovered BPE vocab: %s", bpe_path);
+	}
+
 	/* Initialize processor and load model weights */
 	err = sam3_processor_init(&ctx->proc);
 	if (err != SAM3_OK)
 		return err;
 
-	err = sam3_processor_load(&ctx->proc, path, NULL);
+	err = sam3_processor_load(&ctx->proc, path, vocab);
 	if (err != SAM3_OK) {
 		sam3_processor_free(&ctx->proc);
 		return err;
@@ -97,6 +155,17 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->proc_ready = 1;
 
 	return SAM3_OK;
+}
+
+enum sam3_error sam3_load_bpe(sam3_ctx *ctx, const char *path)
+{
+	if (!ctx || !path)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	return sam3_tokenizer_load_bpe(
+		&ctx->proc.model.backbone.tokenizer, path);
 }
 
 enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
@@ -122,17 +191,22 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
 
 	int target = ctx->config.image_size;
 	if (target <= 0)
-		target = 1024;
+		target = 1008;
 
-	struct sam3_image letterboxed = {0};
-	err = sam3_image_letterbox(&raw, &letterboxed, target);
+	/*
+	 * Resize directly to target x target, matching the Python
+	 * reference: v2.Resize(size=(resolution, resolution)).
+	 * No letterboxing — squash to square like the reference.
+	 */
+	struct sam3_image resized = {0};
+	err = sam3_image_resize(&raw, &resized, target, target);
 	sam3_image_free(&raw);
 	if (err)
 		return err;
 
-	err = sam3_set_image(ctx, letterboxed.pixels,
-			     letterboxed.width, letterboxed.height);
-	sam3_image_free(&letterboxed);
+	err = sam3_set_image(ctx, resized.pixels,
+			     resized.width, resized.height);
+	sam3_image_free(&resized);
 	return err;
 }
 
@@ -153,8 +227,10 @@ void sam3_result_free(struct sam3_result *result)
 		return;
 	free(result->masks);
 	free(result->iou_scores);
+	free(result->boxes);
 	result->masks      = NULL;
 	result->iou_scores = NULL;
+	result->boxes      = NULL;
 	result->n_masks    = 0;
 }
 

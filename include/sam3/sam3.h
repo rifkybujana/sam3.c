@@ -46,6 +46,19 @@ void sam3_free(sam3_ctx *ctx);
 enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path);
 
 /*
+ * sam3_load_bpe - Load BPE vocabulary for text prompt tokenization.
+ *
+ * @ctx:  Context with loaded model
+ * @path: Path to BPE vocabulary file (e.g., bpe_simple_vocab_16e6.txt.gz)
+ *
+ * Without BPE vocab, the tokenizer falls back to byte-level encoding
+ * which produces incorrect tokens. sam3_load_model() auto-discovers
+ * BPE files next to the model, so this is only needed if the BPE
+ * file is in a different location.
+ */
+enum sam3_error sam3_load_bpe(sam3_ctx *ctx, const char *path);
+
+/*
  * sam3_set_image - Set the input image for segmentation.
  *
  * @ctx:    Initialized context with loaded model

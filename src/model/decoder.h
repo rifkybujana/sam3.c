@@ -35,6 +35,11 @@ struct sam3_decoder {
 
 	struct sam3_tensor *query_embed; /* [n_queries, d_model] */
 
+	/* DAB-DETR conditional queries */
+	struct sam3_tensor *reference_points; /* [n_queries, 4] */
+	struct sam3_tensor *rph_fc1_w, *rph_fc1_b; /* ref_point_head layer 1 */
+	struct sam3_tensor *rph_fc2_w, *rph_fc2_b; /* ref_point_head layer 2 */
+
 	/* Output layer norm applied after all layers */
 	struct sam3_tensor *output_ln_w, *output_ln_b;
 
@@ -132,7 +137,9 @@ struct sam3_tensor *sam3_decoder_build(
  * @layer_idx:     Layer index (0 to n_layers-1)
  * @g:             Graph to add nodes to
  * @q:             Query embeddings [n_queries, d_model]
+ * @query_pos:     DAB-DETR position embedding [n_queries, d_model]
  * @enc_features:  Encoder output [n_pixels, d_model]
+ * @enc_pos:       Encoder position embeddings [n_pixels, d_model] (may be NULL)
  * @text_features: Text embeddings [seq_len, d_model]
  * @boxes:         Box accumulator [n_queries, 4] (updated in place)
  * @arena:         Arena for intermediate tensors
@@ -145,10 +152,31 @@ struct sam3_tensor *sam3_decoder_build_layer(
 	int layer_idx,
 	struct sam3_graph *g,
 	struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
 	struct sam3_tensor *enc_features,
+	struct sam3_tensor *enc_pos,
 	struct sam3_tensor *text_features,
 	struct sam3_tensor **boxes,
 	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_compute_query_pos - Compute DAB-DETR conditional query_pos.
+ *
+ * Computes sine position embedding from reference boxes on CPU, then
+ * builds ref_point_head MLP graph nodes. Caller must evaluate graph.
+ *
+ * @dec:       Initialized and loaded decoder
+ * @g:         Graph to add ref_point_head nodes to
+ * @arena:     Arena for intermediate tensors
+ * @ref_boxes: Reference box coordinates after sigmoid [n_queries, 4]
+ *
+ * Returns query_pos [n_queries, d_model], or NULL on error.
+ */
+struct sam3_tensor *sam3_decoder_compute_query_pos(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_arena *arena,
+	const float *ref_boxes);
 
 /*
  * sam3_decoder_build_final - Apply output layer norm after all layers.
@@ -164,6 +192,34 @@ struct sam3_tensor *sam3_decoder_build_final(
 	struct sam3_decoder *dec,
 	struct sam3_graph *g,
 	struct sam3_tensor *q,
+	struct sam3_arena *arena);
+
+/*
+ * Decoder substep builders for debugging. Each builds a single
+ * substep of a decoder layer as a graph. Caller evaluates between
+ * substeps and persists q for the next substep.
+ */
+struct sam3_tensor *sam3_decoder_build_sa(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos, struct sam3_arena *arena);
+
+struct sam3_tensor *sam3_decoder_build_tca(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *text_features, struct sam3_arena *arena);
+
+struct sam3_tensor *sam3_decoder_build_ca(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features, struct sam3_tensor *enc_pos,
+	struct sam3_arena *arena);
+
+struct sam3_tensor *sam3_decoder_build_ffn(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_DECODER_H */

@@ -91,6 +91,9 @@ struct sam3_result {
 	int    mask_height;
 	int    mask_width;
 	int    iou_valid;    /* 1 if iou_scores are model-predicted, 0 if placeholder */
+	float *boxes;        /* Bounding boxes: n_masks * 4 floats (x1,y1,x2,y2 xyxy) */
+	int    boxes_valid;  /* 1 if boxes are computed, 0 if not */
+	int    best_mask;    /* Stability-selected best mask index, -1 if N/A */
 };
 
 /* Model configuration loaded from weights file. */

@@ -84,22 +84,26 @@ static void test_vit_init(void)
 	ASSERT_EQ(vit.grid_size, TEST_GRID_SIZE);
 	ASSERT_EQ(vit.n_patches, TEST_N_PATCHES);
 
-	/* RoPE tables should be allocated */
-	ASSERT(vit.rope_cos != NULL);
-	ASSERT(vit.rope_sin != NULL);
+	/* RoPE tables should be allocated (window + global) */
+	ASSERT(vit.rope_win_cos != NULL);
+	ASSERT(vit.rope_win_sin != NULL);
+	ASSERT(vit.rope_glo_cos != NULL);
+	ASSERT(vit.rope_glo_sin != NULL);
 
 	int head_dim = TEST_EMBED_DIM / TEST_N_HEADS; /* 8 */
 	int half = head_dim / 2;                       /* 4 */
-	ASSERT_EQ(vit.rope_cos->n_dims, 2);
-	ASSERT_EQ(vit.rope_cos->dims[0], TEST_N_PATCHES);
-	ASSERT_EQ(vit.rope_cos->dims[1], half);
-	ASSERT_EQ(vit.rope_sin->n_dims, 2);
-	ASSERT_EQ(vit.rope_sin->dims[0], TEST_N_PATCHES);
-	ASSERT_EQ(vit.rope_sin->dims[1], half);
+
+	/* Both tables have n_patches rows (mask-based windowing) */
+	ASSERT_EQ(vit.rope_win_cos->n_dims, 2);
+	ASSERT_EQ(vit.rope_win_cos->dims[0], TEST_N_PATCHES);
+	ASSERT_EQ(vit.rope_win_cos->dims[1], half);
+	ASSERT_EQ(vit.rope_glo_cos->n_dims, 2);
+	ASSERT_EQ(vit.rope_glo_cos->dims[0], TEST_N_PATCHES);
+	ASSERT_EQ(vit.rope_glo_cos->dims[1], half);
 
 	/* Verify RoPE values are finite */
-	float *cos_data = (float *)vit.rope_cos->data;
-	float *sin_data = (float *)vit.rope_sin->data;
+	float *cos_data = (float *)vit.rope_win_cos->data;
+	float *sin_data = (float *)vit.rope_win_sin->data;
 	for (int i = 0; i < TEST_N_PATCHES * half; i++) {
 		ASSERT(cos_data[i] == cos_data[i]); /* Not NaN */
 		ASSERT(sin_data[i] == sin_data[i]);
@@ -208,6 +212,12 @@ static void test_vit_build_shapes(void)
 	ASSERT_EQ(err, SAM3_OK);
 
 	/* Set layernorm gamma to 1.0 for numerical stability */
+	{
+		float *w;
+		w = (float *)vit.ln_pre_w->data;
+		for (int i = 0; i < TEST_EMBED_DIM; i++)
+			w[i] = 1.0f;
+	}
 	for (int l = 0; l < TEST_DEPTH; l++) {
 		float *w;
 		w = (float *)vit.layers[l].ln1_w->data;
@@ -389,6 +399,12 @@ static void test_vit_windowed_attention(void)
 	ASSERT_EQ(err, SAM3_OK);
 
 	/* Set layernorm gamma to 1.0 for numerical stability */
+	{
+		float *w;
+		w = (float *)vit.ln_pre_w->data;
+		for (int i = 0; i < embed_dim; i++)
+			w[i] = 1.0f;
+	}
 	for (int l = 0; l < depth; l++) {
 		float *w;
 		w = (float *)vit.layers[l].ln1_w->data;

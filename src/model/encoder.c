@@ -24,6 +24,7 @@
 
 #include "encoder.h"
 #include "graph_helpers.h"
+#include "util/log.h"
 
 #define ENC_PREFIX "detector_model.detr_encoder."
 
@@ -344,11 +345,97 @@ enum sam3_error sam3_encoder_fusion_load(struct sam3_encoder_fusion *enc,
 	return SAM3_OK;
 }
 
+/*
+ * encoder_self_attention_with_pos - Self-attention adding pos to Q/K only.
+ *
+ * Python: Q = K = layernorm(x) + pos, V = layernorm(x)
+ *
+ * Splits the fused QKV weight into separate Q/K/V projections so that
+ * Q and K are projected from (x_norm + pos) while V is projected from
+ * x_norm alone (no positional encoding in V).
+ */
+static struct sam3_tensor *encoder_self_attention_with_pos(
+	struct sam3_graph *g, struct sam3_arena *arena,
+	struct sam3_tensor *x_norm,
+	struct sam3_tensor *enc_pos,
+	struct sam3_tensor *qkv_w, struct sam3_tensor *qkv_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int d_model, int n_heads)
+{
+	int head_dim = d_model / n_heads;
+
+	/* x_pos = x_norm + pos: source for Q and K */
+	struct sam3_tensor *x_pos = gh_add(g, arena, x_norm, enc_pos);
+	if (!x_pos)
+		return NULL;
+
+	/*
+	 * Split fused QKV weight [3d, d] into Q_w [d, d], K_w [d, d],
+	 * V_w [d, d] and bias [3d] into Q_b [d], K_b [d], V_b [d].
+	 */
+	struct sam3_tensor *q_w, *k_w, *v_w;
+	struct sam3_tensor *q_b, *k_b, *v_b;
+
+	q_w = gh_slice(g, arena, qkv_w, 0, 0, d_model);
+	k_w = gh_slice(g, arena, qkv_w, 0, d_model, 2 * d_model);
+	v_w = gh_slice(g, arena, qkv_w, 0, 2 * d_model, 3 * d_model);
+	if (!q_w || !k_w || !v_w)
+		return NULL;
+
+	q_b = gh_slice(g, arena, qkv_b, 0, 0, d_model);
+	k_b = gh_slice(g, arena, qkv_b, 0, d_model, 2 * d_model);
+	v_b = gh_slice(g, arena, qkv_b, 0, 2 * d_model, 3 * d_model);
+	if (!q_b || !k_b || !v_b)
+		return NULL;
+
+	/* Q and K from x_pos, V from x_norm (no pos) */
+	struct sam3_tensor *q = gh_linear(g, arena, x_pos, q_w, q_b);
+	struct sam3_tensor *k = gh_linear(g, arena, x_pos, k_w, k_b);
+	struct sam3_tensor *v = gh_linear(g, arena, x_norm, v_w, v_b);
+	if (!q || !k || !v)
+		return NULL;
+
+	/* Per-head SDPA */
+	struct sam3_tensor *head_outs[64];
+	for (int h = 0; h < n_heads; h++) {
+		int hstart = h * head_dim;
+		int hend = hstart + head_dim;
+
+		struct sam3_tensor *hq, *hk, *hv;
+		hq = gh_slice(g, arena, q, 1, hstart, hend);
+		hk = gh_slice(g, arena, k, 1, hstart, hend);
+		hv = gh_slice(g, arena, v, 1, hstart, hend);
+		if (!hq || !hk || !hv)
+			return NULL;
+
+		struct sam3_tensor *ho;
+		ho = gh_sdpa(g, arena, hq, hk, hv, NULL, head_dim);
+		if (!ho)
+			return NULL;
+
+		head_outs[h] = ho;
+	}
+
+	/* Concatenate heads: [n_pixels, d_model] */
+	struct sam3_tensor *merged;
+	if (n_heads == 1) {
+		merged = head_outs[0];
+	} else {
+		merged = gh_concat(g, arena, head_outs, n_heads, 1);
+		if (!merged)
+			return NULL;
+	}
+
+	/* Output projection */
+	return gh_linear(g, arena, merged, out_w, out_b);
+}
+
 struct sam3_tensor *sam3_encoder_fusion_build_layer(
 	struct sam3_encoder_fusion *enc,
 	int layer_idx,
 	struct sam3_graph *g,
 	struct sam3_tensor *x,
+	struct sam3_tensor *enc_pos,
 	struct sam3_tensor *text_features,
 	struct sam3_arena *arena)
 {
@@ -357,7 +444,7 @@ struct sam3_tensor *sam3_encoder_fusion_build_layer(
 
 	/*
 	 * Step 1: Self-attention on image features.
-	 * Pre-norm, multihead attention, residual.
+	 * Pre-norm, then Q=K=x+pos, V=x (if pos provided), residual.
 	 */
 	struct sam3_tensor *x_norm;
 	x_norm = gh_layernorm(g, arena, x,
@@ -366,22 +453,32 @@ struct sam3_tensor *sam3_encoder_fusion_build_layer(
 	if (!x_norm)
 		return NULL;
 
-	/* Reshape to 3D for gh_multihead_attention */
-	int attn_dims[] = {1, n_pixels, enc->d_model};
-	struct sam3_tensor *x3d;
-	x3d = gh_reshape(g, arena, x_norm, 3, attn_dims);
-	if (!x3d)
-		return NULL;
-
 	struct sam3_tensor *sa_out;
-	sa_out = gh_multihead_attention(
-		g, arena,
-		x3d, x3d, x3d,
-		enc->layers[i].sa_qkv_w,
-		enc->layers[i].sa_qkv_b,
-		enc->layers[i].sa_out_w,
-		enc->layers[i].sa_out_b,
-		enc->n_heads);
+	if (enc_pos) {
+		sa_out = encoder_self_attention_with_pos(
+			g, arena, x_norm, enc_pos,
+			enc->layers[i].sa_qkv_w,
+			enc->layers[i].sa_qkv_b,
+			enc->layers[i].sa_out_w,
+			enc->layers[i].sa_out_b,
+			enc->d_model, enc->n_heads);
+	} else {
+		/* Reshape to 3D for gh_multihead_attention */
+		int attn_dims[] = {1, n_pixels, enc->d_model};
+		struct sam3_tensor *x3d;
+		x3d = gh_reshape(g, arena, x_norm, 3, attn_dims);
+		if (!x3d)
+			return NULL;
+
+		sa_out = gh_multihead_attention(
+			g, arena,
+			x3d, x3d, x3d,
+			enc->layers[i].sa_qkv_w,
+			enc->layers[i].sa_qkv_b,
+			enc->layers[i].sa_out_w,
+			enc->layers[i].sa_out_b,
+			enc->n_heads);
+	}
 	if (!sa_out)
 		return NULL;
 
@@ -450,8 +547,15 @@ struct sam3_tensor *sam3_encoder_fusion_build_final(
 	struct sam3_tensor *x,
 	struct sam3_arena *arena)
 {
-	return gh_layernorm(g, arena, x,
-			     enc->final_ln_w, enc->final_ln_b);
+	/*
+	 * The DETR encoder has no top-level layer norm in the
+	 * checkpoint — return the input unchanged. A LayerNorm
+	 * with w=1/b=0 is NOT identity (it still normalizes).
+	 */
+	(void)enc;
+	(void)g;
+	(void)arena;
+	return x;
 }
 
 struct sam3_tensor *sam3_encoder_fusion_build(
@@ -465,6 +569,7 @@ struct sam3_tensor *sam3_encoder_fusion_build(
 
 	for (int i = 0; i < enc->n_layers; i++) {
 		x = sam3_encoder_fusion_build_layer(enc, i, g, x,
+						     NULL, /* enc_pos */
 						     text_features, arena);
 		if (!x)
 			return NULL;

@@ -93,20 +93,17 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
  * @g:              Graph to add nodes to
  * @queries:        DETR decoder output [n_queries, d_model]
  * @encoder_states: Encoder output [seq, d_model] (seq = enc_h * enc_w)
- * @feat_1x:        Backbone feature at 1× [1, d, H1, W1]
  * @feat_2x:        Backbone feature at 2× [1, d, H2, W2]
  * @feat_4x:        Backbone feature at 4× [1, d, H4, W4]
- * @enc_h, enc_w:   Spatial dims of encoder output
- * @text_features:  Text encoder output [n_text, d_model], or NULL
+ * @enc_h, enc_w:   Spatial dims of encoder output (72×72)
  * @arena:          Arena for intermediate tensors
  *
  * Pipeline:
- *  1. (Optional) prompt cross-attention on encoder_states
- *  2. Reshape encoder_states to [1, d, enc_h, enc_w]
- *  3. FPN: interpolate + skip add + 3×3 conv + GroupNorm(8) + ReLU (×3)
- *  4. Instance projection: 1×1 conv on pixel features
- *  5. Mask embedder: 3-layer MLP on queries
- *  6. Dot product: mask_embed @ instance_features → mask logits
+ *  1. Reshape encoder_states to [1, d, enc_h, enc_w] (72×72)
+ *  2. FPN: interpolate + skip add + 3×3 conv + GroupNorm(8) + ReLU (×2)
+ *  3. Instance projection: 1×1 conv on pixel features
+ *  4. Mask embedder: 3-layer MLP on queries
+ *  5. Dot product: mask_embed @ instance_features → mask logits
  *
  * Returns mask logits [n_queries, final_h, final_w], or NULL on error.
  */
@@ -115,7 +112,6 @@ struct sam3_tensor *sam3_seg_head_build(
 	struct sam3_graph *g,
 	struct sam3_tensor *queries,
 	struct sam3_tensor *encoder_states,
-	struct sam3_tensor *feat_1x,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	int enc_h, int enc_w,
@@ -143,6 +139,15 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
 	struct sam3_tensor *text_features,
 	struct sam3_arena *arena);
 
+/* Build FPN pixel decoder only (no instance projection). */
+struct sam3_tensor *sam3_seg_head_build_pixel_decoder(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena);
+
 /*
  * sam3_seg_head_build_fpn - Build FPN pixel decoder + instance projection.
  *
@@ -150,8 +155,7 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
  *
  * @head:     Loaded seg head
  * @g:        Graph to add nodes to
- * @enc_nchw: Encoder output in NCHW [1, d, enc_h, enc_w]
- * @feat_1x:  Backbone feature at 1× [1, d, H1, W1]
+ * @enc_nchw: Encoder output in NCHW [1, d, 72, 72]
  * @feat_2x:  Backbone feature at 2× [1, d, H2, W2]
  * @feat_4x:  Backbone feature at 4× [1, d, H4, W4]
  * @arena:    Arena for intermediate tensors
@@ -162,7 +166,6 @@ struct sam3_tensor *sam3_seg_head_build_fpn(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
 	struct sam3_tensor *enc_nchw,
-	struct sam3_tensor *feat_1x,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *arena);

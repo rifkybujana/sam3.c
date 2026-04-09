@@ -106,7 +106,8 @@ endif()
 add_executable(sam3_main tools/sam3_main.c)
 target_link_libraries(sam3_main sam3)
 
-add_executable(sam3_convert tools/sam3_convert.c)
+add_executable(sam3_convert tools/sam3_convert.c tools/weight_rename.c)
+target_include_directories(sam3_convert PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_convert sam3)
 
 # Tests
@@ -123,6 +124,19 @@ if(SAM3_TESTS)
 	# test_trace needs trace enabled regardless of global setting
 	if(TARGET test_trace)
 		target_compile_definitions(test_trace PRIVATE SAM3_HAS_TRACE)
+	endif()
+
+	# test_weight_rename needs weight_rename.c and tools/ include path
+	if(TARGET test_weight_rename)
+		target_sources(test_weight_rename PRIVATE tools/weight_rename.c)
+		target_include_directories(test_weight_rename PRIVATE
+			${CMAKE_SOURCE_DIR}/tools)
+	endif()
+
+	# test_fixture_compare needs to find fixtures and model at build time
+	if(TARGET test_fixture_compare)
+		target_compile_definitions(test_fixture_compare PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 endif()
 

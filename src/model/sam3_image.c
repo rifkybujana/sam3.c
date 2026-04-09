@@ -23,6 +23,145 @@
 #include "graph_helpers.h"
 #include "util/log.h"
 
+/* ── CPU helpers for decoder box refinement ──────────────────────── */
+
+/*
+ * cpu_layernorm_f32 - Apply LayerNorm on CPU.
+ *
+ * src [N, d] → dst [N, d], using weight w[d] and bias b[d].
+ */
+static void cpu_layernorm_f32(const float *src, const float *w,
+			       const float *b, int N, int d, float *dst)
+{
+	const float eps = 1e-5f;
+	for (int i = 0; i < N; i++) {
+		const float *row = src + i * d;
+		float *out = dst + i * d;
+		float mean = 0, var = 0;
+		for (int j = 0; j < d; j++)
+			mean += row[j];
+		mean /= (float)d;
+		for (int j = 0; j < d; j++) {
+			float diff = row[j] - mean;
+			var += diff * diff;
+		}
+		var /= (float)d;
+		float inv_std = 1.0f / sqrtf(var + eps);
+		for (int j = 0; j < d; j++)
+			out[j] = (row[j] - mean) * inv_std * w[j] + b[j];
+	}
+}
+
+/*
+ * cpu_linear_f32 - Compute dst = src × W^T + b on CPU.
+ *
+ * src [M, K], W [N, K] (row-major), b [N], dst [M, N].
+ */
+static void cpu_linear_f32(const float *src, const float *W,
+			    const float *b, int M, int K, int N,
+			    float *dst)
+{
+	for (int i = 0; i < M; i++) {
+		for (int j = 0; j < N; j++) {
+			float s = b ? b[j] : 0.0f;
+			const float *a = src + i * K;
+			const float *wj = W + j * K;
+			for (int k = 0; k < K; k++)
+				s += a[k] * wj[k];
+			dst[i * N + j] = s;
+		}
+	}
+}
+
+/*
+ * cpu_linear_relu_f32 - Linear + ReLU on CPU.
+ */
+static void cpu_linear_relu_f32(const float *src, const float *W,
+				 const float *b, int M, int K, int N,
+				 float *dst)
+{
+	cpu_linear_f32(src, W, b, M, K, N, dst);
+	int n = M * N;
+	for (int i = 0; i < n; i++)
+		if (dst[i] < 0.0f)
+			dst[i] = 0.0f;
+}
+
+/*
+ * cpu_inverse_sigmoid - Compute logit from probability.
+ *
+ * Returns log(clamp(x, eps) / clamp(1-x, eps)).
+ * Matches Python's inverse_sigmoid(x, eps=1e-3).
+ */
+static inline float cpu_inverse_sigmoid(float x)
+{
+	const float eps = 1e-3f;
+	float x1 = x > eps ? x : eps;
+	float x2 = (1.0f - x) > eps ? (1.0f - x) : eps;
+	return logf(x1 / x2);
+}
+
+/*
+ * cpu_box_refine - Apply box head MLP and update reference boxes.
+ *
+ * Applies output_ln to queries, runs box_head MLP, then updates
+ * ref_boxes via: sigmoid(inverse_sigmoid(old_ref) + delta).
+ * Matches Python's iterative box refinement with
+ * use_normed_output_consistently=True.
+ *
+ * @q:         Query embeddings [nq, d] (raw, before output_ln)
+ * @dec:       Decoder (for weights)
+ * @ref_boxes: Reference boxes [nq, 4] — updated in place
+ * @nq:        Number of queries
+ * @d:         Model dimension
+ * @tmp1:      Scratch buffer [nq * max(d, 4)]
+ * @tmp2:      Scratch buffer [nq * d]
+ */
+static void cpu_box_refine(const float *q,
+			    const struct sam3_decoder *dec,
+			    float *ref_boxes, int nq, int d,
+			    float *tmp1, float *tmp2)
+{
+	/* Step 1: LayerNorm(q) using output_ln weights */
+	cpu_layernorm_f32(q,
+		(const float *)dec->output_ln_w->data,
+		(const float *)dec->output_ln_b->data,
+		nq, d, tmp1);
+
+	/* Step 2: box_head MLP (3 layers, ReLU on first two) */
+	cpu_linear_relu_f32(tmp1,
+		(const float *)dec->layers[0].box_fc1_w->data,
+		(const float *)dec->layers[0].box_fc1_b->data,
+		nq, d, d, tmp2);
+	cpu_linear_relu_f32(tmp2,
+		(const float *)dec->layers[0].box_fc2_w->data,
+		(const float *)dec->layers[0].box_fc2_b->data,
+		nq, d, d, tmp1);
+	cpu_linear_f32(tmp1,
+		(const float *)dec->layers[0].box_fc3_w->data,
+		(const float *)dec->layers[0].box_fc3_b->data,
+		nq, d, 4, tmp2); /* delta [nq, 4] in tmp2 */
+
+	/* Step 3: ref_boxes = sigmoid(inverse_sigmoid(old) + delta) */
+	for (int j = 0; j < nq * 4; j++) {
+		float logit = cpu_inverse_sigmoid(ref_boxes[j]);
+		ref_boxes[j] = 1.0f / (1.0f + expf(-(logit + tmp2[j])));
+	}
+}
+
+/* Debug: dump a tensor to a raw binary file for Python comparison */
+static void dump_tensor(const char *path, const struct sam3_tensor *t)
+{
+	int n = 1;
+	for (int i = 0; i < t->n_dims; i++)
+		n *= t->dims[i];
+	FILE *fp = fopen(path, "wb");
+	if (!fp) return;
+	fwrite(t->data, sizeof(float), (size_t)n, fp);
+	fclose(fp);
+	sam3_log_info("dump: wrote %s (%d floats)", path, n);
+}
+
 enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
 				      struct sam3_arena *arena)
 {
@@ -60,9 +199,10 @@ enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
 	if (err != SAM3_OK)
 		return err;
 
-	/* Objectness scorer config (weights loaded separately) */
-	model->scorer.input_dim = 256;
-	model->scorer.hidden_dim = 256;
+	/* Dot-product scorer config (weights loaded separately) */
+	model->scorer.d_model = 256;
+	model->scorer.d_proj = 256;
+	model->scorer.d_ffn = 2048;
 
 	return SAM3_OK;
 }
@@ -235,13 +375,36 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 		sam3_log_debug("encode: nchw manual transpose done "
 			"[%d,%d,%d,%d]", 1, C, gs, gs);
 
+		/* Dump raw ViT NCHW for debugging */
+		{
+			int nchw_sd2[] = {1, C, gs, gs};
+			struct sam3_tensor tmp;
+			tmp.dtype = SAM3_DTYPE_F32;
+			tmp.n_dims = 4;
+			for (int k = 0; k < 4; k++) tmp.dims[k] = nchw_sd2[k];
+			tmp.data = nchw_buf;
+			tmp.nbytes = nchw_bytes;
+			dump_tensor("/tmp/dbg_vit_nchw.bin", &tmp);
+		}
+
 		/* Step 2: Evaluate each stage independently */
 		struct sam3_tensor *stage_out[4] = {0};
 
 		for (int si = 0; si < model->backbone.neck.n_scales; si++) {
+			/*
+			 * Copy nchw_buf for each stage to prevent
+			 * cross-stage corruption. The backend may
+			 * reuse or invalidate input buffers after
+			 * graph_eval.
+			 */
+			void *stage_nchw = sam3_arena_alloc(scratch,
+							    nchw_bytes);
+			if (!stage_nchw) return SAM3_ENOMEM;
+			memcpy(stage_nchw, nchw_buf, nchw_bytes);
+
 			struct sam3_tensor *nchw_in;
 			nchw_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
-						  4, nchw_dims, nchw_buf);
+						  4, nchw_dims, stage_nchw);
 			if (!nchw_in) return SAM3_ENOMEM;
 
 			struct sam3_tensor *x = nchw_in;
@@ -382,6 +545,11 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 		model->cached_feat_s1 = pf[2];
 		model->cached_image_features = pf[3];
 
+		dump_tensor("/tmp/dbg_neck_4x.bin", pf[0]);
+		dump_tensor("/tmp/dbg_neck_2x.bin", pf[1]);
+		dump_tensor("/tmp/dbg_neck_1x.bin", pf[2]);
+		dump_tensor("/tmp/dbg_neck_05x.bin", pf[3]);
+
 		sam3_log_debug("encode: cached features: main [%d,%d,%d,%d]"
 			       " s0 [%d,%d,%d,%d] s1 [%d,%d,%d,%d]"
 			       " 4x [%d,%d,%d,%d]",
@@ -500,49 +668,480 @@ enum sam3_error sam3_image_model_segment(
 	persist_save = persist->offset;
 
 	/*
-	 * Reshape cached image features from NCHW [1, C, H, W] to
-	 * [H*W, d_model]. The neck stores features in NCHW but all
-	 * downstream modules expect [n_pixels, d_model].
+	 * Reshape 1× backbone features from NCHW [1, C, H, W] to
+	 * [H*W, d_model]. The Python model feeds the 72×72 (1×)
+	 * features to the encoder, not the 36×36 (0.5×) features.
+	 * All downstream modules expect [n_pixels, d_model].
 	 */
-	img_2d = nchw_to_2d(persist, model->cached_image_features);
+	img_2d = nchw_to_2d(persist, model->cached_feat_s1);
 	if (!img_2d)
 		return SAM3_ENOMEM;
 
 	/*
-	 * Stage 1: Geometry encoder — cross-attend prompt tokens to
-	 * cached image features. Output is [N+1, d_model].
+	 * Stage 1: Geometry encoder — full transformer encoder attending
+	 * prompt tokens to cached image features. Output is [N+1, d_model].
+	 *
+	 * Python order:
+	 *   1. Append CLS token after prompt embeddings
+	 *   2. Pre-encoder: final_proj (Linear) + norm (LayerNorm)
+	 *   3. 3 encoder layers: self-attn → cross-attn → FFN
+	 *   4. Post-encoder: encode_norm (LayerNorm)
+	 *
+	 * Cross-attention uses pos_enc_at_cross_attn_keys=True:
+	 *   key = image_features + pos_enc,  value = image_features
 	 */
 	if (prompt_tokens) {
-		sam3_arena_reset(scratch);
-		sam3_graph_init(&g);
+		struct sam3_geometry_encoder *enc = &model->geom_enc;
+		int d = enc->d_model;
+		int n_heads = enc->n_heads;
+		int head_dim = d / n_heads;
 
-		geom_out = sam3_geometry_encoder_build(
-			&model->geom_enc, &g,
-			prompt_tokens,
-			img_2d,
-			scratch);
-		if (!geom_out) {
-			err = SAM3_ENOMEM;
-			goto fail;
+		/* Get position encoding [H, W, d] → flatten to [H*W, d] */
+		struct sam3_tensor *pe_t;
+		pe_t = sam3_pos_encoding_get(&model->backbone.pos_enc);
+		int pe_hw = pe_t->dims[0] * pe_t->dims[1];
+
+		/*
+		 * Pre-compute img_with_pos = img_2d + pos for cross-attn
+		 * keys. Persisted since it's reused across all layers.
+		 */
+		struct sam3_tensor *img_with_pos;
+		img_with_pos = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						2, img_2d->dims);
+		if (!img_with_pos) { err = SAM3_ENOMEM; goto fail; }
+		{
+			const float *id = (const float *)img_2d->data;
+			const float *pd = (const float *)pe_t->data;
+			float *od = (float *)img_with_pos->data;
+			int n = pe_hw * d;
+			for (int j = 0; j < n; j++)
+				od[j] = id[j] + pd[j];
 		}
 
-		err = be->ops->graph_eval(be, &g);
-		if (err != SAM3_OK) {
-			sam3_log_error("segment: geom eval failed: %d",
-				       err);
-			goto fail;
+		/* Step 1: Append CLS token after prompt tokens.
+		 * Python: concat_padded_sequences(point_embeds, ..., cls, ...)
+		 * Result order: [prompt_0, ..., prompt_n, CLS]
+		 */
+		struct sam3_tensor *x;
+		{
+			int xdims[2] = {prompt_tokens->dims[0] +
+					enc->cls_token->dims[0],
+					d};
+			x = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+					     2, xdims);
+			if (!x) { err = SAM3_ENOMEM; goto fail; }
+			size_t pt_bytes = (size_t)prompt_tokens->dims[0]
+				* (size_t)d * sizeof(float);
+			size_t cls_bytes = (size_t)enc->cls_token->dims[0]
+				* (size_t)d * sizeof(float);
+			memcpy(x->data, prompt_tokens->data, pt_bytes);
+			memcpy((char *)x->data + pt_bytes,
+			       enc->cls_token->data, cls_bytes);
 		}
 
-		geom_out = persist_tensor(persist, geom_out);
-		if (!geom_out) {
-			err = SAM3_ENOMEM;
-			goto fail;
+		dump_tensor("/tmp/dbg_geom_after_concat.bin", x);
+
+		/*
+		 * Step 2: Pre-encoder projection + LayerNorm.
+		 * Python: final_embeds = self.norm(self.final_proj(final_embeds))
+		 *
+		 * Manual CPU matmul to avoid Metal backend issues
+		 * with small [2, 256] tensors.
+		 */
+		{
+			int nrows = x->dims[0];
+			struct sam3_tensor *proj;
+			proj = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						2, x->dims);
+			if (!proj) { err = SAM3_ENOMEM; goto fail; }
+
+			const float *xd = (const float *)x->data;
+			const float *wd = (const float *)enc->post_proj_w->data;
+			const float *bd = (const float *)enc->post_proj_b->data;
+			float *od = (float *)proj->data;
+
+			/* out[r,c] = sum(x[r,k] * W[c,k]) + b[c] */
+			for (int r = 0; r < nrows; r++) {
+				for (int c = 0; c < d; c++) {
+					float sum = bd[c];
+					for (int k = 0; k < d; k++)
+						sum += xd[r * d + k] * wd[c * d + k];
+					od[r * d + c] = sum;
+				}
+			}
+			x = proj;
+		}
+		dump_tensor("/tmp/dbg_geom_after_proj.bin", x);
+		{
+			/*
+			 * LayerNorm on CPU — Metal can't read CPU-arena
+			 * tensors as graph inputs.
+			 */
+			int nrows = x->dims[0];
+			const float *gw = (const float *)enc->norm_w->data;
+			const float *gb = (const float *)enc->norm_b->data;
+			float *xd = (float *)x->data;
+			const float eps = 1e-5f;
+
+			for (int r = 0; r < nrows; r++) {
+				float *row = xd + r * d;
+				double sum = 0.0, sum2 = 0.0;
+				for (int c = 0; c < d; c++) {
+					sum += (double)row[c];
+					sum2 += (double)row[c] * (double)row[c];
+				}
+				double mean = sum / d;
+				double var = sum2 / d - mean * mean;
+				double inv = 1.0 / sqrt(var + eps);
+				for (int c = 0; c < d; c++)
+					row[c] = (float)(((double)row[c] - mean) *
+						  inv) * gw[c] + gb[c];
+			}
+		}
+
+		dump_tensor("/tmp/dbg_geom_pre_enc.bin", x);
+
+		/*
+		 * Step 3: Transformer encoder layers (CPU path).
+		 *
+		 * The geometry encoder has only 2 tokens — Metal/MLX
+		 * SDPA kernels degenerate on such tiny inputs, so we
+		 * run the full 3-layer encoder on CPU.
+		 */
+#define GEOM_NROWS_MAX 8	/* CLS + up to 7 prompts */
+		{
+		int nq = x->dims[0];    /* 2 typically */
+		int nkv = img_2d->dims[0]; /* 5184 */
+
+		/* Scratch buffers on the arena (freed after loop) */
+		size_t sa_save = persist->offset;
+		float *buf_norm = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_qkv = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * 3 * (size_t)d * sizeof(float));
+		float *buf_attn = (float *)sam3_arena_alloc(
+			persist, (size_t)n_heads * (size_t)nq * (size_t)nq * sizeof(float));
+		float *buf_sa = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_q = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_k = (float *)sam3_arena_alloc(
+			persist, (size_t)nkv * (size_t)d * sizeof(float));
+		float *buf_v = (float *)sam3_arena_alloc(
+			persist, (size_t)nkv * (size_t)d * sizeof(float));
+		float *buf_ca = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_ff1 = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * 2048 * sizeof(float));
+		float *buf_ff2 = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		if (!buf_norm || !buf_qkv || !buf_attn || !buf_sa ||
+		    !buf_q || !buf_k || !buf_v || !buf_ca ||
+		    !buf_ff1 || !buf_ff2) {
+			err = SAM3_ENOMEM; goto fail;
+		}
+
+		float *xd = (float *)x->data;
+		const float eps = 1e-5f;
+		const float scale = 1.0f / sqrtf((float)head_dim);
+
+		for (int li = 0; li < enc->n_layers; li++) {
+			/* --- 3a: Self-attention --- */
+			/* LayerNorm: buf_norm = LN(xd) */
+			{
+				const float *gw = (const float *)enc->layers[li].norm1_w->data;
+				const float *gb = (const float *)enc->layers[li].norm1_b->data;
+				for (int r = 0; r < nq; r++) {
+					const float *row = xd + r * d;
+					double s = 0, s2 = 0;
+					for (int c = 0; c < d; c++) {
+						s += (double)row[c];
+						s2 += (double)row[c] * (double)row[c];
+					}
+					double m = s / d, v2 = s2 / d - m * m;
+					double inv = 1.0 / sqrt(v2 + eps);
+					for (int c = 0; c < d; c++)
+						buf_norm[r * d + c] = (float)(((double)row[c] - m) * inv) * gw[c] + gb[c];
+				}
+			}
+			/* QKV projection: buf_qkv = buf_norm @ sa_qkv_w^T + sa_qkv_b */
+			{
+				const float *w = (const float *)enc->layers[li].sa_qkv_w->data;
+				const float *b = (const float *)enc->layers[li].sa_qkv_b->data;
+				int d3 = 3 * d;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d3; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_norm[r * d + k] * w[c * d + k];
+						buf_qkv[r * d3 + c] = sum;
+					}
+				}
+			}
+			/* Per-head SDPA: softmax(Q@K^T / sqrt(dh)) @ V */
+			for (int h = 0; h < n_heads; h++) {
+				int hs = h * head_dim;
+				/* Score matrix [nq, nq] */
+				for (int qi = 0; qi < nq; qi++) {
+					float maxs = -1e30f;
+					for (int ki = 0; ki < nq; ki++) {
+						float dot = 0;
+						for (int c = 0; c < head_dim; c++)
+							dot += buf_qkv[qi * 3 * d + hs + c] *
+							       buf_qkv[ki * 3 * d + d + hs + c];
+						dot *= scale;
+						buf_attn[h * nq * nq + qi * nq + ki] = dot;
+						if (dot > maxs) maxs = dot;
+					}
+					/* Softmax */
+					float sexp = 0;
+					for (int ki = 0; ki < nq; ki++) {
+						float e = expf(buf_attn[h * nq * nq + qi * nq + ki] - maxs);
+						buf_attn[h * nq * nq + qi * nq + ki] = e;
+						sexp += e;
+					}
+					float inv_s = 1.0f / sexp;
+					for (int ki = 0; ki < nq; ki++)
+						buf_attn[h * nq * nq + qi * nq + ki] *= inv_s;
+				}
+				/* Weighted sum of V */
+				for (int qi = 0; qi < nq; qi++) {
+					for (int c = 0; c < head_dim; c++) {
+						float sum = 0;
+						for (int ki = 0; ki < nq; ki++)
+							sum += buf_attn[h * nq * nq + qi * nq + ki] *
+							       buf_qkv[ki * 3 * d + 2 * d + hs + c];
+						buf_sa[qi * d + hs + c] = sum;
+					}
+				}
+			}
+			/* Output projection + residual */
+			{
+				const float *w = (const float *)enc->layers[li].sa_out_w->data;
+				const float *b = (const float *)enc->layers[li].sa_out_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_sa[r * d + k] * w[c * d + k];
+						xd[r * d + c] += sum; /* residual */
+					}
+				}
+			}
+			if (li == 0)
+				dump_tensor("/tmp/dbg_geom_l0_sa.bin", x);
+
+			/* --- 3b: Cross-attention --- */
+			/* LayerNorm: buf_norm = LN(xd) using ca_ln */
+			{
+				const float *gw = (const float *)enc->layers[li].ca_ln_w->data;
+				const float *gb = (const float *)enc->layers[li].ca_ln_b->data;
+				for (int r = 0; r < nq; r++) {
+					const float *row = xd + r * d;
+					double s = 0, s2 = 0;
+					for (int c = 0; c < d; c++) {
+						s += (double)row[c];
+						s2 += (double)row[c] * (double)row[c];
+					}
+					double m = s / d, v2 = s2 / d - m * m;
+					double inv = 1.0 / sqrt(v2 + eps);
+					for (int c = 0; c < d; c++)
+						buf_norm[r * d + c] = (float)(((double)row[c] - m) * inv) * gw[c] + gb[c];
+				}
+			}
+			/* Q = buf_norm @ ca_q_w^T + ca_q_b */
+			{
+				const float *w = (const float *)enc->layers[li].ca_q_w->data;
+				const float *b = (const float *)enc->layers[li].ca_q_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_norm[r * d + k] * w[c * d + k];
+						buf_q[r * d + c] = sum;
+					}
+				}
+			}
+			/* K = img_with_pos @ k_w^T + k_b (first half of ca_kv) */
+			/* V = img_2d @ v_w^T + v_b (second half of ca_kv) */
+			{
+				const float *kv_w = (const float *)enc->layers[li].ca_kv_w->data;
+				const float *kv_b = (const float *)enc->layers[li].ca_kv_b->data;
+				/* kv_w is [2d, d], k_w = [0:d, :], v_w = [d:2d, :] */
+				const float *kw = kv_w;
+				const float *vw = kv_w + d * d;
+				const float *kb = kv_b;
+				const float *vb = kv_b + d;
+				const float *img_pos_d = (const float *)img_with_pos->data;
+				const float *img_d = (const float *)img_2d->data;
+
+				for (int r = 0; r < nkv; r++) {
+					for (int c = 0; c < d; c++) {
+						float ks = kb[c], vs = vb[c];
+						for (int k = 0; k < d; k++) {
+							ks += img_pos_d[r * d + k] * kw[c * d + k];
+							vs += img_d[r * d + k] * vw[c * d + k];
+						}
+						buf_k[r * d + c] = ks;
+						buf_v[r * d + c] = vs;
+					}
+				}
+			}
+			/* Per-head cross-SDPA: softmax(Q@K^T / sqrt(dh)) @ V */
+			for (int h = 0; h < n_heads; h++) {
+				int hs = h * head_dim;
+				for (int qi = 0; qi < nq; qi++) {
+					/* For each query, compute attention over all KV */
+					float maxs = -1e30f;
+					/* We need [nq, nkv] scores — too big for stack.
+					 * Process one query row at a time streaming. */
+					/* Pass 1: find max score for numerical stability */
+					for (int ki = 0; ki < nkv; ki++) {
+						float dot = 0;
+						for (int c = 0; c < head_dim; c++)
+							dot += buf_q[qi * d + hs + c] *
+							       buf_k[ki * d + hs + c];
+						dot *= scale;
+						if (dot > maxs) maxs = dot;
+					}
+					/* Pass 2: compute exp sums and weighted V */
+					float sexp = 0;
+					float vsum[64]; /* head_dim max 64 */
+					for (int c = 0; c < head_dim; c++)
+						vsum[c] = 0;
+					for (int ki = 0; ki < nkv; ki++) {
+						float dot = 0;
+						for (int c = 0; c < head_dim; c++)
+							dot += buf_q[qi * d + hs + c] *
+							       buf_k[ki * d + hs + c];
+						float e = expf(dot * scale - maxs);
+						sexp += e;
+						for (int c = 0; c < head_dim; c++)
+							vsum[c] += e * buf_v[ki * d + hs + c];
+					}
+					float inv_s = 1.0f / sexp;
+					for (int c = 0; c < head_dim; c++)
+						buf_ca[qi * d + hs + c] = vsum[c] * inv_s;
+				}
+			}
+			/* Output projection + residual */
+			{
+				const float *w = (const float *)enc->layers[li].ca_out_w->data;
+				const float *b = (const float *)enc->layers[li].ca_out_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_ca[r * d + k] * w[c * d + k];
+						xd[r * d + c] += sum;
+					}
+				}
+			}
+			if (li == 0)
+				dump_tensor("/tmp/dbg_geom_l0_ca.bin", x);
+
+			/* --- 3c: FFN: norm3 → fc1 → relu → fc2 → residual --- */
+			/* LayerNorm */
+			{
+				const float *gw = (const float *)enc->layers[li].norm3_w->data;
+				const float *gb = (const float *)enc->layers[li].norm3_b->data;
+				for (int r = 0; r < nq; r++) {
+					const float *row = xd + r * d;
+					double s = 0, s2 = 0;
+					for (int c = 0; c < d; c++) {
+						s += (double)row[c];
+						s2 += (double)row[c] * (double)row[c];
+					}
+					double m = s / d, v2 = s2 / d - m * m;
+					double inv = 1.0 / sqrt(v2 + eps);
+					for (int c = 0; c < d; c++)
+						buf_norm[r * d + c] = (float)(((double)row[c] - m) * inv) * gw[c] + gb[c];
+				}
+			}
+			/* fc1: [nq, d] → [nq, 2048] + relu */
+			{
+				const float *w = (const float *)enc->layers[li].ffn_fc1_w->data;
+				const float *b = (const float *)enc->layers[li].ffn_fc1_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < 2048; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_norm[r * d + k] * w[c * d + k];
+						buf_ff1[r * 2048 + c] = sum > 0 ? sum : 0; /* relu */
+					}
+				}
+			}
+			/* fc2: [nq, 2048] → [nq, d] + residual */
+			{
+				const float *w = (const float *)enc->layers[li].ffn_fc2_w->data;
+				const float *b = (const float *)enc->layers[li].ffn_fc2_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < 2048; k++)
+							sum += buf_ff1[r * 2048 + k] * w[c * 2048 + k];
+						xd[r * d + c] += sum;
+					}
+				}
+			}
+
+			sam3_log_debug("geom: layer %d done", li);
+			{
+				char dpath[64];
+				snprintf(dpath, sizeof(dpath),
+					 "/tmp/dbg_geom_layer_%02d.bin", li);
+				dump_tensor(dpath, x);
+			}
+		}
+		/* Reclaim scratch buffers */
+		persist->offset = sa_save;
+		/* Re-allocate x as a proper persist tensor */
+		{
+			struct sam3_tensor *xp;
+			xp = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+					      2, x->dims);
+			if (!xp) { err = SAM3_ENOMEM; goto fail; }
+			memcpy(xp->data, x->data, x->nbytes);
+			x = xp;
+		}
+		}
+#undef GEOM_NROWS_MAX
+
+		/* Step 4: Post-encoder LayerNorm (encode_norm) — CPU */
+		{
+			int nrows = x->dims[0];
+			const float *gw = (const float *)enc->encode_norm_w->data;
+			const float *gb = (const float *)enc->encode_norm_b->data;
+			float *xd = (float *)x->data;
+			const float eps = 1e-5f;
+
+			for (int r = 0; r < nrows; r++) {
+				float *row = xd + r * d;
+				double sum = 0.0, sum2 = 0.0;
+				for (int c = 0; c < d; c++) {
+					sum += (double)row[c];
+					sum2 += (double)row[c] * (double)row[c];
+				}
+				double mean = sum / d;
+				double var = sum2 / d - mean * mean;
+				double inv = 1.0 / sqrt(var + eps);
+				for (int c = 0; c < d; c++)
+					row[c] = (float)(((double)row[c] - mean) *
+						  inv) * gw[c] + gb[c];
+			}
+			geom_out = x;
 		}
 
 		sam3_log_debug("segment: geom encoder done, "
 			       "persist %zu/%zu",
 			       persist->offset, persist->size);
 	}
+
+	/* Dump text features and geometry encoder output for fixture comparison */
+	if (text_features)
+		dump_tensor("/tmp/dbg_text_features.bin", text_features);
+	if (geom_out)
+		dump_tensor("/tmp/dbg_geom_out.bin", geom_out);
 
 	/*
 	 * Build context for encoder fusion and decoder. Manual
@@ -597,7 +1196,35 @@ enum sam3_error sam3_image_model_segment(
 				  * sizeof(float);
 		void *x_buf = sam3_arena_alloc(persist, x_bytes);
 		if (!x_buf) { err = SAM3_ENOMEM; goto fail; }
+
+		/*
+		 * Copy encoder input into persist buffer for
+		 * per-layer evaluation. No 0.1*pos addition here;
+		 * that belongs to TransformerEncoderCrossAttention
+		 * (tracking encoder), not TransformerEncoderFusion
+		 * (DETR encoder).
+		 */
 		memcpy(x_buf, enc_x->data, x_bytes);
+
+		/* Dump encoder input for fixture comparison */
+		{
+			struct sam3_tensor dtmp;
+			dtmp.dtype = SAM3_DTYPE_F32;
+			dtmp.n_dims = 2;
+			dtmp.dims[0] = img_2d->dims[0];
+			dtmp.dims[1] = img_2d->dims[1];
+			dtmp.data = x_buf;
+			dtmp.nbytes = x_bytes;
+			dump_tensor("/tmp/dbg_enc_input.bin", &dtmp);
+		}
+
+		/* Flatten pos_enc for encoder layers [H*W, d] */
+		struct sam3_tensor *enc_pe_t;
+		enc_pe_t = sam3_pos_encoding_get(
+				&model->backbone.pos_enc);
+		int epe_n = enc_pe_t->dims[0] * enc_pe_t->dims[1];
+		int epe_d = enc_pe_t->dims[2];
+		int epe_dims[] = {epe_n, epe_d};
 
 		for (int li = 0; li < model->encoder.n_layers; li++) {
 			sam3_arena_reset(scratch);
@@ -609,6 +1236,16 @@ enum sam3_error sam3_image_model_segment(
 						2, x_dims, x_buf);
 			if (!enc_x) { err = SAM3_ENOMEM; goto fail; }
 
+			struct sam3_tensor *epos_wrap;
+			epos_wrap = gh_tensor_wrap(scratch,
+						     SAM3_DTYPE_F32,
+						     2, epe_dims,
+						     enc_pe_t->data);
+			if (!epos_wrap) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+
 			struct sam3_tensor *ctx_copy;
 			ctx_copy = gh_tensor_wrap(scratch, context->dtype,
 						   context->n_dims,
@@ -618,7 +1255,7 @@ enum sam3_error sam3_image_model_segment(
 
 			enc_x = sam3_encoder_fusion_build_layer(
 				&model->encoder, li, &g,
-				enc_x, ctx_copy, scratch);
+				enc_x, epos_wrap, ctx_copy, scratch);
 			if (!enc_x) { err = SAM3_ENOMEM; goto fail; }
 
 			err = be->ops->graph_eval(be, &g);
@@ -628,6 +1265,21 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 			memcpy(x_buf, enc_x->data, x_bytes);
+
+			/* Dump per-layer output for fixture comparison */
+			{
+				char dpath[64];
+				snprintf(dpath, sizeof(dpath),
+					 "/tmp/dbg_enc_layer_%02d.bin", li);
+				struct sam3_tensor dtmp;
+				dtmp.dtype = SAM3_DTYPE_F32;
+				dtmp.n_dims = 2;
+				dtmp.dims[0] = img_2d->dims[0];
+				dtmp.dims[1] = img_2d->dims[1];
+				dtmp.data = x_buf;
+				dtmp.nbytes = x_bytes;
+				dump_tensor(dpath, &dtmp);
+			}
 
 			/* Diagnostic: per-layer stats */
 			{
@@ -644,31 +1296,26 @@ enum sam3_error sam3_image_model_segment(
 			}
 		}
 
-		/* Final layer norm */
-		sam3_arena_reset(scratch);
-		sam3_graph_init(&g);
-		int x_dims[] = {img_2d->dims[0], img_2d->dims[1]};
-		enc_x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
-					2, x_dims, x_buf);
-		if (!enc_x) { err = SAM3_ENOMEM; goto fail; }
-
-		fused = sam3_encoder_fusion_build_final(
-			&model->encoder, &g, enc_x, scratch);
-		if (!fused) { err = SAM3_ENOMEM; goto fail; }
-
-		err = be->ops->graph_eval(be, &g);
-		if (err != SAM3_OK) {
-			sam3_log_error("segment: enc final ln eval "
-				       "failed: %d", err);
-			goto fail;
+		/*
+		 * No final layer norm — the DETR encoder has none.
+		 * Wrap x_buf as fused tensor directly in persist.
+		 */
+		{
+			int x_dims[] = {img_2d->dims[0],
+					 img_2d->dims[1]};
+			fused = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						 2, x_dims);
+			if (!fused) { err = SAM3_ENOMEM; goto fail; }
+			memcpy(fused->data, x_buf,
+			       (size_t)x_dims[0] * x_dims[1]
+			       * sizeof(float));
 		}
-
-		fused = persist_tensor(persist, fused);
-		if (!fused) { err = SAM3_ENOMEM; goto fail; }
 	}
 
 	sam3_log_debug("segment: encoder fusion done, persist %zu/%zu",
 		       persist->offset, persist->size);
+
+	dump_tensor("/tmp/dbg_fused.bin", fused);
 
 	/* Diagnostic: check fused image feature stats */
 	{
@@ -711,72 +1358,317 @@ enum sam3_error sam3_image_model_segment(
 		memcpy(q_buf, model->decoder.query_embed->data,
 		       (size_t)nq * d * sizeof(float));
 
-		for (int li = 0; li < model->decoder.n_layers; li++) {
+		/*
+		 * Compute initial query_pos from reference_points.
+		 * Steps: sigmoid(ref_points) → sine_embed (CPU)
+		 *        → ref_point_head MLP (graph eval once).
+		 *
+		 * After each decoder layer, box refinement updates
+		 * ref_boxes and query_pos is recomputed. This matches
+		 * Python's iterative box refinement with DAB-DETR
+		 * conditional queries.
+		 */
+		float *ref_boxes = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * 4 * sizeof(float));
+		float *qpos_buf = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * d * sizeof(float));
+
+		/* Scratch for CPU box refinement between layers */
+		float *br_tmp1 = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * d * sizeof(float));
+		float *br_tmp2 = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * d * sizeof(float));
+		if (!ref_boxes || !qpos_buf || !br_tmp1 || !br_tmp2) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		{
+			const float *rp = (const float *)
+				model->decoder.reference_points->data;
+			int rp_n = nq * 4;
+			for (int ri = 0; ri < rp_n; ri++)
+				ref_boxes[ri] = 1.0f /
+					(1.0f + expf(-rp[ri]));
+
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 
-			/*
-			 * Wrap persisted q as graph input. Pass NULL
-			 * for boxes to skip box refinement — this
-			 * ensures q is the final graph node and the
-			 * Metal backend copies its data back.
-			 */
-			struct sam3_tensor *q_in;
-			struct sam3_tensor *enc_wrap;
-			struct sam3_tensor *txt_wrap;
-
-			q_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
-					       2, q_dims, q_buf);
-			enc_wrap = gh_tensor_wrap(scratch,
-						   fused->dtype,
-						   fused->n_dims,
-						   fused->dims,
-						   fused->data);
-			txt_wrap = gh_tensor_wrap(scratch,
-						   text_features->dtype,
-						   text_features->n_dims,
-						   text_features->dims,
-						   text_features->data);
-			if (!q_in || !enc_wrap || !txt_wrap) {
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
-
-			struct sam3_tensor *q_out;
-			q_out = sam3_decoder_build_layer(
-				&model->decoder, li, &g,
-				q_in, enc_wrap, txt_wrap,
-				NULL, scratch);
-			if (!q_out) {
-				sam3_log_error("segment: dec layer %d "
-					       "build failed", li);
+			struct sam3_tensor *qpos;
+			qpos = sam3_decoder_compute_query_pos(
+				&model->decoder, &g, scratch,
+				ref_boxes);
+			if (!qpos) {
+				sam3_log_error("segment: query_pos "
+					       "build failed");
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
 
 			err = be->ops->graph_eval(be, &g);
 			if (err != SAM3_OK) {
-				sam3_log_error("segment: dec layer %d "
-					       "eval failed: %d", li, err);
+				sam3_log_error("segment: query_pos "
+					       "eval failed: %d", err);
 				goto fail;
 			}
 
-			/* Snapshot result back to persist buffer */
+			memcpy(qpos_buf, qpos->data,
+			       (size_t)nq * d * sizeof(float));
+
+			sam3_log_debug("segment: query_pos computed "
+				       "[%d,%d]", nq, d);
+		}
+
+		int qpos_dims[] = {nq, d};
+
+		/* Dump query_pos and initial queries for debugging */
+		{
+			struct sam3_tensor qptmp;
+			qptmp.dtype = SAM3_DTYPE_F32;
+			qptmp.n_dims = 2;
+			qptmp.dims[0] = nq;
+			qptmp.dims[1] = d;
+			qptmp.data = qpos_buf;
+			qptmp.nbytes = (size_t)nq * d * sizeof(float);
+			dump_tensor("/tmp/dbg_query_pos.bin", &qptmp);
+
+			qptmp.data = q_buf;
+			dump_tensor("/tmp/dbg_q_init.bin", &qptmp);
+		}
+
+		/*
+		 * Flatten position encoding [H, W, d] → [H*W, d]
+		 * to match enc_features [n_pixels, d_model].
+		 */
+		struct sam3_tensor *pos_enc_t;
+		pos_enc_t = sam3_pos_encoding_get(
+				&model->backbone.pos_enc);
+		int pe_n = pos_enc_t->dims[0] * pos_enc_t->dims[1];
+		int pe_d = pos_enc_t->dims[2];
+		int pe_dims[] = {pe_n, pe_d};
+
+		for (int li = 0; li < model->decoder.n_layers; li++) {
+			/*
+			 * Build/eval each decoder substep as a
+			 * separate graph to isolate divergence.
+			 */
+			struct sam3_tensor *q_in;
+			struct sam3_tensor *qpos_in;
+			struct sam3_tensor *enc_wrap;
+			struct sam3_tensor *enc_pos_wrap;
+			struct sam3_tensor *txt_wrap;
+			struct sam3_tensor *q_out;
+
+#define DEC_WRAP_INPUTS() do { \
+	q_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, \
+			       2, q_dims, q_buf); \
+	qpos_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, \
+				  2, qpos_dims, qpos_buf); \
+	enc_wrap = gh_tensor_wrap(scratch, fused->dtype, \
+				   fused->n_dims, fused->dims, \
+				   fused->data); \
+	enc_pos_wrap = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, \
+				       2, pe_dims, \
+				       pos_enc_t->data); \
+	txt_wrap = context \
+		? gh_tensor_wrap(scratch, context->dtype, \
+				 context->n_dims, \
+				 context->dims, \
+				 context->data) \
+		: NULL; \
+	if (!q_in || !qpos_in || !enc_wrap || \
+	    !enc_pos_wrap) { \
+		err = SAM3_ENOMEM; \
+		goto fail; \
+	} \
+} while (0)
+
+			/* Substep A: Self-attention */
+			sam3_arena_reset(scratch);
+			sam3_graph_init(&g);
+			DEC_WRAP_INPUTS();
+			q_out = sam3_decoder_build_sa(
+				&model->decoder, li, &g,
+				q_in, qpos_in, scratch);
+			if (!q_out) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			err = be->ops->graph_eval(be, &g);
+			if (err != SAM3_OK) goto fail;
 			memcpy(q_buf, q_out->data,
 			       (size_t)nq * d * sizeof(float));
+
+			/* Dump after SA */
+			if (li == 0) {
+				struct sam3_tensor dt;
+				dt.dtype = SAM3_DTYPE_F32;
+				dt.n_dims = 2;
+				dt.dims[0] = nq; dt.dims[1] = d;
+				dt.data = q_buf;
+				dt.nbytes = (size_t)nq * d *
+					sizeof(float);
+				dump_tensor(
+					"/tmp/dbg_dec_l0_sa.bin",
+					&dt);
+			}
+
+			/* Substep B: Text cross-attention */
+			sam3_arena_reset(scratch);
+			sam3_graph_init(&g);
+			DEC_WRAP_INPUTS();
+			q_out = sam3_decoder_build_tca(
+				&model->decoder, li, &g,
+				q_in, qpos_in, txt_wrap, scratch);
+			if (!q_out) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			err = be->ops->graph_eval(be, &g);
+			if (err != SAM3_OK) goto fail;
+			memcpy(q_buf, q_out->data,
+			       (size_t)nq * d * sizeof(float));
+
+			/* Dump after TCA */
+			if (li == 0) {
+				struct sam3_tensor dt;
+				dt.dtype = SAM3_DTYPE_F32;
+				dt.n_dims = 2;
+				dt.dims[0] = nq; dt.dims[1] = d;
+				dt.data = q_buf;
+				dt.nbytes = (size_t)nq * d *
+					sizeof(float);
+				dump_tensor(
+					"/tmp/dbg_dec_l0_tca.bin",
+					&dt);
+			}
+
+			/* Substep C: Vision cross-attention */
+			sam3_arena_reset(scratch);
+			sam3_graph_init(&g);
+			DEC_WRAP_INPUTS();
+			q_out = sam3_decoder_build_ca(
+				&model->decoder, li, &g,
+				q_in, qpos_in,
+				enc_wrap, enc_pos_wrap, scratch);
+			if (!q_out) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			err = be->ops->graph_eval(be, &g);
+			if (err != SAM3_OK) goto fail;
+			memcpy(q_buf, q_out->data,
+			       (size_t)nq * d * sizeof(float));
+
+			/* Dump after CA */
+			if (li == 0) {
+				struct sam3_tensor dt;
+				dt.dtype = SAM3_DTYPE_F32;
+				dt.n_dims = 2;
+				dt.dims[0] = nq; dt.dims[1] = d;
+				dt.data = q_buf;
+				dt.nbytes = (size_t)nq * d *
+					sizeof(float);
+				dump_tensor(
+					"/tmp/dbg_dec_l0_ca.bin",
+					&dt);
+			}
+
+			/* Substep D: FFN */
+			sam3_arena_reset(scratch);
+			sam3_graph_init(&g);
+			DEC_WRAP_INPUTS();
+			q_out = sam3_decoder_build_ffn(
+				&model->decoder, li, &g,
+				q_in, scratch);
+			if (!q_out) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			err = be->ops->graph_eval(be, &g);
+			if (err != SAM3_OK) goto fail;
+			memcpy(q_buf, q_out->data,
+			       (size_t)nq * d * sizeof(float));
+
+#undef DEC_WRAP_INPUTS
+
+			/* Dump per-layer decoder output */
+			{
+				char dpath[64];
+				snprintf(dpath, sizeof(dpath),
+					 "/tmp/dbg_dec_layer_%02d.bin",
+					 li);
+				struct sam3_tensor dtmp;
+				dtmp.dtype = SAM3_DTYPE_F32;
+				dtmp.n_dims = 2;
+				dtmp.dims[0] = nq;
+				dtmp.dims[1] = d;
+				dtmp.data = q_buf;
+				dtmp.nbytes = (size_t)nq * d *
+					sizeof(float);
+				dump_tensor(dpath, &dtmp);
+			}
 
 			/* Diagnostic: per-layer stats */
 			{
 				const float *ld = (const float *)q_buf;
-				int ln = nq * d;
+				int ntot = nq * d;
 				float lmin = ld[0], lmax = ld[0];
-				for (int lj = 0; lj < ln; lj++) {
+				for (int lj = 0; lj < ntot; lj++) {
 					if (ld[lj] < lmin) lmin = ld[lj];
 					if (ld[lj] > lmax) lmax = ld[lj];
 				}
 				sam3_log_debug("segment: dec layer %d "
 					       "q min=%.4f max=%.4f",
 					       li, lmin, lmax);
+			}
+
+			/*
+			 * Box refinement + query_pos update (CPU).
+			 *
+			 * Python applies iterative box refinement after
+			 * each layer:
+			 *   delta = box_head(norm(output))
+			 *   ref = sigmoid(inverse_sigmoid(ref) + delta)
+			 *   query_pos = ref_point_head(sine_embed(ref))
+			 *
+			 * We do this on CPU since the Metal backend only
+			 * copies back final graph outputs. The box head
+			 * MLP on [200, 256] is trivially fast on CPU.
+			 */
+			cpu_box_refine(q_buf, &model->decoder,
+				       ref_boxes, nq, d,
+				       br_tmp1, br_tmp2);
+
+			/* Recompute query_pos for next layer */
+			if (li < model->decoder.n_layers - 1) {
+				sam3_arena_reset(scratch);
+				sam3_graph_init(&g);
+
+				struct sam3_tensor *qpos;
+				qpos = sam3_decoder_compute_query_pos(
+					&model->decoder, &g, scratch,
+					ref_boxes);
+				if (!qpos) {
+					sam3_log_error("segment: "
+						"query_pos rebuild "
+						"failed at layer %d",
+						li);
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+
+				err = be->ops->graph_eval(be, &g);
+				if (err != SAM3_OK) {
+					sam3_log_error("segment: "
+						"query_pos eval "
+						"failed at layer %d: "
+						"%d", li, err);
+					goto fail;
+				}
+
+				memcpy(qpos_buf, qpos->data,
+				       (size_t)nq * d *
+				       sizeof(float));
 			}
 		}
 
@@ -812,6 +1704,9 @@ enum sam3_error sam3_image_model_segment(
 			goto fail;
 		}
 
+		/* Dump decoder queries for Python comparison */
+		dump_tensor("/tmp/dbg_queries.bin", queries);
+
 		/* Diagnostic: check decoder query values */
 		{
 			const float *qd = (const float *)queries->data;
@@ -834,8 +1729,8 @@ enum sam3_error sam3_image_model_segment(
 		 * Stage 4: Segmentation head — FPN pixel decoder +
 		 * mask embedder MLP + dot product mask prediction.
 		 */
-		grid_h = model->cached_image_features->dims[2];
-		grid_w = model->cached_image_features->dims[3];
+		grid_h = model->cached_feat_s1->dims[2];
+		grid_w = model->cached_feat_s1->dims[3];
 
 		sam3_arena_reset(scratch);
 		sam3_graph_init(&g);
@@ -917,7 +1812,7 @@ enum sam3_error sam3_image_model_segment(
 		 * manual NCHW transpose that reads tensor data.
 		 */
 		struct sam3_tensor *seg_enc = fused;
-		if (text_features) {
+		if (context) {
 			struct sam3_tensor *enc_wrap;
 			struct sam3_tensor *txt_wrap;
 
@@ -925,10 +1820,10 @@ enum sam3_error sam3_image_model_segment(
 				fused->dtype, fused->n_dims,
 				fused->dims, fused->data);
 			txt_wrap = gh_tensor_wrap(scratch,
-				text_features->dtype,
-				text_features->n_dims,
-				text_features->dims,
-				text_features->data);
+				context->dtype,
+				context->n_dims,
+				context->dims,
+				context->data);
 			if (!enc_wrap || !txt_wrap) {
 				err = SAM3_ENOMEM;
 				goto fail;
@@ -1068,33 +1963,95 @@ enum sam3_error sam3_image_model_segment(
 				}
 			}
 
-			inst = sam3_seg_head_build_fpn(
-				&model->seg_head, &g,
-				nchw_wrap,
-				model->cached_feat_s1,
-				model->cached_feat_s0,
-				model->cached_feat_4x,
-				scratch);
-			if (!inst) {
-				sam3_log_error("seg: FPN build failed");
-				err = SAM3_ENOMEM;
-				goto fail;
+			dump_tensor("/tmp/dbg_enc_nchw.bin", enc_nchw);
+			dump_tensor("/tmp/dbg_feat_1x.bin",
+				model->cached_feat_s1);
+			dump_tensor("/tmp/dbg_feat_2x.bin",
+				model->cached_feat_s0);
+			dump_tensor("/tmp/dbg_feat_4x.bin",
+				model->cached_feat_4x);
+
+			/*
+			 * Split FPN and inst_proj into two graph evals
+			 * so pixel_embed data gets copied back.
+			 */
+			{
+				/* Build FPN only → pixel_embed */
+				struct sam3_tensor *pixel_embed;
+				pixel_embed = sam3_seg_head_build_pixel_decoder(
+					&model->seg_head, &g,
+					nchw_wrap,
+					model->cached_feat_s0,
+					model->cached_feat_4x,
+					scratch);
+				if (!pixel_embed) {
+					sam3_log_error("seg: FPN build failed");
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+
+				sam3_log_debug("seg: FPN built, %d nodes",
+					       g.n_nodes);
+
+				err = be->ops->graph_eval(be, &g);
+				if (err != SAM3_OK) {
+					sam3_log_error("seg: FPN eval failed");
+					goto fail;
+				}
+
+				pixel_embed = persist_tensor(persist, pixel_embed);
+				if (!pixel_embed) {
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+
+				dump_tensor("/tmp/dbg_pixel_embed.bin",
+					    pixel_embed);
+
+				/* Build inst_proj (1x1 conv) separately */
+				sam3_arena_reset(scratch);
+				sam3_graph_init(&g);
+
+				struct sam3_tensor *pe_wrap;
+				pe_wrap = gh_tensor_wrap(scratch,
+					pixel_embed->dtype,
+					pixel_embed->n_dims,
+					pixel_embed->dims,
+					pixel_embed->data);
+				if (!pe_wrap) {
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+
+				inst = gh_conv2d(&g, scratch,
+						  pe_wrap,
+						  model->seg_head.inst_proj_w,
+						  model->seg_head.inst_proj_b,
+						  1, 0);
+				if (!inst) {
+					sam3_log_error("seg: inst proj build failed");
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+
+				err = be->ops->graph_eval(be, &g);
+				if (err != SAM3_OK) {
+					sam3_log_error("seg: inst proj eval failed");
+					goto fail;
+				}
+
+				inst = persist_tensor(persist, inst);
+				if (!inst) {
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
 			}
 
-			sam3_log_debug("seg: FPN+inst built, %d nodes",
-				       g.n_nodes);
-
-			err = be->ops->graph_eval(be, &g);
-			if (err != SAM3_OK) {
-				sam3_log_error("seg: FPN eval failed");
-				goto fail;
-			}
-
-			inst = persist_tensor(persist, inst);
-			if (!inst) {
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
+			dump_tensor("/tmp/dbg_inst.bin", inst);
+			dump_tensor("/tmp/dbg_inst_proj_w.bin",
+				model->seg_head.inst_proj_w);
+			dump_tensor("/tmp/dbg_inst_proj_b.bin",
+				model->seg_head.inst_proj_b);
 
 			{
 				const float *id =
@@ -1187,6 +2144,8 @@ enum sam3_error sam3_image_model_segment(
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
+
+			dump_tensor("/tmp/dbg_mask_embed.bin", mask_embed);
 
 			{
 				const float *md =
@@ -1343,42 +2302,39 @@ enum sam3_error sam3_image_model_segment(
 		}
 
 		/*
-		 * Stage 4e: Objectness scorer on decoder queries.
+		 * Stage 4e: Objectness scorer (DotProductScoring).
 		 *
-		 * Produces per-query confidence [n_queries, 1]. Only
-		 * computed when text_features are available, since the
-		 * scorer graph references them (for the similarity dot
-		 * product — the actual confidence comes from an MLP on
-		 * queries alone, but the current build wires both).
+		 * Produces per-query confidence logits [n_queries, 1]
+		 * via scaled dot product between projected decoder
+		 * outputs and mean-pooled prompt features.
+		 *
+		 * The caller should apply sigmoid to get probabilities.
 		 */
-		if (text_features) {
+		if (context) {
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 
-			struct sam3_tensor *q_wrap2, *tf_wrap;
+			sam3_log_debug("seg: scorer queries "
+				"[%d,%d] context [%d,%d]",
+				queries->dims[0], queries->dims[1],
+				context->dims[0], context->dims[1]);
+
+			struct sam3_tensor *q_wrap2, *ctx_wrap;
 			q_wrap2 = gh_tensor_wrap(scratch,
 				queries->dtype, queries->n_dims,
 				queries->dims, queries->data);
-			tf_wrap = gh_tensor_wrap(scratch,
-				text_features->dtype,
-				text_features->n_dims,
-				text_features->dims,
-				text_features->data);
-			if (!q_wrap2 || !tf_wrap) {
+			ctx_wrap = gh_tensor_wrap(scratch,
+				context->dtype, context->n_dims,
+				context->dims, context->data);
+			if (!q_wrap2 || !ctx_wrap) {
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
 
 			scores = sam3_dot_scorer_build(&model->scorer,
-				&g, q_wrap2, tf_wrap, scratch);
+				&g, q_wrap2, ctx_wrap, scratch);
 			if (!scores) {
 				sam3_log_error("seg: scorer build failed");
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
-
-			scores = gh_sigmoid(&g, scratch, scores);
-			if (!scores) {
 				err = SAM3_ENOMEM;
 				goto fail;
 			}

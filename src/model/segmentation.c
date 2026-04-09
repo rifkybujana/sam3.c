@@ -228,9 +228,13 @@ static struct sam3_tensor *build_prompt_cross_attn(
 /*
  * build_pixel_decoder - FPN pixel decoder.
  *
- * Takes 4 features (encoder_nchw, feat_1x, feat_2x, feat_4x) and
+ * Takes 3 features (encoder_nchw at 72×72, feat_2x, feat_4x) and
  * iterates from coarse to fine: interpolate + skip add + 3×3 conv +
  * GroupNorm(8) + ReLU.
+ *
+ * Only 2 FPN stages are used (matching Python: conv_layers[2] and
+ * norms[2] are never invoked at inference). The encoder output at
+ * 72×72 replaces the backbone's 1× feature as the starting point.
  *
  * Returns high-resolution pixel features [1, d, H4, W4].
  */
@@ -238,20 +242,26 @@ static struct sam3_tensor *build_pixel_decoder(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
 	struct sam3_tensor *enc_nchw,
-	struct sam3_tensor *feat_1x,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *a)
 {
-	/* backbone_feats = [feat_4x, feat_2x, feat_1x, enc_nchw]
-	 * prev = backbone_feats[-1] = enc_nchw
-	 * fpn_feats = backbone_feats[:-1] = [feat_4x, feat_2x, feat_1x]
-	 * iterate reversed: feat_1x, feat_2x, feat_4x
+	/*
+	 * Python pixel decoder (maskformer_segmentation.py:215-231):
+	 *   backbone_feats = [feat_4x(288²), feat_2x(144²), enc(72²)]
+	 *   prev = backbone_feats[-1] = enc at 72×72
+	 *   fpn_feats = [feat_4x, feat_2x]
+	 *   iterate reversed(fpn_feats): feat_2x, feat_4x
+	 *
+	 * Stage 0: upsample 72→144, add feat_2x, conv[0], norm[0], relu
+	 * Stage 1: upsample 144→288, add feat_4x, conv[1], norm[1], relu
+	 * conv[2] and norm[2] are allocated but never used.
 	 */
-	struct sam3_tensor *skip_feats[] = {feat_1x, feat_2x, feat_4x};
+	struct sam3_tensor *skip_feats[] = {feat_2x, feat_4x};
 	struct sam3_tensor *prev = enc_nchw;
+	int n_stages = 2;
 
-	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++) {
+	for (int i = 0; i < n_stages; i++) {
 		struct sam3_tensor *curr = skip_feats[i];
 
 		/* Upsample prev to match curr spatial dims.
@@ -361,19 +371,32 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
 				        text_features, arena);
 }
 
+struct sam3_tensor *sam3_seg_head_build_pixel_decoder(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena)
+{
+	return build_pixel_decoder(
+		head, g, enc_nchw, feat_2x, feat_4x, arena);
+}
+
 struct sam3_tensor *sam3_seg_head_build_fpn(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
 	struct sam3_tensor *enc_nchw,
-	struct sam3_tensor *feat_1x,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *arena)
 {
 	struct sam3_tensor *pixel_embed = build_pixel_decoder(
-		head, g, enc_nchw, feat_1x, feat_2x, feat_4x, arena);
+		head, g, enc_nchw, feat_2x, feat_4x, arena);
 	if (!pixel_embed)
 		return NULL;
+
+	head->_debug_pixel_embed = pixel_embed;
 
 	struct sam3_tensor *inst = gh_conv2d(g, arena, pixel_embed,
 					      head->inst_proj_w,
@@ -396,7 +419,6 @@ struct sam3_tensor *sam3_seg_head_build(
 	struct sam3_graph *g,
 	struct sam3_tensor *queries,
 	struct sam3_tensor *encoder_states,
-	struct sam3_tensor *feat_1x,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	int enc_h, int enc_w,
@@ -406,7 +428,7 @@ struct sam3_tensor *sam3_seg_head_build(
 
 	if (!head || !g || !queries || !encoder_states || !arena)
 		return NULL;
-	if (!feat_1x || !feat_2x || !feat_4x)
+	if (!feat_2x || !feat_4x)
 		return NULL;
 
 	sam3_log_debug("seg_head: queries [%d, %d], enc [%d, %d], "
@@ -449,7 +471,7 @@ struct sam3_tensor *sam3_seg_head_build(
 	 * Fuses encoder NCHW + backbone features from coarse to fine.
 	 */
 	struct sam3_tensor *pixel_embed = build_pixel_decoder(
-		head, g, enc, feat_1x, feat_2x, feat_4x, arena);
+		head, g, enc, feat_2x, feat_4x, arena);
 	if (!pixel_embed) {
 		sam3_log_error("seg: pixel decoder failed");
 		return NULL;

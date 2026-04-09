@@ -25,6 +25,7 @@
 #include "core/half.h"
 #include "util/log.h"
 #include "util/error.h"
+#include "weight_rename.h"
 
 static void print_usage(const char *prog)
 {
@@ -37,7 +38,7 @@ static void print_usage(const char *prog)
 	printf("  -f <format>          Input format: "
 	       "\"safetensors\" (default)\n");
 	printf("  --image-size <N>     Image input size "
-	       "(default: 1024)\n");
+	       "(default: 1008)\n");
 	printf("  --encoder-dim <N>    Encoder dimension "
 	       "(default: 1280)\n");
 	printf("  --decoder-dim <N>    Decoder dimension "
@@ -72,7 +73,7 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->output_path    = NULL;
 	args->format         = "safetensors";
 	args->quantize       = NULL;
-	args->image_size     = 1024;
+	args->image_size     = 1008;
 	args->encoder_dim    = 1280;
 	args->decoder_dim    = 256;
 	args->encoder_layers = 32;
@@ -340,14 +341,24 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	n = reader.ops->n_tensors(&reader);
+	/* Wrap with rename reader (remaps Python names to C names) */
+	struct weight_reader rename_reader;
+	err = weight_reader_rename_init(&rename_reader, &reader);
+	if (err != SAM3_OK) {
+		fprintf(stderr, "error: failed to build rename table: %s\n",
+			sam3_error_str(err));
+		reader.ops->close(&reader);
+		return 1;
+	}
+
+	n = rename_reader.ops->n_tensors(&rename_reader);
 
 	/* Print conversion summary */
 	printf("sam3_convert\n");
 	printf("  input:          %s\n", args.input_path);
 	printf("  output:         %s\n", args.output_path);
 	printf("  format:         %s\n", args.format);
-	printf("  tensors:        %d\n", n);
+	printf("  tensors:        %d (after rename/split)\n", n);
 	printf("  image_size:     %d\n", args.image_size);
 	printf("  encoder_dim:    %d\n", args.encoder_dim);
 	printf("  decoder_dim:    %d\n", args.decoder_dim);
@@ -362,7 +373,7 @@ int main(int argc, char **argv)
 	config.n_decoder_layers = args.decoder_layers;
 
 	/* Set up quantizing wrapper if requested */
-	struct weight_reader *write_reader = &reader;
+	struct weight_reader *write_reader = &rename_reader;
 	struct quant_reader_state qstate;
 	struct weight_reader quant_reader;
 
@@ -372,11 +383,12 @@ int main(int argc, char **argv)
 				"error: unsupported quantize type '%s' "
 				"(only \"q8_0\" is supported)\n",
 				args.quantize);
+			rename_reader.ops->close(&rename_reader);
 			reader.ops->close(&reader);
 			return 1;
 		}
 
-		qstate.inner = &reader;
+		qstate.inner = &rename_reader;
 		qstate.nelems_threshold = 1024;
 		quant_reader.ops = &quant_reader_ops;
 		quant_reader.impl = &qstate;
@@ -390,10 +402,12 @@ int main(int argc, char **argv)
 	if (err != SAM3_OK) {
 		fprintf(stderr, "error: conversion failed: %s\n",
 			sam3_error_str(err));
+		rename_reader.ops->close(&rename_reader);
 		reader.ops->close(&reader);
 		return 1;
 	}
 
+	rename_reader.ops->close(&rename_reader);
 	reader.ops->close(&reader);
 	printf("Done.\n");
 

@@ -44,16 +44,26 @@ struct sam3_vit {
 	struct sam3_tensor *patch_embed_w; /* [embed_dim, 3, patch_size, patch_size] */
 	struct sam3_tensor *patch_embed_b; /* [embed_dim] */
 
-	/* RoPE precomputed frequencies */
-	struct sam3_tensor *rope_cos; /* [n_patches, head_dim/2] */
-	struct sam3_tensor *rope_sin; /* [n_patches, head_dim/2] */
+	/* Absolute positional embedding (tiled from pretrain res) */
+	struct sam3_tensor *pos_embed; /* [n_patches, embed_dim] after tiling */
+
+	/* Pre-block layer norm (ln_pre) */
+	struct sam3_tensor *ln_pre_w; /* [embed_dim] */
+	struct sam3_tensor *ln_pre_b; /* [embed_dim] */
+
+	/* RoPE precomputed frequencies (separate for window/global) */
+	struct sam3_tensor *rope_win_cos; /* [n_patches, head_dim/2] tiled local coords */
+	struct sam3_tensor *rope_win_sin; /* [n_patches, head_dim/2] tiled local coords */
+	struct sam3_tensor *rope_glo_cos; /* [n_patches, head_dim/2] scaled global coords */
+	struct sam3_tensor *rope_glo_sin; /* [n_patches, head_dim/2] scaled global coords */
 
 	/* Windowed attention mask */
 	struct sam3_tensor *window_mask; /* [n_patches, n_patches] */
 
-	/* Final layer norm (applied after last transformer block) */
-	struct sam3_tensor *ln_final_w; /* [embed_dim] */
-	struct sam3_tensor *ln_final_b; /* [embed_dim] */
+	/*
+	 * Note: Python ViT has ln_post=Identity (no params), so there is
+	 * no final layer norm. The only ViT-level norm is ln_pre above.
+	 */
 
 	/* Per-layer weights */
 	struct {

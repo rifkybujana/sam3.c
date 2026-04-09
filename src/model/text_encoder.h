@@ -22,6 +22,7 @@
 #include "core/graph.h"
 #include "core/alloc.h"
 #include "core/weight.h"
+#include "backend/backend.h"
 
 #define SAM3_TEXT_ENC_MAX_LAYERS 24
 
@@ -40,7 +41,8 @@ struct sam3_text_encoder {
 	/* Final layer norm + projection */
 	struct sam3_tensor *ln_final_w;		/* [width] */
 	struct sam3_tensor *ln_final_b;		/* [width] */
-	struct sam3_tensor *text_projection;	/* [width, d_model] */
+	struct sam3_tensor *text_projection;	/* [d_model, width] */
+	struct sam3_tensor *text_projection_b;	/* [d_model] */
 
 	/* Per-layer weights */
 	struct {
@@ -97,5 +99,18 @@ struct sam3_tensor *sam3_text_encoder_build(
 	struct sam3_tensor *token_ids,
 	struct sam3_tensor **pooled_out,
 	struct sam3_arena *arena);
+
+/*
+ * sam3_text_encoder_build_perblock - Per-block text encoder evaluation.
+ *
+ * Evaluates one block at a time, dumping /tmp/dbg_te_block_XX.bin
+ * for fixture comparison. Used for debugging text encoder divergence.
+ */
+struct sam3_tensor *sam3_text_encoder_build_perblock(
+	struct sam3_text_encoder *te,
+	struct sam3_backend *be,
+	struct sam3_tensor *token_ids,
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist);
 
 #endif /* SAM3_MODEL_TEXT_ENCODER_H */

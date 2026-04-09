@@ -38,11 +38,18 @@ enum sam3_error sam3_pos_encoding_precompute(
 
 	float *data = (float *)pe->cached->data;
 
+	/*
+	 * Python: cumsum([1,2,...,H]) / H * 2π → [(1/H)*2π, ..., 2π]
+	 * We match this with (y+1)/H * 2π for y=0..H-1.
+	 */
+	const float scale = 2.0f * 3.14159265358979323846f;
+
 	for (int y = 0; y < height; y++) {
-		float y_pos = ((float)y + 0.5f) / (float)height;
+		float y_pos = ((float)(y + 1)) / (float)height * scale;
 
 		for (int x = 0; x < width; x++) {
-			float x_pos = ((float)x + 0.5f) / (float)width;
+			float x_pos = ((float)(x + 1)) / (float)width
+				* scale;
 			float *row = data + (y * width + x) * out_dim;
 
 			for (int i = 0; i < num_pos_feats; i++) {

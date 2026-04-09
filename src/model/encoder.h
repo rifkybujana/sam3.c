@@ -35,6 +35,9 @@ struct sam3_encoder_fusion {
 	struct {
 		/* Self-attention on image features */
 		struct sam3_tensor *sa_qkv_w, *sa_qkv_b;
+		struct sam3_tensor *sa_q_w, *sa_q_b;   /* pre-split for pos */
+		struct sam3_tensor *sa_k_w, *sa_k_b;
+		struct sam3_tensor *sa_v_w, *sa_v_b;
 		struct sam3_tensor *sa_out_w, *sa_out_b;
 		struct sam3_tensor *sa_ln_w,  *sa_ln_b;
 
@@ -110,12 +113,16 @@ struct sam3_tensor *sam3_encoder_fusion_build(
  * sam3_encoder_fusion_build_layer - Build a single encoder layer.
  *
  * Used for per-layer evaluation to avoid MLX shared-buffer issues.
+ *
+ * @enc_pos: Sinusoidal position encoding [n_pixels, d_model] (may be NULL).
+ *           When provided, self-attention uses Q=K=x+pos, V=x.
  */
 struct sam3_tensor *sam3_encoder_fusion_build_layer(
 	struct sam3_encoder_fusion *enc,
 	int layer_idx,
 	struct sam3_graph *g,
 	struct sam3_tensor *x,
+	struct sam3_tensor *enc_pos,
 	struct sam3_tensor *text_features,
 	struct sam3_arena *arena);
 

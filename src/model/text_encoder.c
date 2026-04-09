@@ -107,12 +107,19 @@ enum sam3_error sam3_text_encoder_load(struct sam3_text_encoder *te,
 	if (!te->ln_final_b)
 		return SAM3_ENOMEM;
 
-	/* Text projection: detector_model.text_projection.weight */
+	/* Text projection (resizer): detector_model.text_projection.* */
 	int proj_dims[] = {d, w};
 	te->text_projection = gh_load_or_alloc(wf,
 		"detector_model.text_projection.weight",
 		arena, SAM3_DTYPE_F32, 2, proj_dims);
 	if (!te->text_projection)
+		return SAM3_ENOMEM;
+
+	int d_dims[] = {d};
+	te->text_projection_b = gh_load_or_alloc(wf,
+		"detector_model.text_projection.bias",
+		arena, SAM3_DTYPE_F32, 1, d_dims);
+	if (!te->text_projection_b)
 		return SAM3_ENOMEM;
 
 	/* Per-layer weights */
@@ -378,7 +385,7 @@ struct sam3_tensor *sam3_text_encoder_build(
 	/*
 	 * Step 6: Pooled output (from last token / EOT position).
 	 * Slice the last row: [1, width].
-	 * Project: matmul([1, width], [width, d_model]) -> [1, d_model].
+	 * Project: matmul([1, width], [width, d_model]) + bias -> [1, d_model].
 	 * Reshape to [d_model].
 	 */
 	if (pooled_out) {
@@ -393,6 +400,11 @@ struct sam3_tensor *sam3_text_encoder_build(
 		if (!projected)
 			return NULL;
 
+		projected = gh_add(g, arena, projected,
+				   te->text_projection_b);
+		if (!projected)
+			return NULL;
+
 		int pool_dims[] = {te->d_model};
 		*pooled_out = gh_reshape(g, arena, projected,
 					  1, pool_dims);
@@ -403,10 +415,291 @@ struct sam3_tensor *sam3_text_encoder_build(
 	/*
 	 * Step 7: Project all per-token embeddings to d_model.
 	 * x is [seq_len, width].
-	 * matmul(x, proj_t) -> [seq_len, d_model].
+	 * matmul(x, proj_t) + bias -> [seq_len, d_model].
 	 */
 	struct sam3_tensor *out;
 	out = gh_matmul(g, arena, x, proj_t);
+	if (!out)
+		return NULL;
+
+	out = gh_add(g, arena, out, te->text_projection_b);
 
 	return out;
+}
+
+/*
+ * sam3_text_encoder_build_perblock - Per-block text encoder evaluation.
+ *
+ * Evaluates the text encoder one block at a time, persisting the
+ * block output between evaluations. Dumps /tmp/dbg_te_block_XX.bin
+ * and other diagnostic files for fixture comparison.
+ *
+ * @te:      Loaded text encoder
+ * @be:      Backend for graph evaluation
+ * @token_ids: Input token IDs [seq_len] (I32 tensor)
+ * @scratch: Arena for per-block intermediate tensors (reset between blocks)
+ * @persist: Arena for output buffer that survives across blocks
+ *
+ * Returns per-token embeddings [seq_len, d_model], or NULL on error.
+ */
+struct sam3_tensor *sam3_text_encoder_build_perblock(
+	struct sam3_text_encoder *te,
+	struct sam3_backend *be,
+	struct sam3_tensor *token_ids,
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist)
+{
+	struct sam3_graph g;
+	int seq_len = sam3_tensor_nelems(token_ids);
+	int w = te->width;
+	size_t x_bytes = (size_t)seq_len * (size_t)w * sizeof(float);
+	enum sam3_error err;
+
+	/* Allocate persist buffer for block outputs [seq_len, width] */
+	void *x_buf = sam3_arena_alloc(persist, x_bytes);
+	if (!x_buf)
+		return NULL;
+
+	/* Dump token IDs for verification */
+	{
+		FILE *fp = fopen("/tmp/dbg_te_token_ids.bin", "wb");
+		if (fp) {
+			fwrite(token_ids->data, sizeof(int32_t),
+			       (size_t)seq_len, fp);
+			fclose(fp);
+		}
+	}
+
+	/* Step 1a: Token embedding only (for fixture comparison) */
+	{
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *tok;
+		tok = gh_embed(&g, scratch, te->token_embedding, token_ids);
+		if (!tok)
+			return NULL;
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+
+		/* Dump token embedding only (no pos) */
+		{
+			FILE *fp = fopen("/tmp/dbg_te_tok_only.bin", "wb");
+			if (fp) {
+				fwrite(tok->data, sizeof(float),
+				       (size_t)seq_len * (size_t)w, fp);
+				fclose(fp);
+			}
+		}
+	}
+
+	/* Step 1b: Token embedding + positional embedding */
+	{
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *x;
+		x = gh_embed(&g, scratch, te->token_embedding, token_ids);
+		if (!x)
+			return NULL;
+
+		struct sam3_tensor *pos = te->pos_embedding;
+		if (seq_len < te->context_len) {
+			pos = gh_slice(&g, scratch, pos, 0, 0, seq_len);
+			if (!pos)
+				return NULL;
+		}
+		x = gh_add(&g, scratch, x, pos);
+		if (!x)
+			return NULL;
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+
+		memcpy(x_buf, x->data, x_bytes);
+
+		/* Dump token+pos embedding */
+		{
+			FILE *fp = fopen("/tmp/dbg_te_token_embed.bin", "wb");
+			if (fp) {
+				fwrite(x_buf, sizeof(float),
+				       (size_t)seq_len * (size_t)w, fp);
+				fclose(fp);
+			}
+		}
+	}
+
+	/* Build causal mask (persistent across blocks) */
+	int mask_dims[] = {seq_len, seq_len};
+	struct sam3_tensor *causal_mask;
+	causal_mask = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+				       2, mask_dims);
+	if (!causal_mask)
+		return NULL;
+
+	float *mask_data = (float *)causal_mask->data;
+	for (int r = 0; r < seq_len; r++) {
+		for (int c = 0; c < seq_len; c++) {
+			mask_data[r * seq_len + c] =
+				(c > r) ? -1e9f : 0.0f;
+		}
+	}
+
+	/* Step 2: Per-block evaluation */
+	for (int i = 0; i < te->n_layers; i++) {
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		int x_dims[] = {seq_len, w};
+		struct sam3_tensor *x;
+		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, 2,
+				    x_dims, x_buf);
+		if (!x)
+			return NULL;
+
+		struct sam3_tensor *mask_wrap;
+		mask_wrap = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, 2,
+					    mask_dims, causal_mask->data);
+		if (!mask_wrap)
+			return NULL;
+
+		/* Pre-norm for attention */
+		struct sam3_tensor *x_norm;
+		x_norm = gh_layernorm(&g, scratch, x,
+				       te->layers[i].ln1_w,
+				       te->layers[i].ln1_b);
+		if (!x_norm)
+			return NULL;
+
+		/* Reshape to 3D for multihead attention */
+		int attn_dims[] = {1, seq_len, w};
+		struct sam3_tensor *x3d;
+		x3d = gh_reshape(&g, scratch, x_norm, 3, attn_dims);
+		if (!x3d)
+			return NULL;
+
+		/* Self-attention with causal mask */
+		struct sam3_tensor *attn;
+		attn = gh_multihead_attention_rope(
+			&g, scratch,
+			x3d, x3d, x3d,
+			te->layers[i].attn_qkv_w,
+			te->layers[i].attn_qkv_b,
+			te->layers[i].attn_out_w,
+			te->layers[i].attn_out_b,
+			te->n_heads,
+			NULL, NULL,
+			mask_wrap);
+		if (!attn)
+			return NULL;
+
+		/* Residual */
+		x = gh_add(&g, scratch, x, attn);
+		if (!x)
+			return NULL;
+
+		/* Pre-norm for MLP */
+		x_norm = gh_layernorm(&g, scratch, x,
+				       te->layers[i].ln2_w,
+				       te->layers[i].ln2_b);
+		if (!x_norm)
+			return NULL;
+
+		/* MLP: fc1 -> GELU -> fc2 */
+		struct sam3_tensor *ff;
+		ff = gh_mlp(&g, scratch, x_norm,
+			     te->layers[i].mlp_fc1_w,
+			     te->layers[i].mlp_fc1_b,
+			     te->layers[i].mlp_fc2_w,
+			     te->layers[i].mlp_fc2_b,
+			     SAM3_OP_GELU);
+		if (!ff)
+			return NULL;
+
+		/* Residual */
+		x = gh_add(&g, scratch, x, ff);
+		if (!x)
+			return NULL;
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+
+		memcpy(x_buf, x->data, x_bytes);
+
+		/* Dump per-block output */
+		{
+			char path[64];
+			snprintf(path, sizeof(path),
+				 "/tmp/dbg_te_block_%02d.bin", i);
+			FILE *fp = fopen(path, "wb");
+			if (fp) {
+				fwrite(x_buf, sizeof(float),
+				       (size_t)seq_len * (size_t)w, fp);
+				fclose(fp);
+			}
+		}
+	}
+
+	/* Step 3: Final layer norm + projection */
+	{
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		int x_dims[] = {seq_len, w};
+		struct sam3_tensor *x;
+		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, 2,
+				    x_dims, x_buf);
+		if (!x)
+			return NULL;
+
+		x = gh_layernorm(&g, scratch, x,
+				  te->ln_final_w, te->ln_final_b);
+		if (!x)
+			return NULL;
+
+		/* Dump ln_final output */
+		struct sam3_tensor *ln_out = x;
+
+		struct sam3_tensor *proj_t;
+		proj_t = gh_transpose(&g, scratch, te->text_projection);
+		if (!proj_t)
+			return NULL;
+
+		struct sam3_tensor *out;
+		out = gh_matmul(&g, scratch, x, proj_t);
+		if (!out)
+			return NULL;
+
+		out = gh_add(&g, scratch, out, te->text_projection_b);
+		if (!out)
+			return NULL;
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+
+		/* Dump ln_final */
+		{
+			FILE *fp = fopen("/tmp/dbg_te_ln_final.bin", "wb");
+			if (fp) {
+				fwrite(ln_out->data, sizeof(float),
+				       (size_t)seq_len * (size_t)w, fp);
+				fclose(fp);
+			}
+		}
+
+		/* Copy result to persist arena */
+		int out_dims[] = {seq_len, te->d_model};
+		struct sam3_tensor *result;
+		result = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+					  2, out_dims);
+		if (!result)
+			return NULL;
+		memcpy(result->data, out->data, result->nbytes);
+		return result;
+	}
 }

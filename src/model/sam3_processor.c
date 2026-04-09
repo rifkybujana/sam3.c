@@ -16,6 +16,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +26,26 @@
 #include "backend/backend.h"
 #include "backend/cpu/cpu_backend.h"
 #include "util/log.h"
+
+#include "sam3/internal/processor_normalize.h"
+
+void sam3_normalize_rgb_chw(const uint8_t *src, float *dst,
+			    int width, int height)
+{
+	int c, y, x;
+
+	for (c = 0; c < 3; c++) {
+		for (y = 0; y < height; y++) {
+			for (x = 0; x < width; x++) {
+				int src_idx = (y * width + x) * 3 + c;
+				int dst_idx = c * height * width +
+					      y * width + x;
+				dst[dst_idx] =
+					(float)src[src_idx] / 127.5f - 1.0f;
+			}
+		}
+	}
+}
 
 enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 {
@@ -134,7 +155,6 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 	struct sam3_tensor *image;
 	enum sam3_error err;
 	int dims[3];
-	int c, y, x;
 	float *dst;
 
 	if (!proc || !pixels || width <= 0 || height <= 0)
@@ -156,16 +176,7 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 		return SAM3_ENOMEM;
 
 	dst = (float *)image->data;
-	for (c = 0; c < 3; c++) {
-		for (y = 0; y < height; y++) {
-			for (x = 0; x < width; x++) {
-				int src_idx = (y * width + x) * 3 + c;
-				int dst_idx = c * height * width +
-					      y * width + x;
-				dst[dst_idx] = pixels[src_idx] / 255.0f;
-			}
-		}
-	}
+	sam3_normalize_rgb_chw(pixels, dst, width, height);
 
 	/* Run per-block ViT evaluation + neck */
 	err = sam3_image_model_encode(&proc->model, proc->backend, image,
@@ -205,99 +216,295 @@ static void count_prompts_by_type(const struct sam3_prompt *prompts,
 }
 
 /*
+ * cpu_linear - Manual CPU matmul: out[r,c] = sum(in[r,k]*W[c,k]) + b[c].
+ *
+ * @out:    Output buffer [nrows * out_dim]
+ * @in:     Input buffer [nrows * in_dim]
+ * @w:      Weight tensor [out_dim, in_dim] (row-major)
+ * @b:      Bias tensor [out_dim]
+ * @nrows:  Number of input rows
+ * @in_dim: Input dimension
+ * @out_dim: Output dimension
+ */
+static void cpu_linear(float *out, const float *in,
+		       const float *w, const float *b,
+		       int nrows, int in_dim, int out_dim)
+{
+	for (int r = 0; r < nrows; r++) {
+		for (int c = 0; c < out_dim; c++) {
+			float sum = b[c];
+			for (int k = 0; k < in_dim; k++)
+				sum += in[r * in_dim + k] * w[c * in_dim + k];
+			out[r * out_dim + c] = sum;
+		}
+	}
+}
+
+/*
+ * cpu_sinusoidal_posenc - Compute sinusoidal positional encoding.
+ *
+ * Matches PositionEmbeddingSine._encode_xy from the Python reference:
+ *   dim_t[i] = temperature^(2*floor(i/2)/num_pos_feats)
+ *   out[2k]   = sin(coord * scale / dim_t[2k])
+ *   out[2k+1] = cos(coord * scale / dim_t[2k+1])
+ *
+ * @out:            Output buffer [num_pos_feats]
+ * @coord:          Normalized coordinate in [0,1]
+ * @num_pos_feats:  Number of output features (typically d_model/2 = 128)
+ */
+static void cpu_sinusoidal_posenc(float *out, float coord,
+				  int num_pos_feats)
+{
+	const float temperature = 10000.0f;
+	const float scale = 2.0f * 3.14159265358979323846f;
+	float scaled = coord * scale;
+
+	for (int i = 0; i < num_pos_feats / 2; i++) {
+		float exp = 2.0f * (float)i / (float)num_pos_feats;
+		float freq = powf(temperature, exp);
+		float val = scaled / freq;
+		out[2 * i] = sinf(val);
+		out[2 * i + 1] = cosf(val);
+	}
+}
+
+/*
+ * cpu_bilinear_sample_nchw - Bilinear interpolation from NCHW features.
+ *
+ * Matches PyTorch grid_sample with align_corners=False:
+ *   pixel_pos = (grid_coord + 1) / 2 * size - 0.5
+ *
+ * @out:     Output buffer [C]
+ * @data:    NCHW feature data (batch dim ignored, offset to n=0)
+ * @C:       Number of channels
+ * @H:       Height
+ * @W:       Width
+ * @norm_x:  Normalized x coordinate in [0,1]
+ * @norm_y:  Normalized y coordinate in [0,1]
+ */
+static void cpu_bilinear_sample_nchw(float *out, const float *data,
+				     int C, int H, int W,
+				     float norm_x, float norm_y)
+{
+	/* Convert [0,1] to grid [-1,1] then to pixel coords */
+	float gx = 2.0f * norm_x - 1.0f;
+	float gy = 2.0f * norm_y - 1.0f;
+	float fx = (gx + 1.0f) / 2.0f * (float)W - 0.5f;
+	float fy = (gy + 1.0f) / 2.0f * (float)H - 0.5f;
+
+	int x0 = (int)floorf(fx);
+	int y0 = (int)floorf(fy);
+	float dx = fx - (float)x0;
+	float dy = fy - (float)y0;
+
+	/* Clamp to valid range */
+	int x0c = x0 < 0 ? 0 : (x0 >= W ? W - 1 : x0);
+	int x1c = (x0 + 1) < 0 ? 0 : ((x0 + 1) >= W ? W - 1 : x0 + 1);
+	int y0c = y0 < 0 ? 0 : (y0 >= H ? H - 1 : y0);
+	int y1c = (y0 + 1) < 0 ? 0 : ((y0 + 1) >= H ? H - 1 : y0 + 1);
+
+	float w00 = (1.0f - dx) * (1.0f - dy);
+	float w10 = dx * (1.0f - dy);
+	float w01 = (1.0f - dx) * dy;
+	float w11 = dx * dy;
+
+	for (int c = 0; c < C; c++) {
+		const float *ch = data + c * H * W;
+		out[c] = w00 * ch[y0c * W + x0c] +
+			 w10 * ch[y0c * W + x1c] +
+			 w01 * ch[y1c * W + x0c] +
+			 w11 * ch[y1c * W + x1c];
+	}
+}
+
+/*
  * project_prompts - Project point/box coordinates to d_model embeddings.
  *
- * Creates coordinate tensors from prompts and projects them through
- * the geometry encoder's linear layers. Points use [N, 2] -> [N, d_model]
- * and boxes use [N, 4] -> [N, d_model]. Results are concatenated into
- * a single [total, d_model] tensor.
+ * Computes three encoding paths and sums them (matching Python):
+ *   1. Direct projection: Linear(2, d) on normalized coords
+ *   2. Positional encoding: sinusoidal pos enc + Linear(d, d)
+ *   3. Pool projection: bilinear sample from LayerNormed img feats + Linear(d, d)
+ * Then adds label embedding: type_embed + points_embed.
+ *
+ * Points use [N, 2] -> [N, d_model], boxes use [N, 4] -> [N, d_model].
+ * Results are concatenated into a single [total, d_model] tensor.
  */
 static struct sam3_tensor *project_prompts(
 	struct sam3_image_model *model,
-	struct sam3_graph *g,
 	const struct sam3_prompt *prompts,
 	int n_prompts,
 	struct sam3_arena *arena)
 {
+	struct sam3_geometry_encoder *enc = &model->geom_enc;
+	int d = enc->d_model;
 	int n_points, n_boxes;
-	struct sam3_tensor *point_coords = NULL;
-	struct sam3_tensor *box_coords = NULL;
-	struct sam3_tensor *point_proj = NULL;
-	struct sam3_tensor *box_proj = NULL;
-	struct sam3_tensor *parts[2];
-	int n_parts = 0;
 	int pi = 0, bi = 0;
 	int i;
-	float *pdata, *bdata;
+	float img_size = (float)model->backbone.vit.img_size;
 
 	count_prompts_by_type(prompts, n_prompts, &n_points, &n_boxes);
 
 	if (n_points == 0 && n_boxes == 0)
 		return NULL;
 
-	/* Build point coordinate tensor [n_points, 2] */
-	if (n_points > 0) {
-		int dims[2] = { n_points, 2 };
+	int total = n_points + n_boxes;
+	int out_dims[2] = {total, d};
+	struct sam3_tensor *out;
+	out = gh_alloc_tensor(arena, SAM3_DTYPE_F32, 2, out_dims);
+	if (!out)
+		return NULL;
 
-		point_coords = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
-					       2, dims);
-		if (!point_coords)
+	float *od = (float *)out->data;
+	int row = 0;
+
+	/*
+	 * Prepare LayerNormed image features for pool projection.
+	 * Python: img_pre_norm(img_feats[-1]) on [H*W, B, C] format.
+	 * We normalize each spatial position across C channels.
+	 */
+	const float *img_normed = NULL;
+	float *img_norm_buf = NULL;
+	int feat_H = 0, feat_W = 0;
+	if (n_points > 0 && enc->pool_proj_w &&
+	    model->cached_feat_s1) {
+		const struct sam3_tensor *feat = model->cached_feat_s1;
+		int C = feat->dims[1];
+		feat_H = feat->dims[2];
+		feat_W = feat->dims[3];
+		int HW = feat_H * feat_W;
+		const float *fd = (const float *)feat->data;
+		const float *nw = (const float *)enc->img_pre_norm_w->data;
+		const float *nb = (const float *)enc->img_pre_norm_b->data;
+
+		/* Allocate from arena for normed features [C, H, W] */
+		int norm_dims[] = {C, feat_H, feat_W};
+		struct sam3_tensor *norm_t = gh_alloc_tensor(arena,
+			SAM3_DTYPE_F32, 3, norm_dims);
+		if (!norm_t)
 			return NULL;
+		img_norm_buf = (float *)norm_t->data;
 
-		pdata = (float *)point_coords->data;
+		/* LayerNorm per spatial position (along C axis) */
+		for (int hw = 0; hw < HW; hw++) {
+			/* Gather C values for this position */
+			double mean = 0.0;
+			for (int c = 0; c < C; c++)
+				mean += (double)fd[c * HW + hw];
+			mean /= C;
+
+			double var = 0.0;
+			for (int c = 0; c < C; c++) {
+				double diff = (double)fd[c * HW + hw] - mean;
+				var += diff * diff;
+			}
+			var /= C;
+
+			float inv_std = 1.0f / sqrtf((float)var + 1e-5f);
+			for (int c = 0; c < C; c++) {
+				float normed = ((float)(fd[c * HW + hw] -
+					mean)) * inv_std;
+				img_norm_buf[c * HW + hw] =
+					normed * nw[c] + nb[c];
+			}
+		}
+		img_normed = img_norm_buf;
+	}
+
+	/* Project points: direct + posenc + pool + label embed */
+	if (n_points > 0) {
+		const float *pw = (const float *)enc->point_proj_w->data;
+		const float *pb = (const float *)enc->point_proj_b->data;
+		const float *le = (const float *)enc->label_embed->data;
+
 		for (i = 0; i < n_prompts; i++) {
 			if (prompts[i].type != SAM3_PROMPT_POINT)
 				continue;
-			pdata[pi * 2 + 0] = prompts[i].point.x;
-			pdata[pi * 2 + 1] = prompts[i].point.y;
-			pi++;
+
+			float coords[2] = {
+				prompts[i].point.x / img_size,
+				prompts[i].point.y / img_size
+			};
+
+			/* 1. Direct: out = coords @ W^T + b */
+			cpu_linear(od + row * d, coords, pw, pb,
+				   1, 2, d);
+
+			/* 2. Positional encoding projection */
+			if (enc->posenc_proj_w) {
+				float pos_enc[512]; /* d_model max */
+				float proj_tmp[512];
+				int half_d = d / 2;
+				cpu_sinusoidal_posenc(pos_enc,
+					coords[0], half_d);
+				cpu_sinusoidal_posenc(pos_enc + half_d,
+					coords[1], half_d);
+				cpu_linear(proj_tmp, pos_enc,
+					(const float *)enc->posenc_proj_w->data,
+					(const float *)enc->posenc_proj_b->data,
+					1, d, d);
+				for (int c = 0; c < d; c++)
+					od[row * d + c] += proj_tmp[c];
+			}
+
+			/* 3. Pool projection: bilinear sample + linear */
+			if (img_normed && enc->pool_proj_w) {
+				float sampled[512];
+				float proj_tmp[512];
+				cpu_bilinear_sample_nchw(sampled,
+					img_normed, d,
+					feat_H, feat_W,
+					coords[0], coords[1]);
+				cpu_linear(proj_tmp, sampled,
+					(const float *)enc->pool_proj_w->data,
+					(const float *)enc->pool_proj_b->data,
+					1, d, d);
+				for (int c = 0; c < d; c++)
+					od[row * d + c] += proj_tmp[c];
+			}
+
+			/* 4. Add label embedding */
+			int label = prompts[i].point.label;
+			if (label >= 0 && label < enc->n_labels) {
+				const float *lv = le + label * d;
+				for (int c = 0; c < d; c++)
+					od[row * d + c] += lv[c];
+			}
+
+			row++;
 		}
-
-		/* Project: [n_points, 2] @ [2, d_model] -> [n_points, d_model] */
-		point_proj = gh_linear(g, arena, point_coords,
-				       model->geom_enc.point_proj_w,
-				       model->geom_enc.point_proj_b);
-		if (!point_proj)
-			return NULL;
-
-		parts[n_parts++] = point_proj;
 	}
 
-	/* Build box coordinate tensor [n_boxes, 4] */
+	/* Project boxes: normalize to [0,1], linear, add label embed */
 	if (n_boxes > 0) {
-		int dims[2] = { n_boxes, 4 };
+		const float *bw = (const float *)enc->box_proj_w->data;
+		const float *bb = (const float *)enc->box_proj_b->data;
+		const float *le = (const float *)enc->label_embed->data;
 
-		box_coords = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
-					     2, dims);
-		if (!box_coords)
-			return NULL;
-
-		bdata = (float *)box_coords->data;
 		for (i = 0; i < n_prompts; i++) {
 			if (prompts[i].type != SAM3_PROMPT_BOX)
 				continue;
-			bdata[bi * 4 + 0] = prompts[i].box.x1;
-			bdata[bi * 4 + 1] = prompts[i].box.y1;
-			bdata[bi * 4 + 2] = prompts[i].box.x2;
-			bdata[bi * 4 + 3] = prompts[i].box.y2;
-			bi++;
+
+			float coords[4] = {
+				prompts[i].box.x1 / img_size,
+				prompts[i].box.y1 / img_size,
+				prompts[i].box.x2 / img_size,
+				prompts[i].box.y2 / img_size
+			};
+
+			/* Linear: out = coords @ W^T + b */
+			cpu_linear(od + row * d, coords, bw, bb,
+				   1, 4, d);
+
+			/* Box label: default to 0 (positive) */
+			const float *lv = le;  /* label_embed[0] */
+			for (int c = 0; c < d; c++)
+				od[row * d + c] += lv[c];
+
+			row++;
 		}
-
-		/* Project: [n_boxes, 4] @ [4, d_model] -> [n_boxes, d_model] */
-		box_proj = gh_linear(g, arena, box_coords,
-				     model->geom_enc.box_proj_w,
-				     model->geom_enc.box_proj_b);
-		if (!box_proj)
-			return NULL;
-
-		parts[n_parts++] = box_proj;
 	}
 
-	/* Concatenate point and box projections along axis 0 */
-	if (n_parts == 1)
-		return parts[0];
-
-	return gh_concat(g, arena, parts, n_parts, 0);
+	return out;
 }
 
 /*
@@ -320,7 +527,6 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       int n_prompts,
 				       struct sam3_result *result)
 {
-	struct sam3_graph graph;
 	struct sam3_tensor *prompt_tokens = NULL;
 	struct sam3_tensor *text_features = NULL;
 	struct sam3_tensor *mask_logits;
@@ -350,47 +556,101 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	 * survives scratch resets between segmentation stages.
 	 */
 	text = find_text_prompt(prompts, n_prompts);
+
+	/*
+	 * When only geometric prompts are given (no text), inject
+	 * the dummy text "visual" — the Python reference model does
+	 * this automatically in Sam3Processor.add_geometric_prompt().
+	 * The DETR encoder/decoder require text features as context.
+	 */
+	if (!text) {
+		int n_pts, n_bxs;
+		count_prompts_by_type(prompts, n_prompts,
+				      &n_pts, &n_bxs);
+		if (n_pts > 0 || n_bxs > 0) {
+			text = "visual";
+			sam3_log_info("segment: injecting dummy text "
+				      "\"visual\" for geometric prompts");
+		}
+	}
+
 	if (text) {
-		struct sam3_tensor *tf_persist;
+		/*
+		 * Use per-block text encoder evaluation for debugging.
+		 * This dumps /tmp/dbg_te_block_XX.bin for each block.
+		 */
+		struct sam3_text_encoder *te = &proc->model.backbone.text_enc;
+		int32_t tokens[77]; /* max context_len */
+		int n_tokens;
+		struct sam3_tensor *tok_tensor;
+		int tok_dims[1];
 
+		n_tokens = sam3_tokenizer_encode(
+			&proc->model.backbone.tokenizer, text,
+			tokens, te->context_len);
+		if (n_tokens <= 0) {
+			sam3_log_error("segment: tokenize failed");
+			err = SAM3_EINVAL;
+			goto fail;
+		}
+
+		tok_dims[0] = te->context_len;
 		sam3_arena_reset(&proc->scratch_arena);
-		sam3_graph_init(&graph);
+		tok_tensor = gh_alloc_tensor(&proc->model_arena,
+					      SAM3_DTYPE_I32, 1, tok_dims);
+		if (!tok_tensor) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		memcpy(tok_tensor->data, tokens,
+		       (size_t)te->context_len * sizeof(int32_t));
 
-		text_features = sam3_vl_backbone_build_text(
-			&proc->model.backbone, &graph,
-			text, NULL, &proc->scratch_arena);
+		text_features = sam3_text_encoder_build_perblock(
+			te, proc->backend, tok_tensor,
+			&proc->scratch_arena, &proc->model_arena);
 		if (!text_features) {
-			sam3_log_error("segment: text encode build "
-				       "failed, scratch %zu/%zu",
-				       proc->scratch_arena.offset,
-				       proc->scratch_arena.size);
+			sam3_log_error("segment: text encode perblock "
+				       "failed");
 			err = SAM3_ENOMEM;
 			goto fail;
 		}
 
-		err = proc->backend->ops->graph_eval(proc->backend,
-						      &graph);
-		if (err != SAM3_OK) {
-			sam3_log_error("segment: text eval failed: %d",
-				       err);
-			goto fail;
-		}
-
-		/* Copy materialized text features to model arena */
-		tf_persist = gh_alloc_tensor(
-			&proc->model_arena, text_features->dtype,
-			text_features->n_dims, text_features->dims);
-		if (!tf_persist) {
-			err = SAM3_ENOMEM;
-			goto fail;
-		}
-		memcpy(tf_persist->data, text_features->data,
-		       text_features->nbytes);
-		text_features = tf_persist;
-
-		sam3_log_debug("segment: text encoded, %d×%d",
+		sam3_log_debug("segment: text encoded (perblock), %d×%d",
 			       text_features->dims[0],
 			       text_features->dims[1]);
+
+		/*
+		 * Truncate text features to real tokens only.
+		 *
+		 * Python creates text_attention_mask = (tokenized != 0)
+		 * and passes it as key_padding_mask to encoder cross-attn,
+		 * masking out padding tokens.  We achieve the same effect
+		 * by dropping padding tokens entirely — softmax over
+		 * non-masked tokens is identical to softmax over the
+		 * truncated set.
+		 */
+		if (text_features->dims[0] > n_tokens) {
+			int d = text_features->dims[1];
+			int trunc_dims[] = {n_tokens, d};
+			struct sam3_tensor *trunc;
+
+			trunc = gh_alloc_tensor(&proc->model_arena,
+						 SAM3_DTYPE_F32, 2,
+						 trunc_dims);
+			if (!trunc) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			memcpy(trunc->data, text_features->data,
+			       (size_t)n_tokens * (size_t)d *
+			       sizeof(float));
+			sam3_log_info("segment: truncated text %d→%d "
+				      "tokens (dropped %d padding)",
+				      text_features->dims[0],
+				      n_tokens,
+				      text_features->dims[0] - n_tokens);
+			text_features = trunc;
+		}
 	}
 
 	/*
@@ -403,39 +663,18 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 		count_prompts_by_type(prompts, n_prompts,
 				      &n_points, &n_boxes);
 		if (n_points > 0 || n_boxes > 0) {
-			struct sam3_tensor *pt_persist;
-
-			sam3_arena_reset(&proc->scratch_arena);
-			sam3_graph_init(&graph);
-
+			/*
+			 * Project prompts on CPU: normalize coords to
+			 * [0,1], linear projection, add label embedding.
+			 * No graph/Metal needed for tiny prompt tensors.
+			 */
 			prompt_tokens = project_prompts(
-				&proc->model, &graph, prompts,
-				n_prompts, &proc->scratch_arena);
+				&proc->model, prompts,
+				n_prompts, &proc->model_arena);
 			if (!prompt_tokens) {
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
-
-			err = proc->backend->ops->graph_eval(
-				proc->backend, &graph);
-			if (err != SAM3_OK) {
-				sam3_log_error("segment: prompt proj "
-					       "eval failed: %d", err);
-				goto fail;
-			}
-
-			pt_persist = gh_alloc_tensor(
-				&proc->model_arena,
-				prompt_tokens->dtype,
-				prompt_tokens->n_dims,
-				prompt_tokens->dims);
-			if (!pt_persist) {
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
-			memcpy(pt_persist->data, prompt_tokens->data,
-			       prompt_tokens->nbytes);
-			prompt_tokens = pt_persist;
 		}
 	}
 
@@ -500,8 +739,8 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 
 	/*
 	 * Copy scorer output into iou_scores. The scorer produces
-	 * [n_queries, 1] with sigmoid already applied (0-1 range).
-	 * Copy min(n_masks, n_scores) entries.
+	 * raw logits [n_queries, 1]; apply sigmoid to get [0,1]
+	 * probabilities for NMS prefiltering.
 	 */
 	if (score_logits) {
 		int n_scores = score_logits->dims[0];
@@ -510,7 +749,8 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 		const float *sdata = (const float *)score_logits->data;
 
 		for (int i = 0; i < n_copy; i++)
-			result->iou_scores[i] = sdata[i];
+			result->iou_scores[i] = 1.0f /
+				(1.0f + expf(-sdata[i]));
 
 		result->iou_valid = 1;
 		sam3_log_info("segment: %d IoU scores computed", n_copy);

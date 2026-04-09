@@ -301,27 +301,60 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 	}
 
 	case SAM3_OP_GELU: {
-		/* gelu(x) ~ x * sigmoid(1.702 * x) */
+		/*
+		 * Exact GELU matching PyTorch nn.GELU(approximate='none'):
+		 *   gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+		 */
 		int scalar_shape[] = {1};
-		float coeff = 1.702f;
 		mlx_dtype in_dtype = mlx_array_dtype(inputs[0]);
-		mlx_array coeff_arr = mlx_array_new_data(
-			&coeff, scalar_shape, 1, MLX_FLOAT32);
-		mlx_array coeff_cast = mlx_array_new();
-		mlx_astype(&coeff_cast, coeff_arr, in_dtype, stream);
 
-		mlx_array scaled = mlx_array_new();
-		mlx_multiply(&scaled, inputs[0], coeff_cast, stream);
+		float half_val = 0.5f;
+		float rsqrt2_val = 0.7071067811865475f; /* 1/sqrt(2) */
+		float one_val = 1.0f;
 
-		mlx_array sig = mlx_array_new();
-		mlx_sigmoid(&sig, scaled, stream);
+		mlx_array half_arr = mlx_array_new_data(
+			&half_val, scalar_shape, 1, MLX_FLOAT32);
+		mlx_array rsqrt2_arr = mlx_array_new_data(
+			&rsqrt2_val, scalar_shape, 1, MLX_FLOAT32);
+		mlx_array one_arr = mlx_array_new_data(
+			&one_val, scalar_shape, 1, MLX_FLOAT32);
 
-		rc = mlx_multiply(&result, inputs[0], sig, stream);
+		mlx_array half_cast = mlx_array_new();
+		mlx_array rsqrt2_cast = mlx_array_new();
+		mlx_array one_cast = mlx_array_new();
+		mlx_astype(&half_cast, half_arr, in_dtype, stream);
+		mlx_astype(&rsqrt2_cast, rsqrt2_arr, in_dtype, stream);
+		mlx_astype(&one_cast, one_arr, in_dtype, stream);
 
-		mlx_array_free(sig);
-		mlx_array_free(scaled);
-		mlx_array_free(coeff_cast);
-		mlx_array_free(coeff_arr);
+		/* x / sqrt(2) */
+		mlx_array x_scaled = mlx_array_new();
+		mlx_multiply(&x_scaled, inputs[0], rsqrt2_cast, stream);
+
+		/* erf(x / sqrt(2)) */
+		mlx_array erf_val = mlx_array_new();
+		mlx_erf(&erf_val, x_scaled, stream);
+
+		/* 1 + erf(...) */
+		mlx_array one_plus_erf = mlx_array_new();
+		mlx_add(&one_plus_erf, one_cast, erf_val, stream);
+
+		/* 0.5 * x */
+		mlx_array half_x = mlx_array_new();
+		mlx_multiply(&half_x, inputs[0], half_cast, stream);
+
+		/* 0.5 * x * (1 + erf(...)) */
+		rc = mlx_multiply(&result, half_x, one_plus_erf, stream);
+
+		mlx_array_free(half_x);
+		mlx_array_free(one_plus_erf);
+		mlx_array_free(erf_val);
+		mlx_array_free(x_scaled);
+		mlx_array_free(one_cast);
+		mlx_array_free(rsqrt2_cast);
+		mlx_array_free(half_cast);
+		mlx_array_free(one_arr);
+		mlx_array_free(rsqrt2_arr);
+		mlx_array_free(half_arr);
 		break;
 	}
 
@@ -1185,24 +1218,48 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 			}
 
 			{
+				/*
+				 * MLX transpose/reshape create views with
+				 * non-standard strides. Force row-major
+				 * contiguous layout before reading data.
+				 */
+				mlx_array contig = mlx_array_new();
+				int crc = mlx_contiguous(
+					&contig, *out_a,
+					false, /* allow_col_major */
+					mtl->stream);
+				if (crc) {
+					mlx_array_free(contig);
+					sam3_log_error("metal: contiguous failed");
+					break;
+				}
+				{
+					mlx_vector_array va =
+						mlx_vector_array_new();
+					mlx_vector_array_append_value(va,
+								       contig);
+					mlx_eval(va);
+					mlx_vector_array_free(va);
+				}
+
 				const void *src = NULL;
-				mlx_dtype mtype = mlx_array_dtype(*out_a);
+				mlx_dtype mtype = mlx_array_dtype(contig);
 
 				switch (mtype) {
 				case MLX_FLOAT32:
-					src = mlx_array_data_float32(*out_a);
+					src = mlx_array_data_float32(contig);
 					break;
 				case MLX_FLOAT16:
-					src = mlx_array_data_float16(*out_a);
+					src = mlx_array_data_float16(contig);
 					break;
 				case MLX_BFLOAT16:
-					src = mlx_array_data_bfloat16(*out_a);
+					src = mlx_array_data_bfloat16(contig);
 					break;
 				case MLX_INT32:
-					src = mlx_array_data_int32(*out_a);
+					src = mlx_array_data_int32(contig);
 					break;
 				case MLX_INT8:
-					src = mlx_array_data_int8(*out_a);
+					src = mlx_array_data_int8(contig);
 					break;
 				default:
 					sam3_log_error("metal: unsupported output dtype");
@@ -1213,6 +1270,7 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 					memcpy(out_t->data, src, out_t->nbytes);
 					n_copied++;
 				}
+				mlx_array_free(contig);
 			}
 
 		evict:
@@ -1221,6 +1279,25 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 		sam3_log_debug("metal_eval: phase3 copied=%d "
 			"skip_inter=%d skip_nodata=%d",
 			n_copied, n_skip_inter, n_skip_nodata);
+	}
+
+	/*
+	 * Phase 4: evict ephemeral input tensors.
+	 *
+	 * Tensors created by gh_tensor_wrap live in the caller's
+	 * scratch arena, which gets reset between graph_eval calls.
+	 * Subsequent allocations reuse the same header address but
+	 * may point at different external data. Without eviction,
+	 * metal_wrap_tensor would return a stale mlx_array with
+	 * data copied from the previous graph_eval.
+	 */
+	for (int i = 0; i < g->n_nodes; i++) {
+		for (int j = 0; j < g->nodes[i].n_inputs; j++) {
+			const struct sam3_tensor *inp =
+				g->nodes[i].inputs[j];
+			if (inp && inp->ephemeral)
+				metal_map_evict(mtl, inp);
+		}
 	}
 
 	return SAM3_OK;

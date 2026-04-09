@@ -178,10 +178,11 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 		}
 		e->dtype = parse_dtype(dtype_obj->valuestring);
 		if ((int)e->dtype == -1) {
-			sam3_log_error("st_open: unknown dtype '%s' for %s",
-				       dtype_obj->valuestring,
-				       item->string);
-			goto fail;
+			sam3_log_warn("st_open: skipping unknown dtype "
+				      "'%s' for %s",
+				      dtype_obj->valuestring,
+				      item->string);
+			continue;
 		}
 
 		/* shape */
@@ -263,13 +264,13 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 	s->mapped_size  = file_size;
 	s->data_section = (const char *)mapped + 8 + (size_t)header_size;
 	s->entries      = entries;
-	s->n_entries    = n_entries;
+	s->n_entries    = idx;
 
 	r->impl = s;
 
 	cJSON_Delete(root);
 	sam3_log_info("st_open: loaded %d tensors from %s",
-		      n_entries, path);
+		      idx, path);
 	return SAM3_OK;
 
 fail:

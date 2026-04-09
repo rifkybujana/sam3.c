@@ -34,6 +34,24 @@ Run tests:
     tools/            CLI binaries (inference, weight conversion)
     tests/            Unit and integration tests
     models/           Model weights (.gitignored)
+    docs/             Documentation (format specs, reference material)
+
+## .sam3 Weight Format
+
+Model weights are stored in the `.sam3` binary format. See
+[docs/weight-format.md](docs/weight-format.md) for the full specification.
+
+Quick summary:
+- **Magic**: `0x334D4153` (ASCII "SAM3", little-endian)
+- **Version**: 2
+- **Layout**: 48-byte header + tensor descriptors (176 B each) + page-aligned
+  data blob
+- **Alignment**: data blob at 4096-byte boundary, tensors at 64-byte boundaries
+- **Loading**: mmap-based with FNV-1a hash table for O(1) tensor lookup
+- **Dtypes**: F32, F16, BF16, I32, I8, Q8_0 (block-quantized int8)
+- **Conversion**: `sam3_convert` reads SafeTensors, writes `.sam3`
+- **Source**: `src/core/weight.h` (format structs), `src/core/weight.c`
+  (loader/writer)
 
 ## C Coding Standard
 

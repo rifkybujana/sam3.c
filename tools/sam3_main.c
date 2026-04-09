@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "sam3/sam3.h"
+#include "sam3/internal/mask_nms.h"
 #include "util/image.h"
 #include "util/log.h"
 #include "util/error.h"
@@ -70,6 +71,9 @@ struct main_args {
 	int                  write_overlay;
 	int                  write_cutout;
 	float                threshold;
+	int                  nms_enabled;
+	float                nms_prob_thresh;
+	float                nms_iou_thresh;
 	int                  profile;
 	int                  verbose;
 };
@@ -141,6 +145,11 @@ static void print_usage(const char *prog)
 	printf("  --cutout           Write cutout PNGs\n");
 	printf("  --all              Enable all output formats\n");
 	printf("  --threshold <f>    Mask threshold "
+	       "(default: 0.0)\n");
+	printf("  --no-nms           Disable NMS post-processing\n");
+	printf("  --nms-prob-thresh <f>  Score prefilter "
+	       "(default: 0.5)\n");
+	printf("  --nms-iou-thresh <f>   Mask IoU NMS threshold "
 	       "(default: 0.5)\n");
 	printf("\nOther:\n");
 	printf("  --profile          Print profiling report\n");
@@ -163,7 +172,10 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 	args->write_png     = 0;
 	args->write_overlay = 0;
 	args->write_cutout  = 0;
-	args->threshold     = 0.5f;
+	args->threshold     = 0.0f;
+	args->nms_enabled     = 1;
+	args->nms_prob_thresh = 0.5f;
+	args->nms_iou_thresh  = 0.5f;
 	args->profile       = 0;
 	args->verbose       = 0;
 
@@ -269,6 +281,24 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 				return 1;
 			}
 			args->threshold = (float)atof(argv[i]);
+		} else if (strcmp(argv[i], "--no-nms") == 0) {
+			args->nms_enabled = 0;
+		} else if (strcmp(argv[i], "--nms-prob-thresh") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --nms-prob-thresh "
+					"requires a value\n");
+				return 1;
+			}
+			args->nms_prob_thresh = (float)atof(argv[i]);
+		} else if (strcmp(argv[i], "--nms-iou-thresh") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --nms-iou-thresh "
+					"requires a value\n");
+				return 1;
+			}
+			args->nms_iou_thresh = (float)atof(argv[i]);
 		} else if (strcmp(argv[i], "--profile") == 0) {
 			args->profile = 1;
 		} else if (strcmp(argv[i], "-v") == 0) {
@@ -616,6 +646,71 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error: segmentation failed: %s\n",
 			sam3_error_str(err));
 		goto cleanup;
+	}
+
+	/* Post-process: greedy mask NMS. kept_buf and tmp_scores
+	 * are sized to match the 512-mask cap enforced by
+	 * sam3_mask_nms (see include/sam3/internal/mask_nms.h). */
+	if (args.nms_enabled && result.iou_valid && result.n_masks > 0) {
+		size_t mask_pixels = (size_t)result.mask_width *
+				     (size_t)result.mask_height;
+		int kept_buf[512];
+		float tmp_scores[512];
+		int n_kept = sam3_mask_nms(
+			result.masks, result.iou_scores,
+			result.n_masks,
+			result.mask_height, result.mask_width,
+			args.nms_prob_thresh,
+			args.nms_iou_thresh,
+			kept_buf);
+
+		if (n_kept < 0) {
+			fprintf(stderr, "warning: NMS failed, "
+				"falling back to raw output\n");
+		} else if (n_kept == 0) {
+			printf("NMS: %d -> 0 masks\n", result.n_masks);
+			result.n_masks = 0;
+		} else {
+			/* Compact result.masks and result.iou_scores
+			 * to hold only kept entries, in descending-
+			 * score order. kept_buf contains indices into
+			 * the ORIGINAL mask array which are NOT
+			 * guaranteed to be monotonic in position, so
+			 * we stage into a scratch buffer to avoid
+			 * clobbering source slots that later
+			 * iterations still need to read. */
+			size_t total = (size_t)n_kept * mask_pixels;
+			float *tmp = (float *)malloc(total *
+				sizeof(float));
+			if (!tmp) {
+				fprintf(stderr,
+					"warning: NMS compaction "
+					"malloc (%zu bytes) failed, "
+					"using raw output\n",
+					total * sizeof(float));
+			} else {
+				for (int k = 0; k < n_kept; k++) {
+					int src = kept_buf[k];
+					memcpy(tmp +
+						(size_t)k * mask_pixels,
+						result.masks +
+						(size_t)src * mask_pixels,
+						mask_pixels *
+						sizeof(float));
+					tmp_scores[k] =
+						result.iou_scores[src];
+				}
+				memcpy(result.masks, tmp,
+					total * sizeof(float));
+				memcpy(result.iou_scores, tmp_scores,
+					(size_t)n_kept *
+					sizeof(float));
+				free(tmp);
+				printf("NMS: %d -> %d masks\n",
+				       result.n_masks, n_kept);
+				result.n_masks = n_kept;
+			}
+		}
 	}
 
 	/* Print results summary */
