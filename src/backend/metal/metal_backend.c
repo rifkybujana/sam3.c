@@ -695,48 +695,67 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 	case SAM3_OP_SDPA: {
 		/*
 		 * Fused scaled dot-product attention via MLX.
-		 * inputs: Q[n_q,hd], K[n_kv,hd], V[n_kv,hd], mask?
-		 * MLX expects 4D: [batch, n_heads, seq, head_dim].
-		 * Per-head: batch=1, n_heads=1.
-		 * Q and K/V may have different seq lengths (cross-attn).
+		 *
+		 * 4D batched: Q[B, H, seq_q, hd] - pass directly.
+		 * 2D legacy:  Q[seq_q, hd] - reshape to [1, 1, seq_q, hd].
 		 */
 		int hd = node->params[0];
 		float scale = 1.0f / sqrtf((float)hd);
-		int seq_q = node->inputs[0]->dims[0];
-		int seq_kv = node->inputs[1]->dims[0];
+		int ndims = node->inputs[0]->n_dims;
 
-		/* Reshape 2D -> 4D [1, 1, seq, hd] */
-		int q_shape[] = {1, 1, seq_q, hd};
-		int kv_shape[] = {1, 1, seq_kv, hd};
-		mlx_array q4d = mlx_array_new();
-		mlx_array k4d = mlx_array_new();
-		mlx_array v4d = mlx_array_new();
-		rc = mlx_reshape(&q4d, inputs[0], q_shape, 4, stream);
-		if (!rc)
-			rc = mlx_reshape(&k4d, inputs[1], kv_shape, 4,
+		mlx_array q_in, k_in, v_in;
+
+		if (ndims == 4) {
+			/* Batched: already [B, H, seq, hd] */
+			q_in = inputs[0];
+			k_in = inputs[1];
+			v_in = inputs[2];
+		} else {
+			/* Legacy 2D: [seq, hd] -> [1, 1, seq, hd] */
+			int seq_q = node->inputs[0]->dims[0];
+			int seq_kv = node->inputs[1]->dims[0];
+			int q_shape[] = {1, 1, seq_q, hd};
+			int kv_shape[] = {1, 1, seq_kv, hd};
+
+			q_in = mlx_array_new();
+			k_in = mlx_array_new();
+			v_in = mlx_array_new();
+			rc = mlx_reshape(&q_in, inputs[0], q_shape, 4,
 					  stream);
-		if (!rc)
-			rc = mlx_reshape(&v4d, inputs[2], kv_shape, 4,
-					  stream);
-		if (rc) {
-			mlx_array_free(q4d);
-			mlx_array_free(k4d);
-			mlx_array_free(v4d);
-			break;
+			if (!rc)
+				rc = mlx_reshape(&k_in, inputs[1],
+						  kv_shape, 4, stream);
+			if (!rc)
+				rc = mlx_reshape(&v_in, inputs[2],
+						  kv_shape, 4, stream);
+			if (rc) {
+				mlx_array_free(q_in);
+				mlx_array_free(k_in);
+				mlx_array_free(v_in);
+				break;
+			}
 		}
 
-		/* Prepare mask: [n_q, n_kv] -> [1, 1, n_q, n_kv] */
+		/* Prepare mask if present */
 		mlx_array mask4d = (mlx_array){0};
 		const char *mask_mode = "";
 		if (node->n_inputs > 3 && node->inputs[3]) {
 			mask4d = mlx_array_new();
+			int seq_q = (ndims == 4)
+				? node->inputs[0]->dims[2]
+				: node->inputs[0]->dims[0];
+			int seq_kv = (ndims == 4)
+				? node->inputs[1]->dims[2]
+				: node->inputs[1]->dims[0];
 			int mshape[] = {1, 1, seq_q, seq_kv};
 			rc = mlx_reshape(&mask4d, inputs[3], mshape, 4,
 					  stream);
 			if (rc) {
-				mlx_array_free(q4d);
-				mlx_array_free(k4d);
-				mlx_array_free(v4d);
+				if (ndims != 4) {
+					mlx_array_free(q_in);
+					mlx_array_free(k_in);
+					mlx_array_free(v_in);
+				}
 				mlx_array_free(mask4d);
 				break;
 			}
@@ -746,12 +765,14 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		mlx_array sdpa_out = mlx_array_new();
 		mlx_array no_sinks = (mlx_array){0};
 		rc = mlx_fast_scaled_dot_product_attention(
-			&sdpa_out, q4d, k4d, v4d, scale,
+			&sdpa_out, q_in, k_in, v_in, scale,
 			mask_mode, mask4d, no_sinks, stream);
 
-		mlx_array_free(q4d);
-		mlx_array_free(k4d);
-		mlx_array_free(v4d);
+		if (ndims != 4) {
+			mlx_array_free(q_in);
+			mlx_array_free(k_in);
+			mlx_array_free(v_in);
+		}
 		if (mask4d.ctx)
 			mlx_array_free(mask4d);
 
@@ -760,10 +781,17 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 			break;
 		}
 
-		/* Reshape 4D [1, 1, seq_q, hd] -> 2D [seq_q, hd] */
-		int shape2d[] = {seq_q, hd};
-		rc = mlx_reshape(&result, sdpa_out, shape2d, 2, stream);
-		mlx_array_free(sdpa_out);
+		if (ndims == 4) {
+			/* Batched: output [B, H, seq_q, hd] as-is */
+			result = sdpa_out;
+		} else {
+			/* Legacy: [1, 1, seq_q, hd] -> [seq_q, hd] */
+			int seq_q = node->inputs[0]->dims[0];
+			int shape2d[] = {seq_q, hd};
+			rc = mlx_reshape(&result, sdpa_out, shape2d, 2,
+					  stream);
+			mlx_array_free(sdpa_out);
+		}
 		break;
 	}
 
