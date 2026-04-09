@@ -216,6 +216,43 @@ static void test_full_round_trip(void)
 	sam3_profiler_free(p);
 }
 
+static void test_inference_stages(void)
+{
+	struct sam3_profiler *p = sam3_profiler_create();
+	sam3_profiler_enable(p);
+
+	/* Simulate the stages wired in processor.c */
+	sam3_prof_stage_begin(p, "model_load");
+	sam3_prof_stage_end(p, "model_load");
+
+	sam3_prof_stage_begin(p, "image_normalize");
+	sam3_prof_stage_end(p, "image_normalize");
+
+	sam3_prof_stage_begin(p, "image_encode");
+	sam3_prof_stage_end(p, "image_encode");
+
+	sam3_prof_stage_begin(p, "text_encode");
+	sam3_prof_stage_end(p, "text_encode");
+
+	sam3_prof_stage_begin(p, "prompt_project");
+	sam3_prof_stage_end(p, "prompt_project");
+
+	sam3_prof_stage_begin(p, "mask_decode");
+	sam3_prof_stage_end(p, "mask_decode");
+
+	sam3_prof_stage_begin(p, "postprocess");
+	sam3_prof_stage_end(p, "postprocess");
+
+	ASSERT_EQ(p->n_stages, 7);
+	for (int i = 0; i < 7; i++) {
+		ASSERT_EQ(p->stages[i].calls, 1);
+		ASSERT(p->stages[i].total_ns >= 0);
+	}
+
+	sam3_profiler_report(p);
+	sam3_profiler_free(p);
+}
+
 int main(void)
 {
 	/* Task 2: Lifecycle */
@@ -235,6 +272,9 @@ int main(void)
 
 	/* Task 8: Integration */
 	test_full_round_trip();
+
+	/* Task 5: Stage names */
+	test_inference_stages();
 
 	TEST_REPORT();
 }
