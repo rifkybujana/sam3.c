@@ -696,32 +696,113 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 
 				/* Self-attention with RoPE */
 				int is_global = vit->layers[i].is_global;
-				struct sam3_tensor *mask = is_global
-					? NULL : vit->window_mask;
-				struct sam3_tensor *rope_cos = is_global
-					? vit->rope_glo_cos
-					: vit->rope_win_cos;
-				struct sam3_tensor *rope_sin = is_global
-					? vit->rope_glo_sin
-					: vit->rope_win_sin;
-
 				struct sam3_tensor *attn;
-				attn = gh_multihead_attention_rope(
-					&g, scratch,
-					x3d, NULL, NULL,
-					vit->layers[i].qkv_w,
-					vit->layers[i].qkv_b,
-					vit->layers[i].proj_w,
-					vit->layers[i].proj_b,
-					vit->n_heads,
-					rope_cos, rope_sin, mask);
-				if (!attn) {
-					sam3_log_error("vit: block %d "
-						"attention OOM "
-						"(scratch %zu / %zu)",
-						i, scratch->offset,
-						scratch->size);
-					return NULL;
+
+				if (is_global) {
+					/*
+					 * Global block: full attention over
+					 * all n_patches with the 5184-pos
+					 * RoPE table.
+					 */
+					attn = gh_multihead_attention_rope(
+						&g, scratch,
+						x3d, NULL, NULL,
+						vit->layers[i].qkv_w,
+						vit->layers[i].qkv_b,
+						vit->layers[i].proj_w,
+						vit->layers[i].proj_b,
+						vit->n_heads,
+						vit->rope_glo_cos,
+						vit->rope_glo_sin,
+						NULL);
+					if (!attn) {
+						sam3_log_error("vit: "
+							"block %d "
+							"attention OOM "
+							"(scratch %zu / "
+							"%zu)",
+							i, scratch->offset,
+							scratch->size);
+						return NULL;
+					}
+				} else {
+					/*
+					 * Mask-free windowed attention.
+					 *
+					 * Partition the pre-attn layer-norm
+					 * output from [np, e] into
+					 * [n_win, ws*ws, e], run unmasked
+					 * MHA with the small local RoPE
+					 * table, then unpartition back
+					 * to [np, e].
+					 *
+					 * The MHA helper treats dim 0 as
+					 * batch, so this runs n_win
+					 * independent windowed attentions
+					 * in parallel.
+					 */
+					struct sam3_tensor *x_win;
+					x_win = gh_window_partition(
+						&g, scratch, x_norm,
+						vit->window_size,
+						vit->grid_size);
+					if (!x_win)
+						return NULL;
+
+					struct sam3_tensor *attn_win;
+					attn_win = gh_multihead_attention_rope(
+						&g, scratch,
+						x_win, NULL, NULL,
+						vit->layers[i].qkv_w,
+						vit->layers[i].qkv_b,
+						vit->layers[i].proj_w,
+						vit->layers[i].proj_b,
+						vit->n_heads,
+						vit->rope_win_local_cos,
+						vit->rope_win_local_sin,
+						NULL);
+					if (!attn_win) {
+						sam3_log_error("vit: "
+							"block %d "
+							"windowed mha OOM "
+							"(scratch %zu / "
+							"%zu)",
+							i, scratch->offset,
+							scratch->size);
+						return NULL;
+					}
+
+					/*
+					 * The MHA helper returns
+					 * [bs, d_model] = [n_win*ws*ws, e].
+					 * Reshape to [n_win, ws*ws, e]
+					 * before unpartitioning.
+					 */
+					int nw = vit->grid_size /
+						 vit->window_size;
+					int win_3d[] = {
+						nw * nw,
+						vit->window_size *
+						vit->window_size,
+						e
+					};
+					attn_win = gh_reshape(&g, scratch,
+							      attn_win, 3,
+							      win_3d);
+					if (!attn_win)
+						return NULL;
+
+					attn = gh_window_unpartition(
+						&g, scratch, attn_win,
+						vit->window_size,
+						vit->grid_size);
+					if (!attn) {
+						sam3_log_error("vit: "
+							"block %d "
+							"unpartition fail",
+							i);
+						return NULL;
+					}
 				}
 
 				/* Residual: x + attn */
