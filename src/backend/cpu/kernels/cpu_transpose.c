@@ -1,10 +1,15 @@
 /*
- * src/backend/cpu/kernels/cpu_transpose.c - 2D transpose kernel
+ * src/backend/cpu/kernels/cpu_transpose.c - N-D transpose kernel
  *
- * Transposes a 2D matrix [rows, cols] -> [cols, rows] by copying.
- * NEON/AVX2 paths use block transpose for cache efficiency (f32 only).
- * Non-f32 dtypes use a generic byte-level path via sam3_dtype_size().
- * Always copies data (no lazy stride swap).
+ * Transposes tensors of any rank with arbitrary axis permutation.
+ * For 2D, NEON/AVX2 fast paths use block transpose for cache efficiency
+ * (f32 only). Non-f32 2D dtypes use a generic byte-level path. For 3D
+ * and 4D tensors a generic stride-based gather is used.
+ *
+ * Permutation is read from node->params[i] where axes[i] is the source
+ * dimension that becomes output dimension i. If all params are zero the
+ * kernel falls back to swapping the last two dimensions (the legacy
+ * 2D-transpose behaviour).
  *
  * Key types:  sam3_node, sam3_tensor
  * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h, util/threadpool.h
@@ -180,6 +185,62 @@ static void transpose_f32_avx2(const float *in, float *out,
 
 #endif /* SAM3_HAS_AVX2 */
 
+/* --- Generic N-D transpose --- */
+
+/*
+ * transpose_nd_generic - N-D transpose with arbitrary axis permutation.
+ *
+ * @axes:    out_dim[i] = in_dim[axes[i]]
+ * @ndim:    rank (1..SAM3_MAX_DIMS)
+ *
+ * Iterates over a contiguous slice of the output index space and gathers
+ * each element from the corresponding input position. Uses pre-computed
+ * input/output strides so the inner loop is just a multiply-add per dim.
+ */
+static void transpose_nd_generic(const void *in, void *out,
+				  const int *in_dims, const int *out_dims,
+				  const int *axes, int ndim,
+				  size_t elem_size,
+				  long out_start, long out_end)
+{
+	const unsigned char *src = (const unsigned char *)in;
+	unsigned char *dst = (unsigned char *)out;
+	long in_strides[SAM3_MAX_DIMS];
+	long out_strides[SAM3_MAX_DIMS];
+	int coords[SAM3_MAX_DIMS];
+
+	in_strides[ndim - 1] = 1;
+	out_strides[ndim - 1] = 1;
+	for (int i = ndim - 2; i >= 0; i--) {
+		in_strides[i] = in_strides[i + 1] * in_dims[i + 1];
+		out_strides[i] = out_strides[i + 1] * out_dims[i + 1];
+	}
+
+	/* Initialise coords from out_start. */
+	long rem = out_start;
+	for (int d = 0; d < ndim; d++) {
+		coords[d] = (int)(rem / out_strides[d]);
+		rem %= out_strides[d];
+	}
+
+	for (long o = out_start; o < out_end; o++) {
+		long in_idx = 0;
+		for (int d = 0; d < ndim; d++)
+			in_idx += (long)coords[d] * in_strides[axes[d]];
+
+		memcpy(dst + (size_t)o * elem_size,
+		       src + (size_t)in_idx * elem_size,
+		       elem_size);
+
+		/* Increment row-major coords. */
+		for (int d = ndim - 1; d >= 0; d--) {
+			if (++coords[d] < out_dims[d])
+				break;
+			coords[d] = 0;
+		}
+	}
+}
+
 /* --- Parallel dispatch --- */
 
 struct transpose_par_ctx {
@@ -187,6 +248,17 @@ struct transpose_par_ctx {
 	void       *out;
 	int         rows;
 	int         cols;
+	size_t      elem_size;
+};
+
+struct transpose_nd_par_ctx {
+	const void *in;
+	void       *out;
+	const int  *in_dims;
+	const int  *out_dims;
+	const int  *axes;
+	int         ndim;
+	long        total;
 	size_t      elem_size;
 };
 
@@ -222,6 +294,22 @@ static void transpose_parallel_fn(void *arg, int task_id, int n_tasks)
 	}
 }
 
+static void transpose_nd_parallel_fn(void *arg, int task_id, int n_tasks)
+{
+	struct transpose_nd_par_ctx *ctx = (struct transpose_nd_par_ctx *)arg;
+	long chunk = ctx->total / n_tasks;
+	long start = (long)task_id * chunk;
+	long end = (task_id == n_tasks - 1) ? ctx->total : start + chunk;
+
+	if (start >= end)
+		return;
+
+	transpose_nd_generic(ctx->in, ctx->out,
+			     ctx->in_dims, ctx->out_dims,
+			     ctx->axes, ctx->ndim, ctx->elem_size,
+			     start, end);
+}
+
 enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
 				     struct sam3_threadpool *pool)
 {
@@ -232,27 +320,68 @@ enum sam3_error cpu_kernel_transpose(const struct sam3_node *node,
 
 	struct sam3_tensor *in = node->inputs[0];
 	struct sam3_tensor *out = node->output;
+	int ndim = in->n_dims;
 
-	if (in->n_dims != 2) {
-		sam3_log_error("transpose: expected 2D tensor, got %dD",
-			       in->n_dims);
+	if (ndim < 1 || ndim > SAM3_MAX_DIMS) {
+		sam3_log_error("transpose: invalid n_dims %d", ndim);
 		return SAM3_EINVAL;
 	}
 
-	struct transpose_par_ctx ctx = {
-		.in        = in->data,
-		.out       = out->data,
-		.rows      = in->dims[0],
-		.cols      = in->dims[1],
-		.elem_size = sam3_dtype_size(in->dtype),
-	};
+	/*
+	 * Read permutation from node->params. If all entries are zero,
+	 * fall back to swapping the last two dims (legacy 2D behaviour).
+	 */
+	int axes[SAM3_MAX_DIMS];
+	int has_perm = 0;
+	for (int i = 0; i < ndim; i++) {
+		axes[i] = node->params[i];
+		if (axes[i] != 0)
+			has_perm = 1;
+	}
+	if (!has_perm) {
+		for (int i = 0; i < ndim; i++)
+			axes[i] = i;
+		if (ndim >= 2) {
+			axes[ndim - 2] = ndim - 1;
+			axes[ndim - 1] = ndim - 2;
+		}
+	}
 
 	int n_tasks = sam3_threadpool_n_threads(pool);
 	if (n_tasks < 1)
 		n_tasks = 1;
 
-	sam3_threadpool_parallel_for(pool, transpose_parallel_fn, &ctx,
-				     n_tasks);
+	/* Fast path: 2D swap-last-two via SIMD/scalar block transpose. */
+	if (ndim == 2 && axes[0] == 1 && axes[1] == 0) {
+		struct transpose_par_ctx ctx = {
+			.in        = in->data,
+			.out       = out->data,
+			.rows      = in->dims[0],
+			.cols      = in->dims[1],
+			.elem_size = sam3_dtype_size(in->dtype),
+		};
+		sam3_threadpool_parallel_for(pool, transpose_parallel_fn,
+					     &ctx, n_tasks);
+		return SAM3_OK;
+	}
+
+	/* Generic N-D path. */
+	long total = 1;
+	for (int i = 0; i < ndim; i++)
+		total *= out->dims[i];
+
+	struct transpose_nd_par_ctx ctx = {
+		.in        = in->data,
+		.out       = out->data,
+		.in_dims   = in->dims,
+		.out_dims  = out->dims,
+		.axes      = axes,
+		.ndim      = ndim,
+		.total     = total,
+		.elem_size = sam3_dtype_size(in->dtype),
+	};
+	sam3_threadpool_parallel_for(pool, transpose_nd_parallel_fn,
+				     &ctx, n_tasks);
 
 	return SAM3_OK;
 }

@@ -316,8 +316,51 @@ struct sam3_tensor *gh_transpose(struct sam3_graph *g, struct sam3_arena *a,
 	if (!out)
 		return NULL;
 
-	return sam3_graph_add_op(g, SAM3_OP_TRANSPOSE,
-				 (struct sam3_tensor *[]){input}, 1, out);
+	struct sam3_tensor *result = sam3_graph_add_op(
+		g, SAM3_OP_TRANSPOSE,
+		(struct sam3_tensor *[]){input}, 1, out);
+	if (!result)
+		return NULL;
+
+	/* Set explicit axes: swap last two dims. */
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	for (int i = 0; i < nd; i++)
+		node->params[i] = i;
+	node->params[nd - 2] = nd - 1;
+	node->params[nd - 1] = nd - 2;
+	return result;
+}
+
+struct sam3_tensor *gh_permute(struct sam3_graph *g, struct sam3_arena *a,
+			       struct sam3_tensor *input,
+			       const int *axes)
+{
+	int out_dims[SAM3_MAX_DIMS];
+	int nd = input->n_dims;
+
+	if (nd > 4) {
+		sam3_log_error("gh_permute: n_dims > 4 not supported");
+		return NULL;
+	}
+
+	for (int i = 0; i < nd; i++)
+		out_dims[i] = input->dims[axes[i]];
+
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  nd, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *result = sam3_graph_add_op(
+		g, SAM3_OP_TRANSPOSE,
+		(struct sam3_tensor *[]){input}, 1, out);
+	if (!result)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	for (int i = 0; i < nd; i++)
+		node->params[i] = axes[i];
+	return result;
 }
 
 /* ── Concat ──────────────────────────────────────────────────────── */
@@ -612,14 +655,48 @@ struct sam3_tensor *gh_multihead_attention_rope(
 		       a->offset, a->size, n_heads);
 
 	/*
-	 * Batched multi-head SDPA. Reshape Q/K/V from [bs, d_model]
-	 * to [batch, n_heads, seq_q, head_dim] and emit a single
-	 * SDPA node. MLX handles all heads in one kernel dispatch.
+	 * Batched multi-head SDPA.
+	 *
+	 * Input sq/sk/sv are [bs, d_model] where d_model = n_heads*head_dim
+	 * in row-major layout: for each seq row, the channels are laid out
+	 * as [h0_d0..h0_d{hd-1}, h1_d0..h1_d{hd-1}, ..., h{H-1}_d{hd-1}].
+	 *
+	 * MLX SDPA expects [B, H, S, D]. A naive 4D reshape is WRONG because
+	 * it would place seq rows as the outer axis within each head. We
+	 * need to physically transpose the seq/head axes:
+	 *
+	 *   [bs, d_model]
+	 *     -> [seq_q, n_heads, head_dim]   (pure reshape, split last dim)
+	 *     -> permute(1,0,2) -> [n_heads, seq_q, head_dim]
+	 *     -> [1, n_heads, seq_q, head_dim] (pure reshape, unsqueeze)
+	 *
+	 * This assumes batch==1, which matches all current callers.
 	 */
-	int qkv_4d[] = {batch, n_heads, seq_q, head_dim};
-	struct sam3_tensor *sq_4d = gh_reshape(g, a, sq, 4, qkv_4d);
-	struct sam3_tensor *sk_4d = gh_reshape(g, a, sk, 4, qkv_4d);
-	struct sam3_tensor *sv_4d = gh_reshape(g, a, sv, 4, qkv_4d);
+	int qkv_3d[]     = {seq_q, n_heads, head_dim};
+	int qkv_4d[]     = {batch, n_heads, seq_q, head_dim};
+	int perm_sh[]    = {1, 0, 2};
+
+	struct sam3_tensor *sq_3d = gh_reshape(g, a, sq, 3, qkv_3d);
+	struct sam3_tensor *sk_3d = gh_reshape(g, a, sk, 3, qkv_3d);
+	struct sam3_tensor *sv_3d = gh_reshape(g, a, sv, 3, qkv_3d);
+	if (!sq_3d || !sk_3d || !sv_3d) {
+		sam3_log_error("mha: 3D reshape fail (arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *sq_hs = gh_permute(g, a, sq_3d, perm_sh);
+	struct sam3_tensor *sk_hs = gh_permute(g, a, sk_3d, perm_sh);
+	struct sam3_tensor *sv_hs = gh_permute(g, a, sv_3d, perm_sh);
+	if (!sq_hs || !sk_hs || !sv_hs) {
+		sam3_log_error("mha: permute fail (arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *sq_4d = gh_reshape(g, a, sq_hs, 4, qkv_4d);
+	struct sam3_tensor *sk_4d = gh_reshape(g, a, sk_hs, 4, qkv_4d);
+	struct sam3_tensor *sv_4d = gh_reshape(g, a, sv_hs, 4, qkv_4d);
 	if (!sq_4d || !sk_4d || !sv_4d) {
 		sam3_log_error("mha: 4D reshape fail (arena %zu/%zu)",
 			       a->offset, a->size);
@@ -636,8 +713,31 @@ struct sam3_tensor *gh_multihead_attention_rope(
 		return NULL;
 	}
 
-	/* Reshape back to [bs, d_model] */
-	struct sam3_tensor *merged = gh_reshape(g, a, attn_4d, 2, flat_dims);
+	/*
+	 * Reshape back: [1, n_heads, seq_q, head_dim]
+	 *   -> [n_heads, seq_q, head_dim]        (drop batch)
+	 *   -> permute(1,0,2) -> [seq_q, n_heads, head_dim]
+	 *   -> [bs, d_model]                     (flatten last dim)
+	 */
+	int attn_3d_hs[] = {n_heads, seq_q, head_dim};
+	struct sam3_tensor *attn_hs = gh_reshape(g, a, attn_4d,
+						  3, attn_3d_hs);
+	if (!attn_hs) {
+		sam3_log_error("mha: post-SDPA 3D reshape fail "
+			       "(arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *attn_sh = gh_permute(g, a, attn_hs, perm_sh);
+	if (!attn_sh) {
+		sam3_log_error("mha: post-SDPA permute fail "
+			       "(arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *merged = gh_reshape(g, a, attn_sh, 2, flat_dims);
 	if (!merged) {
 		sam3_log_error("mha: merge reshape fail (arena %zu/%zu)",
 			       a->offset, a->size);
@@ -727,12 +827,36 @@ struct sam3_tensor *gh_multihead_attention_rope_sep(
 		       a->offset, a->size, n_heads);
 
 	/*
-	 * Batched multi-head SDPA.
+	 * Batched multi-head SDPA. See gh_multihead_attention_rope for the
+	 * full explanation of why a direct 4D reshape is incorrect: the
+	 * seq/head axes must be physically transposed, not just relabeled.
 	 */
-	int qkv_4d[] = {batch, n_heads, seq, head_dim};
-	struct sam3_tensor *sq_4d = gh_reshape(g, a, sq, 4, qkv_4d);
-	struct sam3_tensor *sk_4d = gh_reshape(g, a, sk, 4, qkv_4d);
-	struct sam3_tensor *sv_4d = gh_reshape(g, a, sv, 4, qkv_4d);
+	int qkv_3d[]     = {seq, n_heads, head_dim};
+	int qkv_4d[]     = {batch, n_heads, seq, head_dim};
+	int perm_sh[]    = {1, 0, 2};
+
+	struct sam3_tensor *sq_3d = gh_reshape(g, a, sq, 3, qkv_3d);
+	struct sam3_tensor *sk_3d = gh_reshape(g, a, sk, 3, qkv_3d);
+	struct sam3_tensor *sv_3d = gh_reshape(g, a, sv, 3, qkv_3d);
+	if (!sq_3d || !sk_3d || !sv_3d) {
+		sam3_log_error("mha_sep: 3D reshape fail "
+			       "(arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *sq_hs = gh_permute(g, a, sq_3d, perm_sh);
+	struct sam3_tensor *sk_hs = gh_permute(g, a, sk_3d, perm_sh);
+	struct sam3_tensor *sv_hs = gh_permute(g, a, sv_3d, perm_sh);
+	if (!sq_hs || !sk_hs || !sv_hs) {
+		sam3_log_error("mha_sep: permute fail (arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *sq_4d = gh_reshape(g, a, sq_hs, 4, qkv_4d);
+	struct sam3_tensor *sk_4d = gh_reshape(g, a, sk_hs, 4, qkv_4d);
+	struct sam3_tensor *sv_4d = gh_reshape(g, a, sv_hs, 4, qkv_4d);
 	if (!sq_4d || !sk_4d || !sv_4d) {
 		sam3_log_error("mha_sep: 4D reshape fail "
 			       "(arena %zu/%zu)",
@@ -750,7 +874,25 @@ struct sam3_tensor *gh_multihead_attention_rope_sep(
 		return NULL;
 	}
 
-	struct sam3_tensor *merged = gh_reshape(g, a, attn_4d, 2, flat_dims);
+	int attn_3d_hs[] = {n_heads, seq, head_dim};
+	struct sam3_tensor *attn_hs = gh_reshape(g, a, attn_4d,
+						  3, attn_3d_hs);
+	if (!attn_hs) {
+		sam3_log_error("mha_sep: post-SDPA 3D reshape fail "
+			       "(arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *attn_sh = gh_permute(g, a, attn_hs, perm_sh);
+	if (!attn_sh) {
+		sam3_log_error("mha_sep: post-SDPA permute fail "
+			       "(arena %zu/%zu)",
+			       a->offset, a->size);
+		return NULL;
+	}
+
+	struct sam3_tensor *merged = gh_reshape(g, a, attn_sh, 2, flat_dims);
 	if (!merged) {
 		sam3_log_error("mha_sep: merge reshape fail "
 			       "(arena %zu/%zu)",
@@ -817,18 +959,42 @@ struct sam3_tensor *gh_cross_attention(
 		return NULL;
 
 	/*
-	 * Batched multi-head cross-attention.
-	 * Q: [n_q, d_model] -> [1, n_heads, n_q, head_dim]
-	 * K/V: [n_kv, d_model] -> [1, n_heads, n_kv, head_dim]
+	 * Batched multi-head cross-attention. See gh_multihead_attention_rope
+	 * for the full explanation: a direct reshape from [n, d_model] to
+	 * [1, n_heads, n, head_dim] is WRONG -- the seq/head axes must be
+	 * physically transposed, not just relabeled.
+	 *
+	 * Pattern (Q):
+	 *   [n_q, d_model]
+	 *     -> [n_q, n_heads, head_dim]   (pure reshape, split last dim)
+	 *     -> permute(1,0,2) -> [n_heads, n_q, head_dim]
+	 *     -> [1, n_heads, n_q, head_dim] (pure reshape, unsqueeze)
+	 *
+	 * K/V follow the same pattern with n_kv.
 	 */
 	int n_q = q->dims[0];
 	int n_kv = k->dims[0];
-	int q_4d[] = {1, n_heads, n_q, head_dim};
+	int q_3d[]  = {n_q,  n_heads, head_dim};
+	int kv_3d[] = {n_kv, n_heads, head_dim};
+	int q_4d[]  = {1, n_heads, n_q,  head_dim};
 	int kv_4d[] = {1, n_heads, n_kv, head_dim};
+	int perm_sh[] = {1, 0, 2};
 
-	struct sam3_tensor *q4 = gh_reshape(g, arena, q, 4, q_4d);
-	struct sam3_tensor *k4 = gh_reshape(g, arena, k, 4, kv_4d);
-	struct sam3_tensor *v4 = gh_reshape(g, arena, v, 4, kv_4d);
+	struct sam3_tensor *q_3 = gh_reshape(g, arena, q, 3, q_3d);
+	struct sam3_tensor *k_3 = gh_reshape(g, arena, k, 3, kv_3d);
+	struct sam3_tensor *v_3 = gh_reshape(g, arena, v, 3, kv_3d);
+	if (!q_3 || !k_3 || !v_3)
+		return NULL;
+
+	struct sam3_tensor *q_hs = gh_permute(g, arena, q_3, perm_sh);
+	struct sam3_tensor *k_hs = gh_permute(g, arena, k_3, perm_sh);
+	struct sam3_tensor *v_hs = gh_permute(g, arena, v_3, perm_sh);
+	if (!q_hs || !k_hs || !v_hs)
+		return NULL;
+
+	struct sam3_tensor *q4 = gh_reshape(g, arena, q_hs, 4, q_4d);
+	struct sam3_tensor *k4 = gh_reshape(g, arena, k_hs, 4, kv_4d);
+	struct sam3_tensor *v4 = gh_reshape(g, arena, v_hs, 4, kv_4d);
 	if (!q4 || !k4 || !v4)
 		return NULL;
 
@@ -837,9 +1003,25 @@ struct sam3_tensor *gh_cross_attention(
 	if (!attn_4d)
 		return NULL;
 
-	/* Reshape back: [1, n_heads, n_q, head_dim] -> [n_q, d_model] */
+	/*
+	 * Reshape back:
+	 *   [1, n_heads, n_q, head_dim]
+	 *     -> [n_heads, n_q, head_dim]   (drop batch)
+	 *     -> permute(1,0,2) -> [n_q, n_heads, head_dim]
+	 *     -> [n_q, d_model]             (flatten last dim)
+	 */
+	int attn_3d_hs[] = {n_heads, n_q, head_dim};
+	struct sam3_tensor *attn_hs = gh_reshape(g, arena, attn_4d,
+						  3, attn_3d_hs);
+	if (!attn_hs)
+		return NULL;
+
+	struct sam3_tensor *attn_sh = gh_permute(g, arena, attn_hs, perm_sh);
+	if (!attn_sh)
+		return NULL;
+
 	int merged_dims[] = {n_q, d_model};
-	struct sam3_tensor *merged = gh_reshape(g, arena, attn_4d,
+	struct sam3_tensor *merged = gh_reshape(g, arena, attn_sh,
 						 2, merged_dims);
 	if (!merged)
 		return NULL;
@@ -885,16 +1067,32 @@ struct sam3_tensor *gh_cross_attention_sep(
 		return NULL;
 
 	/*
-	 * Batched multi-head cross-attention.
+	 * Batched multi-head cross-attention. See gh_cross_attention for the
+	 * full explanation: physical transpose of seq/head axes is required.
 	 */
 	int n_q = q->dims[0];
 	int n_kv = k->dims[0];
-	int q_4d[] = {1, n_heads, n_q, head_dim};
+	int q_3d[]  = {n_q,  n_heads, head_dim};
+	int kv_3d[] = {n_kv, n_heads, head_dim};
+	int q_4d[]  = {1, n_heads, n_q,  head_dim};
 	int kv_4d[] = {1, n_heads, n_kv, head_dim};
+	int perm_sh[] = {1, 0, 2};
 
-	struct sam3_tensor *q4 = gh_reshape(g, arena, q, 4, q_4d);
-	struct sam3_tensor *k4 = gh_reshape(g, arena, k, 4, kv_4d);
-	struct sam3_tensor *v4 = gh_reshape(g, arena, v, 4, kv_4d);
+	struct sam3_tensor *q_3 = gh_reshape(g, arena, q, 3, q_3d);
+	struct sam3_tensor *k_3 = gh_reshape(g, arena, k, 3, kv_3d);
+	struct sam3_tensor *v_3 = gh_reshape(g, arena, v, 3, kv_3d);
+	if (!q_3 || !k_3 || !v_3)
+		return NULL;
+
+	struct sam3_tensor *q_hs = gh_permute(g, arena, q_3, perm_sh);
+	struct sam3_tensor *k_hs = gh_permute(g, arena, k_3, perm_sh);
+	struct sam3_tensor *v_hs = gh_permute(g, arena, v_3, perm_sh);
+	if (!q_hs || !k_hs || !v_hs)
+		return NULL;
+
+	struct sam3_tensor *q4 = gh_reshape(g, arena, q_hs, 4, q_4d);
+	struct sam3_tensor *k4 = gh_reshape(g, arena, k_hs, 4, kv_4d);
+	struct sam3_tensor *v4 = gh_reshape(g, arena, v_hs, 4, kv_4d);
 	if (!q4 || !k4 || !v4)
 		return NULL;
 
@@ -903,8 +1101,18 @@ struct sam3_tensor *gh_cross_attention_sep(
 	if (!attn_4d)
 		return NULL;
 
+	int attn_3d_hs[] = {n_heads, n_q, head_dim};
+	struct sam3_tensor *attn_hs = gh_reshape(g, arena, attn_4d,
+						  3, attn_3d_hs);
+	if (!attn_hs)
+		return NULL;
+
+	struct sam3_tensor *attn_sh = gh_permute(g, arena, attn_hs, perm_sh);
+	if (!attn_sh)
+		return NULL;
+
 	int merged_dims[] = {n_q, d_model};
-	struct sam3_tensor *merged = gh_reshape(g, arena, attn_4d,
+	struct sam3_tensor *merged = gh_reshape(g, arena, attn_sh,
 						 2, merged_dims);
 	if (!merged)
 		return NULL;
