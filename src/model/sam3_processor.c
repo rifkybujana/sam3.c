@@ -98,13 +98,33 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 	if (err != SAM3_OK)
 		goto cleanup_model_arena;
 
-	/* Initialize all sub-modules with default SAM3 config */
-	err = sam3_image_model_init(&proc->model, &proc->model_arena);
+	/*
+	 * Async text encoder arenas (#11). Sized for the CLIP text
+	 * encoder operating on a 77-token sequence with 4-block
+	 * batching: per-block scratch peaks well under 256 MiB and the
+	 * persistent output is a few hundred KiB.
+	 */
+	err = sam3_arena_init(&proc->text_scratch_arena,
+			      256UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_scratch_arena;
 
+	err = sam3_arena_init(&proc->text_persist_arena,
+			      16UL * 1024 * 1024);
+	if (err != SAM3_OK)
+		goto cleanup_text_scratch_arena;
+
+	/* Initialize all sub-modules with default SAM3 config */
+	err = sam3_image_model_init(&proc->model, &proc->model_arena);
+	if (err != SAM3_OK)
+		goto cleanup_text_persist_arena;
+
 	return SAM3_OK;
 
+cleanup_text_persist_arena:
+	sam3_arena_free(&proc->text_persist_arena);
+cleanup_text_scratch_arena:
+	sam3_arena_free(&proc->text_scratch_arena);
 cleanup_scratch_arena:
 	sam3_arena_free(&proc->scratch_arena);
 cleanup_model_arena:
@@ -129,7 +149,20 @@ void sam3_processor_free(struct sam3_processor *proc)
 	if (!proc)
 		return;
 
+	/* Join any in-flight async text worker before tearing down its
+	 * arenas and backend. */
+	if (proc->text_thread_active) {
+		pthread_join(proc->text_thread, NULL);
+		proc->text_thread_active = 0;
+	}
+
 	sam3_image_model_free(&proc->model);
+
+	if (proc->text_backend) {
+		proc->text_backend->ops->free(proc->text_backend);
+		free(proc->text_backend);
+		proc->text_backend = NULL;
+	}
 
 	if (proc->backend) {
 		proc->backend->ops->free(proc->backend);
@@ -137,6 +170,8 @@ void sam3_processor_free(struct sam3_processor *proc)
 		proc->backend = NULL;
 	}
 
+	sam3_arena_free(&proc->text_persist_arena);
+	sam3_arena_free(&proc->text_scratch_arena);
 	sam3_arena_free(&proc->model_arena);
 	sam3_arena_free(&proc->scratch_arena);
 }
