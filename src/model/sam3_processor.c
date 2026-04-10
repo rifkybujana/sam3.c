@@ -79,10 +79,11 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 		proc->backend = &cpu->base;
 	}
 
-	/* Model arena: 1 GiB for tensor structs, QKV fused weights, tiled
-	 * pos embed, precomputed tables, and cached features. Weight data
+	/* Model arena: 2 GiB for tensor structs, QKV fused weights
+	 * (~700 MiB for ViT + text encoder), tiled pos embed,
+	 * precomputed tables, and cached features. Weight data
 	 * lives in the mmap region, not the arena. */
-	err = sam3_arena_init(&proc->model_arena, 1024UL * 1024 * 1024);
+	err = sam3_arena_init(&proc->model_arena, 2048UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_backend;
 
@@ -176,7 +177,8 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 	SAM3_PROF_BEGIN(proc->profiler, "image_encode");
 	err = sam3_image_model_encode(&proc->model, proc->backend, image,
 				      &proc->scratch_arena,
-				      &proc->model_arena);
+				      &proc->model_arena,
+				      proc->profiler);
 	SAM3_PROF_END(proc->profiler, "image_encode");
 	if (err != SAM3_OK)
 		return err;
@@ -582,9 +584,11 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 		struct sam3_tensor *tok_tensor;
 		int tok_dims[1];
 
+		SAM3_PROF_BEGIN(proc->profiler, "tokenize");
 		n_tokens = sam3_tokenizer_encode(
 			&proc->model.backbone.tokenizer, text,
 			tokens, te->context_len);
+		SAM3_PROF_END(proc->profiler, "tokenize");
 		if (n_tokens <= 0) {
 			sam3_log_error("segment: tokenize failed");
 			err = SAM3_EINVAL;
@@ -602,9 +606,11 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 		memcpy(tok_tensor->data, tokens,
 		       (size_t)te->context_len * sizeof(int32_t));
 
+		SAM3_PROF_BEGIN(proc->profiler, "text_blocks");
 		text_features = sam3_text_encoder_build_perblock(
 			te, proc->backend, tok_tensor,
 			&proc->scratch_arena, &proc->model_arena);
+		SAM3_PROF_END(proc->profiler, "text_blocks");
 		if (!text_features) {
 			sam3_log_error("segment: text encode perblock "
 				       "failed");
@@ -694,7 +700,8 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       prompt_tokens, text_features,
 				       &proc->scratch_arena,
 				       &proc->model_arena,
-				       &mask_logits, &score_logits);
+				       &mask_logits, &score_logits,
+				       proc->profiler);
 	SAM3_PROF_END(proc->profiler, "mask_decode");
 	if (err != SAM3_OK) {
 		sam3_log_error("segment: pipeline failed: %d", err);

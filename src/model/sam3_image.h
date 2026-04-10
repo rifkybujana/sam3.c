@@ -31,6 +31,8 @@
 #include "core/alloc.h"
 #include "backend/backend.h"
 
+struct sam3_profiler;
+
 struct sam3_image_model {
 	struct sam3_vl_backbone backbone;
 	struct sam3_encoder_fusion encoder;
@@ -101,11 +103,12 @@ void sam3_image_model_free(struct sam3_image_model *model);
  * then builds and evaluates the neck graph. Caches the resulting
  * image features for subsequent segment calls.
  *
- * @model:   Initialized and loaded image model
- * @be:      Backend for graph evaluation
- * @image:   Input image [3, img_size, img_size] normalized F32 tensor
- * @scratch: Arena for per-block/stage intermediate tensors
- * @persist: Arena for persistent outputs (ViT buffer, cached features)
+ * @model:    Initialized and loaded image model
+ * @be:       Backend for graph evaluation
+ * @image:    Input image [3, img_size, img_size] normalized F32 tensor
+ * @scratch:  Arena for per-block/stage intermediate tensors
+ * @persist:  Arena for persistent outputs (ViT buffer, cached features)
+ * @profiler: Profiler for sub-stage timing (may be NULL)
  *
  * Returns SAM3_OK on success. Sets model->image_encoded = 1 on success.
  */
@@ -113,7 +116,8 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 					struct sam3_backend *be,
 					struct sam3_tensor *image,
 					struct sam3_arena *scratch,
-					struct sam3_arena *persist);
+					struct sam3_arena *persist,
+					struct sam3_profiler *profiler);
 
 /*
  * sam3_image_model_segment - Run segmentation pipeline per-stage.
@@ -135,6 +139,7 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
  * @out_scores:     Receives scorer output [n_queries, 1] after sigmoid,
  *                  or NULL if text_features is NULL. May be NULL if caller
  *                  does not need scores.
+ * @profiler:       Profiler for sub-stage timing (may be NULL)
  *
  * At least one of prompt_tokens or text_features must be non-NULL.
  * Input tensors must have their data in persist or model_arena (NOT
@@ -150,6 +155,7 @@ enum sam3_error sam3_image_model_segment(
 	struct sam3_arena *scratch,
 	struct sam3_arena *persist,
 	struct sam3_tensor **out_masks,
-	struct sam3_tensor **out_scores);
+	struct sam3_tensor **out_scores,
+	struct sam3_profiler *profiler);
 
 #endif /* SAM3_MODEL_SAM3_IMAGE_H */

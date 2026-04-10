@@ -390,7 +390,7 @@ static void test_end_to_end_fixture_input(void)
 	/* Encode image */
 	err = sam3_image_model_encode(&proc.model, proc.backend, image,
 				      &proc.scratch_arena,
-				      &proc.model_arena);
+				      &proc.model_arena, NULL);
 	ASSERT_EQ(err, SAM3_OK);
 	if (err != SAM3_OK)
 		goto cleanup;

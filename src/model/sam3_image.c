@@ -22,6 +22,7 @@
 #include "sam3_image.h"
 #include "graph_helpers.h"
 #include "util/log.h"
+#include "util/profile.h"
 
 /* ── CPU helpers for decoder box refinement ──────────────────────── */
 
@@ -149,6 +150,7 @@ static void cpu_box_refine(const float *q,
 	}
 }
 
+#ifdef SAM3_DEBUG_DUMP
 /* Debug: dump a tensor to a raw binary file for Python comparison */
 static void dump_tensor(const char *path, const struct sam3_tensor *t)
 {
@@ -161,6 +163,14 @@ static void dump_tensor(const char *path, const struct sam3_tensor *t)
 	fclose(fp);
 	sam3_log_info("dump: wrote %s (%d floats)", path, n);
 }
+#else
+static inline void dump_tensor(const char *path,
+				const struct sam3_tensor *t)
+{
+	(void)path;
+	(void)t;
+}
+#endif
 
 enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
 				      struct sam3_arena *arena)
@@ -270,7 +280,8 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 					struct sam3_backend *be,
 					struct sam3_tensor *image,
 					struct sam3_arena *scratch,
-					struct sam3_arena *persist)
+					struct sam3_arena *persist,
+					struct sam3_profiler *profiler)
 {
 	struct sam3_tensor *features[4];
 	struct sam3_tensor *vit_out;
@@ -284,7 +295,8 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 	 */
 	vit_out = sam3_vl_backbone_build_vision(&model->backbone, &g,
 						be, image, features,
-						scratch, persist);
+						scratch, persist,
+						profiler);
 	if (!vit_out) {
 		sam3_log_error("encode: vl_backbone_build_vision failed");
 		return SAM3_ENOMEM;
@@ -344,6 +356,7 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 	 * All scratch allocations accumulate (no arena resets) so that
 	 * stage outputs survive until we copy them to persist at the end.
 	 */
+	SAM3_PROF_BEGIN(profiler, "neck");
 	{
 		/*
 		 * Step 1: Manual C transpose from [pixels, C] to NCHW.
@@ -563,6 +576,8 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 			       pf[0]->dims[2], pf[0]->dims[3]);
 	}
 
+	SAM3_PROF_END(profiler, "neck");
+
 	model->image_encoded = 1;
 	return SAM3_OK;
 }
@@ -645,7 +660,8 @@ enum sam3_error sam3_image_model_segment(
 	struct sam3_arena *scratch,
 	struct sam3_arena *persist,
 	struct sam3_tensor **out_masks,
-	struct sam3_tensor **out_scores)
+	struct sam3_tensor **out_scores,
+	struct sam3_profiler *profiler)
 {
 	struct sam3_graph g;
 	struct sam3_tensor *img_2d;
@@ -690,6 +706,7 @@ enum sam3_error sam3_image_model_segment(
 	 * Cross-attention uses pos_enc_at_cross_attn_keys=True:
 	 *   key = image_features + pos_enc,  value = image_features
 	 */
+	SAM3_PROF_BEGIN(profiler, "geometry_encode");
 	if (prompt_tokens) {
 		struct sam3_geometry_encoder *enc = &model->geom_enc;
 		int d = enc->d_model;
@@ -1137,6 +1154,8 @@ enum sam3_error sam3_image_model_segment(
 			       persist->offset, persist->size);
 	}
 
+	SAM3_PROF_END(profiler, "geometry_encode");
+
 	/* Dump text features and geometry encoder output for fixture comparison */
 	if (text_features)
 		dump_tensor("/tmp/dbg_text_features.bin", text_features);
@@ -1190,6 +1209,7 @@ enum sam3_error sam3_image_model_segment(
 	 * Evaluate encoder fusion per-layer to avoid MLX
 	 * shared-buffer corruption in large graphs.
 	 */
+	SAM3_PROF_BEGIN(profiler, "encoder_fusion");
 	{
 		struct sam3_tensor *enc_x = img_2d;
 		size_t x_bytes = enc_x->dims[0] * enc_x->dims[1]
@@ -1312,6 +1332,8 @@ enum sam3_error sam3_image_model_segment(
 		}
 	}
 
+	SAM3_PROF_END(profiler, "encoder_fusion");
+
 	sam3_log_debug("segment: encoder fusion done, persist %zu/%zu",
 		       persist->offset, persist->size);
 
@@ -1337,6 +1359,7 @@ enum sam3_error sam3_image_model_segment(
 	 * Stage 3: DETR decoder — per-layer evaluation to avoid MLX
 	 * shared-buffer corruption in the 961-node combined graph.
 	 */
+	SAM3_PROF_BEGIN(profiler, "decoder");
 	{
 		struct sam3_tensor *queries;
 
@@ -1725,10 +1748,13 @@ enum sam3_error sam3_image_model_segment(
 				qmin, qmax, qsum / qn, qnz, qn);
 		}
 
+		SAM3_PROF_END(profiler, "decoder");
+
 		/*
 		 * Stage 4: Segmentation head — FPN pixel decoder +
 		 * mask embedder MLP + dot product mask prediction.
 		 */
+		SAM3_PROF_BEGIN(profiler, "seg_head");
 		grid_h = model->cached_feat_s1->dims[2];
 		grid_w = model->cached_feat_s1->dims[3];
 
@@ -2369,6 +2395,8 @@ enum sam3_error sam3_image_model_segment(
 			}
 		}
 	}
+
+	SAM3_PROF_END(profiler, "seg_head");
 
 	/* Persist masks so they survive persist rollback */
 	masks = persist_tensor(persist, masks);

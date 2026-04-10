@@ -221,7 +221,7 @@ static void test_inference_stages(void)
 	struct sam3_profiler *p = sam3_profiler_create();
 	sam3_profiler_enable(p);
 
-	/* Simulate the stages wired in processor.c */
+	/* Simulate the stages wired in processor.c and sub-modules */
 	sam3_prof_stage_begin(p, "model_load");
 	sam3_prof_stage_end(p, "model_load");
 
@@ -229,22 +229,55 @@ static void test_inference_stages(void)
 	sam3_prof_stage_end(p, "image_normalize");
 
 	sam3_prof_stage_begin(p, "image_encode");
+
+	sam3_prof_stage_begin(p, "vit_precompute");
+	sam3_prof_stage_end(p, "vit_precompute");
+
+	sam3_prof_stage_begin(p, "vit_patch_embed");
+	sam3_prof_stage_end(p, "vit_patch_embed");
+
+	sam3_prof_stage_begin(p, "vit_blocks");
+	sam3_prof_stage_end(p, "vit_blocks");
+
+	sam3_prof_stage_begin(p, "neck");
+	sam3_prof_stage_end(p, "neck");
+
 	sam3_prof_stage_end(p, "image_encode");
 
 	sam3_prof_stage_begin(p, "text_encode");
+
+	sam3_prof_stage_begin(p, "tokenize");
+	sam3_prof_stage_end(p, "tokenize");
+
+	sam3_prof_stage_begin(p, "text_blocks");
+	sam3_prof_stage_end(p, "text_blocks");
+
 	sam3_prof_stage_end(p, "text_encode");
 
 	sam3_prof_stage_begin(p, "prompt_project");
 	sam3_prof_stage_end(p, "prompt_project");
 
 	sam3_prof_stage_begin(p, "mask_decode");
+
+	sam3_prof_stage_begin(p, "geometry_encode");
+	sam3_prof_stage_end(p, "geometry_encode");
+
+	sam3_prof_stage_begin(p, "encoder_fusion");
+	sam3_prof_stage_end(p, "encoder_fusion");
+
+	sam3_prof_stage_begin(p, "decoder");
+	sam3_prof_stage_end(p, "decoder");
+
+	sam3_prof_stage_begin(p, "seg_head");
+	sam3_prof_stage_end(p, "seg_head");
+
 	sam3_prof_stage_end(p, "mask_decode");
 
 	sam3_prof_stage_begin(p, "postprocess");
 	sam3_prof_stage_end(p, "postprocess");
 
-	ASSERT_EQ(p->n_stages, 7);
-	for (int i = 0; i < 7; i++) {
+	ASSERT_EQ(p->n_stages, 17);
+	for (int i = 0; i < 17; i++) {
 		ASSERT_EQ(p->stages[i].calls, 1);
 		ASSERT(p->stages[i].total_ns >= 0);
 	}
