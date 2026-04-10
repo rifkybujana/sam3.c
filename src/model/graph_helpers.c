@@ -363,6 +363,75 @@ struct sam3_tensor *gh_permute(struct sam3_graph *g, struct sam3_arena *a,
 	return result;
 }
 
+/* ── Window partition / unpartition ──────────────────────────────── */
+
+struct sam3_tensor *gh_window_partition(struct sam3_graph *g,
+					struct sam3_arena *a,
+					struct sam3_tensor *x,
+					int ws, int grid_size)
+{
+	int e = x->dims[1];
+	int nw = grid_size / ws;	/* windows per row/col */
+
+	/*
+	 * View [np, e] as [wy, cy, wx, cx*e] (4-D, contiguous view).
+	 * Splitting np into (wy, cy, wx) requires that each is
+	 * contiguous in memory: yes, because np is laid out as
+	 * py * grid_size + px and we are splitting py = wy*ws + cy
+	 * and px = wx*ws + cx with cx folded into the inner cx*e.
+	 */
+	int v1[] = {nw, ws, nw, ws * e};
+	struct sam3_tensor *t1 = gh_reshape(g, a, x, 4, v1);
+	if (!t1)
+		return NULL;
+
+	/* Permute (wy, cy, wx, cx*e) -> (wy, wx, cy, cx*e) */
+	int perm[] = {0, 2, 1, 3};
+	struct sam3_tensor *t2 = gh_permute(g, a, t1, perm);
+	if (!t2)
+		return NULL;
+
+	/* Flatten (wy, wx) -> n_win, (cy, cx*e) -> (ws*ws, e). */
+	int n_win = nw * nw;
+	int win_pos = ws * ws;
+	int v3[] = {n_win, win_pos, e};
+	struct sam3_tensor *out = gh_reshape(g, a, t2, 3, v3);
+	if (!out)
+		return NULL;
+
+	return out;
+}
+
+struct sam3_tensor *gh_window_unpartition(struct sam3_graph *g,
+					  struct sam3_arena *a,
+					  struct sam3_tensor *x,
+					  int ws, int grid_size)
+{
+	int e = x->dims[2];
+	int nw = grid_size / ws;
+
+	/* View [n_win, ws*ws, e] as [wy, wx, cy, cx*e]. */
+	int v1[] = {nw, nw, ws, ws * e};
+	struct sam3_tensor *t1 = gh_reshape(g, a, x, 4, v1);
+	if (!t1)
+		return NULL;
+
+	/* Permute (wy, wx, cy, cx*e) -> (wy, cy, wx, cx*e) */
+	int perm[] = {0, 2, 1, 3};
+	struct sam3_tensor *t2 = gh_permute(g, a, t1, perm);
+	if (!t2)
+		return NULL;
+
+	/* Flatten back to [np, e]. */
+	int np = grid_size * grid_size;
+	int v3[] = {np, e};
+	struct sam3_tensor *out = gh_reshape(g, a, t2, 2, v3);
+	if (!out)
+		return NULL;
+
+	return out;
+}
+
 /* ── Concat ──────────────────────────────────────────────────────── */
 
 /*

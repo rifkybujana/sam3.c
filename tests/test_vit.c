@@ -303,6 +303,98 @@ static void test_vit_eval(void)
 }
 
 /*
+ * test_vit_window_partition - Verify partition/unpartition correctness.
+ *
+ * Uses grid=4, ws=2, e=3 so the result is small enough to inspect
+ * by hand. Patch (py, px) carries value py*100 + px*10 + c.
+ */
+static void test_vit_window_partition(void)
+{
+	int gs = 4;
+	int ws = 2;
+	int e = 3;
+	int np = gs * gs;	/* 16 */
+	int n_win = (gs / ws) * (gs / ws); /* 4 */
+	int win_pos = ws * ws;	/* 4 */
+
+	sam3_arena_reset(&g_scratch);
+
+	int x_dims[] = {np, e};
+	struct sam3_tensor *x;
+	x = gh_alloc_tensor(&g_scratch, SAM3_DTYPE_F32, 2, x_dims);
+	ASSERT(x != NULL);
+
+	float *xd = (float *)x->data;
+	for (int py = 0; py < gs; py++) {
+		for (int px = 0; px < gs; px++) {
+			for (int c = 0; c < e; c++) {
+				xd[(py * gs + px) * e + c] =
+					(float)(py * 100 + px * 10 + c);
+			}
+		}
+	}
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+
+	struct sam3_tensor *part;
+	part = gh_window_partition(&g, &g_scratch, x, ws, gs);
+	ASSERT(part != NULL);
+	ASSERT_EQ(part->n_dims, 3);
+	ASSERT_EQ(part->dims[0], n_win);
+	ASSERT_EQ(part->dims[1], win_pos);
+	ASSERT_EQ(part->dims[2], e);
+
+	struct sam3_tensor *back;
+	back = gh_window_unpartition(&g, &g_scratch, part, ws, gs);
+	ASSERT(back != NULL);
+	ASSERT_EQ(back->n_dims, 2);
+	ASSERT_EQ(back->dims[0], np);
+	ASSERT_EQ(back->dims[1], e);
+
+	enum sam3_error err = g_cpu.base.ops->graph_eval(&g_cpu.base, &g);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/*
+	 * After eval, "part" should hold windows in (wy, wx, cy, cx, e)
+	 * order. Window (0, 0) holds patches (0,0), (0,1), (1,0), (1,1).
+	 */
+	float *pd = (float *)part->data;
+
+	/* Window 0, position 0 = patch (0, 0) */
+	for (int c = 0; c < e; c++)
+		ASSERT_NEAR(pd[(0 * win_pos + 0) * e + c],
+			    (float)(0 * 100 + 0 * 10 + c), 1e-6f);
+
+	/* Window 0, position 1 = patch (0, 1) */
+	for (int c = 0; c < e; c++)
+		ASSERT_NEAR(pd[(0 * win_pos + 1) * e + c],
+			    (float)(0 * 100 + 1 * 10 + c), 1e-6f);
+
+	/* Window 0, position 2 = patch (1, 0) */
+	for (int c = 0; c < e; c++)
+		ASSERT_NEAR(pd[(0 * win_pos + 2) * e + c],
+			    (float)(1 * 100 + 0 * 10 + c), 1e-6f);
+
+	/* Window 0, position 3 = patch (1, 1) */
+	for (int c = 0; c < e; c++)
+		ASSERT_NEAR(pd[(0 * win_pos + 3) * e + c],
+			    (float)(1 * 100 + 1 * 10 + c), 1e-6f);
+
+	/* Window 3 = (wy=1, wx=1), position 3 = patch (3, 3) */
+	for (int c = 0; c < e; c++)
+		ASSERT_NEAR(pd[(3 * win_pos + 3) * e + c],
+			    (float)(3 * 100 + 3 * 10 + c), 1e-6f);
+
+	/*
+	 * After unpartition, every position should equal the original.
+	 */
+	float *bd = (float *)back->data;
+	for (int i = 0; i < np * e; i++)
+		ASSERT_NEAR(bd[i], xd[i], 1e-6f);
+}
+
+/*
  * test_vit_windowed_attention - Verify windowed attention mask.
  *
  * Uses a larger config (grid_size=4, window_size=2) so that the
@@ -448,6 +540,7 @@ int main(void)
 	test_vit_load();
 	test_vit_build_shapes();
 	test_vit_eval();
+	test_vit_window_partition();
 	test_vit_windowed_attention();
 
 	teardown();

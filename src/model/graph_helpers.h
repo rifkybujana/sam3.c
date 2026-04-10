@@ -243,6 +243,36 @@ struct sam3_tensor *gh_sdpa(struct sam3_graph *g, struct sam3_arena *a,
 			    int head_dim);
 
 /*
+ * gh_window_partition - Reorder a flat patch grid into contiguous windows.
+ *
+ * Input is [n_patches, e] in natural row-major order
+ * (idx = py * grid_size + px). Output is [n_windows, ws*ws, e] where
+ * n_windows = (grid_size / ws)^2 and the inner ws*ws block holds the
+ * patches of one window in row-major local order.
+ *
+ * Requires that grid_size is a multiple of ws (no padding).
+ *
+ * Implementation: 4-D reshape -> permute -> reshape, with cx folded
+ * into the embedding dim to fit within SAM3_MAX_DIMS=4. The final
+ * reshape materialises (one mlx_contiguous copy).
+ */
+struct sam3_tensor *gh_window_partition(struct sam3_graph *g,
+					struct sam3_arena *a,
+					struct sam3_tensor *x,
+					int ws, int grid_size);
+
+/*
+ * gh_window_unpartition - Inverse of gh_window_partition.
+ *
+ * Takes [n_windows, ws*ws, e] and returns [n_patches, e] in natural
+ * row-major order.
+ */
+struct sam3_tensor *gh_window_unpartition(struct sam3_graph *g,
+					  struct sam3_arena *a,
+					  struct sam3_tensor *x,
+					  int ws, int grid_size);
+
+/*
  * gh_multihead_attention_rope - Multi-head attention with optional RoPE
  *                               and causal mask.
  *
