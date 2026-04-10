@@ -582,6 +582,41 @@ struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 	return result;
 }
 
+struct sam3_tensor *gh_upsample_nhwc(struct sam3_graph *g,
+				     struct sam3_arena *a,
+				     struct sam3_tensor *input, int scale)
+{
+	/*
+	 * Input: [N, H, W, C] -> Output: [N, H*scale, W*scale, C]
+	 *
+	 * Slot usage for SAM3_OP_UPSAMPLE:
+	 *   params[0] = scale (shared with NCHW path)
+	 *   params[1] = NHWC flag (0 = legacy NCHW, 1 = NHWC)
+	 * Slots 2 and 3 remain unused.
+	 */
+	int out_dims[4] = {
+		input->dims[0],
+		input->dims[1] * scale,
+		input->dims[2] * scale,
+		input->dims[3],
+	};
+
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *result = sam3_graph_add_op(g, SAM3_OP_UPSAMPLE,
+		(struct sam3_tensor *[]){input}, 1, out);
+	if (!result)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = scale;
+	node->params[1] = 1;  /* NHWC flag */
+	return result;
+}
+
 /* ── Rotary position embedding ───────────────────────────────────── */
 
 struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
@@ -1246,6 +1281,49 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 	return out;
 }
 
+struct sam3_tensor *gh_groupnorm_nhwc(struct sam3_graph *g,
+				      struct sam3_arena *a,
+				      struct sam3_tensor *input,
+				      struct sam3_tensor *gamma,
+				      struct sam3_tensor *beta,
+				      int num_groups)
+{
+	/*
+	 * NHWC group norm. Output has the same NHWC shape as input.
+	 *
+	 * Slot usage for SAM3_OP_GROUPNORM:
+	 *   params[0] = num_groups (shared with NCHW path)
+	 *   params[1] = NHWC flag (0 = legacy NCHW, 1 = NHWC)
+	 * Slots 2 and 3 remain unused.
+	 */
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  input->n_dims, input->dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[3];
+	int n_inputs = 1;
+	inputs[0] = input;
+	if (gamma) {
+		inputs[1] = gamma;
+		n_inputs = 2;
+	}
+	if (beta) {
+		inputs[2] = beta;
+		n_inputs = 3;
+	}
+
+	out = sam3_graph_add_op(g, SAM3_OP_GROUPNORM,
+				 inputs, n_inputs, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = num_groups;
+	node->params[1] = 1;  /* NHWC flag */
+	return out;
+}
+
 /* ── Convolution helpers ──────────────────────────────────────────── */
 
 /*
@@ -1449,6 +1527,49 @@ struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
 	node->params[0] = kernel_size;
 	node->params[1] = stride;
+
+	return out;
+}
+
+struct sam3_tensor *gh_maxpool2d_nhwc(struct sam3_graph *g,
+				      struct sam3_arena *a,
+				      struct sam3_tensor *input,
+				      int kernel_size, int stride)
+{
+	/*
+	 * NHWC non-overlapping max pooling.
+	 *
+	 * Slot usage for SAM3_OP_MAXPOOL2D:
+	 *   params[0] = kernel_size (shared with NCHW path)
+	 *   params[1] = stride (shared with NCHW path)
+	 *   params[2] = NHWC flag (0 = legacy NCHW, 1 = NHWC)
+	 * Slot 3 remains unused. params[2] matches the slot used by
+	 * gh_conv2d_nhwc so readers learn a single convention for the
+	 * NHWC flag on spatial ops.
+	 */
+	int N = input->dims[0];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int C = input->dims[3];
+
+	int OH = (H - kernel_size) / stride + 1;
+	int OW = (W - kernel_size) / stride + 1;
+
+	int out_dims[] = {N, OH, OW, C};
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[] = {input};
+	out = sam3_graph_add_op(g, SAM3_OP_MAXPOOL2D, inputs, 1, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = kernel_size;
+	node->params[1] = stride;
+	node->params[2] = 1;  /* NHWC flag */
 
 	return out;
 }

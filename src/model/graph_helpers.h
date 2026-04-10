@@ -202,6 +202,20 @@ struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input, int scale);
 
 /*
+ * gh_upsample_nhwc - Nearest-neighbor upsampling for NHWC 4D tensors.
+ *
+ * @input: [N, H, W, C]
+ * @scale: Integer upsample factor (same for H and W)
+ *
+ * Sets node->params[1] = 1 so the backend takes the NHWC reshape path
+ * ([N, H, 1, W, 1, C] -> broadcast -> [N, H*s, W*s, C]) instead of the
+ * legacy NCHW path. Returns tensor [N, H*scale, W*scale, C].
+ */
+struct sam3_tensor *gh_upsample_nhwc(struct sam3_graph *g,
+				     struct sam3_arena *a,
+				     struct sam3_tensor *input, int scale);
+
+/*
  * gh_rope - Apply rotary position embedding.
  *
  * @input: [batch, seq, n_heads, head_dim] tensor
@@ -463,6 +477,26 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 				 int num_groups);
 
 /*
+ * gh_groupnorm_nhwc - Group normalization on NHWC tensor.
+ *
+ * @input:      [N, H, W, C] tensor
+ * @gamma:      Per-channel scale [C], or NULL
+ * @beta:       Per-channel bias [C], or NULL
+ * @num_groups: Number of groups (C must be divisible)
+ *
+ * Sets node->params[1] = 1 so the backend wraps the legacy NCHW body
+ * with an internal NHWC->NCHW->NHWC transpose pair. GroupNorm is only
+ * invoked twice per inference, so the extra transposes are negligible.
+ * Returns a normalized tensor with the same shape as input.
+ */
+struct sam3_tensor *gh_groupnorm_nhwc(struct sam3_graph *g,
+				      struct sam3_arena *a,
+				      struct sam3_tensor *input,
+				      struct sam3_tensor *gamma,
+				      struct sam3_tensor *beta,
+				      int num_groups);
+
+/*
  * gh_conv2d - 2D convolution with optional bias.
  *
  * @input:   [N, C_in, H, W]
@@ -549,5 +583,22 @@ struct sam3_tensor *gh_conv_transpose2d_nhwc(struct sam3_graph *g,
 struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input,
 				int kernel_size, int stride);
+
+/*
+ * gh_maxpool2d_nhwc - 2D max pooling on NHWC input.
+ *
+ * @input:       [N, H, W, C]
+ * @kernel_size: Pooling window size (same for H and W)
+ * @stride:      Pooling stride (same for H and W)
+ *
+ * Sets node->params[2] = 1 so the backend reshapes to
+ * [N, H/k, k, W/k, k, C] and reduces over the two k-axes directly on
+ * the NHWC layout instead of the legacy NCHW path. Returns
+ * [N, H/k, W/k, C] (non-overlapping pooling only).
+ */
+struct sam3_tensor *gh_maxpool2d_nhwc(struct sam3_graph *g,
+				      struct sam3_arena *a,
+				      struct sam3_tensor *input,
+				      int kernel_size, int stride);
 
 #endif /* SAM3_MODEL_GRAPH_HELPERS_H */

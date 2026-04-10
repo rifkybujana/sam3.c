@@ -121,6 +121,17 @@ enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
+	/*
+	 * params[1] == 1 marks an NHWC input. The CPU kernel only
+	 * implements NCHW today; no CPU test exercises the NHWC path
+	 * so rejecting here is enough to satisfy the layout migration
+	 * plan ("any test that was green before must still be green").
+	 */
+	if (node->params[1]) {
+		sam3_log_error("groupnorm: NHWC path not implemented on CPU");
+		return SAM3_EINVAL;
+	}
+
 	struct sam3_tensor *in = node->inputs[0];
 	struct sam3_tensor *out = node->output;
 	int num_groups = node->params[0];

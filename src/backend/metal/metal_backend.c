@@ -565,37 +565,82 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 	case SAM3_OP_UPSAMPLE: {
 		/*
-		 * Nearest-neighbor upsample of [N,C,H,W] by integer scale.
-		 * Strategy: reshape to [N,C,H,1,W,1], broadcast to
-		 * [N,C,H,s,W,s], then reshape to [N,C,H*s,W*s].
+		 * Nearest-neighbor upsample by integer scale.
+		 *
+		 * Legacy NCHW path: reshape [N,C,H,W] to [N,C,H,1,W,1],
+		 * broadcast to [N,C,H,s,W,s], reshape to [N,C,H*s,W*s].
+		 *
+		 * NHWC path (params[1]==1): reshape [N,H,W,C] to
+		 * [N,H,1,W,1,C], broadcast to [N,H,s,W,s,C], reshape to
+		 * [N,H*s,W*s,C]. C sits on the last axis and is not
+		 * replicated, so the broadcast pattern is identical to
+		 * the NCHW case but with the channel axis at position 5.
+		 *
+		 * params[0] = scale, params[1] = NHWC flag.
 		 */
 		int scale = node->params[0];
+		int is_nhwc = node->params[1];
 		int ndim = (int)mlx_array_ndim(inputs[0]);
 		if (ndim != 4) {
 			sam3_log_error("metal: upsample requires 4D input");
 			mlx_array_free(result);
 			return SAM3_EINVAL;
 		}
-		int n = mlx_array_dim(inputs[0], 0);
-		int c = mlx_array_dim(inputs[0], 1);
-		int h = mlx_array_dim(inputs[0], 2);
-		int w = mlx_array_dim(inputs[0], 3);
+		int d0 = mlx_array_dim(inputs[0], 0);
+		int d1 = mlx_array_dim(inputs[0], 1);
+		int d2 = mlx_array_dim(inputs[0], 2);
+		int d3 = mlx_array_dim(inputs[0], 3);
 
-		/* Reshape: [N,C,H,1,W,1] */
-		int shape6[] = {n, c, h, 1, w, 1};
+		int shape6[6];
+		int bcast[6];
+		int shape4[4];
+		if (is_nhwc) {
+			/* NHWC: [N, H, 1, W, 1, C] */
+			shape6[0] = d0;
+			shape6[1] = d1;
+			shape6[2] = 1;
+			shape6[3] = d2;
+			shape6[4] = 1;
+			shape6[5] = d3;
+			bcast[0] = d0;
+			bcast[1] = d1;
+			bcast[2] = scale;
+			bcast[3] = d2;
+			bcast[4] = scale;
+			bcast[5] = d3;
+			shape4[0] = d0;
+			shape4[1] = d1 * scale;
+			shape4[2] = d2 * scale;
+			shape4[3] = d3;
+		} else {
+			/* NCHW: [N, C, H, 1, W, 1] */
+			shape6[0] = d0;
+			shape6[1] = d1;
+			shape6[2] = d2;
+			shape6[3] = 1;
+			shape6[4] = d3;
+			shape6[5] = 1;
+			bcast[0] = d0;
+			bcast[1] = d1;
+			bcast[2] = d2;
+			bcast[3] = scale;
+			bcast[4] = d3;
+			bcast[5] = scale;
+			shape4[0] = d0;
+			shape4[1] = d1;
+			shape4[2] = d2 * scale;
+			shape4[3] = d3 * scale;
+		}
+
 		mlx_array reshaped = mlx_array_new();
 		rc = mlx_reshape(&reshaped, inputs[0], shape6, 6, stream);
 		if (rc) { mlx_array_free(reshaped); break; }
 
-		/* Broadcast: [N,C,H,s,W,s] */
-		int bcast[] = {n, c, h, scale, w, scale};
 		mlx_array expanded = mlx_array_new();
 		rc = mlx_broadcast_to(&expanded, reshaped, bcast, 6, stream);
 		mlx_array_free(reshaped);
 		if (rc) { mlx_array_free(expanded); break; }
 
-		/* Reshape: [N,C,H*s,W*s] */
-		int shape4[] = {n, c, h * scale, w * scale};
 		rc = mlx_reshape(&result, expanded, shape4, 4, stream);
 		mlx_array_free(expanded);
 		break;
@@ -941,16 +986,35 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 	case SAM3_OP_MAXPOOL2D: {
 		/*
 		 * MaxPool2d for non-overlapping case (stride == kernel_size).
-		 * NCHW [N, C, H, W] -> reshape [N, C, H/k, k, W/k, k]
-		 * then max over k-dims (axes 3, 5) -> [N, C, H/k, W/k].
+		 *
+		 * Legacy NCHW path: [N, C, H, W] -> reshape to
+		 * [N, C, H/k, k, W/k, k] -> max over axes 5 then 3 ->
+		 * [N, C, H/k, W/k].
+		 *
+		 * NHWC path (params[2]==1): [N, H, W, C] -> reshape to
+		 * [N, H/k, k, W/k, k, C] -> max over axes 4 then 2 ->
+		 * [N, H/k, W/k, C].
+		 *
+		 * params[0] = kernel_size, params[1] = stride,
+		 * params[2] = NHWC flag.
 		 */
 		int mp_k = node->params[0];
 		int mp_s = node->params[1];
+		int mp_is_nhwc = node->params[2];
 		const struct sam3_tensor *mp_in = node->inputs[0];
 		int mp_N = mp_in->dims[0];
-		int mp_C = mp_in->dims[1];
-		int mp_H = mp_in->dims[2];
-		int mp_W = mp_in->dims[3];
+		int mp_C;
+		int mp_H;
+		int mp_W;
+		if (mp_is_nhwc) {
+			mp_H = mp_in->dims[1];
+			mp_W = mp_in->dims[2];
+			mp_C = mp_in->dims[3];
+		} else {
+			mp_C = mp_in->dims[1];
+			mp_H = mp_in->dims[2];
+			mp_W = mp_in->dims[3];
+		}
 
 		if (mp_s != mp_k || mp_H % mp_k != 0 || mp_W % mp_k != 0) {
 			sam3_log_error("metal: maxpool2d only supports "
@@ -959,49 +1023,115 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 			return SAM3_EINVAL;
 		}
 
-		/* Reshape to [N, C, H/k, k, W/k, k] */
-		int mp_shape[] = {mp_N, mp_C, mp_H / mp_k, mp_k,
-				  mp_W / mp_k, mp_k};
+		int mp_shape[6];
+		int mp_axis_a;
+		int mp_axis_b;
+		if (mp_is_nhwc) {
+			/* [N, H/k, k, W/k, k, C] */
+			mp_shape[0] = mp_N;
+			mp_shape[1] = mp_H / mp_k;
+			mp_shape[2] = mp_k;
+			mp_shape[3] = mp_W / mp_k;
+			mp_shape[4] = mp_k;
+			mp_shape[5] = mp_C;
+			/* Reduce the two k-axes, inner one first. */
+			mp_axis_a = 4;
+			mp_axis_b = 2;
+		} else {
+			/* [N, C, H/k, k, W/k, k] */
+			mp_shape[0] = mp_N;
+			mp_shape[1] = mp_C;
+			mp_shape[2] = mp_H / mp_k;
+			mp_shape[3] = mp_k;
+			mp_shape[4] = mp_W / mp_k;
+			mp_shape[5] = mp_k;
+			mp_axis_a = 5;
+			mp_axis_b = 3;
+		}
+
 		mlx_array mp_reshaped = mlx_array_new();
 		rc = mlx_reshape(&mp_reshaped, inputs[0],
 				 mp_shape, 6, stream);
 		if (rc) { mlx_array_free(mp_reshaped); break; }
 
-		/* Max over axis 5 (last k-dim) */
+		/* Max over inner k-axis */
 		mlx_array mp_tmp = mlx_array_new();
-		rc = mlx_max_axis(&mp_tmp, mp_reshaped, 5, false, stream);
+		rc = mlx_max_axis(&mp_tmp, mp_reshaped, mp_axis_a,
+				  false, stream);
 		mlx_array_free(mp_reshaped);
 		if (rc) { mlx_array_free(mp_tmp); break; }
 
-		/* Max over axis 3 (remaining k-dim, now shifted) */
-		rc = mlx_max_axis(&result, mp_tmp, 3, false, stream);
+		/* Max over remaining k-axis (index shifts after reduction) */
+		rc = mlx_max_axis(&result, mp_tmp, mp_axis_b, false, stream);
 		mlx_array_free(mp_tmp);
 		break;
 	}
 
 	case SAM3_OP_GROUPNORM: {
 		/*
-		 * GroupNorm(num_groups) on NCHW input.
-		 * inputs[0]=x[N,C,H,W], inputs[1]=gamma[C], inputs[2]=beta[C].
-		 * params[0]=num_groups.
+		 * GroupNorm(num_groups).
+		 * inputs[0]=x, inputs[1]=gamma[C], inputs[2]=beta[C].
+		 * params[0] = num_groups.
+		 * params[1] = NHWC flag (0 = legacy NCHW, 1 = NHWC).
 		 *
-		 * Strategy: reshape [N,C,H,W] -> [N,G,C/G,H*W], normalize
-		 * over last 2 dims via layer_norm (no affine), reshape back,
-		 * then apply per-channel gamma/beta.
+		 * Core strategy on NCHW input [N, C, H, W]: reshape to
+		 * [N, G, C/G * H * W], normalize the last dim via
+		 * layer_norm without affine, reshape back, then apply
+		 * per-channel gamma/beta via broadcast.
+		 *
+		 * NHWC path wraps that body with a single NHWC->NCHW
+		 * transpose up front and one NCHW->NHWC transpose at the
+		 * end. GroupNorm runs twice per inference so the extra
+		 * transposes are negligible and let both layouts share
+		 * one code path.
 		 */
 		int gn_groups = node->params[0];
+		int gn_is_nhwc = node->params[1];
 		const struct sam3_tensor *gn_in = node->inputs[0];
 		int gn_N = gn_in->dims[0];
-		int gn_C = gn_in->dims[1];
-		int gn_H = gn_in->dims[2];
-		int gn_W = gn_in->dims[3];
+		int gn_C;
+		int gn_H;
+		int gn_W;
+		if (gn_is_nhwc) {
+			gn_H = gn_in->dims[1];
+			gn_W = gn_in->dims[2];
+			gn_C = gn_in->dims[3];
+		} else {
+			gn_C = gn_in->dims[1];
+			gn_H = gn_in->dims[2];
+			gn_W = gn_in->dims[3];
+		}
 		int gn_cpg = gn_C / gn_groups;
 		int gn_hw = gn_H * gn_W;
+
+		/*
+		 * If NHWC, transpose inputs[0] from [N,H,W,C] to
+		 * [N,C,H,W] so the rest of the body can proceed as
+		 * before. gn_body_in owns the NCHW view and must be
+		 * freed once consumed.
+		 */
+		mlx_array gn_body_in = (mlx_array){0};
+		int gn_need_free_body_in = 0;
+		if (gn_is_nhwc) {
+			int gn_in_perm[] = {0, 3, 1, 2};
+			gn_body_in = mlx_array_new();
+			rc = mlx_transpose_axes(&gn_body_in, inputs[0],
+						gn_in_perm, 4, stream);
+			if (rc) {
+				mlx_array_free(gn_body_in);
+				break;
+			}
+			gn_need_free_body_in = 1;
+		} else {
+			gn_body_in = inputs[0];
+		}
 
 		/* Reshape to [N, G, C/G * H * W] for layer_norm over last dim */
 		int gn_shape3[] = {gn_N, gn_groups, gn_cpg * gn_hw};
 		mlx_array gn_x3 = mlx_array_new();
-		rc = mlx_reshape(&gn_x3, inputs[0], gn_shape3, 3, stream);
+		rc = mlx_reshape(&gn_x3, gn_body_in, gn_shape3, 3, stream);
+		if (gn_need_free_body_in)
+			mlx_array_free(gn_body_in);
 		if (rc) { mlx_array_free(gn_x3); break; }
 
 		/* Layer norm over last dim (no affine) */
@@ -1050,8 +1180,16 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 			gn_normed4 = gn_biased;
 		}
 
-		result = gn_normed4;
-		rc = 0;
+		if (gn_is_nhwc) {
+			/* Transpose [N,C,H,W] -> [N,H,W,C] for the output. */
+			int gn_out_perm[] = {0, 2, 3, 1};
+			rc = mlx_transpose_axes(&result, gn_normed4,
+						gn_out_perm, 4, stream);
+			mlx_array_free(gn_normed4);
+		} else {
+			result = gn_normed4;
+			rc = 0;
+		}
 		break;
 	}
 
