@@ -718,87 +718,133 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 
 	if (text) {
 		SAM3_PROF_BEGIN(proc->profiler, "text_encode");
-		/*
-		 * Use per-block text encoder evaluation for debugging.
-		 * This dumps /tmp/dbg_te_block_XX.bin for each block.
-		 */
-		struct sam3_text_encoder *te = &proc->model.backbone.text_enc;
-		int32_t tokens[77]; /* max context_len */
-		int n_tokens;
-		struct sam3_tensor *tok_tensor;
-		int tok_dims[1];
-
-		SAM3_PROF_BEGIN(proc->profiler, "tokenize");
-		n_tokens = sam3_tokenizer_encode(
-			&proc->model.backbone.tokenizer, text,
-			tokens, te->context_len);
-		SAM3_PROF_END(proc->profiler, "tokenize");
-		if (n_tokens <= 0) {
-			sam3_log_error("segment: tokenize failed");
-			err = SAM3_EINVAL;
-			goto fail;
-		}
-
-		tok_dims[0] = te->context_len;
-		sam3_arena_reset(&proc->scratch_arena);
-		tok_tensor = gh_alloc_tensor(&proc->model_arena,
-					      SAM3_DTYPE_I32, 1, tok_dims);
-		if (!tok_tensor) {
-			err = SAM3_ENOMEM;
-			goto fail;
-		}
-		memcpy(tok_tensor->data, tokens,
-		       (size_t)te->context_len * sizeof(int32_t));
-
-		SAM3_PROF_BEGIN(proc->profiler, "text_blocks");
-		text_features = sam3_text_encoder_build_perblock(
-			te, proc->backend, tok_tensor,
-			&proc->scratch_arena, &proc->model_arena);
-		SAM3_PROF_END(proc->profiler, "text_blocks");
-		if (!text_features) {
-			sam3_log_error("segment: text encode perblock "
-				       "failed");
-			err = SAM3_ENOMEM;
-			goto fail;
-		}
-
-		sam3_log_debug("segment: text encoded (perblock), %d×%d",
-			       text_features->dims[0],
-			       text_features->dims[1]);
 
 		/*
-		 * Truncate text features to real tokens only.
-		 *
-		 * Python creates text_attention_mask = (tokenized != 0)
-		 * and passes it as key_padding_mask to encoder cross-attn,
-		 * masking out padding tokens.  We achieve the same effect
-		 * by dropping padding tokens entirely — softmax over
-		 * non-masked tokens is identical to softmax over the
-		 * truncated set.
+		 * If sam3_processor_set_text() was called earlier, the
+		 * worker (or sync caller) has already produced
+		 * text_features_async in proc->text_persist_arena. Copy
+		 * them into model_arena so they survive scratch resets
+		 * and live alongside other persistent tensors used by
+		 * the segmentation stages.
 		 */
-		if (text_features->dims[0] > n_tokens) {
-			int d = text_features->dims[1];
-			int trunc_dims[] = {n_tokens, d};
-			struct sam3_tensor *trunc;
+		if (proc->text_features_async) {
+			struct sam3_tensor *src = proc->text_features_async;
+			int copy_dims[2] = {src->dims[0], src->dims[1]};
 
-			trunc = gh_alloc_tensor(&proc->model_arena,
-						 SAM3_DTYPE_F32, 2,
-						 trunc_dims);
-			if (!trunc) {
+			text_features = gh_alloc_tensor(&proc->model_arena,
+							SAM3_DTYPE_F32,
+							2, copy_dims);
+			if (!text_features) {
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
-			memcpy(trunc->data, text_features->data,
-			       (size_t)n_tokens * (size_t)d *
+			memcpy(text_features->data, src->data,
+			       (size_t)src->dims[0] * (size_t)src->dims[1] *
 			       sizeof(float));
-			sam3_log_info("segment: truncated text %d→%d "
-				      "tokens (dropped %d padding)",
-				      text_features->dims[0],
-				      n_tokens,
-				      text_features->dims[0] - n_tokens);
-			text_features = trunc;
+
+			/*
+			 * One-shot consumption: clear the async slot so a
+			 * subsequent segment() without a fresh set_text()
+			 * falls back to inline encoding.
+			 */
+			proc->text_features_async = NULL;
+
+			sam3_log_debug("segment: consumed async text "
+				       "features [%d,%d]",
+				       text_features->dims[0],
+				       text_features->dims[1]);
+			SAM3_PROF_END(proc->profiler, "text_encode");
+		} else {
+			/*
+			 * Legacy inline path — runs the text encoder on
+			 * the main backend with proc->scratch_arena and
+			 * proc->model_arena. Used when set_text() was not
+			 * called before segment().
+			 */
+			struct sam3_text_encoder *te =
+				&proc->model.backbone.text_enc;
+			int32_t tokens[77]; /* max context_len */
+			int n_tokens;
+			struct sam3_tensor *tok_tensor;
+			int tok_dims[1];
+
+			SAM3_PROF_BEGIN(proc->profiler, "tokenize");
+			n_tokens = sam3_tokenizer_encode(
+				&proc->model.backbone.tokenizer, text,
+				tokens, te->context_len);
+			SAM3_PROF_END(proc->profiler, "tokenize");
+			if (n_tokens <= 0) {
+				sam3_log_error("segment: tokenize failed");
+				err = SAM3_EINVAL;
+				goto fail;
+			}
+
+			tok_dims[0] = te->context_len;
+			sam3_arena_reset(&proc->scratch_arena);
+			tok_tensor = gh_alloc_tensor(&proc->model_arena,
+						      SAM3_DTYPE_I32, 1,
+						      tok_dims);
+			if (!tok_tensor) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			memcpy(tok_tensor->data, tokens,
+			       (size_t)te->context_len * sizeof(int32_t));
+
+			SAM3_PROF_BEGIN(proc->profiler, "text_blocks");
+			text_features = sam3_text_encoder_build_perblock(
+				te, proc->backend, tok_tensor,
+				&proc->scratch_arena, &proc->model_arena);
+			SAM3_PROF_END(proc->profiler, "text_blocks");
+			if (!text_features) {
+				sam3_log_error("segment: text encode "
+					       "perblock failed");
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+
+			sam3_log_debug("segment: text encoded (perblock), "
+				       "%d×%d",
+				       text_features->dims[0],
+				       text_features->dims[1]);
+
+			/*
+			 * Truncate text features to real tokens only.
+			 *
+			 * Python creates text_attention_mask = (tokenized
+			 * != 0) and passes it as key_padding_mask to
+			 * encoder cross-attn, masking out padding tokens.
+			 * We achieve the same effect by dropping padding
+			 * tokens entirely — softmax over non-masked
+			 * tokens is identical to softmax over the
+			 * truncated set.
+			 */
+			if (text_features->dims[0] > n_tokens) {
+				int d = text_features->dims[1];
+				int trunc_dims[] = {n_tokens, d};
+				struct sam3_tensor *trunc;
+
+				trunc = gh_alloc_tensor(&proc->model_arena,
+							 SAM3_DTYPE_F32, 2,
+							 trunc_dims);
+				if (!trunc) {
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+				memcpy(trunc->data, text_features->data,
+				       (size_t)n_tokens * (size_t)d *
+				       sizeof(float));
+				sam3_log_info("segment: truncated text "
+					      "%d→%d tokens (dropped %d "
+					      "padding)",
+					      text_features->dims[0],
+					      n_tokens,
+					      text_features->dims[0] -
+						      n_tokens);
+				text_features = trunc;
+			}
+			SAM3_PROF_END(proc->profiler, "text_encode");
 		}
-		SAM3_PROF_END(proc->profiler, "text_encode");
 	}
 
 	/*
