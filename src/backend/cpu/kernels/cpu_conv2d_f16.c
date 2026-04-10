@@ -263,6 +263,11 @@ enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
+	if (node->params[2]) {
+		return cpu_conv2d_nhwc_wrap(cpu_kernel_conv2d_f16, node,
+					    scratch, pool);
+	}
+
 	struct sam3_tensor *input  = node->inputs[0];
 	struct sam3_tensor *weight = node->inputs[1];
 	struct sam3_tensor *output = node->output;

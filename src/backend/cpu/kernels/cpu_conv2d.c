@@ -7,7 +7,12 @@
  * of offset so the temp buffer is freed automatically.
  *
  * Layout: input [N,C,H,W], weight [OC,C,KH,KW], output [N,OC,OH,OW].
- * node->params[0]=stride, params[1]=padding.
+ * node->params[0]=stride, params[1]=padding, params[2]=NHWC flag
+ * (0 = legacy NCHW, 1 = NHWC input + OHWI weight + NHWC output).
+ * When the NHWC flag is set, the dtype-specific kernels forward to
+ * the transpose wrappers defined below; this file also hosts the
+ * shared NHWC wrappers used by the f16 / bf16 / conv_transpose2d
+ * kernels so every NHWC branch shares the same scalar transpose code.
  *
  * Key types:  sam3_node, sam3_tensor, sam3_arena
  * Depends on: cpu_kernels.h, core/tensor.h, core/alloc.h
@@ -23,6 +28,7 @@
 #include "util/log.h"
 #include "util/threadpool.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #ifdef SAM3_HAS_BLAS
@@ -155,6 +161,405 @@ static void conv2d_matmul_parallel_fn(void *arg, int task_id, int n_tasks)
 	}
 }
 
+/* ── NHWC transpose wrappers (dtype-generic) ───────────────────────── */
+
+/*
+ * Transpose NHWC -> NCHW at byte granularity.
+ *
+ * src is [N, H, W, C] with `elem_sz` bytes per element. dst is
+ * [N, C, H, W]. This is test-only scaffolding for the CPU conv
+ * path, so a straight scalar loop with per-element memcpy is
+ * sufficient (single-byte / two-byte / four-byte dtypes).
+ */
+static void nhwc_to_nchw_bytes(const uint8_t *src, uint8_t *dst,
+			       int N, int H, int W, int C,
+			       size_t elem_sz)
+{
+	size_t hw = (size_t)H * W;
+
+	for (int n = 0; n < N; n++) {
+		for (int h = 0; h < H; h++) {
+			for (int w = 0; w < W; w++) {
+				const uint8_t *src_px = src +
+					(((size_t)n * H + h) * W + w) *
+					C * elem_sz;
+				for (int c = 0; c < C; c++) {
+					uint8_t *dst_px = dst +
+						(((size_t)n * C + c) * hw +
+						 (size_t)h * W + w) *
+						elem_sz;
+					memcpy(dst_px,
+					       src_px + (size_t)c * elem_sz,
+					       elem_sz);
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Transpose NCHW -> NHWC at byte granularity. Inverse of the above.
+ */
+static void nchw_to_nhwc_bytes(const uint8_t *src, uint8_t *dst,
+			       int N, int C, int H, int W,
+			       size_t elem_sz)
+{
+	size_t hw = (size_t)H * W;
+
+	for (int n = 0; n < N; n++) {
+		for (int h = 0; h < H; h++) {
+			for (int w = 0; w < W; w++) {
+				uint8_t *dst_px = dst +
+					(((size_t)n * H + h) * W + w) *
+					C * elem_sz;
+				for (int c = 0; c < C; c++) {
+					const uint8_t *src_px = src +
+						(((size_t)n * C + c) * hw +
+						 (size_t)h * W + w) *
+						elem_sz;
+					memcpy(dst_px + (size_t)c * elem_sz,
+					       src_px, elem_sz);
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Transpose OHWI -> OIHW at byte granularity for conv2d weights.
+ *
+ * src is [OC, KH, KW, IC]. dst is [OC, IC, KH, KW].
+ */
+static void ohwi_to_oihw_bytes(const uint8_t *src, uint8_t *dst,
+			       int OC, int KH, int KW, int IC,
+			       size_t elem_sz)
+{
+	size_t khkw = (size_t)KH * KW;
+
+	for (int oc = 0; oc < OC; oc++) {
+		for (int kh = 0; kh < KH; kh++) {
+			for (int kw = 0; kw < KW; kw++) {
+				const uint8_t *src_px = src +
+					(((size_t)oc * KH + kh) * KW + kw) *
+					IC * elem_sz;
+				for (int ic = 0; ic < IC; ic++) {
+					uint8_t *dst_px = dst +
+						(((size_t)oc * IC + ic) *
+						 khkw + (size_t)kh * KW +
+						 kw) * elem_sz;
+					memcpy(dst_px,
+					       src_px +
+					       (size_t)ic * elem_sz,
+					       elem_sz);
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Transpose OHWI -> IOHW at byte granularity for conv_transpose2d
+ * weights.
+ *
+ * src is [OC, KH, KW, IC]. dst is [IC, OC, KH, KW].
+ */
+static void ohwi_to_iohw_bytes(const uint8_t *src, uint8_t *dst,
+			       int OC, int KH, int KW, int IC,
+			       size_t elem_sz)
+{
+	size_t khkw = (size_t)KH * KW;
+
+	for (int oc = 0; oc < OC; oc++) {
+		for (int kh = 0; kh < KH; kh++) {
+			for (int kw = 0; kw < KW; kw++) {
+				const uint8_t *src_px = src +
+					(((size_t)oc * KH + kh) * KW + kw) *
+					IC * elem_sz;
+				for (int ic = 0; ic < IC; ic++) {
+					uint8_t *dst_px = dst +
+						(((size_t)ic * OC + oc) *
+						 khkw + (size_t)kh * KW +
+						 kw) * elem_sz;
+					memcpy(dst_px,
+					       src_px +
+					       (size_t)ic * elem_sz,
+					       elem_sz);
+				}
+			}
+		}
+	}
+}
+
+enum sam3_error cpu_conv2d_nhwc_wrap(cpu_conv_kernel_fn kernel,
+				     const struct sam3_node *node,
+				     struct sam3_arena *scratch,
+				     struct sam3_threadpool *pool)
+{
+	if (!kernel || !node || !scratch) {
+		sam3_log_error("conv2d_nhwc_wrap: NULL argument");
+		return SAM3_EINVAL;
+	}
+
+	if (node->n_inputs < 2 || !node->inputs[0] || !node->inputs[1] ||
+	    !node->output) {
+		sam3_log_error("conv2d_nhwc_wrap: NULL tensor");
+		return SAM3_EINVAL;
+	}
+
+	struct sam3_tensor *input = node->inputs[0];
+	struct sam3_tensor *weight = node->inputs[1];
+	struct sam3_tensor *output = node->output;
+
+	if (input->n_dims != 4 || weight->n_dims != 4 ||
+	    output->n_dims != 4) {
+		sam3_log_error("conv2d_nhwc_wrap: expected 4D tensors");
+		return SAM3_EINVAL;
+	}
+
+	size_t elem_sz = sam3_dtype_size(input->dtype);
+	if (elem_sz == 0) {
+		sam3_log_error("conv2d_nhwc_wrap: bad dtype %d",
+			       input->dtype);
+		return SAM3_EINVAL;
+	}
+
+	/* NHWC input [N, H, W, C_in] */
+	int N_batch = input->dims[0];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int C_in = input->dims[3];
+
+	/* OHWI weight [C_out, KH, KW, C_in] */
+	int C_out = weight->dims[0];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
+	int KIC = weight->dims[3];
+
+	if (KIC != C_in) {
+		sam3_log_error("conv2d_nhwc_wrap: channel mismatch "
+			       "%d != %d", KIC, C_in);
+		return SAM3_EINVAL;
+	}
+
+	/* NHWC output [N, OH, OW, C_out] */
+	int OH = output->dims[1];
+	int OW = output->dims[2];
+	if (output->dims[0] != N_batch || output->dims[3] != C_out) {
+		sam3_log_error("conv2d_nhwc_wrap: output shape mismatch");
+		return SAM3_EINVAL;
+	}
+
+	size_t saved_offset = scratch->offset;
+
+	size_t in_bytes = (size_t)N_batch * C_in * H * W * elem_sz;
+	size_t wt_bytes = (size_t)C_out * C_in * KH * KW * elem_sz;
+	size_t out_bytes = (size_t)N_batch * C_out * OH * OW * elem_sz;
+
+	uint8_t *in_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							   in_bytes);
+	uint8_t *wt_oihw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							   wt_bytes);
+	uint8_t *out_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							    out_bytes);
+	if (!in_nchw || !wt_oihw || !out_nchw) {
+		sam3_log_error("conv2d_nhwc_wrap: scratch OOM "
+			       "(need %zu bytes)",
+			       in_bytes + wt_bytes + out_bytes);
+		scratch->offset = saved_offset;
+		return SAM3_ENOMEM;
+	}
+
+	nhwc_to_nchw_bytes((const uint8_t *)input->data, in_nchw,
+			   N_batch, H, W, C_in, elem_sz);
+	ohwi_to_oihw_bytes((const uint8_t *)weight->data, wt_oihw,
+			   C_out, KH, KW, C_in, elem_sz);
+
+	/* Build stack tensors with NCHW dims pointing at scratch. */
+	struct sam3_tensor input_nchw = *input;
+	input_nchw.dims[0] = N_batch;
+	input_nchw.dims[1] = C_in;
+	input_nchw.dims[2] = H;
+	input_nchw.dims[3] = W;
+	input_nchw.data = in_nchw;
+	input_nchw.nbytes = in_bytes;
+	sam3_tensor_compute_strides(&input_nchw);
+
+	struct sam3_tensor weight_oihw = *weight;
+	weight_oihw.dims[0] = C_out;
+	weight_oihw.dims[1] = C_in;
+	weight_oihw.dims[2] = KH;
+	weight_oihw.dims[3] = KW;
+	weight_oihw.data = wt_oihw;
+	weight_oihw.nbytes = wt_bytes;
+	sam3_tensor_compute_strides(&weight_oihw);
+
+	struct sam3_tensor output_nchw = *output;
+	output_nchw.dims[0] = N_batch;
+	output_nchw.dims[1] = C_out;
+	output_nchw.dims[2] = OH;
+	output_nchw.dims[3] = OW;
+	output_nchw.data = out_nchw;
+	output_nchw.nbytes = out_bytes;
+	sam3_tensor_compute_strides(&output_nchw);
+
+	/*
+	 * Build a local node copy with params[2]=0 so the inner
+	 * kernel takes the legacy NCHW path on the scratch buffers.
+	 * Only inputs/output and params[2] are rewritten; everything
+	 * else (stride, padding, n_inputs) stays identical.
+	 */
+	struct sam3_node nchw_node = *node;
+	nchw_node.inputs[0] = &input_nchw;
+	nchw_node.inputs[1] = &weight_oihw;
+	nchw_node.output = &output_nchw;
+	nchw_node.params[2] = 0;
+
+	enum sam3_error err = kernel(&nchw_node, scratch, pool);
+	if (err != SAM3_OK) {
+		scratch->offset = saved_offset;
+		return err;
+	}
+
+	nchw_to_nhwc_bytes(out_nchw, (uint8_t *)output->data,
+			   N_batch, C_out, OH, OW, elem_sz);
+
+	scratch->offset = saved_offset;
+	return SAM3_OK;
+}
+
+enum sam3_error
+cpu_conv_transpose2d_nhwc_wrap(cpu_conv_kernel_fn kernel,
+			       const struct sam3_node *node,
+			       struct sam3_arena *scratch,
+			       struct sam3_threadpool *pool)
+{
+	if (!kernel || !node || !scratch) {
+		sam3_log_error("conv_transpose2d_nhwc_wrap: NULL argument");
+		return SAM3_EINVAL;
+	}
+
+	if (node->n_inputs < 2 || !node->inputs[0] || !node->inputs[1] ||
+	    !node->output) {
+		sam3_log_error("conv_transpose2d_nhwc_wrap: NULL tensor");
+		return SAM3_EINVAL;
+	}
+
+	struct sam3_tensor *input = node->inputs[0];
+	struct sam3_tensor *weight = node->inputs[1];
+	struct sam3_tensor *output = node->output;
+
+	if (input->n_dims != 4 || weight->n_dims != 4 ||
+	    output->n_dims != 4) {
+		sam3_log_error("conv_transpose2d_nhwc_wrap: "
+			       "expected 4D tensors");
+		return SAM3_EINVAL;
+	}
+
+	size_t elem_sz = sam3_dtype_size(input->dtype);
+	if (elem_sz == 0) {
+		sam3_log_error("conv_transpose2d_nhwc_wrap: bad dtype %d",
+			       input->dtype);
+		return SAM3_EINVAL;
+	}
+
+	/* NHWC input [N, H, W, C_in] */
+	int N_batch = input->dims[0];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int C_in = input->dims[3];
+
+	/* OHWI weight [C_out, KH, KW, C_in] */
+	int C_out = weight->dims[0];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
+	int KIC = weight->dims[3];
+
+	if (KIC != C_in) {
+		sam3_log_error("conv_transpose2d_nhwc_wrap: "
+			       "channel mismatch %d != %d", KIC, C_in);
+		return SAM3_EINVAL;
+	}
+
+	/* NHWC output [N, OH, OW, C_out] */
+	int OH = output->dims[1];
+	int OW = output->dims[2];
+	if (output->dims[0] != N_batch || output->dims[3] != C_out) {
+		sam3_log_error("conv_transpose2d_nhwc_wrap: "
+			       "output shape mismatch");
+		return SAM3_EINVAL;
+	}
+
+	size_t saved_offset = scratch->offset;
+
+	size_t in_bytes = (size_t)N_batch * C_in * H * W * elem_sz;
+	size_t wt_bytes = (size_t)C_in * C_out * KH * KW * elem_sz;
+	size_t out_bytes = (size_t)N_batch * C_out * OH * OW * elem_sz;
+
+	uint8_t *in_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							   in_bytes);
+	uint8_t *wt_iohw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							   wt_bytes);
+	uint8_t *out_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							    out_bytes);
+	if (!in_nchw || !wt_iohw || !out_nchw) {
+		sam3_log_error("conv_transpose2d_nhwc_wrap: scratch OOM "
+			       "(need %zu bytes)",
+			       in_bytes + wt_bytes + out_bytes);
+		scratch->offset = saved_offset;
+		return SAM3_ENOMEM;
+	}
+
+	nhwc_to_nchw_bytes((const uint8_t *)input->data, in_nchw,
+			   N_batch, H, W, C_in, elem_sz);
+	ohwi_to_iohw_bytes((const uint8_t *)weight->data, wt_iohw,
+			   C_out, KH, KW, C_in, elem_sz);
+
+	struct sam3_tensor input_nchw = *input;
+	input_nchw.dims[0] = N_batch;
+	input_nchw.dims[1] = C_in;
+	input_nchw.dims[2] = H;
+	input_nchw.dims[3] = W;
+	input_nchw.data = in_nchw;
+	input_nchw.nbytes = in_bytes;
+	sam3_tensor_compute_strides(&input_nchw);
+
+	struct sam3_tensor weight_iohw = *weight;
+	weight_iohw.dims[0] = C_in;
+	weight_iohw.dims[1] = C_out;
+	weight_iohw.dims[2] = KH;
+	weight_iohw.dims[3] = KW;
+	weight_iohw.data = wt_iohw;
+	weight_iohw.nbytes = wt_bytes;
+	sam3_tensor_compute_strides(&weight_iohw);
+
+	struct sam3_tensor output_nchw = *output;
+	output_nchw.dims[0] = N_batch;
+	output_nchw.dims[1] = C_out;
+	output_nchw.dims[2] = OH;
+	output_nchw.dims[3] = OW;
+	output_nchw.data = out_nchw;
+	output_nchw.nbytes = out_bytes;
+	sam3_tensor_compute_strides(&output_nchw);
+
+	struct sam3_node nchw_node = *node;
+	nchw_node.inputs[0] = &input_nchw;
+	nchw_node.inputs[1] = &weight_iohw;
+	nchw_node.output = &output_nchw;
+	nchw_node.params[2] = 0;
+
+	enum sam3_error err = kernel(&nchw_node, scratch, pool);
+	if (err != SAM3_OK) {
+		scratch->offset = saved_offset;
+		return err;
+	}
+
+	nchw_to_nhwc_bytes(out_nchw, (uint8_t *)output->data,
+			   N_batch, C_out, OH, OW, elem_sz);
+
+	scratch->offset = saved_offset;
+	return SAM3_OK;
+}
+
 enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 				  struct sam3_arena *scratch,
 				  struct sam3_threadpool *pool)
@@ -168,6 +573,11 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 	if (!scratch) {
 		sam3_log_error("conv2d: NULL scratch arena");
 		return SAM3_EINVAL;
+	}
+
+	if (node->params[2]) {
+		return cpu_conv2d_nhwc_wrap(cpu_kernel_conv2d, node,
+					    scratch, pool);
 	}
 
 #ifdef SAM3_HAS_BLAS

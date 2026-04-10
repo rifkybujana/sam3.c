@@ -8,7 +8,10 @@
  *
  * Layout: input [N,C_in,H,W], weight [C_in,C_out,KH,KW] (PyTorch layout),
  * output [N,C_out,OH,OW] where OH = (H-1)*stride - 2*pad + KH.
- * node->params[0]=stride, params[1]=padding.
+ * node->params[0]=stride, params[1]=padding, params[2]=NHWC flag.
+ * When params[2]=1 the kernel forwards to cpu_conv_transpose2d_nhwc_wrap
+ * (defined in cpu_conv2d.c) which transposes NHWC/OHWI to NCHW/IOHW
+ * in scratch and recursively re-enters this kernel with params[2]=0.
  *
  * Key types:  sam3_node, sam3_tensor, sam3_arena
  * Depends on: cpu_kernels.h, core/tensor.h, core/alloc.h
@@ -122,6 +125,16 @@ enum sam3_error cpu_kernel_conv_transpose2d(const struct sam3_node *node,
 	    !node->output) {
 		sam3_log_error("conv_transpose2d: NULL tensor");
 		return SAM3_EINVAL;
+	}
+
+	if (node->params[2]) {
+		if (!scratch) {
+			sam3_log_error("conv_transpose2d: NULL scratch "
+				       "arena for NHWC wrap");
+			return SAM3_EINVAL;
+		}
+		return cpu_conv_transpose2d_nhwc_wrap(
+			cpu_kernel_conv_transpose2d, node, scratch, pool);
 	}
 
 	(void)scratch;

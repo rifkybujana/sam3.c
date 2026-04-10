@@ -57,6 +57,53 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 				  struct sam3_arena *scratch,
 				  struct sam3_threadpool *pool);
 
+/*
+ * Uniform kernel signature used by the NHWC wrappers below. Matches
+ * the real cpu_kernel_conv2d* and cpu_kernel_conv_transpose2d
+ * signatures so the wrappers can recursively re-enter the NCHW path
+ * with params[2] cleared.
+ */
+typedef enum sam3_error (*cpu_conv_kernel_fn)(const struct sam3_node *,
+					      struct sam3_arena *,
+					      struct sam3_threadpool *);
+
+/*
+ * cpu_conv2d_nhwc_wrap - Run a CONV2D kernel on NHWC inputs by
+ * transposing to NCHW into scratch, calling the legacy NCHW path,
+ * and transposing the result back to NHWC.
+ *
+ * @kernel:  The dtype-specific conv2d kernel to invoke on the NCHW
+ *           scratch copies. Must take the uniform signature above.
+ * @node:    Original node with NHWC input [N,H,W,C], OHWI weight
+ *           [OC,KH,KW,IC], NHWC output [N,OH,OW,OC], and
+ *           params[2]==1.
+ * @scratch: Scratch arena for the NCHW intermediate buffers; offset
+ *           is saved/restored on every return path.
+ * @pool:    Thread pool forwarded to the inner NCHW kernel.
+ *
+ * The wrapper does not touch the output tensor's dims; it only
+ * writes bytes into output->data. The CPU conv path is test-only,
+ * so the transposes are plain scalar loops over dtype_size bytes.
+ */
+enum sam3_error cpu_conv2d_nhwc_wrap(cpu_conv_kernel_fn kernel,
+				     const struct sam3_node *node,
+				     struct sam3_arena *scratch,
+				     struct sam3_threadpool *pool);
+
+/*
+ * cpu_conv_transpose2d_nhwc_wrap - Same as cpu_conv2d_nhwc_wrap but
+ * for transposed convolution, whose weight permutation differs.
+ *
+ * Input is NHWC [N,H,W,C_in]; weight is OHWI [C_out,KH,KW,C_in] and
+ * must be repacked to IOHW [C_in,C_out,KH,KW] for the legacy kernel.
+ * Output is NHWC [N,OH,OW,C_out].
+ */
+enum sam3_error
+cpu_conv_transpose2d_nhwc_wrap(cpu_conv_kernel_fn kernel,
+			       const struct sam3_node *node,
+			       struct sam3_arena *scratch,
+			       struct sam3_threadpool *pool);
+
 /* Reshape: zero-copy, sets output->data = input->data */
 enum sam3_error cpu_kernel_reshape(const struct sam3_node *node);
 
