@@ -59,6 +59,14 @@ struct sam3_vit {
 	struct sam3_tensor *rope_glo_cos; /* [n_patches, head_dim/2] scaled global coords */
 	struct sam3_tensor *rope_glo_sin; /* [n_patches, head_dim/2] scaled global coords */
 
+	/*
+	 * Window-local RoPE: [ws*ws, head_dim/2] tiny tables used by
+	 * mask-free windowed attention. Each window of patches gets the
+	 * same local positions 0..ws-1, so a single small table suffices.
+	 */
+	struct sam3_tensor *rope_win_local_cos;
+	struct sam3_tensor *rope_win_local_sin;
+
 	/* Windowed attention mask */
 	struct sam3_tensor *window_mask; /* [n_patches, n_patches] */
 

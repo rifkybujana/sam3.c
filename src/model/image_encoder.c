@@ -518,6 +518,16 @@ static enum sam3_error vit_lazy_precompute(struct sam3_vit *vit)
 	if (err != SAM3_OK)
 		return err;
 
+	/* Window-local RoPE (used by mask-free windowed attention) */
+	int ws = vit->window_size;
+	err = precompute_rope_table(arena, ws * ws, ws, head_dim,
+				    1.0f, theta,
+				    &vit->rope_win_local_cos,
+				    &vit->rope_win_local_sin,
+				    0);
+	if (err != SAM3_OK)
+		return err;
+
 	/* Window mask */
 	err = precompute_window_mask(vit, arena);
 	if (err != SAM3_OK)
