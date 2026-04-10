@@ -3,78 +3,57 @@
 Remaining optimizations for the Metal inference path. CPU-only items
 (#8 Q8 NEON, #9 SDPA threadpool) are tracked separately and excluded.
 
-Baseline (Apple M3 Pro, F16, 4-block batching, fused MHSA+QKV — already
-landed):
+Baseline (Apple M3 Pro, F16, 4-block batching, fused MHSA+QKV,
+async image∥text pipeline, **mask-free windowed attention** — all
+already landed; median of 5 Release runs):
 
 | Stage        | Time   | %    |
 |--------------|-------:|-----:|
-| image_encode | 6324ms | 51%  |
-| &nbsp;&nbsp;vit_blocks  | 5756ms | 46% |
-| &nbsp;&nbsp;neck        |  428ms | 3.5% |
-| text_encode  | 3747ms | 30%  |
-| mask_decode  | 1245ms | 10%  |
-| **Total**    |**12.4s**|     |
+| image_encode | 3622ms | 38%  |
+| &nbsp;&nbsp;vit_blocks  | 3076ms | 32% |
+| &nbsp;&nbsp;neck        |  469ms | 4.9% |
+| text_encode  |   <0.1ms | ~0% (hidden behind image_encode) |
+| mask_decode  |  829ms | 8.6% |
+| **Total**    |**9.6s** |     |
 
 Already shipped: #1 multi-block batching, #2 fused MHSA, #5 fused QKV,
 #6 F16 compute, #7 debug-dump gating, **#11 async image ∥ text encoding
-pipeline**. See PERFORMANCE.md for history.
+pipeline**, **#4 mask-free windowed attention**. See PERFORMANCE.md for
+history.
 
 ---
 
 ## P0 — Highest Leverage
 
-### #4. Mask-Free Windowed Attention
+### #4. Mask-Free Windowed Attention — ✅ SHIPPED
 
-**Why:** 28 of 32 ViT blocks use windowed attention, and each one
-references a 5184×5184 F32 mask (~107 MiB). The mask is materialized
-once in `precompute_window_mask` but is then loaded into every
-windowed-attention SDPA call across 28 blocks. Most of those bytes
-encode the trivial structure "same window or not" — pure waste.
+**Result:** `vit_blocks` dropped from 6371 ms → **3076 ms**
+(-3295 ms, -51.7%) and `image_encode` from 6916 ms → 3622 ms
+(-47.6%) on the `assets/cat.jpeg` + "cat" benchmark. Correctness
+preserved — `test_fixture_compare` stays green in Release.
 
-**Current state:**
-- `src/model/image_encoder.c:135-165` `precompute_window_mask` builds
-  the dense `[n_patches, n_patches]` F32 mask.
-- `src/model/image_encoder.c:689-690` selects `vit->window_mask` for
-  non-global blocks and passes it into the attention call.
+**What landed:**
+- `precompute_window_mask` and the `vit->window_mask` field were
+  deleted, along with the full-size 5184-token window RoPE.
+- New `gh_window_partition` / `gh_window_unpartition` helpers in
+  `src/model/graph_helpers.c` convert `[5184, dim]` ↔ `[9, 576, dim]`
+  (9 windows of 24×24 tokens each, reshaped from the 72×72 grid).
+- `gh_multihead_attention_rope` now handles batch > 1 correctly so
+  the window dim can live in the leading axis.
+- Each windowed ViT block partitions → unmasked SDPA with the
+  precomputed 576-token window RoPE → unpartition. Global blocks
+  still use the 5184-token RoPE unchanged.
 
-**Approach:** reshape Q/K/V into windows so attention is naturally
-local — no mask needed.
+**Savings per windowed block:** ~107 MiB of mask traffic eliminated
+and attention FLOPs dropped from O(5184²·d) to 9·O(576²·d), roughly
+9× fewer multiplies across 28 of the 32 ViT blocks. Measured impact
+is substantially larger than the 10-15% / 600-850 ms originally
+estimated because MLX's masked SDPA kernel wasn't exploiting the
+mask sparsity — deleting the mask both removes bandwidth and unlocks
+a much faster code path inside the SDPA kernel itself.
 
-For window size `ws=14` and grid `gs=72`:
-1. Reshape `[seq=5184, dim]` → `[gs/ws, ws, gs/ws, ws, dim]` =
-   `[5, 14, 5, 14, dim]` (handle the 72/14 remainder via padding to
-   70+2 or via the existing padding the Python ref uses).
-2. Permute to `[gs/ws*gs/ws, ws*ws, dim]` = `[25, 196, dim]` (batch
-   dim of 25 windows).
-3. Run unmasked SDPA with `[25, n_heads, 196, head_dim]`.
-4. Reverse the permute/reshape.
-
-Eliminates the 5184×5184 mask entirely and shrinks attention from
-`5184×5184` per block to `25 × 196×196` — same FLOPs, no mask traffic,
-much smaller intermediate.
-
-**Files to touch:**
-- `src/model/image_encoder.c:135-165` — delete `precompute_window_mask`
-  and the `vit->window_mask` field.
-- `src/model/image_encoder.c:680-720` — gate the
-  windowed-vs-global path; for windowed path, do the
-  reshape→SDPA→inverse-reshape.
-- `src/model/graph_helpers.c` (`gh_multihead_attention_rope`) — may
-  need a variant that accepts pre-batched windows, or do the
-  reshape outside the helper and call `gh_sdpa` directly.
-- Verify that `vit_precompute` profile time drops from 43ms → ~0ms.
-
-**Risks:**
-- Padding: 72 is not a multiple of 14. Either round up to 84
-  (5×14² windows but pad the input) or use the same uneven last-window
-  trick the Python reference uses. Check what
-  `facebookresearch/sam3` does.
-- RoPE — windowed RoPE table is already precomputed per-window in
-  `vit->rope_window`, so this should still work.
-
-**Estimated impact:** 10-15% of vit_blocks → ~600-850ms saved →
-12.4s → ~11.7s.
-**Complexity:** Medium.
+See `PERFORMANCE.md` optimization-history table and the dated entry
+`2026-04-10 — Mask-free windowed attention` for full numbers.
 
 ---
 
@@ -220,8 +199,9 @@ images or multiple segments — single-shot inference gets nothing.
 
 1. ~~**#11 async pipeline**~~ ✅ **SHIPPED** (-3.7s wall, fully hides
    text_encode behind image_encode)
-2. **#4 mask-free window attention** (P0, ~600-850ms, also frees
-   ~107 MiB of arena pressure → enables larger batch in #1)
+2. ~~**#4 mask-free window attention**~~ ✅ **SHIPPED** (-3.3s
+   on `vit_blocks`, -51.7%; freed ~107 MiB of per-block arena
+   pressure)
 3. **#3 backend-side NHWC fold** (P1, easy if MLX cooperates)
 4. **#10 graph template reuse** (P1, small but cheap)
 5. **#12 text KV cache** (P2, only if interactive workloads matter)
@@ -229,5 +209,10 @@ images or multiple segments — single-shot inference gets nothing.
    and the next bottleneck is still kernel launch overhead)
 7. **#14 sparse attention** (P2, speculative)
 
-**Current total (post-#11):** 12.4s → ~9.1s median (-27%).
-**Projected total after #4:** ~8.3s (-33%).
+**Current total (post-#4):** 12.4s → ~9.6s median (-23%). The warm
+floor is ~9.3s; the median includes a cold first run. The biggest
+remaining line item on the critical path is `vit_blocks` at 3.1s
+(~32% of wall time); the next-largest stages are `neck` (469ms),
+`mask_decode` (829ms), and `model_load` (1.05s, amortized across
+repeated inferences).
+**Projected total after #3 + #10:** ~9.1–9.3s median.
