@@ -140,23 +140,13 @@ static void test_vit_load(void)
 		ASSERT(vit.layers[i].ln1_b != NULL);
 		ASSERT_EQ(vit.layers[i].ln1_w->dims[0], TEST_EMBED_DIM);
 
-		ASSERT(vit.layers[i].q_w != NULL);
-		ASSERT_EQ(vit.layers[i].q_w->dims[0], TEST_EMBED_DIM);
-		ASSERT_EQ(vit.layers[i].q_w->dims[1], TEST_EMBED_DIM);
-		ASSERT(vit.layers[i].q_b != NULL);
-		ASSERT_EQ(vit.layers[i].q_b->dims[0], TEST_EMBED_DIM);
-
-		ASSERT(vit.layers[i].k_w != NULL);
-		ASSERT_EQ(vit.layers[i].k_w->dims[0], TEST_EMBED_DIM);
-		ASSERT_EQ(vit.layers[i].k_w->dims[1], TEST_EMBED_DIM);
-		ASSERT(vit.layers[i].k_b != NULL);
-		ASSERT_EQ(vit.layers[i].k_b->dims[0], TEST_EMBED_DIM);
-
-		ASSERT(vit.layers[i].v_w != NULL);
-		ASSERT_EQ(vit.layers[i].v_w->dims[0], TEST_EMBED_DIM);
-		ASSERT_EQ(vit.layers[i].v_w->dims[1], TEST_EMBED_DIM);
-		ASSERT(vit.layers[i].v_b != NULL);
-		ASSERT_EQ(vit.layers[i].v_b->dims[0], TEST_EMBED_DIM);
+		ASSERT(vit.layers[i].qkv_w != NULL);
+		ASSERT_EQ(vit.layers[i].qkv_w->dims[0],
+			  3 * TEST_EMBED_DIM);
+		ASSERT_EQ(vit.layers[i].qkv_w->dims[1], TEST_EMBED_DIM);
+		ASSERT(vit.layers[i].qkv_b != NULL);
+		ASSERT_EQ(vit.layers[i].qkv_b->dims[0],
+			  3 * TEST_EMBED_DIM);
 
 		ASSERT(vit.layers[i].proj_w != NULL);
 		ASSERT_EQ(vit.layers[i].proj_w->dims[0], TEST_EMBED_DIM);
@@ -237,7 +227,7 @@ static void test_vit_build_shapes(void)
 
 	struct sam3_tensor *out;
 	out = sam3_vit_build(&vit, &g_cpu.base, image,
-			      &g_scratch, &g_persist);
+			      &g_scratch, &g_persist, NULL);
 	ASSERT(out != NULL);
 
 	/* Output shape: [n_patches, embed_dim] */
@@ -299,7 +289,7 @@ static void test_vit_eval(void)
 
 	struct sam3_tensor *out;
 	out = sam3_vit_build(&vit, &g_cpu.base, image,
-			      &g_scratch, &g_persist);
+			      &g_scratch, &g_persist, NULL);
 	ASSERT(out != NULL);
 
 	/* Verify output is finite (already evaluated by vit_build) */
@@ -393,7 +383,7 @@ static void test_vit_windowed_attention(void)
 
 	struct sam3_tensor *out;
 	out = sam3_vit_build(&vit, &g_cpu.base, image,
-			      &g_scratch, &g_persist);
+			      &g_scratch, &g_persist, NULL);
 	ASSERT(out != NULL);
 
 	/*

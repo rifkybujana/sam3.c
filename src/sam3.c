@@ -237,6 +237,16 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
 	return err;
 }
 
+enum sam3_error sam3_set_text(sam3_ctx *ctx, const char *text)
+{
+	if (!ctx || !text)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	return sam3_processor_set_text(&ctx->proc, text);
+}
+
 enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
 			     int n_prompts, struct sam3_result *result)
 {

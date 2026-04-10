@@ -612,7 +612,31 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Encode image */
+	/*
+	 * If a text prompt is present, kick off async text encoding
+	 * BEFORE the image encoder so the two run concurrently
+	 * (image on Metal, text on a CPU worker). The encoded text
+	 * features are consumed automatically by sam3_segment().
+	 */
+	const char *async_text = NULL;
+	for (int i = 0; i < args.n_prompts; i++) {
+		if (args.prompts[i].type == SAM3_PROMPT_TEXT &&
+		    args.prompts[i].text) {
+			async_text = args.prompts[i].text;
+			break;
+		}
+	}
+	if (async_text) {
+		enum sam3_error te_err = sam3_set_text(ctx, async_text);
+		if (te_err != SAM3_OK) {
+			fprintf(stderr,
+				"warning: async set_text failed (%s); "
+				"falling back to inline encode\n",
+				sam3_error_str(te_err));
+		}
+	}
+
+	/* Encode image (overlaps with the async text worker if any) */
 	printf("Encoding image: %s\n", args.image_path);
 	t0 = sam3_time_ns();
 	err = sam3_set_image_file(ctx, args.image_path);

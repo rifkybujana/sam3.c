@@ -110,7 +110,8 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 	struct sam3_tensor *image,
 	struct sam3_tensor *out_features[],
 	struct sam3_arena *scratch,
-	struct sam3_arena *persist)
+	struct sam3_arena *persist,
+	struct sam3_profiler *profiler)
 {
 	/*
 	 * Run ViT per-block: evaluates internally, returns
@@ -118,7 +119,8 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 	 */
 	struct sam3_tensor *vit_out;
 
-	vit_out = sam3_vit_build(&vl->vit, be, image, scratch, persist);
+	vit_out = sam3_vit_build(&vl->vit, be, image, scratch, persist,
+				  profiler);
 	if (!vit_out) {
 		sam3_log_error("vl_backbone: vit_build returned NULL");
 		return NULL;

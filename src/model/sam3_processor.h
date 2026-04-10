@@ -18,12 +18,22 @@
 #ifndef SAM3_MODEL_SAM3_PROCESSOR_H
 #define SAM3_MODEL_SAM3_PROCESSOR_H
 
+#include <pthread.h>
+#include <stdint.h>
+
 #include "sam3_image.h"
 #include "backend/backend.h"
 #include "sam3/sam3_types.h"
 
 /* Forward declaration — only used as an opaque pointer here. */
 struct sam3_profiler;
+
+/*
+ * SAM3 text prompt token capacity. Matches the CLIP context length used
+ * by the text encoder; sized as a small fixed array to keep set_text
+ * lock-free with respect to the worker thread.
+ */
+#define SAM3_PROCESSOR_MAX_TOKENS 77
 
 struct sam3_processor {
 	struct sam3_image_model model;
@@ -32,6 +42,32 @@ struct sam3_processor {
 	struct sam3_arena scratch_arena;  /* per-inference temp */
 	int image_loaded;
 	struct sam3_profiler *profiler;   /* NULL when profiling disabled */
+
+	/*
+	 * Async text encoding state (#11). The text encoder runs on a
+	 * worker thread against its own backend and arenas so that it
+	 * overlaps with sam3_processor_set_image on the main thread.
+	 *
+	 * - text_backend:        second backend handle for the worker
+	 * - text_scratch_arena:  worker's per-block scratch
+	 * - text_persist_arena:  output buffer that survives the worker
+	 * - text_thread:         pthread handle (valid iff active=1)
+	 * - text_thread_active:  1 between pthread_create and join
+	 * - text_thread_err:     last worker exit code
+	 * - text_features_async: text features the worker produced
+	 *                        (NULL when no async result is pending)
+	 * - text_tokens:         raw token IDs the worker reads
+	 * - text_n_tokens:       number of real (non-padding) tokens
+	 */
+	struct sam3_backend *text_backend;
+	struct sam3_arena    text_scratch_arena;
+	struct sam3_arena    text_persist_arena;
+	pthread_t            text_thread;
+	int                  text_thread_active;
+	enum sam3_error      text_thread_err;
+	struct sam3_tensor  *text_features_async;
+	int32_t              text_tokens[SAM3_PROCESSOR_MAX_TOKENS];
+	int                  text_n_tokens;
 };
 
 /*
@@ -70,7 +106,12 @@ enum sam3_error sam3_processor_load(struct sam3_processor *proc,
  *
  * @proc: Processor to free (may be partially initialized).
  *
- * Frees the image model, backend, and both arenas.
+ * Frees the image model, backend, and both arenas. If an async text
+ * encoding worker is in flight (see sam3_processor_set_text) it is
+ * joined first. Callers MUST invoke this before sam3_weight_close()
+ * on the underlying weight file: the worker reads tensor data
+ * directly from the mmap'd weight region, and unmapping it while
+ * the worker is still running will SEGV.
  */
 void sam3_processor_free(struct sam3_processor *proc);
 
@@ -91,6 +132,35 @@ void sam3_processor_free(struct sam3_processor *proc);
 enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 					 const uint8_t *pixels,
 					 int width, int height);
+
+/*
+ * sam3_processor_set_text - Pre-tokenize and encode a text prompt.
+ *
+ * @proc: Initialized and loaded processor
+ * @text: Null-terminated text prompt (e.g. "cat")
+ *
+ * Tokenizes the text on the caller thread, then spawns a worker
+ * pthread that runs the text encoder against proc->text_backend
+ * (CPU) using the per-text arenas. The call returns as soon as the
+ * worker is spawned so the caller can proceed with
+ * sam3_processor_set_image() (image encoder runs concurrently on
+ * the Metal backend). The worker output is held in
+ * text_persist_arena and consumed automatically by the next
+ * sam3_processor_segment() call, which joins the worker first.
+ *
+ * Calling set_text twice without an intervening segment() joins
+ * the previous worker before discarding its result. The processor
+ * must have a valid text_backend (created in init); if it is NULL,
+ * this returns SAM3_EBACKEND.
+ *
+ * Lifetime: the worker reads weight tensors directly from the mmap'd
+ * .sam3 file. The weight file MUST outlive the worker — i.e.
+ * sam3_processor_free() must be called before sam3_weight_close().
+ *
+ * Returns SAM3_OK on success.
+ */
+enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
+					const char *text);
 
 /*
  * sam3_processor_segment - Run segmentation with geometric prompts.

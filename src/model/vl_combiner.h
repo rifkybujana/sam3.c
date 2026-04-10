@@ -85,6 +85,7 @@ void sam3_vl_backbone_free(struct sam3_vl_backbone *vl);
  * @out_features: Array of 4 pointers filled with multi-scale features
  * @scratch:      Arena for intermediate tensors (reset between stages)
  * @persist:      Arena for persistent ViT output buffer
+ * @profiler:     Profiler for sub-stage timing (may be NULL)
  *
  * Returns the raw ViT features [n_patches, embed_dim], or NULL on error.
  */
@@ -95,7 +96,8 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 	struct sam3_tensor *image,
 	struct sam3_tensor *out_features[],
 	struct sam3_arena *scratch,
-	struct sam3_arena *persist);
+	struct sam3_arena *persist,
+	struct sam3_profiler *profiler);
 
 /*
  * sam3_vl_backbone_build_text - Build text pipeline graph.

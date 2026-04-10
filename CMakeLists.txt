@@ -169,6 +169,12 @@ if(SAM3_TESTS)
 		target_compile_definitions(test_fixture_compare PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
+
+	# test_processor_async needs the model path at build time
+	if(TARGET test_processor_async)
+		target_compile_definitions(test_processor_async PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
 endif()
 
 # Benchmarks (not included in CTest; use Release build for accurate numbers)

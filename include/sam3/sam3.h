@@ -85,6 +85,24 @@ enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
 enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path);
 
 /*
+ * sam3_set_text - Pre-tokenize and asynchronously encode a text prompt.
+ *
+ * @ctx:  Initialized context with loaded model
+ * @text: Null-terminated prompt text (e.g. "cat")
+ *
+ * Optional optimization: tokenizes @text on the caller thread, then
+ * spawns a worker that runs the text encoder on a CPU backend so it
+ * overlaps with the next sam3_set_image() call (which runs the image
+ * encoder on the main backend). The encoded features are consumed
+ * automatically by the next sam3_segment() call. Calling sam3_segment
+ * without a prior sam3_set_text() still works and uses the inline
+ * legacy path.
+ *
+ * Returns SAM3_OK on success.
+ */
+enum sam3_error sam3_set_text(sam3_ctx *ctx, const char *text);
+
+/*
  * sam3_segment - Run segmentation with the given prompts.
  *
  * @ctx:       Context with image already set

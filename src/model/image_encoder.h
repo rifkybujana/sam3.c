@@ -26,6 +26,8 @@
 #include "core/weight.h"
 #include "backend/backend.h"
 
+struct sam3_profiler;
+
 #define SAM3_VIT_MAX_LAYERS      32
 #define SAM3_VIT_N_GLOBAL_BLOCKS 4
 
@@ -73,9 +75,7 @@ struct sam3_vit {
 	/* Per-layer weights */
 	struct {
 		struct sam3_tensor *ln1_w, *ln1_b;		/* [embed_dim] */
-		struct sam3_tensor *q_w, *q_b;			/* [embed_dim, embed_dim] / [embed_dim] */
-		struct sam3_tensor *k_w, *k_b;			/* [embed_dim, embed_dim] / [embed_dim] */
-		struct sam3_tensor *v_w, *v_b;			/* [embed_dim, embed_dim] / [embed_dim] */
+		struct sam3_tensor *qkv_w, *qkv_b;		/* [3*embed_dim, embed_dim] / [3*embed_dim] */
 		struct sam3_tensor *proj_w, *proj_b;		/* [embed_dim, embed_dim] / [embed_dim] */
 		struct sam3_tensor *ln2_w, *ln2_b;		/* [embed_dim] */
 		struct sam3_tensor *mlp_fc1_w, *mlp_fc1_b;	/* [mlp_dim, embed_dim] / [mlp_dim] */
@@ -132,11 +132,12 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
  * between blocks in a buffer allocated from the persist arena.
  * This reduces peak memory from ~55 GB to ~2.5 GB.
  *
- * @vit:     Initialized and loaded ViT
- * @be:      Backend for per-block graph evaluation
- * @image:   Input image tensor [3, img_size, img_size] (F32, normalized)
- * @scratch: Arena for per-block intermediate tensors (reset between blocks)
- * @persist: Arena for the output buffer that survives across blocks
+ * @vit:      Initialized and loaded ViT
+ * @be:       Backend for per-block graph evaluation
+ * @image:    Input image tensor [3, img_size, img_size] (F32, normalized)
+ * @scratch:  Arena for per-block intermediate tensors (reset between blocks)
+ * @persist:  Arena for the output buffer that survives across blocks
+ * @profiler: Profiler for sub-stage timing (may be NULL)
  *
  * Returns output features [n_patches, embed_dim] allocated from
  * persist arena, or NULL on error.
@@ -145,6 +146,7 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 				    struct sam3_backend *be,
 				    struct sam3_tensor *image,
 				    struct sam3_arena *scratch,
-				    struct sam3_arena *persist);
+				    struct sam3_arena *persist,
+				    struct sam3_profiler *profiler);
 
 #endif /* SAM3_MODEL_IMAGE_ENCODER_H */

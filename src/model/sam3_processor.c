@@ -33,6 +33,10 @@
 #include "mask_decoder.h"
 #include "util/profile.h"
 
+/* Forward declarations for async text worker helpers (defined below). */
+static void join_text_worker(struct sam3_processor *proc);
+static void *text_worker_main(void *arg);
+
 void sam3_normalize_rgb_chw(const uint8_t *src, float *dst,
 			    int width, int height)
 {
@@ -79,10 +83,11 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 		proc->backend = &cpu->base;
 	}
 
-	/* Model arena: 1 GiB for tensor structs, QKV fused weights, tiled
-	 * pos embed, precomputed tables, and cached features. Weight data
+	/* Model arena: 2 GiB for tensor structs, QKV fused weights
+	 * (~700 MiB for ViT + text encoder), tiled pos embed,
+	 * precomputed tables, and cached features. Weight data
 	 * lives in the mmap region, not the arena. */
-	err = sam3_arena_init(&proc->model_arena, 1024UL * 1024 * 1024);
+	err = sam3_arena_init(&proc->model_arena, 2048UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_backend;
 
@@ -97,13 +102,66 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 	if (err != SAM3_OK)
 		goto cleanup_model_arena;
 
-	/* Initialize all sub-modules with default SAM3 config */
-	err = sam3_image_model_init(&proc->model, &proc->model_arena);
+	/*
+	 * Async text encoder arenas (#11). Sized for the CLIP text
+	 * encoder operating on a 77-token sequence with 4-block
+	 * batching: per-block scratch peaks well under 256 MiB and the
+	 * persistent output is a few hundred KiB.
+	 */
+	err = sam3_arena_init(&proc->text_scratch_arena,
+			      256UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_scratch_arena;
 
+	err = sam3_arena_init(&proc->text_persist_arena,
+			      16UL * 1024 * 1024);
+	if (err != SAM3_OK)
+		goto cleanup_text_scratch_arena;
+
+	/*
+	 * Async text encoder backend (#11). The text worker runs against
+	 * its own CPU backend so it does not contend with the image
+	 * encoder's Metal device. We deliberately use CPU here even
+	 * when Metal is available: MLX-C 0.6 keeps a process-wide
+	 * device kernel cache that is not safe to mutate from two
+	 * threads concurrently (validated by test_metal_cpu_concurrent),
+	 * so two parallel Metal backends would race on get_kernel().
+	 * CPU + Metal sit on disjoint hardware and synchronize cleanly,
+	 * which gives us true parallelism for the text + image encoders.
+	 */
+	proc->text_backend = NULL;
+	{
+		struct sam3_cpu_backend *cpu_t = calloc(1, sizeof(*cpu_t));
+		if (cpu_t) {
+			cpu_t->base.type = SAM3_BACKEND_CPU;
+			cpu_t->base.ops  = sam3_cpu_backend_ops();
+			cpu_t->arena_capacity = 256UL * 1024 * 1024;
+			if (cpu_t->base.ops->init(&cpu_t->base) == SAM3_OK)
+				proc->text_backend = &cpu_t->base;
+			else
+				free(cpu_t);
+		}
+		if (!proc->text_backend)
+			sam3_log_warn("processor: text backend unavailable, "
+				      "async text encoding disabled");
+	}
+
+	/* Initialize all sub-modules with default SAM3 config */
+	err = sam3_image_model_init(&proc->model, &proc->model_arena);
+	if (err != SAM3_OK)
+		goto cleanup_text_backend;
+
 	return SAM3_OK;
 
+cleanup_text_backend:
+	if (proc->text_backend) {
+		proc->text_backend->ops->free(proc->text_backend);
+		free(proc->text_backend);
+		proc->text_backend = NULL;
+	}
+	sam3_arena_free(&proc->text_persist_arena);
+cleanup_text_scratch_arena:
+	sam3_arena_free(&proc->text_scratch_arena);
 cleanup_scratch_arena:
 	sam3_arena_free(&proc->scratch_arena);
 cleanup_model_arena:
@@ -128,7 +186,17 @@ void sam3_processor_free(struct sam3_processor *proc)
 	if (!proc)
 		return;
 
+	/* Join any in-flight async text worker before tearing down its
+	 * arenas and backend. */
+	join_text_worker(proc);
+
 	sam3_image_model_free(&proc->model);
+
+	if (proc->text_backend) {
+		proc->text_backend->ops->free(proc->text_backend);
+		free(proc->text_backend);
+		proc->text_backend = NULL;
+	}
 
 	if (proc->backend) {
 		proc->backend->ops->free(proc->backend);
@@ -136,6 +204,8 @@ void sam3_processor_free(struct sam3_processor *proc)
 		proc->backend = NULL;
 	}
 
+	sam3_arena_free(&proc->text_persist_arena);
+	sam3_arena_free(&proc->text_scratch_arena);
 	sam3_arena_free(&proc->model_arena);
 	sam3_arena_free(&proc->scratch_arena);
 }
@@ -176,7 +246,8 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 	SAM3_PROF_BEGIN(proc->profiler, "image_encode");
 	err = sam3_image_model_encode(&proc->model, proc->backend, image,
 				      &proc->scratch_arena,
-				      &proc->model_arena);
+				      &proc->model_arena,
+				      proc->profiler);
 	SAM3_PROF_END(proc->profiler, "image_encode");
 	if (err != SAM3_OK)
 		return err;
@@ -518,6 +589,144 @@ static const char *find_text_prompt(const struct sam3_prompt *prompts,
 	return NULL;
 }
 
+/*
+ * join_text_worker - Wait for the text worker thread (if any) to
+ * finish and clear the active flag. Safe to call even when no worker
+ * is in flight.
+ */
+static void join_text_worker(struct sam3_processor *proc)
+{
+	if (proc->text_thread_active) {
+		pthread_join(proc->text_thread, NULL);
+		proc->text_thread_active = 0;
+	}
+}
+
+/*
+ * text_worker_main - pthread entry point for async text encoding.
+ *
+ * Reads pre-tokenized state from proc, runs the text encoder, writes
+ * the result tensor pointer (or NULL on error) and the error code into
+ * proc->text_features_async / proc->text_thread_err. Owns the text
+ * arenas exclusively for the duration of this call — the main thread
+ * must not touch them until pthread_join returns.
+ */
+static void *text_worker_main(void *arg)
+{
+	struct sam3_processor *proc = arg;
+	struct sam3_text_encoder *te = &proc->model.backbone.text_enc;
+	struct sam3_tensor *tok_tensor;
+	int tok_dims[1] = {te->context_len};
+
+	/*
+	 * Wrap the pre-tokenized buffer (lives in proc->text_tokens,
+	 * a stable processor field) into a tensor allocated from
+	 * text_persist_arena.
+	 */
+	tok_tensor = gh_alloc_tensor(&proc->text_persist_arena,
+				     SAM3_DTYPE_I32, 1, tok_dims);
+	if (!tok_tensor) {
+		proc->text_features_async = NULL;
+		proc->text_thread_err = SAM3_ENOMEM;
+		return NULL;
+	}
+	memcpy(tok_tensor->data, proc->text_tokens,
+	       (size_t)te->context_len * sizeof(int32_t));
+
+	struct sam3_tensor *features;
+	features = sam3_text_encoder_build_perblock(
+		te, proc->text_backend, tok_tensor,
+		&proc->text_scratch_arena,
+		&proc->text_persist_arena);
+	if (!features) {
+		proc->text_features_async = NULL;
+		proc->text_thread_err = SAM3_ENOMEM;
+		return NULL;
+	}
+
+	/* Truncate to real tokens (mirrors the inline path). */
+	if (features->dims[0] > proc->text_n_tokens) {
+		int d = features->dims[1];
+		int trunc_dims[] = {proc->text_n_tokens, d};
+		struct sam3_tensor *trunc;
+
+		trunc = gh_alloc_tensor(&proc->text_persist_arena,
+					SAM3_DTYPE_F32, 2, trunc_dims);
+		if (!trunc) {
+			proc->text_features_async = NULL;
+			proc->text_thread_err = SAM3_ENOMEM;
+			return NULL;
+		}
+		memcpy(trunc->data, features->data,
+		       (size_t)proc->text_n_tokens * (size_t)d *
+		       sizeof(float));
+		features = trunc;
+	}
+
+	proc->text_features_async = features;
+	proc->text_thread_err = SAM3_OK;
+	return NULL;
+}
+
+enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
+					const char *text)
+{
+	struct sam3_text_encoder *te;
+	int n_tokens;
+	int rc;
+
+	if (!proc || !text)
+		return SAM3_EINVAL;
+
+	if (!proc->text_backend) {
+		sam3_log_error("set_text: text_backend unavailable");
+		return SAM3_EBACKEND;
+	}
+
+	/* Join any prior worker before stomping on the text arenas. */
+	join_text_worker(proc);
+
+	sam3_arena_reset(&proc->text_scratch_arena);
+	sam3_arena_reset(&proc->text_persist_arena);
+	proc->text_features_async = NULL;
+	proc->text_thread_err = SAM3_OK;
+
+	te = &proc->model.backbone.text_enc;
+
+	/* Tokenize on the caller thread (cheap, < 1ms). */
+	n_tokens = sam3_tokenizer_encode(
+		&proc->model.backbone.tokenizer, text,
+		proc->text_tokens, te->context_len);
+	if (n_tokens <= 0) {
+		sam3_log_error("set_text: tokenize failed");
+		return SAM3_EINVAL;
+	}
+	proc->text_n_tokens = n_tokens;
+
+	/*
+	 * Spawn the worker. Request an 8 MiB stack — MLX-C plus ASan
+	 * blows the default 512 KiB pthread stack on macOS, and the
+	 * matching size is validated by test_metal_cpu_concurrent.
+	 */
+	pthread_attr_t attr;
+	if (pthread_attr_init(&attr) != 0)
+		return SAM3_EBACKEND;
+	if (pthread_attr_setstacksize(&attr, 8UL * 1024 * 1024) != 0) {
+		pthread_attr_destroy(&attr);
+		return SAM3_EBACKEND;
+	}
+
+	rc = pthread_create(&proc->text_thread, &attr,
+			    text_worker_main, proc);
+	pthread_attr_destroy(&attr);
+	if (rc != 0) {
+		sam3_log_error("set_text: pthread_create failed (%d)", rc);
+		return SAM3_EBACKEND;
+	}
+	proc->text_thread_active = 1;
+	return SAM3_OK;
+}
+
 enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       const struct sam3_prompt *prompts,
 				       int n_prompts,
@@ -572,83 +781,147 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 
 	if (text) {
 		SAM3_PROF_BEGIN(proc->profiler, "text_encode");
-		/*
-		 * Use per-block text encoder evaluation for debugging.
-		 * This dumps /tmp/dbg_te_block_XX.bin for each block.
-		 */
-		struct sam3_text_encoder *te = &proc->model.backbone.text_enc;
-		int32_t tokens[77]; /* max context_len */
-		int n_tokens;
-		struct sam3_tensor *tok_tensor;
-		int tok_dims[1];
-
-		n_tokens = sam3_tokenizer_encode(
-			&proc->model.backbone.tokenizer, text,
-			tokens, te->context_len);
-		if (n_tokens <= 0) {
-			sam3_log_error("segment: tokenize failed");
-			err = SAM3_EINVAL;
-			goto fail;
-		}
-
-		tok_dims[0] = te->context_len;
-		sam3_arena_reset(&proc->scratch_arena);
-		tok_tensor = gh_alloc_tensor(&proc->model_arena,
-					      SAM3_DTYPE_I32, 1, tok_dims);
-		if (!tok_tensor) {
-			err = SAM3_ENOMEM;
-			goto fail;
-		}
-		memcpy(tok_tensor->data, tokens,
-		       (size_t)te->context_len * sizeof(int32_t));
-
-		text_features = sam3_text_encoder_build_perblock(
-			te, proc->backend, tok_tensor,
-			&proc->scratch_arena, &proc->model_arena);
-		if (!text_features) {
-			sam3_log_error("segment: text encode perblock "
-				       "failed");
-			err = SAM3_ENOMEM;
-			goto fail;
-		}
-
-		sam3_log_debug("segment: text encoded (perblock), %d×%d",
-			       text_features->dims[0],
-			       text_features->dims[1]);
 
 		/*
-		 * Truncate text features to real tokens only.
-		 *
-		 * Python creates text_attention_mask = (tokenized != 0)
-		 * and passes it as key_padding_mask to encoder cross-attn,
-		 * masking out padding tokens.  We achieve the same effect
-		 * by dropping padding tokens entirely — softmax over
-		 * non-masked tokens is identical to softmax over the
-		 * truncated set.
+		 * If a worker thread is in flight, wait for it to finish.
+		 * After this returns, proc->text_features_async is either
+		 * set (worker succeeded) or NULL (worker failed — see
+		 * text_thread_err).
 		 */
-		if (text_features->dims[0] > n_tokens) {
-			int d = text_features->dims[1];
-			int trunc_dims[] = {n_tokens, d};
-			struct sam3_tensor *trunc;
+		join_text_worker(proc);
+		if (proc->text_thread_err != SAM3_OK) {
+			sam3_log_error("segment: text worker failed: %d",
+				       proc->text_thread_err);
+			err = proc->text_thread_err;
+			proc->text_thread_err = SAM3_OK;
+			goto fail;
+		}
 
-			trunc = gh_alloc_tensor(&proc->model_arena,
-						 SAM3_DTYPE_F32, 2,
-						 trunc_dims);
-			if (!trunc) {
+		/*
+		 * If sam3_processor_set_text() was called earlier, the
+		 * worker has produced text_features_async in
+		 * proc->text_persist_arena. Copy it into model_arena so
+		 * it survives scratch resets and lives alongside other
+		 * persistent tensors used by the segmentation stages.
+		 */
+		if (proc->text_features_async) {
+			struct sam3_tensor *src = proc->text_features_async;
+			int copy_dims[2] = {src->dims[0], src->dims[1]};
+
+			text_features = gh_alloc_tensor(&proc->model_arena,
+							SAM3_DTYPE_F32,
+							2, copy_dims);
+			if (!text_features) {
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
-			memcpy(trunc->data, text_features->data,
-			       (size_t)n_tokens * (size_t)d *
+			memcpy(text_features->data, src->data,
+			       (size_t)src->dims[0] * (size_t)src->dims[1] *
 			       sizeof(float));
-			sam3_log_info("segment: truncated text %d→%d "
-				      "tokens (dropped %d padding)",
-				      text_features->dims[0],
-				      n_tokens,
-				      text_features->dims[0] - n_tokens);
-			text_features = trunc;
+
+			/*
+			 * One-shot consumption: clear the async slot so a
+			 * subsequent segment() without a fresh set_text()
+			 * falls back to inline encoding.
+			 */
+			proc->text_features_async = NULL;
+
+			sam3_log_debug("segment: consumed async text "
+				       "features [%d,%d]",
+				       text_features->dims[0],
+				       text_features->dims[1]);
+			SAM3_PROF_END(proc->profiler, "text_encode");
+		} else {
+			/*
+			 * Legacy inline path — runs the text encoder on
+			 * the main backend with proc->scratch_arena and
+			 * proc->model_arena. Used when set_text() was not
+			 * called before segment().
+			 */
+			struct sam3_text_encoder *te =
+				&proc->model.backbone.text_enc;
+			int32_t tokens[77]; /* max context_len */
+			int n_tokens;
+			struct sam3_tensor *tok_tensor;
+			int tok_dims[1];
+
+			SAM3_PROF_BEGIN(proc->profiler, "tokenize");
+			n_tokens = sam3_tokenizer_encode(
+				&proc->model.backbone.tokenizer, text,
+				tokens, te->context_len);
+			SAM3_PROF_END(proc->profiler, "tokenize");
+			if (n_tokens <= 0) {
+				sam3_log_error("segment: tokenize failed");
+				err = SAM3_EINVAL;
+				goto fail;
+			}
+
+			tok_dims[0] = te->context_len;
+			sam3_arena_reset(&proc->scratch_arena);
+			tok_tensor = gh_alloc_tensor(&proc->model_arena,
+						      SAM3_DTYPE_I32, 1,
+						      tok_dims);
+			if (!tok_tensor) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+			memcpy(tok_tensor->data, tokens,
+			       (size_t)te->context_len * sizeof(int32_t));
+
+			SAM3_PROF_BEGIN(proc->profiler, "text_blocks");
+			text_features = sam3_text_encoder_build_perblock(
+				te, proc->backend, tok_tensor,
+				&proc->scratch_arena, &proc->model_arena);
+			SAM3_PROF_END(proc->profiler, "text_blocks");
+			if (!text_features) {
+				sam3_log_error("segment: text encode "
+					       "perblock failed");
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+
+			sam3_log_debug("segment: text encoded (perblock), "
+				       "%d×%d",
+				       text_features->dims[0],
+				       text_features->dims[1]);
+
+			/*
+			 * Truncate text features to real tokens only.
+			 *
+			 * Python creates text_attention_mask = (tokenized
+			 * != 0) and passes it as key_padding_mask to
+			 * encoder cross-attn, masking out padding tokens.
+			 * We achieve the same effect by dropping padding
+			 * tokens entirely — softmax over non-masked
+			 * tokens is identical to softmax over the
+			 * truncated set.
+			 */
+			if (text_features->dims[0] > n_tokens) {
+				int d = text_features->dims[1];
+				int trunc_dims[] = {n_tokens, d};
+				struct sam3_tensor *trunc;
+
+				trunc = gh_alloc_tensor(&proc->model_arena,
+							 SAM3_DTYPE_F32, 2,
+							 trunc_dims);
+				if (!trunc) {
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+				memcpy(trunc->data, text_features->data,
+				       (size_t)n_tokens * (size_t)d *
+				       sizeof(float));
+				sam3_log_info("segment: truncated text "
+					      "%d→%d tokens (dropped %d "
+					      "padding)",
+					      text_features->dims[0],
+					      n_tokens,
+					      text_features->dims[0] -
+						      n_tokens);
+				text_features = trunc;
+			}
+			SAM3_PROF_END(proc->profiler, "text_encode");
 		}
-		SAM3_PROF_END(proc->profiler, "text_encode");
 	}
 
 	/*
@@ -694,7 +967,8 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       prompt_tokens, text_features,
 				       &proc->scratch_arena,
 				       &proc->model_arena,
-				       &mask_logits, &score_logits);
+				       &mask_logits, &score_logits,
+				       proc->profiler);
 	SAM3_PROF_END(proc->profiler, "mask_decode");
 	if (err != SAM3_OK) {
 		sam3_log_error("segment: pipeline failed: %d", err);
