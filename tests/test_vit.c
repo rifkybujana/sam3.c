@@ -85,14 +85,13 @@ static void test_vit_init(void)
 	ASSERT_EQ(vit.n_patches, TEST_N_PATCHES);
 
 	/*
-	 * RoPE tables, window mask, and pos_embed are lazily computed
-	 * on first sam3_vit_build() call, so they should be NULL here.
+	 * RoPE tables and pos_embed are lazily computed on first
+	 * sam3_vit_build() call, so they should be NULL here.
 	 */
-	ASSERT(vit.rope_win_cos == NULL);
-	ASSERT(vit.rope_win_sin == NULL);
 	ASSERT(vit.rope_glo_cos == NULL);
 	ASSERT(vit.rope_glo_sin == NULL);
-	ASSERT(vit.window_mask == NULL);
+	ASSERT(vit.rope_win_local_cos == NULL);
+	ASSERT(vit.rope_win_local_sin == NULL);
 	ASSERT(vit.precomputed == 0);
 	ASSERT(vit.model_arena == &g_cpu.arena);
 
@@ -395,12 +394,13 @@ static void test_vit_window_partition(void)
 }
 
 /*
- * test_vit_windowed_attention - Verify windowed attention mask.
+ * test_vit_windowed_attention - Verify mask-free windowed attention.
  *
- * Uses a larger config (grid_size=4, window_size=2) so that the
- * 16x16 mask has non-trivial window structure. Layer 0 is windowed,
- * layer 1 is global. Verifies mask shape, mask values at known
- * positions, and that the graph builds and evaluates without error.
+ * Uses a larger config (grid_size=4, window_size=2) so layer 0 is
+ * windowed and layer 1 is global. Verifies that the small window-
+ * local RoPE table is lazily built with the right shape, that its
+ * first row corresponds to position 0 (cos=1, sin=0), and that the
+ * graph builds and evaluates without error.
  */
 static void test_vit_windowed_attention(void)
 {
@@ -414,6 +414,7 @@ static void test_vit_windowed_attention(void)
 	int mlp_dim = 64;
 	int grid_size = img_size / patch_size;   /* 4 */
 	int n_patches = grid_size * grid_size;   /* 16 */
+	int head_dim = embed_dim / n_heads;      /* 8 */
 
 	struct sam3_vit vit;
 	enum sam3_error err;
@@ -432,8 +433,9 @@ static void test_vit_windowed_attention(void)
 	vit.layers[0].is_global = 0;
 	vit.layers[1].is_global = 1;
 
-	/* Window mask is lazily computed on first build */
-	ASSERT(vit.window_mask == NULL);
+	/* Window-local RoPE is lazily computed on first build */
+	ASSERT(vit.rope_win_local_cos == NULL);
+	ASSERT(vit.rope_win_local_sin == NULL);
 
 	/* Load weights (zero-init) and build graph */
 	err = sam3_vit_load(&vit, NULL, &g_cpu.arena);
@@ -479,43 +481,29 @@ static void test_vit_windowed_attention(void)
 	ASSERT(out != NULL);
 
 	/*
-	 * Verify window_mask (lazily computed by first build).
-	 *
-	 * Grid layout (4x4), window_size=2:
-	 *   Patch index = row * grid_size + col
-	 *   Window = (row / ws, col / ws)
-	 *
-	 * Patch (0,0) = index 0:  row=0, col=0 -> window (0,0)
-	 * Patch (0,1) = index 1:  row=0, col=1 -> window (0,0)
-	 * Patch (0,2) = index 2:  row=0, col=2 -> window (0,1)
-	 * Patch (1,0) = index 4:  row=1, col=0 -> window (0,0)
-	 * Patch (1,1) = index 5:  row=1, col=1 -> window (0,0)
+	 * Verify window-local RoPE table (lazily computed by first
+	 * build). Shape is [ws*ws, head_dim/2] with positions 0..ws-1
+	 * in each axis. Row 0 corresponds to position (0, 0), so all
+	 * angles are zero -> cos=1, sin=0.
 	 */
-	ASSERT(vit.window_mask != NULL);
-	ASSERT_EQ(vit.window_mask->n_dims, 2);
-	ASSERT_EQ(vit.window_mask->dims[0], n_patches);
-	ASSERT_EQ(vit.window_mask->dims[1], n_patches);
+	ASSERT(vit.rope_win_local_cos != NULL);
+	ASSERT(vit.rope_win_local_sin != NULL);
+	ASSERT_EQ(vit.rope_win_local_cos->n_dims, 2);
+	ASSERT_EQ(vit.rope_win_local_cos->dims[0],
+		  window_size * window_size);
+	ASSERT_EQ(vit.rope_win_local_cos->dims[1], head_dim / 2);
+	ASSERT_EQ(vit.rope_win_local_sin->n_dims, 2);
+	ASSERT_EQ(vit.rope_win_local_sin->dims[0],
+		  window_size * window_size);
+	ASSERT_EQ(vit.rope_win_local_sin->dims[1], head_dim / 2);
 
-	float *mask_data = (float *)vit.window_mask->data;
-
-	/* Patches 0 and 1: same window (0,0) -> 0.0f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 1], 0.0f, 1e-6f);
-
-	/* Patches 0 and 4: same window (0,0) -> 0.0f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 4], 0.0f, 1e-6f);
-
-	/* Patches 0 and 5: same window (0,0) -> 0.0f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 5], 0.0f, 1e-6f);
-
-	/* Patches 0 and 2: different windows (0,0) vs (0,1) -> -1e9f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 2], -1e9f, 1.0f);
-
-	/* Patches 0 and 8: different windows (0,0) vs (1,0) -> -1e9f */
-	ASSERT_NEAR(mask_data[0 * n_patches + 8], -1e9f, 1.0f);
-
-	/* Diagonal: always same window -> 0.0f */
-	for (int i = 0; i < n_patches; i++)
-		ASSERT_NEAR(mask_data[i * n_patches + i], 0.0f, 1e-6f);
+	/* Row 0 (position (0,0)) has angle 0 -> cos=1, sin=0 */
+	float *rcos = (float *)vit.rope_win_local_cos->data;
+	float *rsin = (float *)vit.rope_win_local_sin->data;
+	for (int i = 0; i < head_dim / 2; i++) {
+		ASSERT_NEAR(rcos[i], 1.0f, 1e-6f);
+		ASSERT_NEAR(rsin[i], 0.0f, 1e-6f);
+	}
 
 	/* Output shape: [n_patches, embed_dim] */
 	ASSERT_EQ(out->n_dims, 2);

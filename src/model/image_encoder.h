@@ -6,8 +6,8 @@
  * (implemented as conv2d), 32 transformer blocks with multi-head
  * self-attention and GELU MLP, and RoPE for position encoding.
  * Global attention is used at layers 7, 15, 23, 31; the remaining
- * layers use windowed attention via a precomputed additive mask that
- * blocks cross-window attention scores.
+ * layers use mask-free windowed attention via window partitioning
+ * with a small local RoPE table.
  *
  * Key types:  sam3_vit
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h, core/weight.h
@@ -53,11 +53,9 @@ struct sam3_vit {
 	struct sam3_tensor *ln_pre_w; /* [embed_dim] */
 	struct sam3_tensor *ln_pre_b; /* [embed_dim] */
 
-	/* RoPE precomputed frequencies (separate for window/global) */
-	struct sam3_tensor *rope_win_cos; /* [n_patches, head_dim/2] tiled local coords */
-	struct sam3_tensor *rope_win_sin; /* [n_patches, head_dim/2] tiled local coords */
-	struct sam3_tensor *rope_glo_cos; /* [n_patches, head_dim/2] scaled global coords */
-	struct sam3_tensor *rope_glo_sin; /* [n_patches, head_dim/2] scaled global coords */
+	/* Global RoPE precomputed frequencies [n_patches, head_dim/2] */
+	struct sam3_tensor *rope_glo_cos; /* scaled global coords */
+	struct sam3_tensor *rope_glo_sin; /* scaled global coords */
 
 	/*
 	 * Window-local RoPE: [ws*ws, head_dim/2] tiny tables used by
@@ -66,9 +64,6 @@ struct sam3_vit {
 	 */
 	struct sam3_tensor *rope_win_local_cos;
 	struct sam3_tensor *rope_win_local_sin;
-
-	/* Windowed attention mask */
-	struct sam3_tensor *window_mask; /* [n_patches, n_patches] */
 
 	/* Lazy precompute state */
 	struct sam3_arena *model_arena;	/* stored during init for lazy precompute */
@@ -103,11 +98,11 @@ struct sam3_vit {
  * @n_heads:     Number of attention heads (16)
  * @window_size: Window size for windowed attention (24)
  * @mlp_dim:     MLP hidden dimension (4736)
- * @arena:       Model arena (stored for lazy precompute of RoPE/mask)
+ * @arena:       Model arena (stored for lazy precompute of RoPE tables)
  *
- * Sets dimensions and marks global attention blocks. RoPE tables,
- * window mask, and position embed tiling are deferred to first
- * sam3_vit_build() call. Returns SAM3_OK on success.
+ * Sets dimensions and marks global attention blocks. RoPE tables
+ * and position embed tiling are deferred to first sam3_vit_build()
+ * call. Returns SAM3_OK on success.
  */
 enum sam3_error sam3_vit_init(struct sam3_vit *vit,
 			       int img_size, int patch_size,

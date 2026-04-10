@@ -9,9 +9,10 @@
  * multi-head self-attention (using 2D axial RoPE) and GELU MLP,
  * producing per-patch feature embeddings.
  *
- * Window blocks (28 of 32) use 576-position RoPE (24x24, scale 1.0)
- * and an additive mask for local attention. Global blocks (7,15,23,31)
- * use 5184-position RoPE (72x72, scale 1/3) with full attention.
+ * Window blocks (28 of 32) use a small 576-position local RoPE
+ * (24x24, scale 1.0) and unmasked SDPA on partitioned
+ * [n_windows, ws*ws, e] tensors. Global blocks (7, 15, 23, 31) use
+ * the 5184-position RoPE (72x72, scale 1/3) with full attention.
  *
  * Key types:  sam3_vit
  * Depends on: image_encoder.h, graph_helpers.h
@@ -43,23 +44,20 @@ static const int global_blocks[] = {7, 15, 23, 31};
  *     last  dim//4 entries: x * scale * freq
  *
  * @arena:     Arena to allocate from
- * @n_pos:     Number of positions (always grid_size^2 = 5184)
- * @grid_w:    Grid width (grid_size = 72)
+ * @n_pos:     Number of positions (grid_w * grid_h)
+ * @grid_w:    Grid width
  * @head_dim:  Per-head dimension (embed_dim / n_heads)
- * @scale:     Position scale factor (1.0 for window, 1/3 for global)
+ * @scale:     Position scale factor (1.0 for window-local, <1 for global)
  * @theta:     RoPE base frequency (10000.0)
  * @out_cos:   Output cosine table [n_pos, head_dim/2]
  * @out_sin:   Output sine table [n_pos, head_dim/2]
- * @tile_ws:   If > 0, tile positions modulo tile_ws (for window RoPE).
- *             If 0, use raw grid positions (for global RoPE).
  */
 static enum sam3_error precompute_rope_table(
 	struct sam3_arena *arena,
 	int n_pos, int grid_w, int head_dim,
 	float scale, float theta,
 	struct sam3_tensor **out_cos,
-	struct sam3_tensor **out_sin,
-	int tile_ws)
+	struct sam3_tensor **out_sin)
 {
 	int half = head_dim / 2;	/* 32 */
 	int quarter = head_dim / 4;	/* 16 frequencies per axis */
@@ -90,17 +88,8 @@ static enum sam3_error precompute_rope_table(
 	for (int py = 0; py < grid_h; py++) {
 		for (int px = 0; px < grid_w; px++) {
 			int pos = py * grid_w + px;
-
-			/*
-			 * For window RoPE (tile_ws > 0): use local coords
-			 * within each window, matching Python's
-			 * window_partition which gives each window
-			 * positions 0..ws-1.
-			 */
-			float cy = (float)(tile_ws > 0 ? py % tile_ws : py);
-			float cx = (float)(tile_ws > 0 ? px % tile_ws : px);
-			float sy = cy * scale;
-			float sx = cx * scale;
+			float sy = (float)py * scale;
+			float sx = (float)px * scale;
 
 			/*
 			 * First quarter: x-axis (column) frequencies.
@@ -119,45 +108,6 @@ static enum sam3_error precompute_rope_table(
 				cos_data[pos * half + quarter + i] = cosf(angle);
 				sin_data[pos * half + quarter + i] = sinf(angle);
 			}
-		}
-	}
-
-	return SAM3_OK;
-}
-
-/*
- * precompute_window_mask - Build additive mask for windowed attention.
- *
- * Allocates an [n_patches, n_patches] F32 tensor. For each pair (i, j),
- * computes grid positions and checks if they fall in the same window.
- * Same-window pairs get 0.0f; different-window pairs get -1e9f.
- */
-static enum sam3_error precompute_window_mask(struct sam3_vit *vit,
-					      struct sam3_arena *arena)
-{
-	int np = vit->n_patches;
-	int gs = vit->grid_size;
-	int ws = vit->window_size;
-
-	int mask_dims[] = {np, np};
-	vit->window_mask = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
-					   2, mask_dims);
-	if (!vit->window_mask)
-		return SAM3_ENOMEM;
-
-	float *data = (float *)vit->window_mask->data;
-
-	for (int i = 0; i < np; i++) {
-		int iy = i / gs;
-		int ix = i % gs;
-		int wy = iy / ws;
-		int wx = ix / ws;
-
-		for (int j = 0; j < np; j++) {
-			int jy = j / gs;
-			int jx = j % gs;
-			int same = (wy == jy / ws) && (wx == jx / ws);
-			data[i * np + j] = same ? 0.0f : -1e9f;
 		}
 	}
 
@@ -486,7 +436,7 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 }
 
 /*
- * vit_lazy_precompute - Compute RoPE tables, window mask, and pos tiling.
+ * vit_lazy_precompute - Compute RoPE tables and pos embed tiling.
  *
  * Deferred from init/load to first sam3_vit_build() call so that
  * model loading does not pay the cost of these CPU-bound computations.
@@ -498,23 +448,13 @@ static enum sam3_error vit_lazy_precompute(struct sam3_vit *vit)
 	float theta = 10000.0f;
 	enum sam3_error err;
 
-	/* Window RoPE */
-	err = precompute_rope_table(arena, vit->n_patches, vit->grid_size,
-				    head_dim, 1.0f, theta,
-				    &vit->rope_win_cos,
-				    &vit->rope_win_sin,
-				    vit->window_size);
-	if (err != SAM3_OK)
-		return err;
-
 	/* Global RoPE */
 	float global_scale = (float)vit->window_size /
 			     (float)vit->grid_size;
 	err = precompute_rope_table(arena, vit->n_patches, vit->grid_size,
 				    head_dim, global_scale, theta,
 				    &vit->rope_glo_cos,
-				    &vit->rope_glo_sin,
-				    0);
+				    &vit->rope_glo_sin);
 	if (err != SAM3_OK)
 		return err;
 
@@ -523,13 +463,7 @@ static enum sam3_error vit_lazy_precompute(struct sam3_vit *vit)
 	err = precompute_rope_table(arena, ws * ws, ws, head_dim,
 				    1.0f, theta,
 				    &vit->rope_win_local_cos,
-				    &vit->rope_win_local_sin,
-				    0);
-	if (err != SAM3_OK)
-		return err;
-
-	/* Window mask */
-	err = precompute_window_mask(vit, arena);
+				    &vit->rope_win_local_sin);
 	if (err != SAM3_OK)
 		return err;
 
@@ -563,7 +497,7 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	struct sam3_graph g;
 	enum sam3_error err;
 
-	/* Lazy-init RoPE, window mask, and tiled pos_embed on first build */
+	/* Lazy-init RoPE tables and tiled pos_embed on first build */
 	if (!vit->precomputed) {
 		SAM3_PROF_BEGIN(profiler, "vit_precompute");
 		err = vit_lazy_precompute(vit);
