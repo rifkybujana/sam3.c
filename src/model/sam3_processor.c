@@ -114,14 +114,47 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 	if (err != SAM3_OK)
 		goto cleanup_text_scratch_arena;
 
+	/*
+	 * Async text encoder backend (#11). The text worker runs against
+	 * its own backend so it does not contend with the image encoder
+	 * for backend-internal state. Try Metal first to keep both
+	 * encoders on the GPU; fall back to CPU. If both fail, the
+	 * field stays NULL and set_text() will reject async mode so the
+	 * legacy inline path in segment() takes over.
+	 */
+	proc->text_backend = NULL;
+#ifdef SAM3_HAS_METAL
+	proc->text_backend = sam3_backend_init(SAM3_BACKEND_METAL);
+#endif
+	if (!proc->text_backend) {
+		struct sam3_cpu_backend *cpu_t = calloc(1, sizeof(*cpu_t));
+		if (cpu_t) {
+			cpu_t->base.type = SAM3_BACKEND_CPU;
+			cpu_t->base.ops  = sam3_cpu_backend_ops();
+			cpu_t->arena_capacity = 256UL * 1024 * 1024;
+			if (cpu_t->base.ops->init(&cpu_t->base) == SAM3_OK)
+				proc->text_backend = &cpu_t->base;
+			else
+				free(cpu_t);
+		}
+		if (!proc->text_backend)
+			sam3_log_warn("processor: text backend unavailable, "
+				      "async text encoding disabled");
+	}
+
 	/* Initialize all sub-modules with default SAM3 config */
 	err = sam3_image_model_init(&proc->model, &proc->model_arena);
 	if (err != SAM3_OK)
-		goto cleanup_text_persist_arena;
+		goto cleanup_text_backend;
 
 	return SAM3_OK;
 
-cleanup_text_persist_arena:
+cleanup_text_backend:
+	if (proc->text_backend) {
+		proc->text_backend->ops->free(proc->text_backend);
+		free(proc->text_backend);
+		proc->text_backend = NULL;
+	}
 	sam3_arena_free(&proc->text_persist_arena);
 cleanup_text_scratch_arena:
 	sam3_arena_free(&proc->text_scratch_arena);
