@@ -588,6 +588,82 @@ static const char *find_text_prompt(const struct sam3_prompt *prompts,
 	return NULL;
 }
 
+enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
+					const char *text)
+{
+	struct sam3_text_encoder *te;
+	struct sam3_tensor *tok_tensor;
+	int tok_dims[1];
+	int n_tokens;
+
+	if (!proc || !text)
+		return SAM3_EINVAL;
+
+	if (!proc->text_backend) {
+		sam3_log_error("set_text: text_backend unavailable");
+		return SAM3_EBACKEND;
+	}
+
+	/* Reset both text arenas — discards any previous result. */
+	sam3_arena_reset(&proc->text_scratch_arena);
+	sam3_arena_reset(&proc->text_persist_arena);
+	proc->text_features_async = NULL;
+	proc->text_thread_err = SAM3_OK;
+
+	te = &proc->model.backbone.text_enc;
+
+	/* Tokenize on the caller thread. */
+	n_tokens = sam3_tokenizer_encode(
+		&proc->model.backbone.tokenizer, text,
+		proc->text_tokens, te->context_len);
+	if (n_tokens <= 0) {
+		sam3_log_error("set_text: tokenize failed");
+		return SAM3_EINVAL;
+	}
+	proc->text_n_tokens = n_tokens;
+
+	/* Wrap tokens as a tensor in the text persist arena. */
+	tok_dims[0] = te->context_len;
+	tok_tensor = gh_alloc_tensor(&proc->text_persist_arena,
+				     SAM3_DTYPE_I32, 1, tok_dims);
+	if (!tok_tensor)
+		return SAM3_ENOMEM;
+	memcpy(tok_tensor->data, proc->text_tokens,
+	       (size_t)te->context_len * sizeof(int32_t));
+
+	/* Run the text encoder against the text-only backend + arenas. */
+	struct sam3_tensor *features;
+	features = sam3_text_encoder_build_perblock(
+		te, proc->text_backend, tok_tensor,
+		&proc->text_scratch_arena,
+		&proc->text_persist_arena);
+	if (!features) {
+		sam3_log_error("set_text: text encode failed");
+		return SAM3_ENOMEM;
+	}
+
+	/*
+	 * Truncate to real tokens only (mirror the segment() behavior).
+	 * Both source and destination live in text_persist_arena.
+	 */
+	if (features->dims[0] > n_tokens) {
+		int d = features->dims[1];
+		int trunc_dims[] = {n_tokens, d};
+		struct sam3_tensor *trunc;
+
+		trunc = gh_alloc_tensor(&proc->text_persist_arena,
+					SAM3_DTYPE_F32, 2, trunc_dims);
+		if (!trunc)
+			return SAM3_ENOMEM;
+		memcpy(trunc->data, features->data,
+		       (size_t)n_tokens * (size_t)d * sizeof(float));
+		features = trunc;
+	}
+
+	proc->text_features_async = features;
+	return SAM3_OK;
+}
+
 enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       const struct sam3_prompt *prompts,
 				       int n_prompts,

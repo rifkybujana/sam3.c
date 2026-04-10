@@ -129,6 +129,30 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 					 int width, int height);
 
 /*
+ * sam3_processor_set_text - Pre-tokenize and encode a text prompt.
+ *
+ * @proc: Initialized and loaded processor
+ * @text: Null-terminated text prompt (e.g. "cat")
+ *
+ * Tokenizes the text and runs the text encoder. The result is held
+ * in the processor's text_persist_arena and consumed automatically
+ * by the next sam3_processor_segment() call.
+ *
+ * In its current synchronous form this runs the text encoder on the
+ * caller thread. Task 6 makes it asynchronous: the call returns
+ * immediately and a worker thread runs the encoder while the caller
+ * proceeds with sam3_processor_set_image().
+ *
+ * Calling set_text twice without an intervening segment() discards
+ * the previous result. The processor must have a valid text_backend
+ * (created in init); if it is NULL, this returns SAM3_EBACKEND.
+ *
+ * Returns SAM3_OK on success.
+ */
+enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
+					const char *text);
+
+/*
  * sam3_processor_segment - Run segmentation with geometric prompts.
  *
  * @proc:      Processor with image already set
