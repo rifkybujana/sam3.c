@@ -116,17 +116,17 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 
 	/*
 	 * Async text encoder backend (#11). The text worker runs against
-	 * its own backend so it does not contend with the image encoder
-	 * for backend-internal state. Try Metal first to keep both
-	 * encoders on the GPU; fall back to CPU. If both fail, the
-	 * field stays NULL and set_text() will reject async mode so the
-	 * legacy inline path in segment() takes over.
+	 * its own CPU backend so it does not contend with the image
+	 * encoder's Metal device. We deliberately use CPU here even
+	 * when Metal is available: MLX-C 0.6 keeps a process-wide
+	 * device kernel cache that is not safe to mutate from two
+	 * threads concurrently (validated by test_metal_cpu_concurrent),
+	 * so two parallel Metal backends would race on get_kernel().
+	 * CPU + Metal sit on disjoint hardware and synchronize cleanly,
+	 * which gives us true parallelism for the text + image encoders.
 	 */
 	proc->text_backend = NULL;
-#ifdef SAM3_HAS_METAL
-	proc->text_backend = sam3_backend_init(SAM3_BACKEND_METAL);
-#endif
-	if (!proc->text_backend) {
+	{
 		struct sam3_cpu_backend *cpu_t = calloc(1, sizeof(*cpu_t));
 		if (cpu_t) {
 			cpu_t->base.type = SAM3_BACKEND_CPU;
