@@ -105,9 +105,10 @@ The five landed optimizations:
    join is effectively free (<0.1 ms measured). Saves ~3.7 s wall-clock.
 5. **Mask-free windowed attention** — The 28 windowed ViT blocks no
    longer allocate or reference a 5184×5184 F32 attention mask. Instead
-   the block reshapes its `[5184, 1280]` input into `[9, 576, 1280]`
-   via `gh_window_partition` (padding 72→72 is a no-op; the helper is
-   general), runs `gh_multihead_attention_rope` on the 9-way batch with
+   the block reshapes its `[5184, 1024]` input into `[9, 576, 1024]`
+   via `gh_window_partition` (72 is already a multiple of the 24-patch
+   window, so no padding is needed), runs `gh_multihead_attention_rope`
+   on the 9-way batch with
    a precomputed 576-token window RoPE table, and reverses the partition
    with `gh_window_unpartition`. Dropping the mask saves ~107 MiB of
    per-block memory traffic and cuts attention FLOPs from O(5184²·d)
@@ -134,9 +135,9 @@ data is copied during load — tensors reference the mmap'd region directly.
   are no longer allocated after the mask-free windowed attention rework.
 - **vit_patch_embed** (~35ms): 14x14 conv2d patch embedding, absolute
   position embedding addition, and ln_pre LayerNorm. Single graph eval.
-- **vit_blocks** (~3.1s, 32%): 32 ViT-H transformer blocks (1280-dim, 16
-  heads). 28 of the 32 blocks use windowed attention: their input is
-  partitioned from `[5184, 1280]` to `[9, 576, 1280]`, passed through
+- **vit_blocks** (~3.1s, 32%): 32 ViT transformer blocks (1024-dim, 16
+  heads, 64 head_dim). 28 of the 32 blocks use windowed attention: their
+  input is partitioned from `[5184, 1024]` to `[9, 576, 1024]`, passed through
   unmasked multi-head SDPA with a precomputed 576-token window RoPE,
   then unpartitioned — no attention mask is materialized. The remaining
   4 blocks use global attention with the 5184-token RoPE. Up to 4
@@ -179,7 +180,7 @@ Stability-based mask selection, bounding box extraction, and NMS
 
 Replaced the 5184×5184 F32 window mask that the 28 windowed ViT blocks
 used to reference on every attention call with a window-partition +
-unmasked SDPA on `[9, 576, 1280]`. Eliminates ~107 MiB of mask traffic
+unmasked SDPA on `[9, 576, 1024]`. Eliminates ~107 MiB of mask traffic
 per windowed block and roughly 9× fewer attention FLOPs in those
 blocks. Correctness verified by `test_fixture_compare` in Release.
 

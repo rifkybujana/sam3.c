@@ -98,7 +98,7 @@ backend approach doesn't recover the win.
 - `src/model/segmentation.c` — seg_head transposes.
 
 **Estimated impact:** 10-20% of (neck+seg_head) ≈ 80-165ms.
-12.4s → ~12.25s. (Smaller absolute win but easy if the backend trick
+9.6s → ~9.45–9.52s. (Smaller absolute win but easy if the backend trick
 works.)
 **Complexity:** Medium (backend) or High (full NHWC migration).
 
