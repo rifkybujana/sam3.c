@@ -141,6 +141,9 @@ add_executable(sam3_convert tools/sam3_convert.c tools/weight_rename.c)
 target_include_directories(sam3_convert PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_convert sam3)
 
+add_executable(gen_nhwc_fixtures tools/gen_nhwc_fixtures.c)
+target_link_libraries(gen_nhwc_fixtures sam3)
+
 # Tests
 if(SAM3_TESTS)
 	enable_testing()
