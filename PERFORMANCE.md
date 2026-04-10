@@ -6,30 +6,38 @@ Measured on Apple M3 Pro, Release build (`-O2`), Metal backend, single run.
 
 **Model:** sam3.sam3 (3.3 GB, 1787 tensors)
 **Input:** `assets/cat.jpeg` (1008x1008 after resize), 1 text prompt ("cat")
-**Output:** 1 mask, IoU 0.6325, box=[0,54,180,282] (default NMS)
+**Output:** 1 mask, IoU 0.6331, box=[0,54,180,282] (default NMS)
 
 Top-level stages sum to wall-clock; indented sub-stages are nested
 inside their parent and are not added to the total.
 
 | Stage              | Time (ms) |    % |
 |--------------------|----------:|-----:|
-| model_load         |      1070 |  8.6 |
-| image_normalize    |         1 |  0.0 |
-| image_encode       |      6324 | 51.0 |
-| &nbsp;&nbsp;vit_precompute  |        43 |  0.3 |
-| &nbsp;&nbsp;vit_patch_embed |        27 |  0.2 |
-| &nbsp;&nbsp;vit_blocks      |      5756 | 46.4 |
-| &nbsp;&nbsp;neck            |       428 |  3.5 |
-| text_encode        |      3747 | 30.2 |
-| &nbsp;&nbsp;tokenize        |      <0.1 |  0.0 |
-| &nbsp;&nbsp;text_blocks     |      3747 | 30.2 |
-| mask_decode        |      1245 | 10.0 |
+| model_load         |      1046 | 11.5 |
+| image_normalize    |         2 |  0.0 |
+| image_encode       |      6916 | 76.3 |
+| &nbsp;&nbsp;vit_precompute  |        58 |  0.6 |
+| &nbsp;&nbsp;vit_patch_embed |        36 |  0.4 |
+| &nbsp;&nbsp;vit_blocks      |      6371 | 70.3 |
+| &nbsp;&nbsp;neck            |       375 |  4.1 |
+| text_encode (join) |     <0.1  |  0.0 |
+| mask_decode        |       894 |  9.9 |
 | &nbsp;&nbsp;geometry_encode |      <0.1 |  0.0 |
-| &nbsp;&nbsp;encoder_fusion  |       617 |  5.0 |
-| &nbsp;&nbsp;decoder         |       225 |  1.8 |
-| &nbsp;&nbsp;seg_head        |       396 |  3.2 |
-| postprocess        |        19 |  0.2 |
-| **Total (wall)**   | **12406** |      |
+| &nbsp;&nbsp;encoder_fusion  |       380 |  4.2 |
+| &nbsp;&nbsp;decoder         |       215 |  2.4 |
+| &nbsp;&nbsp;seg_head        |       292 |  3.2 |
+| postprocess        |        20 |  0.2 |
+| **Total (wall)**   |  **9065** |      |
+
+The `text_encode` stage measures only the pthread join — the actual text
+encoder graph runs on a CPU worker thread in parallel with the Metal
+image encoder, so its ~3.7s of work is fully hidden behind `image_encode`.
+See **Async pipeline** below.
+
+Wall-time variance: `image_encode` varies ±20% between runs due to thermal
+and GPU contention. Median of 5 Release runs: 9.07s (range 6.78–10.40s).
+The async pipeline saves a fixed ~3.7s vs the synchronous baseline
+regardless of which image-encode sample you pick.
 
 ### Optimization History
 
@@ -40,17 +48,25 @@ Comparison of the four critical Metal inference stages over time:
 | Baseline (per-head SDPA, F32, per-block eval)         | 8419 | 5064 | 1639 | 499 | 15621 |
 | + Fused MHSA + F16 + 4-block batching (broken accuracy) | 6087 | 3090 | 1358 | 353 | 10888 |
 | + Correct seq/head physical transpose (fixed)         | 5756 | 3747 | 1245 | 428 | **11176** |
-| Speedup vs baseline                                   | -32% | -26% | -24% | -14% | **-28%** |
+| + Async image ∥ text encoding pipeline                | 6371 |    0 |  894 | 375 |  **7640** |
+| Speedup vs baseline                                   | -24% |-100% | -45% | -25% | **-51%** |
+
+The async row hides `text_blocks` entirely behind `vit_blocks` on a CPU
+worker thread (MLX-C 0.6 has a non-thread-safe process-wide Metal device
+cache, so the worker is pinned to the CPU backend). The image encoder
+still owns Metal; the `text_encode` stage timer now measures only the
+pthread join, which is <0.1 ms in every run because the CPU encoder
+finishes well before the 6-second image encoder.
 
 The previous "10888 ms" row used a naive 4D reshape that scrambled the
 multi-head SDPA inputs, producing wrong outputs. The fix replaces it with
 a 3-step `[seq, n_heads, head_dim] → permute(1,0,2) → [1, n_heads, seq,
 head_dim]` pattern, which adds an explicit transpose op per attention
 layer. The transpose costs back ~290 ms across the four stages but the
-output is now correct (`IoU 0.6325` matches the F32 baseline `0.6331`
-within F16 rounding).
+output is now correct (`IoU 0.6331` matches the F32 baseline within F16
+rounding).
 
-The three landed optimizations:
+The four landed optimizations:
 
 1. **Fused multi-head SDPA** — Replaced the per-head Q/K/V slice + per-head
    `mlx_fast_scaled_dot_product_attention` loop in `gh_multihead_attention_*`
@@ -66,6 +82,14 @@ The three landed optimizations:
    `graph_eval`, reducing GPU sync points from 56 to ~14. Per-block arena
    cost is tracked and the batch is flushed early if the next block would
    not fit, preserving correctness for very large inputs.
+4. **Async image ∥ text encoding pipeline** — `sam3_set_text()` spawns a
+   pthread worker that runs the text encoder on a second CPU-backed
+   processor instance with its own arenas, in parallel with the main
+   thread's Metal image encoder. `sam3_segment()` joins the worker and
+   consumes the pre-computed text features. Worker stack is 8 MiB
+   (MLX-C needs more than the 512 KiB pthread default on macOS). The
+   CPU text encoder finishes well before the Metal image encoder, so the
+   join is effectively free (<0.1 ms measured). Saves ~3.7 s wall-clock.
 
 ### Stage Details
 
@@ -91,12 +115,16 @@ is copied during load — tensors reference the mmap'd region directly.
 - **neck** (~428ms, 3.5%): 4-scale FPN producing feature maps at 4x, 2x,
   1x, and 0.5x resolution via conv2d, transposed conv2d, and maxpool stages.
 
-**text_encode** (~3.7s, 30%)
-- **tokenize** (<0.1ms): BPE tokenization of the text prompt.
-- **text_blocks** (~3.7s, 30%): CLIP text encoder (24-layer transformer,
-  1024-dim, 16 heads). Up to 4 blocks are batched per `graph_eval` call.
-  Each block: LayerNorm, fused-multi-head self-attention with causal mask,
-  residual, LayerNorm, GELU MLP, residual.
+**text_encode** (<0.1 ms join — real work ~3.7 s, fully overlapped)
+- **tokenize** (<0.1 ms): BPE tokenization of the text prompt, still on
+  the caller thread before spawning the worker.
+- **text_blocks** (~3.7 s, off the critical path): CLIP text encoder
+  (24-layer transformer, 1024-dim, 16 heads) runs on a CPU worker
+  backend. Up to 4 blocks are batched per `graph_eval` call. Each block:
+  LayerNorm, fused-multi-head self-attention with causal mask, residual,
+  LayerNorm, GELU MLP, residual. Wall-clock time is hidden behind
+  `image_encode`; the profiler stage timer measures only the pthread
+  join (<0.1 ms because the worker is already done).
 
 **mask_decode** (~1.2s, 10%)
 - **geometry_encode** (<0.1ms): 3-layer geometry transformer for point/box
