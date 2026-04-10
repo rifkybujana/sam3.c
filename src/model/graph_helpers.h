@@ -499,6 +499,45 @@ struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 					int stride, int padding);
 
 /*
+ * gh_conv2d_nhwc - 2D convolution with NHWC input and OHWI weight.
+ *
+ * @input:   [N, H, W, C_in]
+ * @weight:  [C_out, KH, KW, C_in]
+ * @bias:    [C_out] (optional, may be NULL)
+ * @stride:  same stride for H and W
+ * @padding: same padding for H and W
+ *
+ * Sets node->params[2] = 1 so the backend skips the NCHW transpose
+ * path. Returns tensor [N, OH, OW, C_out].
+ */
+struct sam3_tensor *gh_conv2d_nhwc(struct sam3_graph *g,
+				   struct sam3_arena *a,
+				   struct sam3_tensor *input,
+				   struct sam3_tensor *weight,
+				   struct sam3_tensor *bias,
+				   int stride, int padding);
+
+/*
+ * gh_conv_transpose2d_nhwc - 2D transposed conv with NHWC / OHWI.
+ *
+ * @input:   [N, H, W, C_in]
+ * @weight:  [C_out, KH, KW, C_in]
+ * @bias:    [C_out] (optional, may be NULL)
+ * @stride:  same stride for H and W
+ * @padding: same padding for H and W
+ *
+ * Sets node->params[2] = 1 so the backend skips the NCHW transpose
+ * path. Returns tensor [N, OH, OW, C_out] where
+ * OH = (H - 1) * stride - 2 * padding + KH.
+ */
+struct sam3_tensor *gh_conv_transpose2d_nhwc(struct sam3_graph *g,
+					     struct sam3_arena *a,
+					     struct sam3_tensor *input,
+					     struct sam3_tensor *weight,
+					     struct sam3_tensor *bias,
+					     int stride, int padding);
+
+/*
  * gh_maxpool2d - 2D max pooling.
  *
  * @input:       [N, C, H, W]

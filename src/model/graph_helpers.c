@@ -1344,6 +1344,85 @@ struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 	return out;
 }
 
+struct sam3_tensor *gh_conv2d_nhwc(struct sam3_graph *g,
+				   struct sam3_arena *a,
+				   struct sam3_tensor *input,
+				   struct sam3_tensor *weight,
+				   struct sam3_tensor *bias,
+				   int stride, int padding)
+{
+	int N = input->dims[0];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int OC = weight->dims[0];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
+
+	int OH = (H + 2 * padding - KH) / stride + 1;
+	int OW = (W + 2 * padding - KW) / stride + 1;
+
+	int out_dims[] = {N, OH, OW, OC};
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[] = {input, weight};
+	out = sam3_graph_add_op(g, SAM3_OP_CONV2D, inputs, 2, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = stride;
+	node->params[1] = padding;
+	node->params[2] = 1;  /* NHWC flag */
+
+	if (bias)
+		out = conv_add_bias(g, a, out, bias);
+
+	return out;
+}
+
+struct sam3_tensor *gh_conv_transpose2d_nhwc(struct sam3_graph *g,
+					     struct sam3_arena *a,
+					     struct sam3_tensor *input,
+					     struct sam3_tensor *weight,
+					     struct sam3_tensor *bias,
+					     int stride, int padding)
+{
+	int N = input->dims[0];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int OC = weight->dims[0];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
+
+	int OH = (H - 1) * stride - 2 * padding + KH;
+	int OW = (W - 1) * stride - 2 * padding + KW;
+
+	int out_dims[] = {N, OH, OW, OC};
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[] = {input, weight};
+	out = sam3_graph_add_op(g, SAM3_OP_CONV_TRANSPOSE2D,
+				 inputs, 2, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = stride;
+	node->params[1] = padding;
+	node->params[2] = 1;  /* NHWC flag */
+
+	if (bias)
+		out = conv_add_bias(g, a, out, bias);
+
+	return out;
+}
+
 struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input,
 				int kernel_size, int stride)
