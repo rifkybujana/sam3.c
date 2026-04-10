@@ -532,6 +532,77 @@ static void test_vit_windowed_attention(void)
 	}
 }
 
+/*
+ * test_mha_rope_batch2 - Smoke test that MHA helper accepts batch>1.
+ *
+ * Uses zero-init weights so output is deterministic (zero) but
+ * exercises the full reshape/permute/SDPA path with batch=2.
+ */
+static void test_mha_rope_batch2(void)
+{
+	int batch = 2;
+	int seq = 4;
+	int e = 8;
+	int n_heads = 2;
+	int hd = e / n_heads;
+
+	sam3_arena_reset(&g_scratch);
+
+	int x_dims[] = {batch, seq, e};
+	struct sam3_tensor *x = gh_alloc_tensor(&g_scratch,
+		SAM3_DTYPE_F32, 3, x_dims);
+	ASSERT(x != NULL);
+
+	int qkv_w_dims[] = {3 * e, e};
+	int qkv_b_dims[] = {3 * e};
+	int o_w_dims[] = {e, e};
+	int o_b_dims[] = {e};
+
+	struct sam3_tensor *qkv_w = gh_alloc_tensor(&g_scratch,
+		SAM3_DTYPE_F32, 2, qkv_w_dims);
+	struct sam3_tensor *qkv_b = gh_alloc_tensor(&g_scratch,
+		SAM3_DTYPE_F32, 1, qkv_b_dims);
+	struct sam3_tensor *o_w = gh_alloc_tensor(&g_scratch,
+		SAM3_DTYPE_F32, 2, o_w_dims);
+	struct sam3_tensor *o_b = gh_alloc_tensor(&g_scratch,
+		SAM3_DTYPE_F32, 1, o_b_dims);
+	ASSERT(qkv_w && qkv_b && o_w && o_b);
+
+	int rope_dims[] = {seq, hd / 2};
+	struct sam3_tensor *rcos = gh_alloc_tensor(&g_scratch,
+		SAM3_DTYPE_F32, 2, rope_dims);
+	struct sam3_tensor *rsin = gh_alloc_tensor(&g_scratch,
+		SAM3_DTYPE_F32, 2, rope_dims);
+	ASSERT(rcos && rsin);
+
+	/* cos = 1.0, sin = 0.0 -> RoPE is identity */
+	float *cd = (float *)rcos->data;
+	for (int i = 0; i < seq * hd / 2; i++)
+		cd[i] = 1.0f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+
+	struct sam3_tensor *out;
+	out = gh_multihead_attention_rope(&g, &g_scratch, x,
+					  NULL, NULL,
+					  qkv_w, qkv_b, o_w, o_b,
+					  n_heads, rcos, rsin, NULL);
+	ASSERT(out != NULL);
+	/* Output is [batch*seq, e] */
+	ASSERT_EQ(out->n_dims, 2);
+	ASSERT_EQ(out->dims[0], batch * seq);
+	ASSERT_EQ(out->dims[1], e);
+
+	enum sam3_error err = g_cpu.base.ops->graph_eval(&g_cpu.base, &g);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* All-zero weights -> all-zero output. */
+	float *od = (float *)out->data;
+	for (int i = 0; i < batch * seq * e; i++)
+		ASSERT_NEAR(od[i], 0.0f, 1e-6f);
+}
+
 int main(void)
 {
 	setup();
@@ -542,6 +613,7 @@ int main(void)
 	test_vit_eval();
 	test_vit_window_partition();
 	test_vit_windowed_attention();
+	test_mha_rope_batch2();
 
 	teardown();
 
