@@ -400,15 +400,36 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 	case SAM3_OP_CONV2D: {
 		/*
-		 * SAM3 uses NCHW (input) and OIHW (weight).
+		 * Legacy SAM3 uses NCHW (input) and OIHW (weight).
 		 * MLX conv2d expects NHWC (input) and OHWI (weight).
-		 * Transpose before conv, transpose result back.
+		 * Legacy path transposes before conv, then back.
+		 *
+		 * During the NHWC layout migration callers may emit
+		 * this node with params[2] == 1, indicating that the
+		 * input is already NHWC and the weight is already
+		 * OHWI. In that case we call MLX directly, skipping
+		 * every transpose wrap.
 		 *
 		 * params[0] = stride (same for H and W)
 		 * params[1] = padding (same for H and W)
+		 * params[2] = NHWC flag (0 = legacy NCHW, 1 = NHWC)
 		 */
 		int stride = node->params[0] ? node->params[0] : 1;
 		int pad = node->params[1];
+		int is_nhwc = node->params[2];
+
+		if (is_nhwc) {
+			/*
+			 * NHWC input, OHWI weight — call MLX directly,
+			 * no transpose wrapping and no post-conv perm.
+			 */
+			rc = mlx_conv2d(&result, inputs[0], inputs[1],
+					stride, stride, pad, pad,
+					1, 1,  /* dilation */
+					1,     /* groups */
+					stream);
+			break;
+		}
 
 		/* Input NCHW -> NHWC: perm [0,2,3,1] */
 		int in_perm[] = {0, 2, 3, 1};
@@ -826,11 +847,36 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 	case SAM3_OP_CONV_TRANSPOSE2D: {
 		/*
-		 * SAM3: NCHW input, IOHW weight [C_in, C_out, KH, KW].
-		 * MLX:  NHWC input, OHWI weight [C_out, KH, KW, C_in].
+		 * Legacy SAM3: NCHW input, IOHW weight
+		 *              [C_in, C_out, KH, KW].
+		 * MLX:         NHWC input, OHWI weight
+		 *              [C_out, KH, KW, C_in].
+		 *
+		 * During the NHWC layout migration callers may emit
+		 * this node with params[2] == 1, indicating that the
+		 * input is already NHWC and the weight is already
+		 * OHWI. In that case we call MLX directly, skipping
+		 * every transpose wrap.
 		 */
 		int stride = node->params[0] ? node->params[0] : 1;
 		int pad = node->params[1];
+		int is_nhwc = node->params[2];
+
+		if (is_nhwc) {
+			/*
+			 * NHWC input, OHWI weight — call MLX directly,
+			 * no transpose wrapping and no post-conv perm.
+			 */
+			rc = mlx_conv_transpose2d(&result,
+						   inputs[0], inputs[1],
+						   stride, stride,
+						   pad, pad,
+						   1, 1,  /* dilation */
+						   0, 0,  /* out pad */
+						   1,     /* groups */
+						   stream);
+			break;
+		}
 
 		/* Input NCHW -> NHWC: perm [0,2,3,1] */
 		int ct_in_perm[] = {0, 2, 3, 1};
