@@ -43,12 +43,10 @@ struct sam3_vit {
 	int n_patches;		/* 5184 = grid_size^2 */
 
 	/*
-	 * Patch embedding (implemented as conv2d). Weight is permuted
-	 * from the checkpoint OIHW [embed_dim, 3, patch_size,
-	 * patch_size] into OHWI [embed_dim, patch_size, patch_size, 3]
-	 * at load time so the conv can be dispatched via
-	 * gh_conv2d_nhwc. Task 12 will move this transpose into the
-	 * .sam3 converter.
+	 * Patch embedding (implemented as conv2d). The .sam3 converter
+	 * writes this weight in OHWI layout
+	 * [embed_dim, patch_size, patch_size, 3], matching the NHWC
+	 * conv dispatch path.
 	 */
 	struct sam3_tensor *patch_embed_w; /* [embed_dim, patch_size, patch_size, 3] */
 	struct sam3_tensor *patch_embed_b; /* [embed_dim] */

@@ -427,7 +427,7 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 			if (model->backbone.neck.stages[si].has_maxpool) {
 				struct sam3_graph g_stage;
 				sam3_graph_init(&g_stage);
-				x = gh_maxpool2d_nhwc(&g_stage, scratch,
+				x = gh_maxpool2d(&g_stage, scratch,
 						      x, 2, 2);
 				if (!x) return SAM3_ENOMEM;
 				err = be->ops->graph_eval(be, &g_stage);
@@ -444,12 +444,12 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 				int pad = (k == 3) ? 1 : 0;
 
 				if (model->backbone.neck.stages[si].is_transpose[j]) {
-					x = gh_conv_transpose2d_nhwc(&g_stage, scratch, x,
+					x = gh_conv_transpose2d(&g_stage, scratch, x,
 						model->backbone.neck.stages[si].conv_w[j],
 						model->backbone.neck.stages[si].conv_b[j],
 						2, 0);
 				} else {
-					x = gh_conv2d_nhwc(&g_stage, scratch, x,
+					x = gh_conv2d(&g_stage, scratch, x,
 						model->backbone.neck.stages[si].conv_w[j],
 						model->backbone.neck.stages[si].conv_b[j],
 						1, pad);
@@ -1979,7 +1979,7 @@ enum sam3_error sam3_image_model_segment(
 					goto fail;
 				}
 
-				inst = gh_conv2d_nhwc(&g, scratch,
+				inst = gh_conv2d(&g, scratch,
 						  pe_wrap,
 						  model->seg_head.inst_proj_w,
 						  model->seg_head.inst_proj_b,

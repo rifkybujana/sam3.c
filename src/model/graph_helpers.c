@@ -560,40 +560,7 @@ struct sam3_tensor *gh_embed(struct sam3_graph *g, struct sam3_arena *a,
 struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input, int scale)
 {
-	/* Input: [N, C, H, W] -> Output: [N, C, H*scale, W*scale] */
-	int out_dims[4] = {
-		input->dims[0],
-		input->dims[1],
-		input->dims[2] * scale,
-		input->dims[3] * scale,
-	};
-
-	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
-						  4, out_dims);
-	if (!out)
-		return NULL;
-
-	struct sam3_tensor *result = sam3_graph_add_op(g, SAM3_OP_UPSAMPLE,
-		(struct sam3_tensor *[]){input}, 1, out);
-	if (!result)
-		return NULL;
-
-	g->nodes[g->n_nodes - 1].params[0] = scale;
-	return result;
-}
-
-struct sam3_tensor *gh_upsample_nhwc(struct sam3_graph *g,
-				     struct sam3_arena *a,
-				     struct sam3_tensor *input, int scale)
-{
-	/*
-	 * Input: [N, H, W, C] -> Output: [N, H*scale, W*scale, C]
-	 *
-	 * Slot usage for SAM3_OP_UPSAMPLE:
-	 *   params[0] = scale (shared with NCHW path)
-	 *   params[1] = NHWC flag (0 = legacy NCHW, 1 = NHWC)
-	 * Slots 2 and 3 remain unused.
-	 */
+	/* Input: [N, H, W, C] -> Output: [N, H*scale, W*scale, C] */
 	int out_dims[4] = {
 		input->dims[0],
 		input->dims[1] * scale,
@@ -611,9 +578,7 @@ struct sam3_tensor *gh_upsample_nhwc(struct sam3_graph *g,
 	if (!result)
 		return NULL;
 
-	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
-	node->params[0] = scale;
-	node->params[1] = 1;  /* NHWC flag */
+	g->nodes[g->n_nodes - 1].params[0] = scale;
 	return result;
 }
 
@@ -1281,64 +1246,18 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 	return out;
 }
 
-struct sam3_tensor *gh_groupnorm_nhwc(struct sam3_graph *g,
-				      struct sam3_arena *a,
-				      struct sam3_tensor *input,
-				      struct sam3_tensor *gamma,
-				      struct sam3_tensor *beta,
-				      int num_groups)
-{
-	/*
-	 * NHWC group norm. Output has the same NHWC shape as input.
-	 *
-	 * Slot usage for SAM3_OP_GROUPNORM:
-	 *   params[0] = num_groups (shared with NCHW path)
-	 *   params[1] = NHWC flag (0 = legacy NCHW, 1 = NHWC)
-	 * Slots 2 and 3 remain unused.
-	 */
-	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
-						  input->n_dims, input->dims);
-	if (!out)
-		return NULL;
-
-	struct sam3_tensor *inputs[3];
-	int n_inputs = 1;
-	inputs[0] = input;
-	if (gamma) {
-		inputs[1] = gamma;
-		n_inputs = 2;
-	}
-	if (beta) {
-		inputs[2] = beta;
-		n_inputs = 3;
-	}
-
-	out = sam3_graph_add_op(g, SAM3_OP_GROUPNORM,
-				 inputs, n_inputs, out);
-	if (!out)
-		return NULL;
-
-	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
-	node->params[0] = num_groups;
-	node->params[1] = 1;  /* NHWC flag */
-	return out;
-}
-
 /* ── Convolution helpers ──────────────────────────────────────────── */
 
 /*
- * conv_add_bias - Add bias [C] to a 4D tensor via fused op.
+ * conv_add_bias - Add bias [C] to an NHWC 4D tensor via fused op.
  *
- * Uses SAM3_OP_BIAS_ADD which broadcasts bias along the channel
- * dimension. When @nhwc is non-zero, sets params[2]=1 so the CPU
- * and Metal kernels treat the input as NHWC [N,H,W,C]; otherwise
- * the kernel uses the legacy NCHW [N,C,H,W] layout.
+ * Uses SAM3_OP_BIAS_ADD which broadcasts bias along the innermost
+ * channel dimension of an [N, H, W, C] tensor.
  */
 static struct sam3_tensor *conv_add_bias(struct sam3_graph *g,
 					 struct sam3_arena *a,
 					 struct sam3_tensor *x,
-					 struct sam3_tensor *bias,
-					 int nhwc)
+					 struct sam3_tensor *bias)
 {
 	struct sam3_tensor *out = gh_alloc_tensor(a, x->dtype,
 						  x->n_dims, x->dims);
@@ -1346,15 +1265,7 @@ static struct sam3_tensor *conv_add_bias(struct sam3_graph *g,
 		return NULL;
 
 	struct sam3_tensor *inputs[] = {x, bias};
-	out = sam3_graph_add_op(g, SAM3_OP_BIAS_ADD, inputs, 2, out);
-	if (!out)
-		return NULL;
-
-	if (nhwc) {
-		struct sam3_node *node = &g->nodes[g->n_nodes - 1];
-		node->params[2] = 1;
-	}
-	return out;
+	return sam3_graph_add_op(g, SAM3_OP_BIAS_ADD, inputs, 2, out);
 }
 
 struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
@@ -1364,16 +1275,16 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 			      int stride, int padding)
 {
 	int N = input->dims[0];
-	int H = input->dims[2];
-	int W = input->dims[3];
+	int H = input->dims[1];
+	int W = input->dims[2];
 	int OC = weight->dims[0];
-	int KH = weight->dims[2];
-	int KW = weight->dims[3];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
 
 	int OH = (H + 2 * padding - KH) / stride + 1;
 	int OW = (W + 2 * padding - KW) / stride + 1;
 
-	int out_dims[] = {N, OC, OH, OW};
+	int out_dims[] = {N, OH, OW, OC};
 	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
 						  4, out_dims);
 	if (!out)
@@ -1389,7 +1300,7 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 	node->params[1] = padding;
 
 	if (bias)
-		out = conv_add_bias(g, a, out, bias, 0);
+		out = conv_add_bias(g, a, out, bias);
 
 	return out;
 }
@@ -1402,84 +1313,6 @@ struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 					int stride, int padding)
 {
 	int N = input->dims[0];
-	int H = input->dims[2];
-	int W = input->dims[3];
-	int C_out = weight->dims[1];
-	int KH = weight->dims[2];
-	int KW = weight->dims[3];
-
-	int OH = (H - 1) * stride - 2 * padding + KH;
-	int OW = (W - 1) * stride - 2 * padding + KW;
-
-	int out_dims[] = {N, C_out, OH, OW};
-	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
-						  4, out_dims);
-	if (!out)
-		return NULL;
-
-	struct sam3_tensor *inputs[] = {input, weight};
-	out = sam3_graph_add_op(g, SAM3_OP_CONV_TRANSPOSE2D,
-				 inputs, 2, out);
-	if (!out)
-		return NULL;
-
-	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
-	node->params[0] = stride;
-	node->params[1] = padding;
-
-	if (bias)
-		out = conv_add_bias(g, a, out, bias, 0);
-
-	return out;
-}
-
-struct sam3_tensor *gh_conv2d_nhwc(struct sam3_graph *g,
-				   struct sam3_arena *a,
-				   struct sam3_tensor *input,
-				   struct sam3_tensor *weight,
-				   struct sam3_tensor *bias,
-				   int stride, int padding)
-{
-	int N = input->dims[0];
-	int H = input->dims[1];
-	int W = input->dims[2];
-	int OC = weight->dims[0];
-	int KH = weight->dims[1];
-	int KW = weight->dims[2];
-
-	int OH = (H + 2 * padding - KH) / stride + 1;
-	int OW = (W + 2 * padding - KW) / stride + 1;
-
-	int out_dims[] = {N, OH, OW, OC};
-	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
-						  4, out_dims);
-	if (!out)
-		return NULL;
-
-	struct sam3_tensor *inputs[] = {input, weight};
-	out = sam3_graph_add_op(g, SAM3_OP_CONV2D, inputs, 2, out);
-	if (!out)
-		return NULL;
-
-	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
-	node->params[0] = stride;
-	node->params[1] = padding;
-	node->params[2] = 1;  /* NHWC flag */
-
-	if (bias)
-		out = conv_add_bias(g, a, out, bias, 1);
-
-	return out;
-}
-
-struct sam3_tensor *gh_conv_transpose2d_nhwc(struct sam3_graph *g,
-					     struct sam3_arena *a,
-					     struct sam3_tensor *input,
-					     struct sam3_tensor *weight,
-					     struct sam3_tensor *bias,
-					     int stride, int padding)
-{
-	int N = input->dims[0];
 	int H = input->dims[1];
 	int W = input->dims[2];
 	int OC = weight->dims[0];
@@ -1504,10 +1337,9 @@ struct sam3_tensor *gh_conv_transpose2d_nhwc(struct sam3_graph *g,
 	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
 	node->params[0] = stride;
 	node->params[1] = padding;
-	node->params[2] = 1;  /* NHWC flag */
 
 	if (bias)
-		out = conv_add_bias(g, a, out, bias, 1);
+		out = conv_add_bias(g, a, out, bias);
 
 	return out;
 }
@@ -1516,48 +1348,7 @@ struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input,
 				int kernel_size, int stride)
 {
-	int N = input->dims[0];
-	int C = input->dims[1];
-	int H = input->dims[2];
-	int W = input->dims[3];
-
-	int OH = (H - kernel_size) / stride + 1;
-	int OW = (W - kernel_size) / stride + 1;
-
-	int out_dims[] = {N, C, OH, OW};
-	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
-						  4, out_dims);
-	if (!out)
-		return NULL;
-
-	struct sam3_tensor *inputs[] = {input};
-	out = sam3_graph_add_op(g, SAM3_OP_MAXPOOL2D, inputs, 1, out);
-	if (!out)
-		return NULL;
-
-	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
-	node->params[0] = kernel_size;
-	node->params[1] = stride;
-
-	return out;
-}
-
-struct sam3_tensor *gh_maxpool2d_nhwc(struct sam3_graph *g,
-				      struct sam3_arena *a,
-				      struct sam3_tensor *input,
-				      int kernel_size, int stride)
-{
-	/*
-	 * NHWC non-overlapping max pooling.
-	 *
-	 * Slot usage for SAM3_OP_MAXPOOL2D:
-	 *   params[0] = kernel_size (shared with NCHW path)
-	 *   params[1] = stride (shared with NCHW path)
-	 *   params[2] = NHWC flag (0 = legacy NCHW, 1 = NHWC)
-	 * Slot 3 remains unused. params[2] matches the slot used by
-	 * gh_conv2d_nhwc so readers learn a single convention for the
-	 * NHWC flag on spatial ops.
-	 */
+	/* Non-overlapping NHWC max pool: [N,H,W,C] -> [N,OH,OW,C]. */
 	int N = input->dims[0];
 	int H = input->dims[1];
 	int W = input->dims[2];
@@ -1580,7 +1371,6 @@ struct sam3_tensor *gh_maxpool2d_nhwc(struct sam3_graph *g,
 	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
 	node->params[0] = kernel_size;
 	node->params[1] = stride;
-	node->params[2] = 1;  /* NHWC flag */
 
 	return out;
 }

@@ -1033,7 +1033,7 @@ enum sam3_error sam3_mask_decoder_build(
 	}
 
 	/* Conv transpose 1: [1, H, W, 256] -> [1, 2H, 2W, 64] */
-	px = gh_conv_transpose2d_nhwc(g, arena, px,
+	px = gh_conv_transpose2d(g, arena, px,
 				       dec->up_conv1_w, dec->up_conv1_b,
 				       2, 0);
 	if (!px)
@@ -1046,7 +1046,7 @@ enum sam3_error sam3_mask_decoder_build(
 	 */
 	if (feat_s1) {
 		struct sam3_tensor *skip1;
-		skip1 = gh_conv2d_nhwc(g, arena, feat_s1,
+		skip1 = gh_conv2d(g, arena, feat_s1,
 					dec->conv_s1_w, dec->conv_s1_b,
 					1, 0);
 		if (!skip1)
@@ -1087,7 +1087,7 @@ enum sam3_error sam3_mask_decoder_build(
 
 	/* Conv transpose 2: [1, 2H, 2W, 64] -> [1, 4H, 4W, 32]
 	 * SAM2: act2(dc2(act1(ln1(dc1(src) + feat_s1))) + feat_s0) */
-	px = gh_conv_transpose2d_nhwc(g, arena, px,
+	px = gh_conv_transpose2d(g, arena, px,
 				       dec->up_conv2_w, dec->up_conv2_b,
 				       2, 0);
 	if (!px)
@@ -1100,7 +1100,7 @@ enum sam3_error sam3_mask_decoder_build(
 	 */
 	if (feat_s0) {
 		struct sam3_tensor *skip0;
-		skip0 = gh_conv2d_nhwc(g, arena, feat_s0,
+		skip0 = gh_conv2d(g, arena, feat_s0,
 					dec->conv_s0_w, dec->conv_s0_b,
 					1, 0);
 		if (!skip0)

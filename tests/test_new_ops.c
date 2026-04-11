@@ -486,9 +486,9 @@ static void test_slice_axis1(void)
 
 static void test_upsample_2x(void)
 {
-	/* [1,1,2,2] with scale=2 -> [1,1,4,4] */
-	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 1, 2, 2});
-	struct sam3_tensor *out = make_tensor(4, (int[]){1, 1, 4, 4});
+	/* NHWC [1,2,2,1] with scale=2 -> [1,4,4,1] */
+	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 2, 2, 1});
+	struct sam3_tensor *out = make_tensor(4, (int[]){1, 4, 4, 1});
 
 	float inp_data[] = {1, 2, 3, 4};
 	fill_data(inp, inp_data);
@@ -525,9 +525,9 @@ static void test_upsample_2x(void)
 
 static void test_upsample_3x(void)
 {
-	/* [1,1,2,3] with scale=3 -> [1,1,6,9] */
-	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 1, 2, 3});
-	struct sam3_tensor *out = make_tensor(4, (int[]){1, 1, 6, 9});
+	/* NHWC [1,2,3,1] with scale=3 -> [1,6,9,1] */
+	struct sam3_tensor *inp = make_tensor(4, (int[]){1, 2, 3, 1});
+	struct sam3_tensor *out = make_tensor(4, (int[]){1, 6, 9, 1});
 
 	float inp_data[] = {1, 2, 3, 4, 5, 6};
 	fill_data(inp, inp_data);
@@ -843,11 +843,11 @@ static void test_slice_f16_axis1(void)
 
 static void test_upsample_f16_2x(void)
 {
-	/* [1,1,2,2] with scale=2 -> [1,1,4,4] in F16 */
+	/* NHWC [1,2,2,1] with scale=2 -> [1,4,4,1] in F16 */
 	struct sam3_tensor *inp = make_typed_tensor(SAM3_DTYPE_F16, 4,
-						    (int[]){1, 1, 2, 2});
+						    (int[]){1, 2, 2, 1});
 	struct sam3_tensor *out = make_typed_tensor(SAM3_DTYPE_F16, 4,
-						    (int[]){1, 1, 4, 4});
+						    (int[]){1, 4, 4, 1});
 
 	float inp_f32[] = {1, 2, 3, 4};
 	fill_f16_from_f32(inp, inp_f32, 4);

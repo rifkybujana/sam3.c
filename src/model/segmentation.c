@@ -287,7 +287,7 @@ static struct sam3_tensor *build_pixel_decoder(
 			sam3_log_debug("seg: FPN stage %d upsample %dx%d -> "
 				       "%dx%d (scale %d)",
 				       i, ph, pw, ch, cw, scale);
-			prev = gh_upsample_nhwc(g, a, prev, scale);
+			prev = gh_upsample(g, a, prev, scale);
 			if (!prev) {
 				sam3_log_error("seg: FPN stage %d upsample "
 					       "fail", i);
@@ -307,7 +307,7 @@ static struct sam3_tensor *build_pixel_decoder(
 		}
 
 		/* 3×3 NHWC conv with stride=1, padding=1 */
-		prev = gh_conv2d_nhwc(g, a, prev,
+		prev = gh_conv2d(g, a, prev,
 				      head->fpn[i].conv_w,
 				      head->fpn[i].conv_b,
 				      1, 1);
@@ -317,7 +317,7 @@ static struct sam3_tensor *build_pixel_decoder(
 		}
 
 		/* GroupNorm(8) + ReLU on NHWC */
-		prev = gh_groupnorm_nhwc(g, a, prev,
+		prev = gh_groupnorm(g, a, prev,
 					 head->fpn[i].gn_w,
 					 head->fpn[i].gn_b,
 					 SAM3_SEG_GN_GROUPS);
@@ -409,7 +409,7 @@ struct sam3_tensor *sam3_seg_head_build_fpn(
 
 	head->_debug_pixel_embed = pixel_embed;
 
-	struct sam3_tensor *inst = gh_conv2d_nhwc(g, arena, pixel_embed,
+	struct sam3_tensor *inst = gh_conv2d(g, arena, pixel_embed,
 						  head->inst_proj_w,
 						  head->inst_proj_b,
 						  1, 0);
@@ -492,7 +492,7 @@ struct sam3_tensor *sam3_seg_head_build(
 	 * Step 4: Instance projection (NHWC 1×1 conv).
 	 * pixel_embed [1, H, W, d] → instance_embeds [1, H, W, d]
 	 */
-	struct sam3_tensor *inst = gh_conv2d_nhwc(g, arena, pixel_embed,
+	struct sam3_tensor *inst = gh_conv2d(g, arena, pixel_embed,
 						  head->inst_proj_w,
 						  head->inst_proj_b,
 						  1, 0);

@@ -376,10 +376,7 @@ static enum sam3_error
 wrap_maxpool2d(const struct sam3_node *node, struct sam3_arena *scratch,
 	       struct sam3_threadpool *pool)
 {
-	if (node->params[2])
-		return cpu_maxpool2d_nhwc_wrap(node, scratch, pool);
-	(void)scratch;
-	return cpu_kernel_maxpool2d(node, pool);
+	return cpu_kernel_maxpool2d(node, scratch, pool);
 }
 
 static enum sam3_error
@@ -399,14 +396,11 @@ wrap_groupnorm(const struct sam3_node *node, struct sam3_arena *scratch,
 }
 
 /*
- * wrap_bias_add - Bias add with layout switch.
+ * wrap_bias_add - NHWC bias add.
  *
- * params[2] == 0: NCHW [N,C,H,W] + bias[C] broadcast over HW.
- * params[2] == 1: NHWC [N,H,W,C] + bias[C] broadcast over pixels.
- *
- * The NCHW path walks the bias once per (n,c) plane and sums across
- * a contiguous HW block; the NHWC path walks the bias across the
- * innermost dimension so each pixel just adds the per-channel value.
+ * Inputs: x[N, H, W, C] and bias[C]. Each pixel just adds the
+ * per-channel bias to the innermost axis, so the hot loop walks
+ * the bias in the same order as the input.
  */
 static enum sam3_error
 wrap_bias_add(const struct sam3_node *node, struct sam3_arena *scratch,
@@ -422,35 +416,16 @@ wrap_bias_add(const struct sam3_node *node, struct sam3_arena *scratch,
 	const float *bd = (const float *)bias->data;
 	float *od = (float *)out->data;
 
-	if (node->params[2]) {
-		/* NHWC: dims = [N, H, W, C] */
-		int N = x->dims[0];
-		int H = x->dims[1];
-		int W = x->dims[2];
-		int C = x->dims[3];
-		size_t pixels = (size_t)N * H * W;
-
-		for (size_t p = 0; p < pixels; p++) {
-			size_t off = p * (size_t)C;
-			for (int c = 0; c < C; c++)
-				od[off + c] = xd[off + c] + bd[c];
-		}
-		return SAM3_OK;
-	}
-
 	int N = x->dims[0];
-	int C = x->dims[1];
-	int H = x->dims[2];
-	int W = x->dims[3];
-	int spatial = H * W;
+	int H = x->dims[1];
+	int W = x->dims[2];
+	int C = x->dims[3];
+	size_t pixels = (size_t)N * H * W;
 
-	for (int n = 0; n < N; n++) {
-		for (int c = 0; c < C; c++) {
-			float b = bd[c];
-			int off = (n * C + c) * spatial;
-			for (int i = 0; i < spatial; i++)
-				od[off + i] = xd[off + i] + b;
-		}
+	for (size_t p = 0; p < pixels; p++) {
+		size_t off = p * (size_t)C;
+		for (int c = 0; c < C; c++)
+			od[off + c] = xd[off + c] + bd[c];
 	}
 
 	return SAM3_OK;

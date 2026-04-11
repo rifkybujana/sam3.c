@@ -318,10 +318,10 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	char name[128];
 
 	/*
-	 * Patch embedding Conv2d weight. sam3_convert (Task 12)
-	 * permutes the checkpoint OIHW [embed_dim, 3, ps, ps] tensor
-	 * to OHWI [embed_dim, ps, ps, 3] before writing, so the load
-	 * path maps it directly for gh_conv2d_nhwc.
+	 * Patch embedding Conv2d weight. sam3_convert permutes the
+	 * checkpoint OIHW [embed_dim, 3, ps, ps] tensor to OHWI
+	 * [embed_dim, ps, ps, 3] before writing, so the load path
+	 * maps it directly for the NHWC conv dispatch.
 	 */
 	int pe_w_dims[] = {e, ps, ps, 3};
 	vit->patch_embed_w = gh_load_mmap(wf,
@@ -618,7 +618,7 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 		return NULL;
 
 	struct sam3_tensor *conv_out;
-	conv_out = gh_conv2d_nhwc(&g, scratch, image_nhwc,
+	conv_out = gh_conv2d(&g, scratch, image_nhwc,
 				  vit->patch_embed_w, NULL,
 				  vit->patch_size, 0);
 	if (!conv_out)
