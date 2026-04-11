@@ -60,10 +60,10 @@ struct sam3_seg_head {
 	struct sam3_tensor *pxattn_norm_w, *pxattn_norm_b;
 
 	/* Debug: intermediate tensors (valid after build, data after eval) */
-	struct sam3_tensor *_debug_pixel_embed; /* FPN output [1,d,H,W] */
-	struct sam3_tensor *_debug_inst;        /* inst proj [1,d,H,W] */
+	struct sam3_tensor *_debug_pixel_embed; /* FPN output [1,H,W,d] */
+	struct sam3_tensor *_debug_inst;        /* inst proj [1,H,W,d] */
 	struct sam3_tensor *_debug_mask_embed;  /* MLP output [nq,d] */
-	struct sam3_tensor *_debug_enc_nchw;    /* encoder NCHW [1,d,h,w] */
+	struct sam3_tensor *_debug_enc_nchw;    /* encoder NHWC [1,h,w,d] */
 };
 
 /*
@@ -99,9 +99,9 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
  * @arena:          Arena for intermediate tensors
  *
  * Pipeline:
- *  1. Reshape encoder_states to [1, d, enc_h, enc_w] (72×72)
+ *  1. Reshape encoder_states to NHWC [1, enc_h, enc_w, d] (72×72)
  *  2. FPN: interpolate + skip add + 3×3 conv + GroupNorm(8) + ReLU (×2)
- *  3. Instance projection: 1×1 conv on pixel features
+ *  3. Instance projection: NHWC 1×1 conv on pixel features
  *  4. Mask embedder: 3-layer MLP on queries
  *  5. Dot product: mask_embed @ instance_features → mask logits
  *
@@ -120,9 +120,9 @@ struct sam3_tensor *sam3_seg_head_build(
 /*
  * sam3_seg_head_build_cross_attn - Build prompt cross-attention graph.
  *
- * Must be evaluated as a separate graph before calling seg_head_build,
- * because seg_head_build does a manual NCHW transpose that reads
- * materialized tensor data.
+ * Must be evaluated as a separate graph before calling seg_head_build
+ * when the caller needs the cross-attention result materialized, for
+ * example to feed it into a follow-on graph.
  *
  * @head:           Loaded seg head
  * @g:              Graph to add nodes to
@@ -139,33 +139,37 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
 	struct sam3_tensor *text_features,
 	struct sam3_arena *arena);
 
-/* Build FPN pixel decoder only (no instance projection). */
+/*
+ * Build FPN pixel decoder only (no instance projection). Operates on
+ * NHWC tensors [1, H, W, d].
+ */
 struct sam3_tensor *sam3_seg_head_build_pixel_decoder(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
-	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *enc_nhwc,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *arena);
 
 /*
- * sam3_seg_head_build_fpn - Build FPN pixel decoder + instance projection.
+ * sam3_seg_head_build_fpn - Build FPN pixel decoder + instance
+ *                           projection.
  *
  * Must be evaluated and persisted before building the dot product.
  *
  * @head:     Loaded seg head
  * @g:        Graph to add nodes to
- * @enc_nchw: Encoder output in NCHW [1, d, 72, 72]
- * @feat_2x:  Backbone feature at 2× [1, d, H2, W2]
- * @feat_4x:  Backbone feature at 4× [1, d, H4, W4]
+ * @enc_nhwc: Encoder output in NHWC [1, 72, 72, d]
+ * @feat_2x:  Backbone feature at 2× [1, H2, W2, d]
+ * @feat_4x:  Backbone feature at 4× [1, H4, W4, d]
  * @arena:    Arena for intermediate tensors
  *
- * Returns instance-projected pixel features [1, d, H4, W4].
+ * Returns instance-projected pixel features [1, H4, W4, d].
  */
 struct sam3_tensor *sam3_seg_head_build_fpn(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
-	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *enc_nhwc,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *arena);

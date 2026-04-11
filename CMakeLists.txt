@@ -179,6 +179,12 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
+	# test_seg_head_nhwc reads pre-migration reference .bin fixtures
+	if(TARGET test_seg_head_nhwc)
+		target_compile_definitions(test_seg_head_nhwc PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
 	# test_processor_async needs the model path at build time
 	if(TARGET test_processor_async)
 		target_compile_definitions(test_processor_async PRIVATE

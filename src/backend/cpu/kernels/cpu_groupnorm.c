@@ -1,11 +1,12 @@
 /*
  * src/backend/cpu/kernels/cpu_groupnorm.c - Group normalization kernel
  *
- * Computes group normalization on NCHW tensors:
- *   For each group of C/num_groups channels, normalize across (channels, H, W):
+ * Computes group normalization on 4D tensors in either NCHW [N,C,H,W]
+ * or NHWC [N,H,W,C] layout. For each group of C/num_groups channels,
+ * normalize across (channels, H, W):
  *   out = (x - mean) / sqrt(var + eps) * gamma + beta
- * inputs[0]=input [N,C,H,W], inputs[1]=gamma [C], inputs[2]=beta [C].
- * params[0]=num_groups. eps is fixed at 1e-5.
+ * inputs[0]=input, inputs[1]=gamma [C], inputs[2]=beta [C].
+ * params[0]=num_groups, params[1]=1 marks NHWC. eps is fixed at 1e-5.
  *
  * Key types:  sam3_node, sam3_tensor
  * Depends on: cpu_kernels.h, core/tensor.h, util/threadpool.h
@@ -76,6 +77,55 @@ static void groupnorm_group(const float *in, float *out,
 	}
 }
 
+/*
+ * groupnorm_group_nhwc - Normalize one group for one batch element on
+ *                         NHWC data.
+ *
+ * NHWC storage interleaves channels, so reductions and writes use
+ * stride C between spatial samples of the same channel.
+ */
+static void groupnorm_group_nhwc(const float *in, float *out,
+				  int group, int channels_per_group,
+				  int hw, int C,
+				  const float *gamma, const float *beta)
+{
+	int c_start = group * channels_per_group;
+	int group_size = channels_per_group * hw;
+
+	/* Mean over the group */
+	float sum = 0.0f;
+	for (int p = 0; p < hw; p++) {
+		const float *pix = in + (size_t)p * C + c_start;
+		for (int c = 0; c < channels_per_group; c++)
+			sum += pix[c];
+	}
+	float mean = sum / (float)group_size;
+
+	/* Variance over the group */
+	float var_sum = 0.0f;
+	for (int p = 0; p < hw; p++) {
+		const float *pix = in + (size_t)p * C + c_start;
+		for (int c = 0; c < channels_per_group; c++) {
+			float d = pix[c] - mean;
+			var_sum += d * d;
+		}
+	}
+	float inv_std = 1.0f / sqrtf(var_sum / (float)group_size +
+				      GROUPNORM_EPS);
+
+	/* Normalize, scale, shift */
+	for (int p = 0; p < hw; p++) {
+		const float *pix_in = in + (size_t)p * C + c_start;
+		float *pix_out = out + (size_t)p * C + c_start;
+		for (int c = 0; c < channels_per_group; c++) {
+			int abs_c = c_start + c;
+			float g = gamma ? gamma[abs_c] : 1.0f;
+			float b = beta ? beta[abs_c] : 0.0f;
+			pix_out[c] = (pix_in[c] - mean) * inv_std * g + b;
+		}
+	}
+}
+
 /* --- Parallel dispatch --- */
 
 struct groupnorm_par_ctx {
@@ -85,6 +135,7 @@ struct groupnorm_par_ctx {
 	int          channels_per_group;
 	int          hw;
 	int          batch_size;
+	int          nhwc;
 	const float *gamma;
 	const float *beta;
 };
@@ -106,10 +157,19 @@ static void groupnorm_parallel_fn(void *arg, int task_id, int n_tasks)
 	for (int idx = start; idx < end; idx++) {
 		int n = idx / ctx->num_groups;
 		int g = idx % ctx->num_groups;
-		groupnorm_group(ctx->in + n * batch_stride,
-				ctx->out + n * batch_stride,
+		if (ctx->nhwc) {
+			groupnorm_group_nhwc(
+				ctx->in + (size_t)n * batch_stride,
+				ctx->out + (size_t)n * batch_stride,
+				g, ctx->channels_per_group, ctx->hw, C,
+				ctx->gamma, ctx->beta);
+		} else {
+			groupnorm_group(
+				ctx->in + (size_t)n * batch_stride,
+				ctx->out + (size_t)n * batch_stride,
 				g, ctx->channels_per_group, ctx->hw,
 				ctx->gamma, ctx->beta);
+		}
 	}
 }
 
@@ -121,23 +181,14 @@ enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	/*
-	 * params[1] == 1 marks an NHWC input. The CPU kernel only
-	 * implements NCHW today; no CPU test exercises the NHWC path
-	 * so rejecting here is enough to satisfy the layout migration
-	 * plan ("any test that was green before must still be green").
-	 */
-	if (node->params[1]) {
-		sam3_log_error("groupnorm: NHWC path not implemented on CPU");
-		return SAM3_EINVAL;
-	}
+	int nhwc = node->params[1];
 
 	struct sam3_tensor *in = node->inputs[0];
 	struct sam3_tensor *out = node->output;
 	int num_groups = node->params[0];
 
 	if (in->n_dims != 4) {
-		sam3_log_error("groupnorm: expected 4D NCHW input, got %dD",
+		sam3_log_error("groupnorm: expected 4D input, got %dD",
 			       in->n_dims);
 		return SAM3_EINVAL;
 	}
@@ -147,10 +198,18 @@ enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	int N = in->dims[0];
-	int C = in->dims[1];
-	int H = in->dims[2];
-	int W = in->dims[3];
+	int N, C, H, W;
+	if (nhwc) {
+		N = in->dims[0];
+		H = in->dims[1];
+		W = in->dims[2];
+		C = in->dims[3];
+	} else {
+		N = in->dims[0];
+		C = in->dims[1];
+		H = in->dims[2];
+		W = in->dims[3];
+	}
 
 	if (C % num_groups != 0) {
 		sam3_log_error("groupnorm: C=%d not divisible by groups=%d",
@@ -173,6 +232,7 @@ enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,
 		.channels_per_group = C / num_groups,
 		.hw                 = H * W,
 		.batch_size         = N,
+		.nhwc               = nhwc,
 		.gamma              = gamma,
 		.beta               = beta,
 	};

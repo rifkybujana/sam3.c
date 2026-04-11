@@ -1326,6 +1326,67 @@ struct sam3_tensor *gh_groupnorm_nhwc(struct sam3_graph *g,
 
 /* ── Convolution helpers ──────────────────────────────────────────── */
 
+struct sam3_tensor *gh_permute_conv_weight_ohwi(
+	struct sam3_arena *arena,
+	const struct sam3_tensor *src,
+	int is_transpose)
+{
+	int oc = is_transpose ? src->dims[1] : src->dims[0];
+	int ic = is_transpose ? src->dims[0] : src->dims[1];
+	int kh = src->dims[2];
+	int kw = src->dims[3];
+
+	int dst_dims[] = {oc, kh, kw, ic};
+	struct sam3_tensor *dst = gh_alloc_tensor(arena, src->dtype,
+						  4, dst_dims);
+	if (!dst)
+		return NULL;
+
+	size_t esz = sam3_dtype_size(src->dtype);
+	if (esz == 0) {
+		sam3_log_error("permute_conv_weight: unsupported dtype %d",
+			       src->dtype);
+		return NULL;
+	}
+
+	const char *sbytes = (const char *)src->data;
+	char *dbytes = (char *)dst->data;
+
+	/*
+	 * Walk the OHWI destination linearly; compute the source
+	 * offset per element. Source stride order depends on whether
+	 * the layer is Conv2d (OIHW) or ConvTranspose2d (IOHW):
+	 *
+	 *   Conv2d:    s = ((o * IC + c) * KH + y) * KW + x
+	 *   ConvTrans: s = ((c * OC + o) * KH + y) * KW + x
+	 *
+	 * Destination:  d = ((o * KH + y) * KW + x) * IC + c
+	 */
+	for (int o = 0; o < oc; o++) {
+		for (int y = 0; y < kh; y++) {
+			for (int x = 0; x < kw; x++) {
+				for (int c = 0; c < ic; c++) {
+					size_t s;
+					if (is_transpose) {
+						s = (((size_t)c * oc + o)
+						     * kh + y) * kw + x;
+					} else {
+						s = (((size_t)o * ic + c)
+						     * kh + y) * kw + x;
+					}
+					size_t d = (((size_t)o * kh + y)
+						    * kw + x) * ic + c;
+					memcpy(dbytes + d * esz,
+					       sbytes + s * esz,
+					       esz);
+				}
+			}
+		}
+	}
+
+	return dst;
+}
+
 /*
  * conv_add_bias - Add bias [C] to a 4D tensor via fused op.
  *

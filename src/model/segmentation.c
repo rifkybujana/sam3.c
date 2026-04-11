@@ -1,17 +1,21 @@
 /*
- * src/model/segmentation.c - SAM3 UniversalSegmentationHead graph construction
+ * src/model/segmentation.c - SAM3 UniversalSegmentationHead graph
+ *                            construction (NHWC)
  *
- * Builds the MaskFormer-style segmentation head compute graph. The FPN
- * pixel decoder fuses multi-scale backbone features from coarse to fine
- * using nearest-neighbor upsampling + skip add + 3×3 conv + GroupNorm(8)
- * + ReLU. The mask prediction uses a 3-layer MLP on query embeddings
- * and a dot product with instance-projected pixel features.
+ * Builds the MaskFormer-style segmentation head compute graph on the
+ * NHWC layout. The FPN pixel decoder fuses multi-scale backbone
+ * features from coarse to fine using nearest-neighbor upsampling +
+ * skip add + 3×3 conv + GroupNorm(8) + ReLU. The mask prediction
+ * uses a 3-layer MLP on query embeddings and a dot product with
+ * instance-projected pixel features. Conv weights are permuted from
+ * checkpoint OIHW to OHWI at load time via
+ * gh_permute_conv_weight_ohwi; Task 12 moves this into sam3_convert.
  *
  * Weight prefix: detector_model.mask_decoder.*
  *
  * Key types:  sam3_seg_head
  * Depends on: segmentation.h, graph_helpers.h, util/log.h
- * Used by:    sam3_image.c
+ * Used by:    sam3_image.c, tests/test_seg_head_nhwc.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
@@ -53,10 +57,22 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 
 	/* FPN pixel decoder: 3 stages */
 	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++) {
+		struct sam3_tensor *raw_w;
+
 		snprintf(name, sizeof(name),
 			 WP "pixel_decoder.conv_layers.%d.weight", i);
-		head->fpn[i].conv_w = gh_load_mmap(wf, name, arena,
-			SAM3_DTYPE_F32, 4, conv_w_dims);
+		raw_w = gh_load_mmap(wf, name, arena,
+				     SAM3_DTYPE_F32, 4, conv_w_dims);
+		if (!raw_w)
+			return SAM3_ENOMEM;
+
+		/*
+		 * Permute Conv2d weight from checkpoint OIHW to OHWI
+		 * so gh_conv2d_nhwc can consume it directly. Task 12
+		 * moves this into the converter.
+		 */
+		head->fpn[i].conv_w = gh_permute_conv_weight_ohwi(
+			arena, raw_w, 0);
 		if (!head->fpn[i].conv_w)
 			return SAM3_ENOMEM;
 
@@ -83,11 +99,21 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 	}
 
 	/* Instance projection: 1×1 conv */
-	head->inst_proj_w = gh_load_mmap(wf,
-		WP "instance_projection.weight", arena,
-		SAM3_DTYPE_F32, 4, proj_w_dims);
-	if (!head->inst_proj_w)
-		return SAM3_ENOMEM;
+	{
+		struct sam3_tensor *raw_w;
+
+		raw_w = gh_load_mmap(wf,
+			WP "instance_projection.weight", arena,
+			SAM3_DTYPE_F32, 4, proj_w_dims);
+		if (!raw_w)
+			return SAM3_ENOMEM;
+
+		/* Permute Conv2d OIHW -> OHWI for gh_conv2d_nhwc. */
+		head->inst_proj_w = gh_permute_conv_weight_ohwi(
+			arena, raw_w, 0);
+		if (!head->inst_proj_w)
+			return SAM3_ENOMEM;
+	}
 
 	head->inst_proj_b = gh_load_mmap(wf,
 		WP "instance_projection.bias", arena,
@@ -226,9 +252,9 @@ static struct sam3_tensor *build_prompt_cross_attn(
 }
 
 /*
- * build_pixel_decoder - FPN pixel decoder.
+ * build_pixel_decoder - FPN pixel decoder (NHWC).
  *
- * Takes 3 features (encoder_nchw at 72×72, feat_2x, feat_4x) and
+ * Takes 3 NHWC features (encoder at 72×72, feat_2x, feat_4x) and
  * iterates from coarse to fine: interpolate + skip add + 3×3 conv +
  * GroupNorm(8) + ReLU.
  *
@@ -236,12 +262,13 @@ static struct sam3_tensor *build_prompt_cross_attn(
  * norms[2] are never invoked at inference). The encoder output at
  * 72×72 replaces the backbone's 1× feature as the starting point.
  *
- * Returns high-resolution pixel features [1, d, H4, W4].
+ * All tensors in the pipeline are [1, H, W, d_model]. Returns
+ * high-resolution pixel features [1, H4, W4, d_model].
  */
 static struct sam3_tensor *build_pixel_decoder(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
-	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *enc_nhwc,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *a)
@@ -258,25 +285,26 @@ static struct sam3_tensor *build_pixel_decoder(
 	 * conv[2] and norm[2] are allocated but never used.
 	 */
 	struct sam3_tensor *skip_feats[] = {feat_2x, feat_4x};
-	struct sam3_tensor *prev = enc_nchw;
+	struct sam3_tensor *prev = enc_nhwc;
 	int n_stages = 2;
 
 	for (int i = 0; i < n_stages; i++) {
 		struct sam3_tensor *curr = skip_feats[i];
 
-		/* Upsample prev to match curr spatial dims.
-		 * Python: F.interpolate(prev, size=curr.shape[-2:])
-		 * Skip when already matching (e.g. enc and feat_1x both 72×72).
+		/*
+		 * Upsample prev to match curr spatial dims.
+		 * NHWC: dims = [N, H, W, C]. Skip when already
+		 * matching (e.g. enc and feat_1x both 72×72).
 		 */
-		int ch = curr->dims[2], cw = curr->dims[3];
-		int ph = prev->dims[2], pw = prev->dims[3];
+		int ch = curr->dims[1], cw = curr->dims[2];
+		int ph = prev->dims[1], pw = prev->dims[2];
 
 		if (ph != ch || pw != cw) {
 			int scale = ch / ph;
 			sam3_log_debug("seg: FPN stage %d upsample %dx%d -> "
 				       "%dx%d (scale %d)",
 				       i, ph, pw, ch, cw, scale);
-			prev = gh_upsample(g, a, prev, scale);
+			prev = gh_upsample_nhwc(g, a, prev, scale);
 			if (!prev) {
 				sam3_log_error("seg: FPN stage %d upsample "
 					       "fail", i);
@@ -295,21 +323,21 @@ static struct sam3_tensor *build_pixel_decoder(
 			return NULL;
 		}
 
-		/* 3×3 conv with stride=1, padding=1 */
-		prev = gh_conv2d(g, a, prev,
-				  head->fpn[i].conv_w,
-				  head->fpn[i].conv_b,
-				  1, 1);
+		/* 3×3 NHWC conv with stride=1, padding=1 */
+		prev = gh_conv2d_nhwc(g, a, prev,
+				      head->fpn[i].conv_w,
+				      head->fpn[i].conv_b,
+				      1, 1);
 		if (!prev) {
 			sam3_log_error("seg: FPN stage %d conv fail", i);
 			return NULL;
 		}
 
-		/* GroupNorm(8) + ReLU */
-		prev = gh_groupnorm(g, a, prev,
-				     head->fpn[i].gn_w,
-				     head->fpn[i].gn_b,
-				     SAM3_SEG_GN_GROUPS);
+		/* GroupNorm(8) + ReLU on NHWC */
+		prev = gh_groupnorm_nhwc(g, a, prev,
+					 head->fpn[i].gn_w,
+					 head->fpn[i].gn_b,
+					 SAM3_SEG_GN_GROUPS);
 		if (!prev) {
 			sam3_log_error("seg: FPN stage %d groupnorm fail", i);
 			return NULL;
@@ -374,34 +402,34 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
 struct sam3_tensor *sam3_seg_head_build_pixel_decoder(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
-	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *enc_nhwc,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *arena)
 {
 	return build_pixel_decoder(
-		head, g, enc_nchw, feat_2x, feat_4x, arena);
+		head, g, enc_nhwc, feat_2x, feat_4x, arena);
 }
 
 struct sam3_tensor *sam3_seg_head_build_fpn(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
-	struct sam3_tensor *enc_nchw,
+	struct sam3_tensor *enc_nhwc,
 	struct sam3_tensor *feat_2x,
 	struct sam3_tensor *feat_4x,
 	struct sam3_arena *arena)
 {
 	struct sam3_tensor *pixel_embed = build_pixel_decoder(
-		head, g, enc_nchw, feat_2x, feat_4x, arena);
+		head, g, enc_nhwc, feat_2x, feat_4x, arena);
 	if (!pixel_embed)
 		return NULL;
 
 	head->_debug_pixel_embed = pixel_embed;
 
-	struct sam3_tensor *inst = gh_conv2d(g, arena, pixel_embed,
-					      head->inst_proj_w,
-					      head->inst_proj_b,
-					      1, 0);
+	struct sam3_tensor *inst = gh_conv2d_nhwc(g, arena, pixel_embed,
+						  head->inst_proj_w,
+						  head->inst_proj_b,
+						  1, 0);
 	return inst;
 }
 
@@ -437,33 +465,22 @@ struct sam3_tensor *sam3_seg_head_build(
 		       encoder_states->dims[0], encoder_states->dims[1],
 		       enc_h, enc_w);
 
-	struct sam3_tensor *enc = encoder_states;
+	struct sam3_tensor *enc;
 
 	/*
-	 * Step 2: Reshape encoder output to NCHW.
-	 * [seq, d_model] → manual transpose+reshape → [1, d, enc_h, enc_w]
-	 *
-	 * Done manually (not as graph op) because the input tensor is
-	 * from the persist arena (materialized in a previous graph eval).
-	 * The MLX cache can hold stale references for cross-eval tensors.
+	 * Step 2: Reshape encoder output to NHWC.
+	 * [seq, d_model] with seq = enc_h * enc_w is already the
+	 * NHWC byte layout for [1, enc_h, enc_w, d], so a pure
+	 * reshape suffices — no memcpy.
 	 */
 	{
-		int seq = enc->dims[0];
-		int nchw_d[] = {1, d, enc_h, enc_w};
-		struct sam3_tensor *nchw = gh_alloc_tensor(arena,
-			enc->dtype, 4, nchw_d);
-		if (!nchw)
+		int nhwc_d[] = {1, enc_h, enc_w, d};
+		enc = gh_reshape(g, arena, encoder_states, 4, nhwc_d);
+		if (!enc)
 			return NULL;
-		const float *src = (const float *)enc->data;
-		float *dst = (float *)nchw->data;
-		/* Transpose [seq, d] → [d, seq] then treat as [1,d,h,w] */
-		for (int s = 0; s < seq; s++)
-			for (int c = 0; c < d; c++)
-				dst[c * seq + s] = src[s * d + c];
-		enc = nchw;
 	}
 
-	/* Stash for debug: encoder states before and after cross-attn */
+	/* Stash for debug: encoder states after the NHWC reshape */
 	head->_debug_enc_nchw = enc;
 
 	/*
@@ -477,25 +494,25 @@ struct sam3_tensor *sam3_seg_head_build(
 		return NULL;
 	}
 
-	int final_h = pixel_embed->dims[2];
-	int final_w = pixel_embed->dims[3];
+	int final_h = pixel_embed->dims[1];
+	int final_w = pixel_embed->dims[2];
 	int final_hw = final_h * final_w;
 
 	sam3_log_debug("seg: pixel embed [%d, %d, %d, %d]",
-		       pixel_embed->dims[0], pixel_embed->dims[1],
-		       final_h, final_w);
+		       pixel_embed->dims[0], final_h, final_w,
+		       pixel_embed->dims[3]);
 
 	/* Stash for debug */
 	head->_debug_pixel_embed = pixel_embed;
 
 	/*
-	 * Step 4: Instance projection (1×1 conv).
-	 * pixel_embed [1, d, H, W] → instance_embeds [1, d, H, W]
+	 * Step 4: Instance projection (NHWC 1×1 conv).
+	 * pixel_embed [1, H, W, d] → instance_embeds [1, H, W, d]
 	 */
-	struct sam3_tensor *inst = gh_conv2d(g, arena, pixel_embed,
-					      head->inst_proj_w,
-					      head->inst_proj_b,
-					      1, 0);
+	struct sam3_tensor *inst = gh_conv2d_nhwc(g, arena, pixel_embed,
+						  head->inst_proj_w,
+						  head->inst_proj_b,
+						  1, 0);
 	if (!inst) {
 		sam3_log_error("seg: instance projection failed");
 		return NULL;
@@ -521,18 +538,25 @@ struct sam3_tensor *sam3_seg_head_build(
 	/*
 	 * Step 6: Dot product for mask logits.
 	 * einsum("bqc,bchw->bqhw") with batch=1:
-	 *   mask_embed [n_q, d] @ inst_flat [d, H*W] → [n_q, H*W]
+	 *   mask_embed [n_q, d] @ inst_flat_t [d, H*W] → [n_q, H*W]
 	 *
-	 * Reshape instance features: [1, d, H, W] → [d, H*W]
+	 * NHWC inst is [1, H, W, d], so a plain reshape yields
+	 * [H*W, d]; a single transpose produces [d, H*W] for the
+	 * matmul. One explicit transpose instead of the two the old
+	 * NCHW path needed.
 	 */
-	int flat_dims[] = {d, final_hw};
+	int flat_dims[] = {final_hw, d};
 	struct sam3_tensor *inst_flat = gh_reshape(g, arena, inst,
 						    2, flat_dims);
 	if (!inst_flat)
 		return NULL;
 
+	struct sam3_tensor *inst_flat_t = gh_transpose(g, arena, inst_flat);
+	if (!inst_flat_t)
+		return NULL;
+
 	struct sam3_tensor *masks = gh_matmul(g, arena,
-					       mask_embed, inst_flat);
+					       mask_embed, inst_flat_t);
 	if (!masks)
 		return NULL;
 

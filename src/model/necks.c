@@ -6,8 +6,8 @@
  * to NHWC [1, gs, gs, dim], optional NHWC MaxPool, spatial rescaling
  * via NHWC ConvTranspose2d (with GELU), 1x1 NHWC conv projection to
  * d_model, 3x3 NHWC conv spatial mixing. Conv weights are permuted
- * from checkpoint OIHW/IOHW to OHWI at load time (see
- * permute_conv_weight); Task 12 moves this into sam3_convert.
+ * from checkpoint OIHW/IOHW to OHWI at load time via
+ * gh_permute_conv_weight_ohwi; Task 12 moves this into sam3_convert.
  *
  * Key types:  sam3_neck
  * Depends on: necks.h, graph_helpers.h, util/log.h
@@ -262,86 +262,6 @@ static void neck_weight_name(char *buf, size_t buflen,
 	}
 }
 
-/*
- * permute_conv_weight - Copy-permute a neck conv weight into OHWI.
- *
- * @src:          Source weight loaded from the checkpoint.
- *                Conv2d layout is OIHW [OC, IC, KH, KW].
- *                ConvTranspose2d layout is IOHW [IC, OC, KH, KW].
- * @arena:        Arena for the freshly allocated OHWI tensor.
- * @is_transpose: 1 for ConvTranspose2d sources, 0 for Conv2d.
- *
- * Destination layout is always OHWI [OC, KH, KW, IC]. The source
- * tensor may point into the mmap region or into a zero-initialised
- * arena fallback; either way the data is copied element by element
- * using sam3_dtype_size + memcpy so F32 and any future narrower
- * dtype both work. Returns NULL on arena OOM or bad dtype.
- *
- * The original source header stays in the arena but is unreferenced
- * — the caller replaces its pointer with the returned OHWI tensor.
- * Task 12 will move this permute into sam3_convert so the weight
- * lands in OHWI on disk and this helper can go away.
- */
-static struct sam3_tensor *permute_conv_weight(struct sam3_tensor *src,
-					       struct sam3_arena *arena,
-					       int is_transpose)
-{
-	int oc = is_transpose ? src->dims[1] : src->dims[0];
-	int ic = is_transpose ? src->dims[0] : src->dims[1];
-	int kh = src->dims[2];
-	int kw = src->dims[3];
-
-	int dst_dims[] = {oc, kh, kw, ic};
-	struct sam3_tensor *dst = gh_alloc_tensor(arena, src->dtype,
-						  4, dst_dims);
-	if (!dst)
-		return NULL;
-
-	size_t esz = sam3_dtype_size(src->dtype);
-	if (esz == 0) {
-		sam3_log_error("neck permute: unsupported dtype %d",
-			       src->dtype);
-		return NULL;
-	}
-
-	const char *sbytes = (const char *)src->data;
-	char *dbytes = (char *)dst->data;
-
-	/*
-	 * Walk the OHWI destination linearly; compute the source
-	 * offset per element. Source stride order depends on whether
-	 * the layer is Conv2d (OIHW) or ConvTranspose2d (IOHW):
-	 *
-	 *   Conv2d:    s = ((o * IC + c) * KH + y) * KW + x
-	 *   ConvTrans: s = ((c * OC + o) * KH + y) * KW + x
-	 *
-	 * Destination:  d = ((o * KH + y) * KW + x) * IC + c
-	 */
-	for (int o = 0; o < oc; o++) {
-		for (int y = 0; y < kh; y++) {
-			for (int x = 0; x < kw; x++) {
-				for (int c = 0; c < ic; c++) {
-					size_t s;
-					if (is_transpose) {
-						s = (((size_t)c * oc + o)
-						     * kh + y) * kw + x;
-					} else {
-						s = (((size_t)o * ic + c)
-						     * kh + y) * kw + x;
-					}
-					size_t d = (((size_t)o * kh + y)
-						    * kw + x) * ic + c;
-					memcpy(dbytes + d * esz,
-					       sbytes + s * esz,
-					       esz);
-				}
-			}
-		}
-	}
-
-	return dst;
-}
-
 enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			       const struct sam3_weight_file *wf,
 			       struct sam3_arena *arena)
@@ -382,9 +302,10 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			 * directly. Task 12 moves this into the
 			 * converter.
 			 */
-			neck->stages[i].conv_w[j] = permute_conv_weight(
-				raw_w, arena,
-				neck->stages[i].is_transpose[j]);
+			neck->stages[i].conv_w[j] =
+				gh_permute_conv_weight_ohwi(
+					arena, raw_w,
+					neck->stages[i].is_transpose[j]);
 			if (!neck->stages[i].conv_w[j])
 				return SAM3_ENOMEM;
 

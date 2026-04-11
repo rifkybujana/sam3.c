@@ -552,6 +552,31 @@ struct sam3_tensor *gh_conv2d_nhwc(struct sam3_graph *g,
 				   int stride, int padding);
 
 /*
+ * gh_permute_conv_weight_ohwi - Permute conv weights from OIHW/IOHW
+ *                               to OHWI.
+ *
+ * @arena:        Arena for the destination tensor
+ * @src:          Source tensor with 4-D conv weights
+ * @is_transpose: 0 for Conv2d [OC,IC,KH,KW], 1 for ConvT2d
+ *                [IC,OC,KH,KW]
+ *
+ * Writes a new OHWI tensor with shape [OC,KH,KW,IC] regardless of
+ * whether the source was a forward or transposed conv. Dtype-generic:
+ * supports F32/F16/BF16/I32/I8 via sam3_dtype_size + memcpy. Rejects
+ * quantized dtypes (Q8_0) because each block crosses channels.
+ *
+ * Task 12 will move this permute into sam3_convert so the converter
+ * writes OHWI directly and this helper can be deleted.
+ *
+ * Returns the new tensor, NULL on arena exhaustion or unsupported
+ * dtype.
+ */
+struct sam3_tensor *gh_permute_conv_weight_ohwi(
+	struct sam3_arena *arena,
+	const struct sam3_tensor *src,
+	int is_transpose);
+
+/*
  * gh_conv_transpose2d_nhwc - 2D transposed conv with NHWC / OHWI.
  *
  * @input:   [N, H, W, C_in]

@@ -45,10 +45,17 @@ struct sam3_image_model {
 	/* Cached image features after encoding */
 	struct sam3_tensor *cached_image_features; /* [1, d_model, H, W] */
 	struct sam3_tensor *cached_text_features;  /* [seq_len, d_model] */
-	/* Multi-scale backbone features for FPN pixel decoder */
+	/*
+	 * Multi-scale backbone features for FPN pixel decoders. The
+	 * NCHW snapshots feed the mask decoder path (Task 10 still).
+	 * The NHWC snapshots feed the NHWC seg_head after Task 9.
+	 */
 	struct sam3_tensor *cached_feat_s0;  /* [1, d_model, 2H, 2W] 2x */
 	struct sam3_tensor *cached_feat_s1;  /* [1, d_model, H, W]   1x */
 	struct sam3_tensor *cached_feat_4x;  /* [1, d_model, 4H, 4W] 4x */
+	struct sam3_tensor *cached_feat_s0_nhwc; /* [1, 2H, 2W, d] 2x */
+	struct sam3_tensor *cached_feat_s1_nhwc; /* [1, H,  W,  d] 1x */
+	struct sam3_tensor *cached_feat_4x_nhwc; /* [1, 4H, 4W, d] 4x */
 	int image_encoded;
 };
 
