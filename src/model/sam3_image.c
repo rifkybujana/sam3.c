@@ -359,73 +359,71 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 	SAM3_PROF_BEGIN(profiler, "neck");
 	{
 		/*
-		 * Step 1: Manual C transpose from [pixels, C] to NCHW.
+		 * Step 1: Wrap the ViT output as an NHWC tensor.
 		 *
-		 * ViT output is [HW, C] row-major. We need [1, C, H, W].
-		 * The MLX graph-based transpose produces garbage due to
-		 * intermediate buffer handling, so we do it in C.
+		 * ViT output is [HW, C] row-major, which is already
+		 * the NHWC byte layout for [1, gs, gs, C]. After the
+		 * Task 8 neck migration, the neck conv weights are
+		 * stored OHWI and the NHWC conv helpers consume NHWC
+		 * input directly, so no transpose is needed here.
 		 *
-		 * dst[c * HW + p] = src[p * C + c]
+		 * The downstream seg_head / mask decoder still expect
+		 * NCHW [1, C, H, W], so after each stage we do a
+		 * manual NHWC -> NCHW copy when snapshotting the
+		 * output into scratch. This keeps the contract for
+		 * cached_feat_4x / _s0 / _s1 / _image_features stable
+		 * while letting the compute graph run fully in NHWC.
 		 */
 		sam3_arena_reset(scratch);
 
 		int C = model->backbone.neck.backbone_dim;
 		int gs = model->backbone.neck.grid_size;
 		int HW = gs * gs;
-		int nchw_dims[] = {1, C, gs, gs};
-		size_t nchw_bytes = (size_t)C * HW * sizeof(float);
-		void *nchw_buf = sam3_arena_alloc(scratch, nchw_bytes);
-		if (!nchw_buf) return SAM3_ENOMEM;
+		int nhwc_dims[] = {1, gs, gs, C};
+		size_t nhwc_bytes = (size_t)C * HW * sizeof(float);
 
+		sam3_log_debug("encode: neck NHWC wrap [%d,%d,%d,%d]",
+			       1, gs, gs, C);
+
+		/* Dump raw ViT NHWC for debugging */
 		{
-			const float *src = (const float *)vit_out->data;
-			float *dst = (float *)nchw_buf;
-			for (int p = 0; p < HW; p++)
-				for (int c = 0; c < C; c++)
-					dst[c * HW + p] = src[p * C + c];
-		}
-
-		sam3_log_debug("encode: nchw manual transpose done "
-			"[%d,%d,%d,%d]", 1, C, gs, gs);
-
-		/* Dump raw ViT NCHW for debugging */
-		{
-			int nchw_sd2[] = {1, C, gs, gs};
+			int nhwc_sd2[] = {1, gs, gs, C};
 			struct sam3_tensor tmp;
 			tmp.dtype = SAM3_DTYPE_F32;
 			tmp.n_dims = 4;
-			for (int k = 0; k < 4; k++) tmp.dims[k] = nchw_sd2[k];
-			tmp.data = nchw_buf;
-			tmp.nbytes = nchw_bytes;
-			dump_tensor("/tmp/dbg_vit_nchw.bin", &tmp);
+			for (int k = 0; k < 4; k++) tmp.dims[k] = nhwc_sd2[k];
+			tmp.data = vit_out->data;
+			tmp.nbytes = nhwc_bytes;
+			dump_tensor("/tmp/dbg_vit_nhwc.bin", &tmp);
 		}
 
-		/* Step 2: Evaluate each stage independently */
+		/* Step 2: Evaluate each stage independently in NHWC */
 		struct sam3_tensor *stage_out[4] = {0};
 
 		for (int si = 0; si < model->backbone.neck.n_scales; si++) {
 			/*
-			 * Copy nchw_buf for each stage to prevent
-			 * cross-stage corruption. The backend may
-			 * reuse or invalidate input buffers after
-			 * graph_eval.
+			 * Copy the ViT NHWC payload per stage. MLX
+			 * may invalidate input buffers after a
+			 * graph_eval, so each stage gets its own
+			 * private copy of the shared input.
 			 */
-			void *stage_nchw = sam3_arena_alloc(scratch,
-							    nchw_bytes);
-			if (!stage_nchw) return SAM3_ENOMEM;
-			memcpy(stage_nchw, nchw_buf, nchw_bytes);
+			void *stage_nhwc = sam3_arena_alloc(scratch,
+							    nhwc_bytes);
+			if (!stage_nhwc) return SAM3_ENOMEM;
+			memcpy(stage_nhwc, vit_out->data, nhwc_bytes);
 
-			struct sam3_tensor *nchw_in;
-			nchw_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
-						  4, nchw_dims, stage_nchw);
-			if (!nchw_in) return SAM3_ENOMEM;
+			struct sam3_tensor *nhwc_in;
+			nhwc_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+						  4, nhwc_dims, stage_nhwc);
+			if (!nhwc_in) return SAM3_ENOMEM;
 
-			struct sam3_tensor *x = nchw_in;
+			struct sam3_tensor *x = nhwc_in;
 
 			if (model->backbone.neck.stages[si].has_maxpool) {
 				struct sam3_graph g_stage;
 				sam3_graph_init(&g_stage);
-				x = gh_maxpool2d(&g_stage, scratch, x, 2, 2);
+				x = gh_maxpool2d_nhwc(&g_stage, scratch,
+						      x, 2, 2);
 				if (!x) return SAM3_ENOMEM;
 				err = be->ops->graph_eval(be, &g_stage);
 				if (err != SAM3_OK) return err;
@@ -441,12 +439,12 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 				int pad = (k == 3) ? 1 : 0;
 
 				if (model->backbone.neck.stages[si].is_transpose[j]) {
-					x = gh_conv_transpose2d(&g_stage, scratch, x,
+					x = gh_conv_transpose2d_nhwc(&g_stage, scratch, x,
 						model->backbone.neck.stages[si].conv_w[j],
 						model->backbone.neck.stages[si].conv_b[j],
 						2, 0);
 				} else {
-					x = gh_conv2d(&g_stage, scratch, x,
+					x = gh_conv2d_nhwc(&g_stage, scratch, x,
 						model->backbone.neck.stages[si].conv_w[j],
 						model->backbone.neck.stages[si].conv_b[j],
 						1, pad);
@@ -461,35 +459,41 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 				err = be->ops->graph_eval(be, &g_stage);
 				if (err != SAM3_OK) return err;
 
-				/* Snapshot layer output + smoothness */
+				/* Snapshot layer output + smoothness (NHWC) */
 				{
 					const float *ld =
 						(const float *)x->data;
-					int lC = x->dims[1];
-					int lH = x->dims[2];
-					int lW = x->dims[3];
-					int ln = lC * lH * lW;
+					int lH = x->dims[1];
+					int lW = x->dims[2];
+					int lC = x->dims[3];
 					float lmin = ld[0], lmax = ld[0];
 					double la = 0, ldw = 0, ldh = 0;
 					long ca = 0, cw2 = 0, ch3 = 0;
-					for (int c = 0; c < lC; c++) {
-						const float *lc =
-							ld + (long)c*lH*lW;
-						for (int h = 0; h < lH; h++)
+					for (int h = 0; h < lH; h++) {
 						for (int w = 0; w < lW; w++) {
-							float v = lc[h*lW+w];
-							if (v < lmin) lmin = v;
-							if (v > lmax) lmax = v;
-							la += fabs(v); ca++;
+							const float *pv =
+							  ld + ((long)h*lW+w)*lC;
+							for (int c = 0; c < lC; c++) {
+								float v = pv[c];
+								if (v < lmin) lmin = v;
+								if (v > lmax) lmax = v;
+								la += fabs(v); ca++;
+							}
 							if (w+1<lW) {
-								ldw += fabs(v-
-								  lc[h*lW+w+1]);
-								cw2++;
+								const float *pn =
+								  ld + ((long)h*lW+w+1)*lC;
+								for (int c = 0; c < lC; c++) {
+									ldw += fabs(pv[c]-pn[c]);
+									cw2++;
+								}
 							}
 							if (h+1<lH) {
-								ldh += fabs(v-
-								  lc[(h+1)*lW+w]);
-								ch3++;
+								const float *pn =
+								  ld + ((long)(h+1)*lW+w)*lC;
+								for (int c = 0; c < lC; c++) {
+									ldh += fabs(pv[c]-pn[c]);
+									ch3++;
+								}
 							}
 						}
 					}
@@ -497,7 +501,7 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 					double rw = (ldw/cw2)/(lm+1e-8);
 					double rh = (ldh/ch3)/(lm+1e-8);
 					sam3_log_debug("encode: neck[%d].layer[%d]"
-						" [%d,%d,%d,%d] min=%.4f"
+						" nhwc [%d,%d,%d,%d] min=%.4f"
 						" max=%.4f rw=%.3f rh=%.3f",
 						si, j,
 						x->dims[0], x->dims[1],
@@ -512,32 +516,55 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 			}
 
 			/*
-			 * Copy stage output to scratch immediately.
-			 * MLX recycles internal buffers between
-			 * graph_eval calls, so we must snapshot data
-			 * before building the next stage's graph.
+			 * Snapshot stage output and permute NHWC->NCHW
+			 * in one pass. MLX recycles internal buffers
+			 * between graph_eval calls, so we materialize
+			 * a private NCHW copy in scratch before the
+			 * next stage builds its graph. Downstream
+			 * consumers (seg_head, mask decoder, geom
+			 * encoder) still require NCHW layout.
 			 */
-			stage_out[si] = gh_alloc_tensor(
-				scratch, x->dtype, x->n_dims, x->dims);
-			if (!stage_out[si]) return SAM3_ENOMEM;
-			memcpy(stage_out[si]->data, x->data, x->nbytes);
+			{
+				int sH = x->dims[1];
+				int sW = x->dims[2];
+				int sC = x->dims[3];
+				int nchw_dims_out[] = {1, sC, sH, sW};
+				stage_out[si] = gh_alloc_tensor(
+					scratch, x->dtype, 4, nchw_dims_out);
+				if (!stage_out[si]) return SAM3_ENOMEM;
+
+				const float *src = (const float *)x->data;
+				float *dst = (float *)stage_out[si]->data;
+				for (int h = 0; h < sH; h++) {
+					for (int w = 0; w < sW; w++) {
+						const float *pv =
+							src + ((long)h*sW+w)*sC;
+						for (int c = 0; c < sC; c++)
+							dst[((long)c*sH+h)*sW+w] =
+								pv[c];
+					}
+				}
+			}
 
 			{
 				const float *sd =
 					(const float *)stage_out[si]->data;
 				int sn = 1;
-				for (int sj = 0; sj < x->n_dims; sj++)
-					sn *= x->dims[sj];
+				for (int sj = 0; sj < stage_out[si]->n_dims; sj++)
+					sn *= stage_out[si]->dims[sj];
 				float smin = sd[0], smax = sd[0];
 				for (int sj = 0; sj < sn; sj++) {
 					if (sd[sj] < smin) smin = sd[sj];
 					if (sd[sj] > smax) smax = sd[sj];
 				}
-				sam3_log_debug("encode: feat[%d] "
+				sam3_log_debug("encode: feat[%d] nchw "
 					"[%d,%d,%d,%d] "
 					"min=%.4f max=%.4f",
-					si, x->dims[0], x->dims[1],
-					x->dims[2], x->dims[3],
+					si,
+					stage_out[si]->dims[0],
+					stage_out[si]->dims[1],
+					stage_out[si]->dims[2],
+					stage_out[si]->dims[3],
 					smin, smax);
 			}
 		}

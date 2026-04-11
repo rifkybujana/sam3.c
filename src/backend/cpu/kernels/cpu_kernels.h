@@ -218,9 +218,29 @@ enum sam3_error cpu_kernel_conv_transpose2d(const struct sam3_node *node,
 					    struct sam3_arena *scratch,
 					    struct sam3_threadpool *pool);
 
-/* Max pooling 2D: sliding-window max. params[0]=kernel, [1]=stride */
+/* Max pooling 2D: sliding-window max. params[0]=kernel, [1]=stride.
+ * NCHW path only; the NHWC wrapper below handles params[2]==1. */
 enum sam3_error cpu_kernel_maxpool2d(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
+
+/*
+ * cpu_maxpool2d_nhwc_wrap - Run the NCHW maxpool kernel on NHWC input
+ * by transposing to NCHW into scratch, calling the legacy path, and
+ * transposing the result back.
+ *
+ * @node:    Original node with NHWC input [N,H,W,C], NHWC output
+ *           [N,OH,OW,C], and params[2]==1.
+ * @scratch: Scratch arena for the NCHW intermediate buffers; offset
+ *           is saved/restored on every return path.
+ * @pool:    Thread pool forwarded to the inner NCHW kernel.
+ *
+ * Used by the FPN neck's scale=0.5 stage on the CPU backend. The
+ * production path runs on Metal (NHWC-native); this shim keeps the
+ * CPU test surface green without forking a second maxpool kernel.
+ */
+enum sam3_error cpu_maxpool2d_nhwc_wrap(const struct sam3_node *node,
+					struct sam3_arena *scratch,
+					struct sam3_threadpool *pool);
 
 /*
  * Tiled scaled dot-product attention.

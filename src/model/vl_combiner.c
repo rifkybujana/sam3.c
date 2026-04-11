@@ -146,6 +146,31 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 		return NULL;
 	}
 
+	/*
+	 * TODO(nhwc): remove bridge permute after Tasks 9/10.
+	 *
+	 * Task 8 made sam3_neck_build emit NHWC [1, H, W, d_model]
+	 * feature maps, but the seg_head (Task 9) and mask decoder
+	 * pixel decoder (Task 10) still expect NCHW
+	 * [1, d_model, H, W]. Downstream consumers in sam3_image.c
+	 * currently re-run the neck inline so out_features[] is only
+	 * read by tests, but the contract advertised in necks.h is
+	 * "NCHW output"; the permute below keeps that contract valid
+	 * until the rest of the pipeline migrates.
+	 */
+	static const int to_nchw[4] = {0, 3, 1, 2};
+	for (int i = 0; i < vl->neck.n_scales; i++) {
+		if (!out_features[i])
+			continue;
+		out_features[i] = gh_permute(g, scratch,
+					     out_features[i], to_nchw);
+		if (!out_features[i]) {
+			sam3_log_error("vl_backbone: neck bridge permute "
+				       "failed (stage %d)", i);
+			return NULL;
+		}
+	}
+
 	sam3_log_debug("vl_backbone: neck built, scratch %zu/%zu, %d nodes",
 		       scratch->offset, scratch->size, g->n_nodes);
 

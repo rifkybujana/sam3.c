@@ -1327,15 +1327,18 @@ struct sam3_tensor *gh_groupnorm_nhwc(struct sam3_graph *g,
 /* ── Convolution helpers ──────────────────────────────────────────── */
 
 /*
- * conv_add_bias - Add bias [C] to a 4D NCHW tensor via fused op.
+ * conv_add_bias - Add bias [C] to a 4D tensor via fused op.
  *
  * Uses SAM3_OP_BIAS_ADD which broadcasts bias along the channel
- * dimension. One op, one output allocation (same size as input).
+ * dimension. When @nhwc is non-zero, sets params[2]=1 so the CPU
+ * and Metal kernels treat the input as NHWC [N,H,W,C]; otherwise
+ * the kernel uses the legacy NCHW [N,C,H,W] layout.
  */
 static struct sam3_tensor *conv_add_bias(struct sam3_graph *g,
 					 struct sam3_arena *a,
 					 struct sam3_tensor *x,
-					 struct sam3_tensor *bias)
+					 struct sam3_tensor *bias,
+					 int nhwc)
 {
 	struct sam3_tensor *out = gh_alloc_tensor(a, x->dtype,
 						  x->n_dims, x->dims);
@@ -1343,7 +1346,15 @@ static struct sam3_tensor *conv_add_bias(struct sam3_graph *g,
 		return NULL;
 
 	struct sam3_tensor *inputs[] = {x, bias};
-	return sam3_graph_add_op(g, SAM3_OP_BIAS_ADD, inputs, 2, out);
+	out = sam3_graph_add_op(g, SAM3_OP_BIAS_ADD, inputs, 2, out);
+	if (!out)
+		return NULL;
+
+	if (nhwc) {
+		struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+		node->params[2] = 1;
+	}
+	return out;
 }
 
 struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
@@ -1378,7 +1389,7 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 	node->params[1] = padding;
 
 	if (bias)
-		out = conv_add_bias(g, a, out, bias);
+		out = conv_add_bias(g, a, out, bias, 0);
 
 	return out;
 }
@@ -1417,7 +1428,7 @@ struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 	node->params[1] = padding;
 
 	if (bias)
-		out = conv_add_bias(g, a, out, bias);
+		out = conv_add_bias(g, a, out, bias, 0);
 
 	return out;
 }
@@ -1456,7 +1467,7 @@ struct sam3_tensor *gh_conv2d_nhwc(struct sam3_graph *g,
 	node->params[2] = 1;  /* NHWC flag */
 
 	if (bias)
-		out = conv_add_bias(g, a, out, bias);
+		out = conv_add_bias(g, a, out, bias, 1);
 
 	return out;
 }
@@ -1496,7 +1507,7 @@ struct sam3_tensor *gh_conv_transpose2d_nhwc(struct sam3_graph *g,
 	node->params[2] = 1;  /* NHWC flag */
 
 	if (bias)
-		out = conv_add_bias(g, a, out, bias);
+		out = conv_add_bias(g, a, out, bias, 1);
 
 	return out;
 }

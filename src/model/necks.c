@@ -1,14 +1,18 @@
 /*
  * src/model/necks.c - Multi-scale feature pyramid neck implementation
  *
- * Implements Meta's SAM3 FPN neck architecture. For each scale stage,
- * the pipeline is: reshape to NCHW, optional MaxPool, spatial rescaling
- * via ConvTranspose2d (with GELU), 1x1 conv projection to d_model,
- * 3x3 conv spatial mixing. No layernorm in the FPN.
+ * Implements Meta's SAM3 FPN neck architecture on the NHWC layout.
+ * For each scale stage, the pipeline is: reshape [np, dim] directly
+ * to NHWC [1, gs, gs, dim], optional NHWC MaxPool, spatial rescaling
+ * via NHWC ConvTranspose2d (with GELU), 1x1 NHWC conv projection to
+ * d_model, 3x3 NHWC conv spatial mixing. Conv weights are permuted
+ * from checkpoint OIHW/IOHW to OHWI at load time (see
+ * permute_conv_weight); Task 12 moves this into sam3_convert.
  *
  * Key types:  sam3_neck
- * Depends on: necks.h, graph_helpers.h
- * Used by:    sam3.c (top-level image encoding pipeline)
+ * Depends on: necks.h, graph_helpers.h, util/log.h
+ * Used by:    vl_combiner.c (vision pipeline), tests/test_necks.c,
+ *             tests/test_neck_nhwc.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
@@ -19,6 +23,7 @@
 
 #include "necks.h"
 #include "graph_helpers.h"
+#include "util/log.h"
 
 /*
  * init_stage_4x - Scale 4.0: two ConvTranspose2d + 1x1 proj + 3x3 mix.
@@ -257,6 +262,86 @@ static void neck_weight_name(char *buf, size_t buflen,
 	}
 }
 
+/*
+ * permute_conv_weight - Copy-permute a neck conv weight into OHWI.
+ *
+ * @src:          Source weight loaded from the checkpoint.
+ *                Conv2d layout is OIHW [OC, IC, KH, KW].
+ *                ConvTranspose2d layout is IOHW [IC, OC, KH, KW].
+ * @arena:        Arena for the freshly allocated OHWI tensor.
+ * @is_transpose: 1 for ConvTranspose2d sources, 0 for Conv2d.
+ *
+ * Destination layout is always OHWI [OC, KH, KW, IC]. The source
+ * tensor may point into the mmap region or into a zero-initialised
+ * arena fallback; either way the data is copied element by element
+ * using sam3_dtype_size + memcpy so F32 and any future narrower
+ * dtype both work. Returns NULL on arena OOM or bad dtype.
+ *
+ * The original source header stays in the arena but is unreferenced
+ * — the caller replaces its pointer with the returned OHWI tensor.
+ * Task 12 will move this permute into sam3_convert so the weight
+ * lands in OHWI on disk and this helper can go away.
+ */
+static struct sam3_tensor *permute_conv_weight(struct sam3_tensor *src,
+					       struct sam3_arena *arena,
+					       int is_transpose)
+{
+	int oc = is_transpose ? src->dims[1] : src->dims[0];
+	int ic = is_transpose ? src->dims[0] : src->dims[1];
+	int kh = src->dims[2];
+	int kw = src->dims[3];
+
+	int dst_dims[] = {oc, kh, kw, ic};
+	struct sam3_tensor *dst = gh_alloc_tensor(arena, src->dtype,
+						  4, dst_dims);
+	if (!dst)
+		return NULL;
+
+	size_t esz = sam3_dtype_size(src->dtype);
+	if (esz == 0) {
+		sam3_log_error("neck permute: unsupported dtype %d",
+			       src->dtype);
+		return NULL;
+	}
+
+	const char *sbytes = (const char *)src->data;
+	char *dbytes = (char *)dst->data;
+
+	/*
+	 * Walk the OHWI destination linearly; compute the source
+	 * offset per element. Source stride order depends on whether
+	 * the layer is Conv2d (OIHW) or ConvTranspose2d (IOHW):
+	 *
+	 *   Conv2d:    s = ((o * IC + c) * KH + y) * KW + x
+	 *   ConvTrans: s = ((c * OC + o) * KH + y) * KW + x
+	 *
+	 * Destination:  d = ((o * KH + y) * KW + x) * IC + c
+	 */
+	for (int o = 0; o < oc; o++) {
+		for (int y = 0; y < kh; y++) {
+			for (int x = 0; x < kw; x++) {
+				for (int c = 0; c < ic; c++) {
+					size_t s;
+					if (is_transpose) {
+						s = (((size_t)c * oc + o)
+						     * kh + y) * kw + x;
+					} else {
+						s = (((size_t)o * ic + c)
+						     * kh + y) * kw + x;
+					}
+					size_t d = (((size_t)o * kh + y)
+						    * kw + x) * ic + c;
+					memcpy(dbytes + d * esz,
+					       sbytes + s * esz,
+					       esz);
+				}
+			}
+		}
+	}
+
+	return dst;
+}
+
 enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			       const struct sam3_weight_file *wf,
 			       struct sam3_arena *arena)
@@ -284,9 +369,22 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 
 			neck_weight_name(name, sizeof(name),
 					 neck, i, j, "weight");
-			neck->stages[i].conv_w[j] = gh_load_mmap(
+			struct sam3_tensor *raw_w = gh_load_mmap(
 				wf, name, arena, SAM3_DTYPE_F32,
 				4, w_dims);
+			if (!raw_w)
+				return SAM3_ENOMEM;
+
+			/*
+			 * Permute the conv weight from checkpoint
+			 * OIHW/IOHW to OHWI so gh_conv2d_nhwc /
+			 * gh_conv_transpose2d_nhwc can consume it
+			 * directly. Task 12 moves this into the
+			 * converter.
+			 */
+			neck->stages[i].conv_w[j] = permute_conv_weight(
+				raw_w, arena,
+				neck->stages[i].is_transpose[j]);
 			if (!neck->stages[i].conv_w[j])
 				return SAM3_ENOMEM;
 
@@ -307,24 +405,24 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 /*
  * build_stage - Build the compute graph for a single FPN stage.
  *
- * Pipeline:
- * 1. Reshape [n_patches, backbone_dim] -> [1, backbone_dim, gs, gs]
- * 2. Optional MaxPool(k=2, s=2)
- * 3. For each conv: ConvTranspose2d or Conv2d, optional GELU
+ * Pipeline (NHWC):
+ * 1. Optional NHWC MaxPool(k=2, s=2) on [1, H, W, dim]
+ * 2. For each conv: NHWC ConvTranspose2d or Conv2d (OHWI weight),
+ *    optional GELU
  *
- * Returns the output feature map [1, d_model, H_out, W_out], or NULL.
+ * Returns the output feature map [1, H_out, W_out, d_model], or NULL.
  */
 static struct sam3_tensor *build_stage(struct sam3_neck *neck,
 					int stage,
 					struct sam3_graph *g,
-					struct sam3_tensor *nchw_in,
+					struct sam3_tensor *nhwc_in,
 					struct sam3_arena *arena)
 {
-	struct sam3_tensor *x = nchw_in;
+	struct sam3_tensor *x = nhwc_in;
 
 	/* Optional MaxPool before convs */
 	if (neck->stages[stage].has_maxpool) {
-		x = gh_maxpool2d(g, arena, x, 2, 2);
+		x = gh_maxpool2d_nhwc(g, arena, x, 2, 2);
 		if (!x)
 			return NULL;
 	}
@@ -335,12 +433,12 @@ static struct sam3_tensor *build_stage(struct sam3_neck *neck,
 		int padding = (k == 3) ? 1 : 0;
 
 		if (neck->stages[stage].is_transpose[j]) {
-			x = gh_conv_transpose2d(g, arena, x,
+			x = gh_conv_transpose2d_nhwc(g, arena, x,
 				neck->stages[stage].conv_w[j],
 				neck->stages[stage].conv_b[j],
 				2, 0);
 		} else {
-			x = gh_conv2d(g, arena, x,
+			x = gh_conv2d_nhwc(g, arena, x,
 				neck->stages[stage].conv_w[j],
 				neck->stages[stage].conv_b[j],
 				1, padding);
@@ -368,21 +466,20 @@ enum sam3_error sam3_neck_build(struct sam3_neck *neck,
 		return SAM3_EINVAL;
 
 	/*
-	 * Shared NCHW reshape: [n_patches, backbone_dim] ->
-	 * [1, backbone_dim, gs, gs]. Done once, reused by all stages.
+	 * The ViT output is already channels-last: [n_patches,
+	 * backbone_dim] is exactly [1, gs*gs, dim] so a plain reshape
+	 * to NHWC [1, gs, gs, dim] is zero-copy. This replaces the
+	 * old gh_transpose + NCHW reshape pair.
 	 */
-	struct sam3_tensor *nchw = gh_transpose(g, arena, vit_features);
-	if (!nchw)
-		return SAM3_ENOMEM;
-
-	int nchw_dims[] = {1, neck->backbone_dim, neck->grid_size,
-			   neck->grid_size};
-	nchw = gh_reshape(g, arena, nchw, 4, nchw_dims);
-	if (!nchw)
+	int nhwc_dims[] = {1, neck->grid_size, neck->grid_size,
+			   neck->backbone_dim};
+	struct sam3_tensor *nhwc = gh_reshape(g, arena, vit_features,
+					      4, nhwc_dims);
+	if (!nhwc)
 		return SAM3_ENOMEM;
 
 	for (int i = 0; i < neck->n_scales; i++) {
-		out_features[i] = build_stage(neck, i, g, nchw, arena);
+		out_features[i] = build_stage(neck, i, g, nhwc, arena);
 		if (!out_features[i])
 			return SAM3_ENOMEM;
 	}

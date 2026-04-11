@@ -2,9 +2,14 @@
  * tests/test_necks.c - Feature pyramid neck unit tests
  *
  * Tests the multi-scale FPN neck with small dimensions to verify
- * initialization, weight loading, graph construction, and output
- * shapes. Uses zeroed weights (no weight file) and a small config:
- * d_model=16, backbone_dim=32, grid_size=4, 4 scales.
+ * initialization, weight loading, graph construction, and NHWC
+ * output shapes. Uses zeroed weights (no weight file) and a small
+ * config: d_model=16, backbone_dim=32, grid_size=4, 4 scales.
+ *
+ * After the NHWC migration (Task 8) the neck emits
+ * [1, H, W, d_model] feature maps and conv weights are stored in
+ * OHWI [OC, KH, KW, IC] order — both the shape assertions below
+ * reflect the new layout.
  *
  * Key types:  sam3_neck, sam3_graph, sam3_cpu_backend
  * Depends on: test_helpers.h, model/necks.h,
@@ -126,35 +131,42 @@ static void test_neck_load(void)
 	}
 
 	/*
-	 * Verify scale=4.0 stage weight shapes:
-	 * conv[0]: ConvT [dim, dim/2, 2, 2] = [32, 16, 2, 2]
-	 * conv[1]: ConvT [dim/2, dim/4, 2, 2] = [16, 8, 2, 2]
-	 * conv[2]: Conv1x1 [d_model, dim/4, 1, 1] = [16, 8, 1, 1]
-	 * conv[3]: Conv3x3 [d_model, d_model, 3, 3] = [16, 16, 3, 3]
+	 * Verify scale=4.0 stage weight shapes after the NHWC
+	 * migration. All conv weights (Conv2d and ConvTranspose2d)
+	 * are stored in OHWI [OC, KH, KW, IC] after permutation at
+	 * load time.
+	 *
+	 * conv[0]: ConvT dim->dim/2, k=2 -> OHWI [16, 2, 2, 32]
+	 * conv[1]: ConvT dim/2->dim/4, k=2 -> OHWI [8, 2, 2, 16]
+	 * conv[2]: Conv1x1 dim/4->d_model  -> OHWI [16, 1, 1, 8]
+	 * conv[3]: Conv3x3 d_model->d_model -> OHWI [16, 3, 3, 16]
 	 */
-	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[0], TEST_BACKBONE_DIM);
-	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[1],
+	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[0],
 		  TEST_BACKBONE_DIM / 2);
+	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[1], 2);
 	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[2], 2);
-	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[3], 2);
+	ASSERT_EQ(neck.stages[0].conv_w[0]->dims[3], TEST_BACKBONE_DIM);
 
 	ASSERT_EQ(neck.stages[0].conv_w[2]->dims[0], TEST_D_MODEL);
-	ASSERT_EQ(neck.stages[0].conv_w[2]->dims[1],
+	ASSERT_EQ(neck.stages[0].conv_w[2]->dims[1], 1);
+	ASSERT_EQ(neck.stages[0].conv_w[2]->dims[2], 1);
+	ASSERT_EQ(neck.stages[0].conv_w[2]->dims[3],
 		  TEST_BACKBONE_DIM / 4);
 
 	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[0], TEST_D_MODEL);
-	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[1], 3);
 	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[2], 3);
-	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[3], 3);
+	ASSERT_EQ(neck.stages[0].conv_w[3]->dims[3], TEST_D_MODEL);
 
 	/*
 	 * Verify scale=0.5 stage has 2 convs (maxpool is not a conv).
-	 * conv[0]: Conv1x1 [d_model, dim, 1, 1] = [16, 32, 1, 1]
-	 * conv[1]: Conv3x3 [d_model, d_model, 3, 3] = [16, 16, 3, 3]
+	 * conv[0]: Conv1x1 dim->d_model  -> OHWI [16, 1, 1, 32]
+	 * conv[1]: Conv3x3 d_model->d_model -> OHWI [16, 3, 3, 16]
 	 */
 	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[0], TEST_D_MODEL);
-	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[1], TEST_BACKBONE_DIM);
+	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[1], 1);
 	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[2], 1);
+	ASSERT_EQ(neck.stages[3].conv_w[0]->dims[3], TEST_BACKBONE_DIM);
 }
 
 /*
@@ -189,39 +201,39 @@ static void test_neck_build_shapes(void)
 	ASSERT_EQ(err, SAM3_OK);
 
 	/*
-	 * Expected output shapes (NCHW):
-	 * scale=4.0: [1, d_model, 16, 16]  (4*4 = 16)
-	 * scale=2.0: [1, d_model, 8, 8]    (4*2 = 8)
-	 * scale=1.0: [1, d_model, 4, 4]    (no change)
-	 * scale=0.5: [1, d_model, 2, 2]    (4/2 = 2)
+	 * Expected output shapes (NHWC [1, H, W, d_model]):
+	 * scale=4.0: [1, 16, 16, d_model]  (4*4 = 16)
+	 * scale=2.0: [1,  8,  8, d_model]  (4*2 = 8)
+	 * scale=1.0: [1,  4,  4, d_model]  (no change)
+	 * scale=0.5: [1,  2,  2, d_model]  (4/2 = 2)
 	 */
 	ASSERT(features[0] != NULL);
 	ASSERT_EQ(features[0]->n_dims, 4);
 	ASSERT_EQ(features[0]->dims[0], 1);
-	ASSERT_EQ(features[0]->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(features[0]->dims[1], TEST_GRID_SIZE * 4);
 	ASSERT_EQ(features[0]->dims[2], TEST_GRID_SIZE * 4);
-	ASSERT_EQ(features[0]->dims[3], TEST_GRID_SIZE * 4);
+	ASSERT_EQ(features[0]->dims[3], TEST_D_MODEL);
 
 	ASSERT(features[1] != NULL);
 	ASSERT_EQ(features[1]->n_dims, 4);
 	ASSERT_EQ(features[1]->dims[0], 1);
-	ASSERT_EQ(features[1]->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(features[1]->dims[1], TEST_GRID_SIZE * 2);
 	ASSERT_EQ(features[1]->dims[2], TEST_GRID_SIZE * 2);
-	ASSERT_EQ(features[1]->dims[3], TEST_GRID_SIZE * 2);
+	ASSERT_EQ(features[1]->dims[3], TEST_D_MODEL);
 
 	ASSERT(features[2] != NULL);
 	ASSERT_EQ(features[2]->n_dims, 4);
 	ASSERT_EQ(features[2]->dims[0], 1);
-	ASSERT_EQ(features[2]->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(features[2]->dims[1], TEST_GRID_SIZE);
 	ASSERT_EQ(features[2]->dims[2], TEST_GRID_SIZE);
-	ASSERT_EQ(features[2]->dims[3], TEST_GRID_SIZE);
+	ASSERT_EQ(features[2]->dims[3], TEST_D_MODEL);
 
 	ASSERT(features[3] != NULL);
 	ASSERT_EQ(features[3]->n_dims, 4);
 	ASSERT_EQ(features[3]->dims[0], 1);
-	ASSERT_EQ(features[3]->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(features[3]->dims[1], TEST_GRID_SIZE / 2);
 	ASSERT_EQ(features[3]->dims[2], TEST_GRID_SIZE / 2);
-	ASSERT_EQ(features[3]->dims[3], TEST_GRID_SIZE / 2);
+	ASSERT_EQ(features[3]->dims[3], TEST_D_MODEL);
 }
 
 /*

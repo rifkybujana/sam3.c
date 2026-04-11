@@ -1195,11 +1195,18 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 	case SAM3_OP_BIAS_ADD: {
 		/*
-		 * NCHW bias add: x[N,C,H,W] + bias[C].
-		 * Reshape bias to [1,C,1,1] for MLX broadcast.
+		 * Bias add with layout switch.
+		 *
+		 * params[2] == 0: NCHW x[N,C,H,W] + bias[C], broadcast
+		 *                 by reshaping bias to [1,C,1,1].
+		 * params[2] == 1: NHWC x[N,H,W,C] + bias[C], broadcast
+		 *                 by reshaping bias to [1,1,1,C].
 		 */
 		int ba_C = node->inputs[1]->dims[0];
-		int ba_shape[] = {1, ba_C, 1, 1};
+		int ba_shape_nchw[] = {1, ba_C, 1, 1};
+		int ba_shape_nhwc[] = {1, 1, 1, ba_C};
+		const int *ba_shape = node->params[2] ?
+			ba_shape_nhwc : ba_shape_nchw;
 		mlx_array ba_bias4d = mlx_array_new();
 		rc = mlx_reshape(&ba_bias4d, inputs[1],
 				 ba_shape, 4, stream);
