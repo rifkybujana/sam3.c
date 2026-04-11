@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pthread.h>
+#include <sys/qos.h>
+
 #include "sam3/sam3.h"
 #include "sam3/internal/mask_nms.h"
 #include "sam3/internal/mask_resize.h"
@@ -564,6 +567,15 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Run '%s -h' for usage.\n", argv[0]);
 		return 1;
 	}
+
+	/*
+	 * Bias the macOS scheduler toward P-cores so the kernel-launch
+	 * dispatch loop and CPU-side tensor wrappers don't get migrated
+	 * onto E-cores between Metal command buffer submissions. Cuts
+	 * P-core/E-core migration jitter on Apple Silicon. Best-effort:
+	 * a failure here is not fatal.
+	 */
+	(void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
 	/* Set log level */
 	if (args.verbose)

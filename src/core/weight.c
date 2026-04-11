@@ -376,6 +376,23 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 		goto fail;
 	}
 
+	/*
+	 * The initial scan above touches the header, the tensor table,
+	 * and (via build_hash_table) every tensor name — strictly
+	 * sequential, so MADV_SEQUENTIAL was the right hint. Inference,
+	 * however, accesses the data blob in a random-but-repeated
+	 * pattern (the same ~50 tensors per ViT block, per inference).
+	 * MADV_SEQUENTIAL would let the kernel drop those pages after
+	 * the first read, forcing re-faults on every subsequent block.
+	 *
+	 * Switch to MADV_RANDOM to discourage pre-eviction, then issue
+	 * MADV_WILLNEED to ask the kernel to prefetch the data blob
+	 * before the first inference. Both are best-effort hints.
+	 */
+	madvise(mapped, file_size, MADV_RANDOM);
+	madvise((void *)wf->data_base, file_size - data_start,
+		MADV_WILLNEED);
+
 	sam3_log_info("opened %s: %u tensors", path, hdr->n_tensors);
 	return SAM3_OK;
 
