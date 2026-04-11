@@ -28,7 +28,7 @@ Sits at offset 0. Validated with `_Static_assert(sizeof(...) == 48)`.
 | Offset | Field              | Type       | Description                          |
 |--------|--------------------|------------|--------------------------------------|
 | 0      | `magic`            | uint32_t   | `0x334D4153` (ASCII "SAM3", LE)      |
-| 4      | `version`          | uint32_t   | Format version (currently **2**)     |
+| 4      | `version`          | uint32_t   | Format version (currently **3**)     |
 | 8      | `flags`            | uint32_t   | Reserved, set to 0                   |
 | 12     | `n_tensors`        | uint32_t   | Total tensor count                   |
 | 16     | `image_size`       | int32_t    | Input resolution (e.g. 1008)         |
@@ -94,7 +94,7 @@ undefined for Q8_0.
 The loader (`sam3_weight_open()`) does:
 
 1. `mmap()` the file (read-only, `MAP_PRIVATE`)
-2. Validate magic (`0x334D4153`) and version (`2`)
+2. Validate magic (`0x334D4153`) and version (`3`)
 3. Bounds-check the descriptor table and all tensor data ranges
 4. Build an FNV-1a hash table for O(1) tensor lookup by name
    - Table size: next power of 2 >= 2 * `n_tensors`
@@ -142,3 +142,14 @@ The format does **not** include checksums. Integrity is ensured by:
 | `src/core/weight.h`        | Format structs and loader API     |
 | `src/core/weight.c`        | Loader and writer implementation  |
 | `tools/sam3_convert.c`     | SafeTensors -> .sam3 converter    |
+
+## Changelog
+
+### v3 (2026-04-10)
+- Conv2d weights stored in OHWI: `[C_out, KH, KW, C_in]`
+- ConvTranspose2d weights stored in OHWI: `[C_out, KH, KW, C_in]`
+- Enables zero-transpose conv execution on Metal/MLX (NHWC activations)
+- Loader rejects v2 files; regenerate via `sam3_convert`
+
+### v2 (2026-03-31)
+- Initial format as documented above, with conv weights in OIHW / IOHW

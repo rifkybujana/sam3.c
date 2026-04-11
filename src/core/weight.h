@@ -24,7 +24,7 @@
 
 /* .sam3 file magic: ASCII "SAM3" = 0x53414D33 (little-endian: 0x334D4153) */
 #define SAM3_WEIGHT_MAGIC   0x334D4153
-#define SAM3_WEIGHT_VERSION 2
+#define SAM3_WEIGHT_VERSION 3
 
 #define SAM3_WEIGHT_NAME_MAX   128
 #define SAM3_WEIGHT_DATA_ALIGN 64   /* per-tensor alignment in data blob */
