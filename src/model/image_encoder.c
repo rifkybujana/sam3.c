@@ -268,6 +268,74 @@ static struct sam3_tensor *tile_pos_embed(
 }
 
 /*
+ * permute_patch_embed_ohwi - Copy-permute patch embed conv weight
+ * from checkpoint OIHW [oc, ic, kh, kw] into OHWI
+ * [oc, kh, kw, ic].
+ *
+ * The source tensor `src` may point into the mmap region (via
+ * gh_load_mmap) which we must not mutate, or into a zero-initialised
+ * arena fallback. In both cases we allocate a fresh OHWI tensor from
+ * @arena and copy-permute element by element. Element width is
+ * resolved from the dtype so F32 and F16 both work.
+ *
+ * Returns the new OHWI tensor or NULL on arena OOM. The caller
+ * replaces its pointer with the return value; the original header
+ * survives in the arena but is unreferenced (arenas free en masse).
+ *
+ * Task 12 will move this transpose into the .sam3 converter so the
+ * weight lands in OHWI on disk and this helper can go away.
+ */
+static struct sam3_tensor *permute_patch_embed_ohwi(
+	struct sam3_arena *arena,
+	const struct sam3_tensor *src)
+{
+	int oc = src->dims[0];
+	int ic = src->dims[1];
+	int kh = src->dims[2];
+	int kw = src->dims[3];
+	int ohwi_dims[] = {oc, kh, kw, ic};
+
+	struct sam3_tensor *dst = gh_alloc_tensor(arena, src->dtype,
+						  4, ohwi_dims);
+	if (!dst)
+		return NULL;
+
+	size_t esz = sam3_dtype_size(src->dtype);
+	if (esz == 0) {
+		sam3_log_error("patch embed: unsupported dtype %d",
+			       src->dtype);
+		return NULL;
+	}
+
+	const char *sbytes = (const char *)src->data;
+	char *dbytes = (char *)dst->data;
+
+	/*
+	 * Source strides (OIHW, contiguous): [ic*kh*kw, kh*kw, kw, 1].
+	 * Destination strides (OHWI, contiguous): [kh*kw*ic, kw*ic,
+	 * ic, 1]. Walk destination linearly; compute the matching
+	 * source offset per element.
+	 */
+	for (int o = 0; o < oc; o++) {
+		for (int y = 0; y < kh; y++) {
+			for (int x = 0; x < kw; x++) {
+				for (int c = 0; c < ic; c++) {
+					size_t s = (((size_t)o * ic + c)
+						    * kh + y) * kw + x;
+					size_t d = (((size_t)o * kh + y)
+						    * kw + x) * ic + c;
+					memcpy(dbytes + d * esz,
+					       sbytes + s * esz,
+					       esz);
+				}
+			}
+		}
+	}
+
+	return dst;
+}
+
+/*
  * fuse_3 - Load 3 separate [d, d_in] weights and fuse into [3*d, d_in].
  */
 static struct sam3_tensor *fuse_3(const struct sam3_weight_file *wf,
@@ -317,13 +385,25 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	int ps = vit->patch_size;
 	char name[128];
 
-	/* Patch embedding: conv2d weight [embed_dim, 3, ps, ps] */
+	/*
+	 * Patch embedding: conv2d weight. The checkpoint stores this
+	 * as OIHW [embed_dim, 3, ps, ps]; we load the mmap view and
+	 * then copy-permute to OHWI [embed_dim, ps, ps, 3] so the
+	 * conv can use gh_conv2d_nhwc. The original OIHW header is
+	 * discarded. Task 12 moves this transpose into sam3_convert.
+	 */
 	int pe_w_dims[] = {e, 3, ps, ps};
-	vit->patch_embed_w = gh_load_mmap(wf,
+	struct sam3_tensor *pe_w_oihw = gh_load_mmap(wf,
 		VIT_P "embeddings.patch_embeddings.projection.weight",
 		arena, SAM3_DTYPE_F32, 4, pe_w_dims);
-	if (!vit->patch_embed_w)
+	if (!pe_w_oihw)
 		return SAM3_ENOMEM;
+
+	vit->patch_embed_w = permute_patch_embed_ohwi(arena, pe_w_oihw);
+	if (!vit->patch_embed_w) {
+		sam3_log_error("vit: patch embed permute to OHWI failed");
+		return SAM3_ENOMEM;
+	}
 
 	/* Patch embedding bias [embed_dim] — may not exist (bias_patch_embed=False) */
 	int pe_b_dims[] = {e};
@@ -583,42 +663,51 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	/*
 	 * Step 1: Patch embedding + pos_embed + ln_pre.
 	 *
-	 * Build a single graph: conv2d → reshape → transpose → add bias
-	 * → add pos_embed → layernorm. The Metal backend's Phase 3 uses
-	 * mlx_contiguous to ensure correct data layout for transposed views.
+	 * Build a single graph: conv2d (NHWC) -> reshape -> add bias
+	 * -> add pos_embed -> layernorm. The conv input is reshaped
+	 * from [3, img, img] to NHWC [1, img, img, 3] and the weight
+	 * was permuted to OHWI at load time (see sam3_vit_load). The
+	 * conv output [1, gs, gs, e] row-major reshapes directly to
+	 * [np, e] without the transpose the NCHW path used to need.
 	 */
 	SAM3_PROF_BEGIN(profiler, "vit_patch_embed");
 	sam3_graph_init(&g);
 
-	int img4d_dims[] = {1, 3, vit->img_size, vit->img_size};
-	struct sam3_tensor *image_4d;
-	image_4d = gh_reshape(&g, scratch, image, 4, img4d_dims);
-	if (!image_4d)
+	/*
+	 * The caller delivers the image as planar CHW [3, img, img]
+	 * (see sam3_normalize_rgb_chw). We reshape to NCHW
+	 * [1, 3, img, img] and then permute to NHWC [1, img, img, 3]
+	 * so the NHWC conv can consume it directly. The permute runs
+	 * as a graph op — it is a real data movement, not a view.
+	 */
+	int img_nchw_dims[] = {1, 3, vit->img_size, vit->img_size};
+	struct sam3_tensor *image_nchw;
+	image_nchw = gh_reshape(&g, scratch, image, 4, img_nchw_dims);
+	if (!image_nchw)
 		return NULL;
 
-	int conv_dims[] = {1, e, gs, gs};
+	int chw_to_hwc[] = {0, 2, 3, 1};
+	struct sam3_tensor *image_nhwc;
+	image_nhwc = gh_permute(&g, scratch, image_nchw, chw_to_hwc);
+	if (!image_nhwc)
+		return NULL;
+
 	struct sam3_tensor *conv_out;
-	conv_out = gh_alloc_tensor(scratch, SAM3_DTYPE_F32, 4, conv_dims);
+	conv_out = gh_conv2d_nhwc(&g, scratch, image_nhwc,
+				  vit->patch_embed_w, NULL,
+				  vit->patch_size, 0);
 	if (!conv_out)
 		return NULL;
 
-	struct sam3_tensor *conv_inputs[] = {image_4d, vit->patch_embed_w};
-	conv_out = sam3_graph_add_op(&g, SAM3_OP_CONV2D,
-				      conv_inputs, 2, conv_out);
-	if (!conv_out)
-		return NULL;
-
-	struct sam3_node *conv_node = &g.nodes[g.n_nodes - 1];
-	conv_node->params[0] = vit->patch_size;
-	conv_node->params[1] = 0;
-
-	int flat_dims[] = {e, np};
+	/*
+	 * conv_out is NHWC [1, gs, gs, e]. Row-major, this is exactly
+	 * [gs*gs, e] = [np, e] — the element order in memory already
+	 * has the embedding dim as the last, fastest-varying axis. A
+	 * single reshape replaces the old reshape+transpose pair.
+	 */
+	int flat_dims[] = {np, e};
 	struct sam3_tensor *x;
 	x = gh_reshape(&g, scratch, conv_out, 2, flat_dims);
-	if (!x)
-		return NULL;
-
-	x = gh_transpose(&g, scratch, x);
 	if (!x)
 		return NULL;
 

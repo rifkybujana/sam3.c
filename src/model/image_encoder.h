@@ -42,8 +42,15 @@ struct sam3_vit {
 	int grid_size;		/* 72 = img_size / patch_size */
 	int n_patches;		/* 5184 = grid_size^2 */
 
-	/* Patch embedding (implemented as conv2d) */
-	struct sam3_tensor *patch_embed_w; /* [embed_dim, 3, patch_size, patch_size] */
+	/*
+	 * Patch embedding (implemented as conv2d). Weight is permuted
+	 * from the checkpoint OIHW [embed_dim, 3, patch_size,
+	 * patch_size] into OHWI [embed_dim, patch_size, patch_size, 3]
+	 * at load time so the conv can be dispatched via
+	 * gh_conv2d_nhwc. Task 12 will move this transpose into the
+	 * .sam3 converter.
+	 */
+	struct sam3_tensor *patch_embed_w; /* [embed_dim, patch_size, patch_size, 3] */
 	struct sam3_tensor *patch_embed_b; /* [embed_dim] */
 
 	/* Absolute positional embedding (tiled from pretrain res) */

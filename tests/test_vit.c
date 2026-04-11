@@ -121,13 +121,17 @@ static void test_vit_load(void)
 	err = sam3_vit_load(&vit, NULL, &g_cpu.arena);
 	ASSERT_EQ(err, SAM3_OK);
 
-	/* Patch embedding weight */
+	/*
+	 * Patch embedding weight. The loader permutes checkpoint
+	 * OIHW [oc, 3, ps, ps] into OHWI [oc, ps, ps, 3] so the conv
+	 * can use the NHWC path.
+	 */
 	ASSERT(vit.patch_embed_w != NULL);
 	ASSERT_EQ(vit.patch_embed_w->n_dims, 4);
 	ASSERT_EQ(vit.patch_embed_w->dims[0], TEST_EMBED_DIM);
-	ASSERT_EQ(vit.patch_embed_w->dims[1], 3);
+	ASSERT_EQ(vit.patch_embed_w->dims[1], TEST_PATCH_SIZE);
 	ASSERT_EQ(vit.patch_embed_w->dims[2], TEST_PATCH_SIZE);
-	ASSERT_EQ(vit.patch_embed_w->dims[3], TEST_PATCH_SIZE);
+	ASSERT_EQ(vit.patch_embed_w->dims[3], 3);
 
 	/* Patch embedding bias */
 	ASSERT(vit.patch_embed_b != NULL);
