@@ -52,7 +52,15 @@ enum sam3_error cpu_kernel_gelu(const struct sam3_node *node,
 enum sam3_error cpu_kernel_layernorm(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
-/* Conv2D via im2col + matmul. scratch arena for temp buffers. */
+/*
+ * Conv2D via im2col + matmul.
+ *
+ * Input  [N,H,W,C_in] NHWC, weight [OC,KH,KW,C_in] OHWI,
+ * output [N,OH,OW,OC] NHWC. The CPU backend is test-only; Metal
+ * handles conv2d natively via MLX. The kernel transposes to
+ * NCHW/OIHW scratch buffers, runs the legacy im2col + matmul body,
+ * and transposes the result back.
+ */
 enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 				  struct sam3_arena *scratch,
 				  struct sam3_threadpool *pool);
@@ -152,7 +160,7 @@ enum sam3_error cpu_kernel_concat(const struct sam3_node *node,
 enum sam3_error cpu_kernel_slice(const struct sam3_node *node,
 				 struct sam3_threadpool *pool);
 
-/* Nearest-neighbor upsample 4D [N,C,H,W]: params[0]=scale */
+/* Nearest-neighbor upsample 4D NHWC [N,H,W,C]: params[0]=scale */
 enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
@@ -166,13 +174,27 @@ enum sam3_error cpu_kernel_rope_f16(const struct sam3_node *node,
 enum sam3_error cpu_kernel_rope_bf16(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
-/* Transposed conv2d: scatter-accumulate. scratch arena for temp buffers. */
+/*
+ * Transposed conv2d: scatter-accumulate.
+ *
+ * Input  [N,H,W,C_in] NHWC, weight [C_out,KH,KW,C_in] OHWI, output
+ * [N,OH,OW,C_out] NHWC. The CPU body is NCHW-only; the kernel shims
+ * into IOHW-packed scratch and transposes the result back. Test-only
+ * path; Metal handles conv_transpose2d via MLX.
+ */
 enum sam3_error cpu_kernel_conv_transpose2d(const struct sam3_node *node,
 					    struct sam3_arena *scratch,
 					    struct sam3_threadpool *pool);
 
-/* Max pooling 2D: sliding-window max. params[0]=kernel, [1]=stride */
+/*
+ * Max pooling 2D: sliding-window max. params[0]=kernel, [1]=stride.
+ *
+ * Input  [N,H,W,C] NHWC, output [N,OH,OW,C] NHWC. Test-only CPU
+ * path; Metal handles maxpool natively. The scratch arena is used
+ * for the NCHW transpose scaffolds.
+ */
 enum sam3_error cpu_kernel_maxpool2d(const struct sam3_node *node,
+				     struct sam3_arena *scratch,
 				     struct sam3_threadpool *pool);
 
 /*
@@ -183,8 +205,8 @@ enum sam3_error cpu_kernel_maxpool2d(const struct sam3_node *node,
 enum sam3_error cpu_kernel_sdpa(const struct sam3_node *node,
 				struct sam3_threadpool *pool);
 
-/* Group normalization on NCHW input.
- * inputs[0]=x[N,C,H,W], inputs[1]=gamma[C], inputs[2]=beta[C].
+/* Group normalization on NHWC input.
+ * inputs[0]=x[N,H,W,C], inputs[1]=gamma[C], inputs[2]=beta[C].
  * params[0]=num_groups. eps=1e-5.
  */
 enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,

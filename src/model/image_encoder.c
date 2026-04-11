@@ -267,8 +267,13 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	int ps = vit->patch_size;
 	char name[128];
 
-	/* Patch embedding: conv2d weight [embed_dim, 3, ps, ps] */
-	int pe_w_dims[] = {e, 3, ps, ps};
+	/*
+	 * Patch embedding Conv2d weight. sam3_convert permutes the
+	 * checkpoint OIHW [embed_dim, 3, ps, ps] tensor to OHWI
+	 * [embed_dim, ps, ps, 3] before writing, so the load path
+	 * maps it directly for the NHWC conv dispatch.
+	 */
+	int pe_w_dims[] = {e, ps, ps, 3};
 	vit->patch_embed_w = gh_load_mmap(wf,
 		VIT_P "embeddings.patch_embeddings.projection.weight",
 		arena, SAM3_DTYPE_F32, 4, pe_w_dims);
@@ -517,42 +522,51 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	/*
 	 * Step 1: Patch embedding + pos_embed + ln_pre.
 	 *
-	 * Build a single graph: conv2d → reshape → transpose → add bias
-	 * → add pos_embed → layernorm. The Metal backend's Phase 3 uses
-	 * mlx_contiguous to ensure correct data layout for transposed views.
+	 * Build a single graph: conv2d (NHWC) -> reshape -> add bias
+	 * -> add pos_embed -> layernorm. The conv input is reshaped
+	 * from [3, img, img] to NHWC [1, img, img, 3] and the weight
+	 * was permuted to OHWI at load time (see sam3_vit_load). The
+	 * conv output [1, gs, gs, e] row-major reshapes directly to
+	 * [np, e] without the transpose the NCHW path used to need.
 	 */
 	SAM3_PROF_BEGIN(profiler, "vit_patch_embed");
 	sam3_graph_init(&g);
 
-	int img4d_dims[] = {1, 3, vit->img_size, vit->img_size};
-	struct sam3_tensor *image_4d;
-	image_4d = gh_reshape(&g, scratch, image, 4, img4d_dims);
-	if (!image_4d)
+	/*
+	 * The caller delivers the image as planar CHW [3, img, img]
+	 * (see sam3_normalize_rgb_chw). We reshape to NCHW
+	 * [1, 3, img, img] and then permute to NHWC [1, img, img, 3]
+	 * so the NHWC conv can consume it directly. The permute runs
+	 * as a graph op — it is a real data movement, not a view.
+	 */
+	int img_nchw_dims[] = {1, 3, vit->img_size, vit->img_size};
+	struct sam3_tensor *image_nchw;
+	image_nchw = gh_reshape(&g, scratch, image, 4, img_nchw_dims);
+	if (!image_nchw)
 		return NULL;
 
-	int conv_dims[] = {1, e, gs, gs};
+	int chw_to_hwc[] = {0, 2, 3, 1};
+	struct sam3_tensor *image_nhwc;
+	image_nhwc = gh_permute(&g, scratch, image_nchw, chw_to_hwc);
+	if (!image_nhwc)
+		return NULL;
+
 	struct sam3_tensor *conv_out;
-	conv_out = gh_alloc_tensor(scratch, SAM3_DTYPE_F32, 4, conv_dims);
+	conv_out = gh_conv2d(&g, scratch, image_nhwc,
+				  vit->patch_embed_w, NULL,
+				  vit->patch_size, 0);
 	if (!conv_out)
 		return NULL;
 
-	struct sam3_tensor *conv_inputs[] = {image_4d, vit->patch_embed_w};
-	conv_out = sam3_graph_add_op(&g, SAM3_OP_CONV2D,
-				      conv_inputs, 2, conv_out);
-	if (!conv_out)
-		return NULL;
-
-	struct sam3_node *conv_node = &g.nodes[g.n_nodes - 1];
-	conv_node->params[0] = vit->patch_size;
-	conv_node->params[1] = 0;
-
-	int flat_dims[] = {e, np};
+	/*
+	 * conv_out is NHWC [1, gs, gs, e]. Row-major, this is exactly
+	 * [gs*gs, e] = [np, e] — the element order in memory already
+	 * has the embedding dim as the last, fastest-varying axis. A
+	 * single reshape replaces the old reshape+transpose pair.
+	 */
+	int flat_dims[] = {np, e};
 	struct sam3_tensor *x;
 	x = gh_reshape(&g, scratch, conv_out, 2, flat_dims);
-	if (!x)
-		return NULL;
-
-	x = gh_transpose(&g, scratch, x);
 	if (!x)
 		return NULL;
 

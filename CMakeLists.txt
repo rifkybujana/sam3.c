@@ -137,9 +137,15 @@ endif()
 add_executable(sam3_main tools/sam3_main.c)
 target_link_libraries(sam3_main sam3)
 
-add_executable(sam3_convert tools/sam3_convert.c tools/weight_rename.c)
+add_executable(sam3_convert
+	tools/sam3_convert.c
+	tools/weight_rename.c
+	tools/weight_conv_perm.c)
 target_include_directories(sam3_convert PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_convert sam3)
+
+add_executable(gen_nhwc_fixtures tools/gen_nhwc_fixtures.c)
+target_link_libraries(gen_nhwc_fixtures sam3)
 
 # Tests
 if(SAM3_TESTS)
@@ -167,6 +173,24 @@ if(SAM3_TESTS)
 	# test_fixture_compare needs to find fixtures and model at build time
 	if(TARGET test_fixture_compare)
 		target_compile_definitions(test_fixture_compare PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
+	# test_neck_nhwc reads pre-migration reference .bin fixtures
+	if(TARGET test_neck_nhwc)
+		target_compile_definitions(test_neck_nhwc PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
+	# test_seg_head_nhwc reads pre-migration reference .bin fixtures
+	if(TARGET test_seg_head_nhwc)
+		target_compile_definitions(test_seg_head_nhwc PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
+	# test_mask_decoder_nhwc reads pre-migration reference .bin fixtures
+	if(TARGET test_mask_decoder_nhwc)
+		target_compile_definitions(test_mask_decoder_nhwc PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 

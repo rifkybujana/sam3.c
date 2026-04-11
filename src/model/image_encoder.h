@@ -42,8 +42,13 @@ struct sam3_vit {
 	int grid_size;		/* 72 = img_size / patch_size */
 	int n_patches;		/* 5184 = grid_size^2 */
 
-	/* Patch embedding (implemented as conv2d) */
-	struct sam3_tensor *patch_embed_w; /* [embed_dim, 3, patch_size, patch_size] */
+	/*
+	 * Patch embedding (implemented as conv2d). The .sam3 converter
+	 * writes this weight in OHWI layout
+	 * [embed_dim, patch_size, patch_size, 3], matching the NHWC
+	 * conv dispatch path.
+	 */
+	struct sam3_tensor *patch_embed_w; /* [embed_dim, patch_size, patch_size, 3] */
 	struct sam3_tensor *patch_embed_b; /* [embed_dim] */
 
 	/* Absolute positional embedding (tiled from pretrain res) */

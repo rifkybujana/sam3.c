@@ -59,6 +59,12 @@ Comparison of the critical Metal inference stages over time:
 | + Power-state hints (QoS + MADV_RANDOM)               | 2340 |    0 | 1023 | 389 |  **3752** |
 | Speedup vs baseline                                   | -72% |-100% | -38% | -22% | **-76%** |
 
+The 2026-04-12 NHWC conv2d layout migration (TODO #3) is intentionally
+omitted from this table because it is wall-clock neutral (±1% thermal
+noise). It still landed as a source-level cleanup; see the
+**NHWC conv2d layout migration** subsection below for the stage
+comparison and rationale.
+
 The async row hides `text_blocks` entirely behind `vit_blocks` on a CPU
 worker thread (MLX-C 0.6 has a non-thread-safe process-wide Metal device
 cache, so the worker is pinned to the CPU backend). The image encoder
@@ -273,6 +279,43 @@ outlier (14.2 s) and the other four runs clustered at 9.3–10.1 s,
 vs. a warm-run floor of ~9.3 s after #4. The vit_blocks delta is
 the relevant signal: the critical-path transformer stack now spends
 ~3.3 s less per inference.
+
+### 2026-04-12 — NHWC conv2d layout migration (TODO #3)
+
+Full model-level NHWC migration: patch embed, neck, seg_head, mask
+decoder, CPU and Metal backends all consume NHWC activations directly.
+Conv2d / convtranspose2d weights stored in OHWI order in `.sam3` v3
+(see [docs/weight-format.md](docs/weight-format.md)). Removed −625 LOC
+of NCHW↔NHWC scaffolding.
+
+**Stage delta (3 Release trials, interleaved A/B with 30 s cooldowns to
+control for thermal drift, median, measured against the pre-#4 v2
+baseline to isolate the NHWC effect):**
+
+| Stage          | Baseline v2 | NHWC v3 | Delta |
+|----------------|------------:|--------:|------:|
+| vit_blocks     |        6549 |    6465 |   −84 |
+| neck           |         370 |     526 |  +156 |
+| mask_decode    |         873 |     831 |   −42 |
+| &nbsp;&nbsp;seg_head     |         266 |     292 |   +26 |
+| **Total wall** |       16890 |   16936 |   +47 |
+
+Wall-clock delta is within the ±1 % thermal variance of this machine,
+so NHWC is effectively neutral on MLX Metal. MLX already absorbs layout
+transposes internally inside its conv kernels, so eliminating the
+C-level permute does not expose a new shader-level win. The `neck`
+stage shows a consistent +150 ms regression: MLX's NHWC
+`convtranspose2d` path on the 72 → 288 FPN scale appears to hit a
+different, slightly slower kernel than the NCHW path; every other stage
+is within noise.
+
+The migration still lands because its benefits are architectural rather
+than numerical: −625 LOC of NCHW↔NHWC scaffolding, conv2d backends read
+activations with the natural MLX layout, `.sam3` v3 carries OHWI
+weights, and future kernel work (Winograd, im2col, Metal-side conv
+fusion) can assume NHWC inputs without pre-permutes. It also keeps the
+C layer consistent with how upsample, maxpool, groupnorm, and the
+transformer path already store 4D feature maps.
 
 ## Model Load Optimization History
 

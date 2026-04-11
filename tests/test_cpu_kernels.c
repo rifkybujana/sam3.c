@@ -686,10 +686,14 @@ static void test_transpose_large(void)
 
 static void test_conv2d_basic(void)
 {
-	/* Input: [1,1,4,4], Weight: [1,1,2,2], stride=1, pad=0 -> [1,1,3,3] */
-	int in_dims[] = {1, 1, 4, 4};
-	int w_dims[] = {1, 1, 2, 2};
-	int out_dims[] = {1, 1, 3, 3};
+	/*
+	 * NHWC input [N,H,W,C] = [1,4,4,1],
+	 * OHWI weight [OC,KH,KW,IC] = [1,2,2,1],
+	 * NHWC output = [1,3,3,1]. Stride=1, pad=0.
+	 */
+	int in_dims[] = {1, 4, 4, 1};
+	int w_dims[] = {1, 2, 2, 1};
+	int out_dims[] = {1, 3, 3, 1};
 
 	struct sam3_tensor *input = make_tensor(4, in_dims);
 	struct sam3_tensor *weight = make_tensor(4, w_dims);
@@ -723,10 +727,13 @@ static void test_conv2d_basic(void)
 
 static void test_conv2d_with_padding(void)
 {
-	/* Input: [1,1,3,3], Weight: [1,1,3,3], stride=1, pad=1 -> [1,1,3,3] */
-	int in_dims[] = {1, 1, 3, 3};
-	int w_dims[] = {1, 1, 3, 3};
-	int out_dims[] = {1, 1, 3, 3};
+	/*
+	 * NHWC input [1,3,3,1], OHWI weight [1,3,3,1],
+	 * NHWC output [1,3,3,1]. Stride=1, pad=1.
+	 */
+	int in_dims[] = {1, 3, 3, 1};
+	int w_dims[] = {1, 3, 3, 1};
+	int out_dims[] = {1, 3, 3, 1};
 
 	struct sam3_tensor *input = make_tensor(4, in_dims);
 	struct sam3_tensor *weight = make_tensor(4, w_dims);
@@ -760,10 +767,13 @@ static void test_conv2d_with_padding(void)
 
 static void test_conv2d_stride2(void)
 {
-	/* Input: [1,1,4,4], Weight: [1,1,2,2], stride=2, pad=0 -> [1,1,2,2] */
-	int in_dims[] = {1, 1, 4, 4};
-	int w_dims[] = {1, 1, 2, 2};
-	int out_dims[] = {1, 1, 2, 2};
+	/*
+	 * NHWC input [1,4,4,1], OHWI weight [1,2,2,1],
+	 * NHWC output [1,2,2,1]. Stride=2, pad=0.
+	 */
+	int in_dims[] = {1, 4, 4, 1};
+	int w_dims[] = {1, 2, 2, 1};
+	int out_dims[] = {1, 2, 2, 1};
 
 	struct sam3_tensor *input = make_tensor(4, in_dims);
 	struct sam3_tensor *weight = make_tensor(4, w_dims);
@@ -1116,8 +1126,13 @@ static void test_matmul_full_verify(void)
 
 static void test_conv2d_multi_channel(void)
 {
-	/* Input: [1,2,3,3], Weight: [2,2,2,2], stride=1, pad=0 -> [1,2,2,2] */
-	int in_dims[] = {1, 2, 3, 3};
+	/*
+	 * NHWC input [1,3,3,2] (C_in=2, interleaved: ch0=1.0,
+	 * ch1=2.0 at every pixel),
+	 * OHWI weight [2,2,2,2] (OC=2, KH=2, KW=2, IC=2) all-ones,
+	 * NHWC output [1,2,2,2] stride=1 pad=0.
+	 */
+	int in_dims[] = {1, 3, 3, 2};
 	int w_dims[] = {2, 2, 2, 2};
 	int out_dims[] = {1, 2, 2, 2};
 
@@ -1125,15 +1140,15 @@ static void test_conv2d_multi_channel(void)
 	struct sam3_tensor *weight = make_tensor(4, w_dims);
 	struct sam3_tensor *output = make_tensor(4, out_dims);
 
-	/* Fill input: channel 0 = all 1s, channel 1 = all 2s */
+	/* NHWC fill: each pixel has [c0=1.0, c1=2.0] interleaved */
 	float in_data[18];
-	for (int i = 0; i < 9; i++)
-		in_data[i] = 1.0f;
-	for (int i = 9; i < 18; i++)
-		in_data[i] = 2.0f;
+	for (int p = 0; p < 9; p++) {
+		in_data[p * 2 + 0] = 1.0f;
+		in_data[p * 2 + 1] = 2.0f;
+	}
 	fill_data(input, in_data);
 
-	/* Weight: all ones — each output = sum of 2x2 patch across 2 channels */
+	/* All-ones kernel: each filter sums 2x2 patch across 2 inputs */
 	float w_data[16];
 	for (int i = 0; i < 16; i++)
 		w_data[i] = 1.0f;
@@ -1152,11 +1167,12 @@ static void test_conv2d_multi_channel(void)
 	ASSERT_EQ(g_cpu.base.ops->graph_eval(&g_cpu.base, &g), SAM3_OK);
 
 	float *out = (float *)output->data;
-	/* Each output filter sums 2x2 from C=2 channels:
-	 * ch0: 4 * 1.0 = 4, ch1: 4 * 2.0 = 8, total = 12 per position */
-	for (int i = 0; i < 4; i++)
-		ASSERT_NEAR(out[i], 12.0f, EPS);
-	for (int i = 4; i < 8; i++)
+	/*
+	 * Per output pixel per filter: sum of 2x2 patch over 2 channels
+	 *   = 4 * 1.0 + 4 * 2.0 = 12
+	 * NHWC output [1,2,2,2] has 8 elements, all 12.0.
+	 */
+	for (int i = 0; i < 8; i++)
 		ASSERT_NEAR(out[i], 12.0f, EPS);
 }
 
@@ -1164,10 +1180,14 @@ static void test_conv2d_multi_channel(void)
 
 static void test_conv2d_multi_batch(void)
 {
-	/* Input: [2,1,3,3], Weight: [1,1,2,2], stride=1, pad=0 -> [2,1,2,2] */
-	int in_dims[] = {2, 1, 3, 3};
-	int w_dims[] = {1, 1, 2, 2};
-	int out_dims[] = {2, 1, 2, 2};
+	/*
+	 * NHWC input [2,3,3,1] (C_in=1, batch 0 all 1.0, batch 1
+	 * all 3.0), OHWI weight [1,2,2,1], NHWC output [2,2,2,1].
+	 * Stride=1 pad=0.
+	 */
+	int in_dims[] = {2, 3, 3, 1};
+	int w_dims[] = {1, 2, 2, 1};
+	int out_dims[] = {2, 2, 2, 1};
 
 	struct sam3_tensor *input = make_tensor(4, in_dims);
 	struct sam3_tensor *weight = make_tensor(4, w_dims);

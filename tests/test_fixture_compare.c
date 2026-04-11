@@ -140,17 +140,20 @@ static float compare_tensors(const char *label,
 }
 
 /*
- * compare_nchw_fixture - Compare a cached [1,C,H,W] tensor
- * against a fixture SafeTensors file containing a "features" tensor.
+ * compare_nhwc_fixture - Compare a cached NHWC [1,H,W,C] tensor
+ * against a fixture SafeTensors file containing a [1,C,H,W] NCHW
+ * "features" tensor. The actual data is permuted to NCHW before the
+ * element-wise comparison.
  */
-static float compare_nchw_fixture(const char *label,
+static float compare_nhwc_fixture(const char *label,
 				  const struct sam3_tensor *actual,
 				  const char *fixture_path,
 				  const char *tensor_name)
 {
 	int py_ndims, py_dims[SAM3_MAX_DIMS], py_nelems;
 	float *py_data;
-	float maxd;
+	float *nchw_buf = NULL;
+	float maxd = -1.0f;
 
 	py_data = load_fixture_tensor(fixture_path, tensor_name,
 				      &py_ndims, py_dims, &py_nelems);
@@ -159,20 +162,44 @@ static float compare_nchw_fixture(const char *label,
 		return -1.0f;
 	}
 
-	/* Verify shapes match (ignoring batch dim) */
-	int c_nelems = 1;
-	for (int d = 0; d < actual->n_dims; d++)
-		c_nelems *= actual->dims[d];
-
-	if (c_nelems != py_nelems) {
-		printf("  %-30s SKIP (shape mismatch: C=%d vs Py=%d)\n",
-		       label, c_nelems, py_nelems);
-		free(py_data);
-		return -1.0f;
+	if (actual->n_dims != 4) {
+		printf("  %-30s SKIP (expected 4 dims, got %d)\n",
+		       label, actual->n_dims);
+		goto out;
 	}
 
-	maxd = compare_tensors(label, (const float *)actual->data,
-			       py_data, py_nelems, 0.01f);
+	int H = actual->dims[1];
+	int W = actual->dims[2];
+	int C = actual->dims[3];
+	int nelems = H * W * C;
+
+	if (nelems != py_nelems) {
+		printf("  %-30s SKIP (shape mismatch: C=%d vs Py=%d)\n",
+		       label, nelems, py_nelems);
+		goto out;
+	}
+
+	nchw_buf = malloc((size_t)nelems * sizeof(float));
+	if (!nchw_buf) {
+		printf("  %-30s SKIP (alloc failed)\n", label);
+		goto out;
+	}
+
+	const float *src = (const float *)actual->data;
+	for (int h = 0; h < H; h++) {
+		for (int w = 0; w < W; w++) {
+			const float *row = src + (h * W + w) * C;
+			for (int c = 0; c < C; c++) {
+				nchw_buf[c * H * W + h * W + w] = row[c];
+			}
+		}
+	}
+
+	maxd = compare_tensors(label, nchw_buf, py_data,
+			       py_nelems, 0.01f);
+
+out:
+	free(nchw_buf);
 	free(py_data);
 	return maxd;
 }
@@ -400,26 +427,26 @@ static void test_end_to_end_fixture_input(void)
 	/* ── Compare intermediate cached features ──────────────── */
 	printf("\n  Intermediate stage comparison:\n");
 
-	if (proc.model.cached_feat_4x) {
-		compare_nchw_fixture(
+	if (proc.model.cached_feat_4x_nhwc) {
+		compare_nhwc_fixture(
 			"neck scale_4x",
-			proc.model.cached_feat_4x,
+			proc.model.cached_feat_4x_nhwc,
 			FIXTURE_DIR "/02_neck/scale_4x.safetensors",
 			"features");
 	}
 
-	if (proc.model.cached_feat_s0) {
-		compare_nchw_fixture(
+	if (proc.model.cached_feat_s0_nhwc) {
+		compare_nhwc_fixture(
 			"neck scale_2x",
-			proc.model.cached_feat_s0,
+			proc.model.cached_feat_s0_nhwc,
 			FIXTURE_DIR "/02_neck/scale_2x.safetensors",
 			"features");
 	}
 
-	if (proc.model.cached_feat_s1) {
-		compare_nchw_fixture(
+	if (proc.model.cached_feat_s1_nhwc) {
+		compare_nhwc_fixture(
 			"neck scale_1x",
-			proc.model.cached_feat_s1,
+			proc.model.cached_feat_s1_nhwc,
 			FIXTURE_DIR "/02_neck/scale_1x.safetensors",
 			"features");
 	}

@@ -79,10 +79,10 @@ struct sam3_mask_decoder {
 	struct sam3_tensor *final_out_w, *final_out_b;
 	struct sam3_tensor *final_ln_w, *final_ln_b;
 
-	/* Pixel decoder: transposed convolutions */
-	struct sam3_tensor *up_conv1_w, *up_conv1_b;	/* [256,64,2,2]/[64] */
+	/* Pixel decoder: transposed convolutions (OHWI after Task 10) */
+	struct sam3_tensor *up_conv1_w, *up_conv1_b;	/* [64,2,2,256]/[64] */
 	struct sam3_tensor *up_ln_w, *up_ln_b;		/* [64] */
-	struct sam3_tensor *up_conv2_w, *up_conv2_b;	/* [64,32,2,2]/[32] */
+	struct sam3_tensor *up_conv2_w, *up_conv2_b;	/* [32,2,2,64]/[32] */
 
 	/* 4 hypernetwork MLPs: [256] -> [256] -> [256] -> [32] */
 	struct {
@@ -96,9 +96,10 @@ struct sam3_mask_decoder {
 	struct sam3_tensor *iou_hidden_w, *iou_hidden_b;
 	struct sam3_tensor *iou_proj_out_w, *iou_proj_out_b;
 
-	/* Multi-scale skip connections: conv_s0 (32) and conv_s1 (64) */
-	struct sam3_tensor *conv_s0_w, *conv_s0_b;	/* [32,256,1,1]/[32] */
-	struct sam3_tensor *conv_s1_w, *conv_s1_b;	/* [64,256,1,1]/[64] */
+	/* Multi-scale skip connections: conv_s0 (32) and conv_s1 (64)
+	 * (OHWI after Task 10) */
+	struct sam3_tensor *conv_s0_w, *conv_s0_b;	/* [32,1,1,256]/[32] */
+	struct sam3_tensor *conv_s1_w, *conv_s1_b;	/* [64,1,1,256]/[64] */
 
 	/* Dense prompt embedding when no mask prompt is provided */
 	struct sam3_tensor *no_mask_embed;		/* [1, 256] */
@@ -143,10 +144,15 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
  *
  * @dec:       Loaded mask decoder
  * @g:         Graph to populate
- * @img_feat:  [n_pixels, d_model] fused image features
+ * @img_feat:  [n_pixels, d_model] fused image features, row-major
+ *             (h*W + w, c) so it reshapes to NHWC as a pure view
  * @grid_h:    Spatial height of image features
  * @grid_w:    Spatial width of image features
  * @prompt:    [n_prompt, d_model] sparse prompt tokens, or NULL
+ * @feat_s0:   [1, 4H, 4W, d_model] 2x-scale backbone feature (NHWC),
+ *             or NULL
+ * @feat_s1:   [1, 2H, 2W, d_model] 1x-scale backbone feature (NHWC),
+ *             or NULL
  * @arena:     Arena for intermediates
  * @out_masks: Receives [4, H, W] mask logits
  * @out_iou:   Receives [4] IoU predictions, or NULL

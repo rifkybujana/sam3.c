@@ -316,8 +316,9 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 	}
 
 	if (hdr->version != SAM3_WEIGHT_VERSION) {
-		sam3_log_error("weight_open: unsupported version %u in %s",
-			       hdr->version, path);
+		sam3_log_error("weight_open: unsupported version %u in %s "
+			       "(expected %u; regenerate via sam3_convert)",
+			       hdr->version, path, SAM3_WEIGHT_VERSION);
 		munmap(mapped, file_size);
 		memset(wf, 0, sizeof(*wf));
 		return SAM3_EMODEL;

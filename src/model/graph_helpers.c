@@ -560,12 +560,12 @@ struct sam3_tensor *gh_embed(struct sam3_graph *g, struct sam3_arena *a,
 struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input, int scale)
 {
-	/* Input: [N, C, H, W] -> Output: [N, C, H*scale, W*scale] */
+	/* Input: [N, H, W, C] -> Output: [N, H*scale, W*scale, C] */
 	int out_dims[4] = {
 		input->dims[0],
-		input->dims[1],
+		input->dims[1] * scale,
 		input->dims[2] * scale,
-		input->dims[3] * scale,
+		input->dims[3],
 	};
 
 	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
@@ -1225,10 +1225,10 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 /* ── Convolution helpers ──────────────────────────────────────────── */
 
 /*
- * conv_add_bias - Add bias [C] to a 4D NCHW tensor via fused op.
+ * conv_add_bias - Add bias [C] to an NHWC 4D tensor via fused op.
  *
- * Uses SAM3_OP_BIAS_ADD which broadcasts bias along the channel
- * dimension. One op, one output allocation (same size as input).
+ * Uses SAM3_OP_BIAS_ADD which broadcasts bias along the innermost
+ * channel dimension of an [N, H, W, C] tensor.
  */
 static struct sam3_tensor *conv_add_bias(struct sam3_graph *g,
 					 struct sam3_arena *a,
@@ -1251,16 +1251,16 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 			      int stride, int padding)
 {
 	int N = input->dims[0];
-	int H = input->dims[2];
-	int W = input->dims[3];
+	int H = input->dims[1];
+	int W = input->dims[2];
 	int OC = weight->dims[0];
-	int KH = weight->dims[2];
-	int KW = weight->dims[3];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
 
 	int OH = (H + 2 * padding - KH) / stride + 1;
 	int OW = (W + 2 * padding - KW) / stride + 1;
 
-	int out_dims[] = {N, OC, OH, OW};
+	int out_dims[] = {N, OH, OW, OC};
 	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
 						  4, out_dims);
 	if (!out)
@@ -1289,16 +1289,16 @@ struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 					int stride, int padding)
 {
 	int N = input->dims[0];
-	int H = input->dims[2];
-	int W = input->dims[3];
-	int C_out = weight->dims[1];
-	int KH = weight->dims[2];
-	int KW = weight->dims[3];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int OC = weight->dims[0];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
 
 	int OH = (H - 1) * stride - 2 * padding + KH;
 	int OW = (W - 1) * stride - 2 * padding + KW;
 
-	int out_dims[] = {N, C_out, OH, OW};
+	int out_dims[] = {N, OH, OW, OC};
 	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
 						  4, out_dims);
 	if (!out)
@@ -1324,15 +1324,16 @@ struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input,
 				int kernel_size, int stride)
 {
+	/* Non-overlapping NHWC max pool: [N,H,W,C] -> [N,OH,OW,C]. */
 	int N = input->dims[0];
-	int C = input->dims[1];
-	int H = input->dims[2];
-	int W = input->dims[3];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int C = input->dims[3];
 
 	int OH = (H - kernel_size) / stride + 1;
 	int OW = (W - kernel_size) / stride + 1;
 
-	int out_dims[] = {N, C, OH, OW};
+	int out_dims[] = {N, OH, OW, C};
 	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
 						  4, out_dims);
 	if (!out)

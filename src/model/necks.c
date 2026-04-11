@@ -1,14 +1,18 @@
 /*
  * src/model/necks.c - Multi-scale feature pyramid neck implementation
  *
- * Implements Meta's SAM3 FPN neck architecture. For each scale stage,
- * the pipeline is: reshape to NCHW, optional MaxPool, spatial rescaling
- * via ConvTranspose2d (with GELU), 1x1 conv projection to d_model,
- * 3x3 conv spatial mixing. No layernorm in the FPN.
+ * Implements Meta's SAM3 FPN neck architecture on the NHWC layout.
+ * For each scale stage, the pipeline is: reshape [np, dim] directly
+ * to NHWC [1, gs, gs, dim], optional NHWC MaxPool, spatial rescaling
+ * via NHWC ConvTranspose2d (with GELU), 1x1 NHWC conv projection to
+ * d_model, 3x3 NHWC conv spatial mixing. Conv weights already ship
+ * in OHWI on disk (permuted by sam3_convert, Task 12), so the load
+ * path consumes them directly with no runtime transpose.
  *
  * Key types:  sam3_neck
- * Depends on: necks.h, graph_helpers.h
- * Used by:    sam3.c (top-level image encoding pipeline)
+ * Depends on: necks.h, graph_helpers.h, util/log.h
+ * Used by:    vl_combiner.c (vision pipeline), tests/test_necks.c,
+ *             tests/test_neck_nhwc.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
@@ -19,6 +23,7 @@
 
 #include "necks.h"
 #include "graph_helpers.h"
+#include "util/log.h"
 
 /*
  * init_stage_4x - Scale 4.0: two ConvTranspose2d + 1x1 proj + 3x3 mix.
@@ -269,18 +274,12 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			compute_conv_dims(neck, i, j,
 					   &c_in, &c_out, &kh, &kw);
 
-			int w_dims[4];
-			if (neck->stages[i].is_transpose[j]) {
-				/* ConvTranspose2d: [C_in, C_out, KH, KW] */
-				w_dims[0] = c_in;
-				w_dims[1] = c_out;
-			} else {
-				/* Conv2d: [C_out, C_in, KH, KW] */
-				w_dims[0] = c_out;
-				w_dims[1] = c_in;
-			}
-			w_dims[2] = kh;
-			w_dims[3] = kw;
+			/*
+			 * Conv weights ship in OHWI [OC, KH, KW, IC]
+			 * for both Conv2d and ConvTranspose2d after
+			 * Task 12's permute in sam3_convert.
+			 */
+			int w_dims[4] = {c_out, kh, kw, c_in};
 
 			neck_weight_name(name, sizeof(name),
 					 neck, i, j, "weight");
@@ -307,20 +306,20 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 /*
  * build_stage - Build the compute graph for a single FPN stage.
  *
- * Pipeline:
- * 1. Reshape [n_patches, backbone_dim] -> [1, backbone_dim, gs, gs]
- * 2. Optional MaxPool(k=2, s=2)
- * 3. For each conv: ConvTranspose2d or Conv2d, optional GELU
+ * Pipeline (NHWC):
+ * 1. Optional NHWC MaxPool(k=2, s=2) on [1, H, W, dim]
+ * 2. For each conv: NHWC ConvTranspose2d or Conv2d (OHWI weight),
+ *    optional GELU
  *
- * Returns the output feature map [1, d_model, H_out, W_out], or NULL.
+ * Returns the output feature map [1, H_out, W_out, d_model], or NULL.
  */
 static struct sam3_tensor *build_stage(struct sam3_neck *neck,
 					int stage,
 					struct sam3_graph *g,
-					struct sam3_tensor *nchw_in,
+					struct sam3_tensor *nhwc_in,
 					struct sam3_arena *arena)
 {
-	struct sam3_tensor *x = nchw_in;
+	struct sam3_tensor *x = nhwc_in;
 
 	/* Optional MaxPool before convs */
 	if (neck->stages[stage].has_maxpool) {
@@ -368,21 +367,20 @@ enum sam3_error sam3_neck_build(struct sam3_neck *neck,
 		return SAM3_EINVAL;
 
 	/*
-	 * Shared NCHW reshape: [n_patches, backbone_dim] ->
-	 * [1, backbone_dim, gs, gs]. Done once, reused by all stages.
+	 * The ViT output is already channels-last: [n_patches,
+	 * backbone_dim] is exactly [1, gs*gs, dim] so a plain reshape
+	 * to NHWC [1, gs, gs, dim] is zero-copy. This replaces the
+	 * old gh_transpose + NCHW reshape pair.
 	 */
-	struct sam3_tensor *nchw = gh_transpose(g, arena, vit_features);
-	if (!nchw)
-		return SAM3_ENOMEM;
-
-	int nchw_dims[] = {1, neck->backbone_dim, neck->grid_size,
-			   neck->grid_size};
-	nchw = gh_reshape(g, arena, nchw, 4, nchw_dims);
-	if (!nchw)
+	int nhwc_dims[] = {1, neck->grid_size, neck->grid_size,
+			   neck->backbone_dim};
+	struct sam3_tensor *nhwc = gh_reshape(g, arena, vit_features,
+					      4, nhwc_dims);
+	if (!nhwc)
 		return SAM3_ENOMEM;
 
 	for (int i = 0; i < neck->n_scales; i++) {
-		out_features[i] = build_stage(neck, i, g, nchw, arena);
+		out_features[i] = build_stage(neck, i, g, nhwc, arena);
 		if (!out_features[i])
 			return SAM3_ENOMEM;
 	}

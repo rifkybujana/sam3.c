@@ -355,10 +355,19 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		return SAM3_ENOMEM;
 
 	/* ── Pixel decoder ──────────────────────────────────────── */
-	int conv1_w_dims[] = {256, 64, 2, 2};
+	/*
+	 * Pixel decoder conv weights ship in OHWI [OC, KH, KW, IC]
+	 * after Task 12's permute in sam3_convert. Source checkpoint
+	 * was IOHW for ConvTranspose2d (upscale_conv*) and OIHW for
+	 * Conv2d (conv_s*); both converge on the same OHWI layout.
+	 *
+	 * upscale_conv1: IOHW [256, 64, 2, 2] -> OHWI [64, 2, 2, 256]
+	 * upscale_conv2: IOHW [64, 32, 2, 2]  -> OHWI [32, 2, 2, 64]
+	 */
+	int conv1_w_dims[] = {64, 2, 2, 256};
 	int conv1_b_dims[] = {64};
 	int ln64_dims[] = {64};
-	int conv2_w_dims[] = {64, 32, 2, 2};
+	int conv2_w_dims[] = {32, 2, 2, 64};
 	int conv2_b_dims[] = {32};
 
 	dec->up_conv1_w = gh_load_mmap(wf,
@@ -488,8 +497,12 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 
 	/* ── Multi-scale skip connection convolutions ──────────── */
 	{
-		int s0w[] = {32, 256, 1, 1}, s0b[] = {32};
-		int s1w[] = {64, 256, 1, 1}, s1b[] = {64};
+		/* Conv2d weights ship in OHWI after Task 12's permute:
+		 * conv_s0: OIHW [32, 256, 1, 1] -> OHWI [32, 1, 1, 256]
+		 * conv_s1: OIHW [64, 256, 1, 1] -> OHWI [64, 1, 1, 256]
+		 */
+		int s0w[] = {32, 1, 1, 256}, s0b[] = {32};
+		int s1w[] = {64, 1, 1, 256}, s1b[] = {64};
 
 		dec->conv_s0_w = gh_load_mmap(wf,
 			P "conv_s0.weight", arena,
@@ -1004,38 +1017,38 @@ enum sam3_error sam3_mask_decoder_build(
 
 	/*
 	 * Step 5: Pixel decoder — upsample image features.
-	 * Reshape [n_pix, d_model] -> [1, d_model, grid_h, grid_w],
+	 * Reshape [n_pix, d_model] -> [1, H, W, d_model] (NHWC),
 	 * then 2x transposed conv + layer norm + GELU pipeline.
+	 *
+	 * keys is row-major [H*W, d] with element order
+	 * (h*W + w, c), which matches NHWC byte order exactly, so
+	 * the reshape is a pure view change with no data movement.
 	 */
 	struct sam3_tensor *px;
+	{
+		int nhwc_dims[] = {1, grid_h, grid_w, d};
+		px = gh_reshape(g, arena, keys, 4, nhwc_dims);
+		if (!px)
+			return SAM3_ENOMEM;
+	}
 
-	/* Transpose [n_pix, d] -> [d, n_pix] then reshape to NCHW */
-	px = gh_transpose(g, arena, keys);
-	if (!px)
-		return SAM3_ENOMEM;
-
-	int nchw_dims[] = {1, d, grid_h, grid_w};
-	px = gh_reshape(g, arena, px, 4, nchw_dims);
-	if (!px)
-		return SAM3_ENOMEM;
-
-	/* Conv transpose 1: [1, 256, H, W] -> [1, 64, 2H, 2W] */
+	/* Conv transpose 1: [1, H, W, 256] -> [1, 2H, 2W, 64] */
 	px = gh_conv_transpose2d(g, arena, px,
-				  dec->up_conv1_w, dec->up_conv1_b,
-				  2, 0);
+				       dec->up_conv1_w, dec->up_conv1_b,
+				       2, 0);
 	if (!px)
 		return SAM3_ENOMEM;
 
 	/*
 	 * Multi-scale skip: add conv_s1(feat_s1) at 2x resolution.
-	 * feat_s1 is [1, 256, 2H, 2W] from 1x FPN scale,
+	 * feat_s1 is [1, 2H, 2W, 256] from 1x FPN scale (NHWC),
 	 * conv_s1 projects 256→64 channels via 1x1 conv.
 	 */
 	if (feat_s1) {
 		struct sam3_tensor *skip1;
 		skip1 = gh_conv2d(g, arena, feat_s1,
-				   dec->conv_s1_w, dec->conv_s1_b,
-				   1, 0);
+					dec->conv_s1_w, dec->conv_s1_b,
+					1, 0);
 		if (!skip1)
 			return SAM3_ENOMEM;
 		px = gh_add(g, arena, px, skip1);
@@ -1044,28 +1057,26 @@ enum sam3_error sam3_mask_decoder_build(
 	}
 
 	/* Layer norm on 64-dim channels.
-	 * Reshape [1, 64, 2H, 2W] -> [4HW, 64] for LN,
-	 * then back to NCHW.
+	 * In NHWC [1, 2H, 2W, 64], channels are the innermost axis,
+	 * so a reshape to [4HW, 64] is a pure view. LN normalizes
+	 * across the last axis, then reshape back to NHWC.
 	 */
 	{
 		int h2 = grid_h * 2;
 		int w2 = grid_w * 2;
 		int hw2 = h2 * w2;
-		int flat_dims[] = {64, hw2};
-		int nchw2_dims[] = {1, 64, h2, w2};
+		int c1 = dec->up_ln_w->dims[0];
+		int flat_dims[] = {hw2, c1};
+		int nhwc2_dims[] = {1, h2, w2, c1};
 
 		px = gh_reshape(g, arena, px, 2, flat_dims);
-		if (!px) return SAM3_ENOMEM;
-		px = gh_transpose(g, arena, px);
 		if (!px) return SAM3_ENOMEM;
 
 		px = gh_layernorm(g, arena, px,
 				   dec->up_ln_w, dec->up_ln_b);
 		if (!px) return SAM3_ENOMEM;
 
-		px = gh_transpose(g, arena, px);
-		if (!px) return SAM3_ENOMEM;
-		px = gh_reshape(g, arena, px, 4, nchw2_dims);
+		px = gh_reshape(g, arena, px, 4, nhwc2_dims);
 		if (!px) return SAM3_ENOMEM;
 	}
 
@@ -1074,24 +1085,24 @@ enum sam3_error sam3_mask_decoder_build(
 	if (!px)
 		return SAM3_ENOMEM;
 
-	/* Conv transpose 2: [1, 64, 2H, 2W] -> [1, 32, 4H, 4W]
+	/* Conv transpose 2: [1, 2H, 2W, 64] -> [1, 4H, 4W, 32]
 	 * SAM2: act2(dc2(act1(ln1(dc1(src) + feat_s1))) + feat_s0) */
 	px = gh_conv_transpose2d(g, arena, px,
-				  dec->up_conv2_w, dec->up_conv2_b,
-				  2, 0);
+				       dec->up_conv2_w, dec->up_conv2_b,
+				       2, 0);
 	if (!px)
 		return SAM3_ENOMEM;
 
 	/*
 	 * Multi-scale skip: add conv_s0(feat_s0) at 4x resolution.
-	 * feat_s0 is [1, 256, 4H, 4W] from 2x FPN scale,
+	 * feat_s0 is [1, 4H, 4W, 256] from 2x FPN scale (NHWC),
 	 * conv_s0 projects 256→32 channels via 1x1 conv.
 	 */
 	if (feat_s0) {
 		struct sam3_tensor *skip0;
 		skip0 = gh_conv2d(g, arena, feat_s0,
-				   dec->conv_s0_w, dec->conv_s0_b,
-				   1, 0);
+					dec->conv_s0_w, dec->conv_s0_b,
+					1, 0);
 		if (!skip0)
 			return SAM3_ENOMEM;
 		px = gh_add(g, arena, px, skip0);
@@ -1105,17 +1116,18 @@ enum sam3_error sam3_mask_decoder_build(
 		return SAM3_ENOMEM;
 
 	/*
-	 * Flatten pixel features to [4H*4W, 32] for dot product.
-	 * px is [1, 32, 4H, 4W] -> reshape [32, 4H*4W] -> transpose.
+	 * Flatten pixel features for dot product.
+	 * px is NHWC [1, 4H, 4W, 32]; reshape to [4H*4W, 32] is a
+	 * pure view (channels are innermost), then transpose once to
+	 * [32, 4H*4W] so the downstream matmul can do
+	 * hyper_in [4, 32] @ px [32, final_hw] -> [4, final_hw].
 	 */
 	int final_h = grid_h * 4;
 	int final_w = grid_w * 4;
 	int final_hw = final_h * final_w;
 	{
-		int flat_dims[] = {dp, final_hw};
+		int flat_dims[] = {final_hw, dp};
 		px = gh_reshape(g, arena, px, 2, flat_dims);
-		if (!px) return SAM3_ENOMEM;
-		px = gh_transpose(g, arena, px);
 		if (!px) return SAM3_ENOMEM;
 	}
 	/* px is [final_hw, 32] */
@@ -1149,7 +1161,7 @@ enum sam3_error sam3_mask_decoder_build(
 
 	/*
 	 * Step 7: Mask logits = hyper_in @ px^T.
-	 * [4, 32] @ [32, final_hw] -> [4, final_hw].
+	 * hyper_in [4, 32] @ px^T [32, final_hw] -> [4, final_hw].
 	 */
 	struct sam3_tensor *px_t = gh_transpose(g, arena, px);
 	if (!px_t)

@@ -1,10 +1,11 @@
 /*
  * src/backend/cpu/kernels/cpu_upsample.c - Nearest-neighbor upsampling kernel
  *
- * Upsamples a 4D tensor [N, C, H, W] by an integer scale factor using
- * nearest-neighbor interpolation.  Each output pixel at (y, x) copies
- * the input pixel at (y/scale, x/scale).  The outer N*C dimension can
- * be parallelised across threads via the thread pool.
+ * Upsamples a 4D tensor by an integer scale factor using nearest-
+ * neighbor interpolation. Input and output are NHWC [N, H, W, C].
+ * Each output pixel at (y, x) copies the full C-wide channel vector
+ * from the input pixel at (y/scale, x/scale). Parallelised across
+ * output rows (N * dst_h) via the thread pool.
  *
  * Key types:  sam3_node, sam3_tensor
  * Depends on: cpu_kernels.h, core/tensor.h, util/log.h, util/threadpool.h
@@ -30,34 +31,47 @@ struct upsample_ctx {
 	int         dst_h;
 	int         dst_w;
 	int         scale;
-	int         nc;       /* N * C */
+	int         n;        /* batch size */
+	int         c;        /* channels */
 };
 
-static void upsample_parallel_fn(void *arg, int task_id, int n_tasks)
+/*
+ * NHWC nearest-neighbor upsample: parallel over output rows (N*dst_h).
+ * For each output (y, x) pixel, copy the full C-wide channel vector
+ * from the source pixel at (y/scale, x/scale).
+ */
+static void upsample_nhwc_fn(void *arg, int task_id, int n_tasks)
 {
 	struct upsample_ctx *ctx = (struct upsample_ctx *)arg;
 	size_t esz = ctx->esz;
-	int chunk = ctx->nc / n_tasks;
+	size_t row_bytes = (size_t)ctx->c * esz;
+	int total_rows = ctx->n * ctx->dst_h;
+	int chunk = total_rows / n_tasks;
 	int start = task_id * chunk;
-	int end = (task_id == n_tasks - 1) ? ctx->nc : start + chunk;
+	int end = (task_id == n_tasks - 1) ? total_rows : start + chunk;
 
-	int src_plane = ctx->src_h * ctx->src_w;
-	int dst_plane = ctx->dst_h * ctx->dst_w;
+	size_t src_row_stride = (size_t)ctx->src_w * row_bytes;
+	size_t dst_row_stride = (size_t)ctx->dst_w * row_bytes;
+	size_t src_img_stride = (size_t)ctx->src_h * src_row_stride;
+	size_t dst_img_stride = (size_t)ctx->dst_h * dst_row_stride;
 
-	for (int nc = start; nc < end; nc++) {
-		const char *sp = (const char *)ctx->src +
-				 (size_t)nc * src_plane * esz;
-		char *dp = (char *)ctx->dst +
-			   (size_t)nc * dst_plane * esz;
+	for (int r = start; r < end; r++) {
+		int n = r / ctx->dst_h;
+		int y = r % ctx->dst_h;
+		int sy = y / ctx->scale;
 
-		for (int y = 0; y < ctx->dst_h; y++) {
-			int sy = y / ctx->scale;
-			for (int x = 0; x < ctx->dst_w; x++) {
-				int sx = x / ctx->scale;
-				memcpy(dp + (size_t)(y * ctx->dst_w + x) * esz,
-				       sp + (size_t)(sy * ctx->src_w + sx) * esz,
-				       esz);
-			}
+		const char *src_row = (const char *)ctx->src +
+				      (size_t)n * src_img_stride +
+				      (size_t)sy * src_row_stride;
+		char *dst_row = (char *)ctx->dst +
+				(size_t)n * dst_img_stride +
+				(size_t)y * dst_row_stride;
+
+		for (int x = 0; x < ctx->dst_w; x++) {
+			int sx = x / ctx->scale;
+			memcpy(dst_row + (size_t)x * row_bytes,
+			       src_row + (size_t)sx * row_bytes,
+			       row_bytes);
 		}
 	}
 }
@@ -86,19 +100,18 @@ enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	int n = inp->dims[0];
-	int c = inp->dims[1];
-	int src_h = inp->dims[2];
-	int src_w = inp->dims[3];
+	int n     = inp->dims[0];
+	int src_h = inp->dims[1];
+	int src_w = inp->dims[2];
+	int c     = inp->dims[3];
 	int dst_h = src_h * scale;
 	int dst_w = src_w * scale;
 
-	/* Validate output shape */
-	if (out->dims[0] != n || out->dims[1] != c ||
-	    out->dims[2] != dst_h || out->dims[3] != dst_w) {
-		sam3_log_error("upsample: output shape mismatch, "
+	if (out->dims[0] != n || out->dims[1] != dst_h ||
+	    out->dims[2] != dst_w || out->dims[3] != c) {
+		sam3_log_error("upsample: NHWC output shape mismatch, "
 			       "expected [%d,%d,%d,%d]",
-			       n, c, dst_h, dst_w);
+			       n, dst_h, dst_w, c);
 		return SAM3_EINVAL;
 	}
 
@@ -111,17 +124,20 @@ enum sam3_error cpu_kernel_upsample(const struct sam3_node *node,
 		.dst_h = dst_h,
 		.dst_w = dst_w,
 		.scale = scale,
-		.nc    = n * c,
+		.n     = n,
+		.c     = c,
 	};
 
 	int n_tasks = sam3_threadpool_n_threads(pool);
 	if (n_tasks < 1)
 		n_tasks = 1;
-	if (n_tasks > ctx.nc)
-		n_tasks = ctx.nc;
 
-	sam3_threadpool_parallel_for(pool, upsample_parallel_fn, &ctx,
-				     n_tasks);
+	int rows = ctx.n * ctx.dst_h;
+	if (n_tasks > rows)
+		n_tasks = rows;
+	if (n_tasks < 1)
+		n_tasks = 1;
+	sam3_threadpool_parallel_for(pool, upsample_nhwc_fn, &ctx, n_tasks);
 
 	return SAM3_OK;
 }

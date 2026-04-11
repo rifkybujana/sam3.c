@@ -349,9 +349,9 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 	 * Evaluate FPN neck stages one at a time.
 	 *
 	 * Evaluating all 4 stages in a single graph causes the shared
-	 * NCHW input tensor to be corrupted (MLX reuses intermediate
-	 * buffers). Instead, we: (1) evaluate transpose+reshape to get
-	 * NCHW, (2) evaluate each stage as its own graph.
+	 * NHWC input tensor to be corrupted (MLX reuses intermediate
+	 * buffers). Instead, we wrap the ViT output as NHWC and then
+	 * evaluate each stage as its own graph.
 	 *
 	 * All scratch allocations accumulate (no arena resets) so that
 	 * stage outputs survive until we copy them to persist at the end.
@@ -359,73 +359,76 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 	SAM3_PROF_BEGIN(profiler, "neck");
 	{
 		/*
-		 * Step 1: Manual C transpose from [pixels, C] to NCHW.
+		 * Step 1: Wrap the ViT output as an NHWC tensor.
 		 *
-		 * ViT output is [HW, C] row-major. We need [1, C, H, W].
-		 * The MLX graph-based transpose produces garbage due to
-		 * intermediate buffer handling, so we do it in C.
+		 * ViT output is [HW, C] row-major, which is already
+		 * the NHWC byte layout for [1, gs, gs, C]. After the
+		 * Task 8 neck migration, the neck conv weights are
+		 * stored OHWI and the NHWC conv helpers consume NHWC
+		 * input directly, so no transpose is needed here.
 		 *
-		 * dst[c * HW + p] = src[p * C + c]
+		 * All downstream consumers (seg_head, mask decoder,
+		 * geom encoder / fusion) are NHWC after Task 10, so
+		 * stage outputs are snapshotted only in NHWC. The
+		 * geometry encoder / fusion path gets the 1x NHWC
+		 * feature reshaped to [H*W, d_model] as a pure view
+		 * (NHWC byte order already matches row-major [HW, d]).
 		 */
 		sam3_arena_reset(scratch);
 
 		int C = model->backbone.neck.backbone_dim;
 		int gs = model->backbone.neck.grid_size;
 		int HW = gs * gs;
-		int nchw_dims[] = {1, C, gs, gs};
-		size_t nchw_bytes = (size_t)C * HW * sizeof(float);
-		void *nchw_buf = sam3_arena_alloc(scratch, nchw_bytes);
-		if (!nchw_buf) return SAM3_ENOMEM;
+		int nhwc_dims[] = {1, gs, gs, C};
+		size_t nhwc_bytes = (size_t)C * HW * sizeof(float);
 
+		sam3_log_debug("encode: neck NHWC wrap [%d,%d,%d,%d]",
+			       1, gs, gs, C);
+
+		/* Dump raw ViT NHWC for debugging */
 		{
-			const float *src = (const float *)vit_out->data;
-			float *dst = (float *)nchw_buf;
-			for (int p = 0; p < HW; p++)
-				for (int c = 0; c < C; c++)
-					dst[c * HW + p] = src[p * C + c];
-		}
-
-		sam3_log_debug("encode: nchw manual transpose done "
-			"[%d,%d,%d,%d]", 1, C, gs, gs);
-
-		/* Dump raw ViT NCHW for debugging */
-		{
-			int nchw_sd2[] = {1, C, gs, gs};
+			int nhwc_sd2[] = {1, gs, gs, C};
 			struct sam3_tensor tmp;
 			tmp.dtype = SAM3_DTYPE_F32;
 			tmp.n_dims = 4;
-			for (int k = 0; k < 4; k++) tmp.dims[k] = nchw_sd2[k];
-			tmp.data = nchw_buf;
-			tmp.nbytes = nchw_bytes;
-			dump_tensor("/tmp/dbg_vit_nchw.bin", &tmp);
+			for (int k = 0; k < 4; k++) tmp.dims[k] = nhwc_sd2[k];
+			tmp.data = vit_out->data;
+			tmp.nbytes = nhwc_bytes;
+			dump_tensor("/tmp/dbg_vit_nhwc.bin", &tmp);
 		}
 
-		/* Step 2: Evaluate each stage independently */
-		struct sam3_tensor *stage_out[4] = {0};
+		/*
+		 * Step 2: Evaluate each stage independently in NHWC.
+		 *
+		 * After Task 10 every downstream consumer is NHWC,
+		 * so we snapshot only the NHWC payload.
+		 */
+		struct sam3_tensor *stage_out_nhwc[4] = {0};
 
 		for (int si = 0; si < model->backbone.neck.n_scales; si++) {
 			/*
-			 * Copy nchw_buf for each stage to prevent
-			 * cross-stage corruption. The backend may
-			 * reuse or invalidate input buffers after
-			 * graph_eval.
+			 * Copy the ViT NHWC payload per stage. MLX
+			 * may invalidate input buffers after a
+			 * graph_eval, so each stage gets its own
+			 * private copy of the shared input.
 			 */
-			void *stage_nchw = sam3_arena_alloc(scratch,
-							    nchw_bytes);
-			if (!stage_nchw) return SAM3_ENOMEM;
-			memcpy(stage_nchw, nchw_buf, nchw_bytes);
+			void *stage_nhwc = sam3_arena_alloc(scratch,
+							    nhwc_bytes);
+			if (!stage_nhwc) return SAM3_ENOMEM;
+			memcpy(stage_nhwc, vit_out->data, nhwc_bytes);
 
-			struct sam3_tensor *nchw_in;
-			nchw_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
-						  4, nchw_dims, stage_nchw);
-			if (!nchw_in) return SAM3_ENOMEM;
+			struct sam3_tensor *nhwc_in;
+			nhwc_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+						  4, nhwc_dims, stage_nhwc);
+			if (!nhwc_in) return SAM3_ENOMEM;
 
-			struct sam3_tensor *x = nchw_in;
+			struct sam3_tensor *x = nhwc_in;
 
 			if (model->backbone.neck.stages[si].has_maxpool) {
 				struct sam3_graph g_stage;
 				sam3_graph_init(&g_stage);
-				x = gh_maxpool2d(&g_stage, scratch, x, 2, 2);
+				x = gh_maxpool2d(&g_stage, scratch,
+						      x, 2, 2);
 				if (!x) return SAM3_ENOMEM;
 				err = be->ops->graph_eval(be, &g_stage);
 				if (err != SAM3_OK) return err;
@@ -461,35 +464,41 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 				err = be->ops->graph_eval(be, &g_stage);
 				if (err != SAM3_OK) return err;
 
-				/* Snapshot layer output + smoothness */
+				/* Snapshot layer output + smoothness (NHWC) */
 				{
 					const float *ld =
 						(const float *)x->data;
-					int lC = x->dims[1];
-					int lH = x->dims[2];
-					int lW = x->dims[3];
-					int ln = lC * lH * lW;
+					int lH = x->dims[1];
+					int lW = x->dims[2];
+					int lC = x->dims[3];
 					float lmin = ld[0], lmax = ld[0];
 					double la = 0, ldw = 0, ldh = 0;
 					long ca = 0, cw2 = 0, ch3 = 0;
-					for (int c = 0; c < lC; c++) {
-						const float *lc =
-							ld + (long)c*lH*lW;
-						for (int h = 0; h < lH; h++)
+					for (int h = 0; h < lH; h++) {
 						for (int w = 0; w < lW; w++) {
-							float v = lc[h*lW+w];
-							if (v < lmin) lmin = v;
-							if (v > lmax) lmax = v;
-							la += fabs(v); ca++;
+							const float *pv =
+							  ld + ((long)h*lW+w)*lC;
+							for (int c = 0; c < lC; c++) {
+								float v = pv[c];
+								if (v < lmin) lmin = v;
+								if (v > lmax) lmax = v;
+								la += fabs(v); ca++;
+							}
 							if (w+1<lW) {
-								ldw += fabs(v-
-								  lc[h*lW+w+1]);
-								cw2++;
+								const float *pn =
+								  ld + ((long)h*lW+w+1)*lC;
+								for (int c = 0; c < lC; c++) {
+									ldw += fabs(pv[c]-pn[c]);
+									cw2++;
+								}
 							}
 							if (h+1<lH) {
-								ldh += fabs(v-
-								  lc[(h+1)*lW+w]);
-								ch3++;
+								const float *pn =
+								  ld + ((long)(h+1)*lW+w)*lC;
+								for (int c = 0; c < lC; c++) {
+									ldh += fabs(pv[c]-pn[c]);
+									ch3++;
+								}
 							}
 						}
 					}
@@ -497,7 +506,7 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 					double rw = (ldw/cw2)/(lm+1e-8);
 					double rh = (ldh/ch3)/(lm+1e-8);
 					sam3_log_debug("encode: neck[%d].layer[%d]"
-						" [%d,%d,%d,%d] min=%.4f"
+						" nhwc [%d,%d,%d,%d] min=%.4f"
 						" max=%.4f rw=%.3f rh=%.3f",
 						si, j,
 						x->dims[0], x->dims[1],
@@ -512,106 +521,92 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 			}
 
 			/*
-			 * Copy stage output to scratch immediately.
-			 * MLX recycles internal buffers between
-			 * graph_eval calls, so we must snapshot data
-			 * before building the next stage's graph.
+			 * Snapshot stage output in NHWC. MLX recycles
+			 * internal buffers between graph_eval calls,
+			 * so we materialize a private copy in scratch
+			 * before the next stage builds its graph.
 			 */
-			stage_out[si] = gh_alloc_tensor(
-				scratch, x->dtype, x->n_dims, x->dims);
-			if (!stage_out[si]) return SAM3_ENOMEM;
-			memcpy(stage_out[si]->data, x->data, x->nbytes);
+			{
+				int sH = x->dims[1];
+				int sW = x->dims[2];
+				int sC = x->dims[3];
+				int nhwc_dims_out[] = {1, sH, sW, sC};
+
+				stage_out_nhwc[si] = gh_alloc_tensor(
+					scratch, x->dtype, 4, nhwc_dims_out);
+				if (!stage_out_nhwc[si]) return SAM3_ENOMEM;
+				memcpy(stage_out_nhwc[si]->data, x->data,
+				       stage_out_nhwc[si]->nbytes);
+			}
 
 			{
 				const float *sd =
-					(const float *)stage_out[si]->data;
+					(const float *)stage_out_nhwc[si]->data;
 				int sn = 1;
-				for (int sj = 0; sj < x->n_dims; sj++)
-					sn *= x->dims[sj];
+				for (int sj = 0; sj < stage_out_nhwc[si]->n_dims; sj++)
+					sn *= stage_out_nhwc[si]->dims[sj];
 				float smin = sd[0], smax = sd[0];
 				for (int sj = 0; sj < sn; sj++) {
 					if (sd[sj] < smin) smin = sd[sj];
 					if (sd[sj] > smax) smax = sd[sj];
 				}
-				sam3_log_debug("encode: feat[%d] "
+				sam3_log_debug("encode: feat[%d] nhwc "
 					"[%d,%d,%d,%d] "
 					"min=%.4f max=%.4f",
-					si, x->dims[0], x->dims[1],
-					x->dims[2], x->dims[3],
+					si,
+					stage_out_nhwc[si]->dims[0],
+					stage_out_nhwc[si]->dims[1],
+					stage_out_nhwc[si]->dims[2],
+					stage_out_nhwc[si]->dims[3],
 					smin, smax);
 			}
 		}
 
-		/* Step 3: Copy outputs to persist arena */
-		struct sam3_tensor *pf[4];
+		/*
+		 * Step 3: Copy outputs to persist arena. Only NHWC
+		 * snapshots are retained after Task 10 — every
+		 * downstream consumer (geom encoder, fusion, decoder,
+		 * seg_head, mask decoder) now reads NHWC directly.
+		 */
+		struct sam3_tensor *pfn[4];
 		for (int si = 0; si < 4; si++) {
-			pf[si] = gh_alloc_tensor(persist, stage_out[si]->dtype,
-						  stage_out[si]->n_dims,
-						  stage_out[si]->dims);
-			if (!pf[si]) return SAM3_ENOMEM;
-			memcpy(pf[si]->data, stage_out[si]->data,
-			       stage_out[si]->nbytes);
+			pfn[si] = gh_alloc_tensor(persist,
+				stage_out_nhwc[si]->dtype,
+				stage_out_nhwc[si]->n_dims,
+				stage_out_nhwc[si]->dims);
+			if (!pfn[si]) return SAM3_ENOMEM;
+			memcpy(pfn[si]->data, stage_out_nhwc[si]->data,
+			       stage_out_nhwc[si]->nbytes);
 		}
 
-		model->cached_feat_4x = pf[0];
-		model->cached_feat_s0 = pf[1];
-		model->cached_feat_s1 = pf[2];
-		model->cached_image_features = pf[3];
+		model->cached_feat_4x_nhwc = pfn[0];
+		model->cached_feat_s0_nhwc = pfn[1];
+		model->cached_feat_s1_nhwc = pfn[2];
+		model->cached_image_features = pfn[3];
 
-		dump_tensor("/tmp/dbg_neck_4x.bin", pf[0]);
-		dump_tensor("/tmp/dbg_neck_2x.bin", pf[1]);
-		dump_tensor("/tmp/dbg_neck_1x.bin", pf[2]);
-		dump_tensor("/tmp/dbg_neck_05x.bin", pf[3]);
+		dump_tensor("/tmp/dbg_neck_4x.bin", pfn[0]);
+		dump_tensor("/tmp/dbg_neck_2x.bin", pfn[1]);
+		dump_tensor("/tmp/dbg_neck_1x.bin", pfn[2]);
+		dump_tensor("/tmp/dbg_neck_05x.bin", pfn[3]);
 
-		sam3_log_debug("encode: cached features: main [%d,%d,%d,%d]"
-			       " s0 [%d,%d,%d,%d] s1 [%d,%d,%d,%d]"
-			       " 4x [%d,%d,%d,%d]",
-			       pf[3]->dims[0], pf[3]->dims[1],
-			       pf[3]->dims[2], pf[3]->dims[3],
-			       pf[1]->dims[0], pf[1]->dims[1],
-			       pf[1]->dims[2], pf[1]->dims[3],
-			       pf[2]->dims[0], pf[2]->dims[1],
-			       pf[2]->dims[2], pf[2]->dims[3],
-			       pf[0]->dims[0], pf[0]->dims[1],
-			       pf[0]->dims[2], pf[0]->dims[3]);
+		sam3_log_debug("encode: cached features (NHWC): "
+			       "main [%d,%d,%d,%d] "
+			       "s0 [%d,%d,%d,%d] s1 [%d,%d,%d,%d] "
+			       "4x [%d,%d,%d,%d]",
+			       pfn[3]->dims[0], pfn[3]->dims[1],
+			       pfn[3]->dims[2], pfn[3]->dims[3],
+			       pfn[1]->dims[0], pfn[1]->dims[1],
+			       pfn[1]->dims[2], pfn[1]->dims[3],
+			       pfn[2]->dims[0], pfn[2]->dims[1],
+			       pfn[2]->dims[2], pfn[2]->dims[3],
+			       pfn[0]->dims[0], pfn[0]->dims[1],
+			       pfn[0]->dims[2], pfn[0]->dims[3]);
 	}
 
 	SAM3_PROF_END(profiler, "neck");
 
 	model->image_encoded = 1;
 	return SAM3_OK;
-}
-
-/*
- * nchw_to_2d - Transpose [1, C, H, W] NCHW tensor to [H*W, C] 2D tensor.
- *
- * Needed because the neck stores features in NCHW format but the encoder
- * fusion, geometry encoder, and segmentation head expect [n_pixels, d_model].
- */
-static struct sam3_tensor *nchw_to_2d(struct sam3_arena *arena,
-				       struct sam3_tensor *nchw)
-{
-	int C = nchw->dims[1];
-	int H = nchw->dims[2];
-	int W = nchw->dims[3];
-	int HW = H * W;
-	int dims[2] = { HW, C };
-	struct sam3_tensor *out;
-	const float *src;
-	float *dst;
-	int hw, c;
-
-	out = gh_alloc_tensor(arena, nchw->dtype, 2, dims);
-	if (!out)
-		return NULL;
-
-	src = (const float *)nchw->data;
-	dst = (float *)out->data;
-	for (hw = 0; hw < HW; hw++)
-		for (c = 0; c < C; c++)
-			dst[hw * C + c] = src[c * HW + hw];
-
-	return out;
 }
 
 /*
@@ -684,14 +679,23 @@ enum sam3_error sam3_image_model_segment(
 	persist_save = persist->offset;
 
 	/*
-	 * Reshape 1× backbone features from NCHW [1, C, H, W] to
-	 * [H*W, d_model]. The Python model feeds the 72×72 (1×)
-	 * features to the encoder, not the 36×36 (0.5×) features.
-	 * All downstream modules expect [n_pixels, d_model].
+	 * Reshape 1× backbone features from NHWC [1, H, W, d_model]
+	 * to [H*W, d_model]. NHWC row-major byte order already
+	 * matches the downstream [n_pixels, d_model] layout, so we
+	 * just copy the payload into a fresh 2D tensor in persist.
+	 * The Python model feeds the 72×72 (1×) features to the
+	 * encoder, not the 36×36 (0.5×) features.
 	 */
-	img_2d = nchw_to_2d(persist, model->cached_feat_s1);
-	if (!img_2d)
-		return SAM3_ENOMEM;
+	{
+		struct sam3_tensor *s1 = model->cached_feat_s1_nhwc;
+		int HW = s1->dims[1] * s1->dims[2];
+		int C = s1->dims[3];
+		int dims[2] = {HW, C};
+		img_2d = gh_alloc_tensor(persist, s1->dtype, 2, dims);
+		if (!img_2d)
+			return SAM3_ENOMEM;
+		memcpy(img_2d->data, s1->data, s1->nbytes);
+	}
 
 	/*
 	 * Stage 1: Geometry encoder — full transformer encoder attending
@@ -1755,8 +1759,8 @@ enum sam3_error sam3_image_model_segment(
 		 * mask embedder MLP + dot product mask prediction.
 		 */
 		SAM3_PROF_BEGIN(profiler, "seg_head");
-		grid_h = model->cached_feat_s1->dims[2];
-		grid_w = model->cached_feat_s1->dims[3];
+		grid_h = model->cached_feat_s1_nhwc->dims[1];
+		grid_w = model->cached_feat_s1_nhwc->dims[2];
 
 		sam3_arena_reset(scratch);
 		sam3_graph_init(&g);
@@ -1765,9 +1769,9 @@ enum sam3_error sam3_image_model_segment(
 		{
 			struct sam3_tensor *bf[] = {
 				fused,
-				model->cached_feat_s1,
-				model->cached_feat_s0,
-				model->cached_feat_4x
+				model->cached_feat_s1_nhwc,
+				model->cached_feat_s0_nhwc,
+				model->cached_feat_4x_nhwc
 			};
 			const char *bn[] = {
 				"fused", "feat_1x", "feat_2x", "feat_4x"
@@ -1834,8 +1838,8 @@ enum sam3_error sam3_image_model_segment(
 
 		/*
 		 * Prompt cross-attention must be evaluated as a
-		 * separate graph because seg_head_build does a
-		 * manual NCHW transpose that reads tensor data.
+		 * separate graph so the cross-attended result is
+		 * persisted before we wrap it as NHWC for the FPN.
 		 */
 		struct sam3_tensor *seg_enc = fused;
 		if (context) {
@@ -1872,7 +1876,7 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			/* Materialize result for NCHW transpose */
+			/* Materialize result so NHWC wrap can read it */
 			seg_enc = persist_tensor(persist, seg_enc);
 			if (!seg_enc) {
 				err = SAM3_ENOMEM;
@@ -1888,41 +1892,24 @@ enum sam3_error sam3_image_model_segment(
 		}
 
 		/*
-		 * Stage 4a: Manual NCHW transpose of seg_enc.
+		 * Stage 4a: Reshape seg_enc to NHWC [1, H, W, d].
+		 *
+		 * seg_enc is [seq, d] = [grid_h*grid_w, d]. Because
+		 * NHWC element order is N,H,W,C and seg_enc is already
+		 * row-major over (h*W + w, d), the reshape is a pure
+		 * view change with no data movement.
 		 */
 		int seg_d = model->seg_head.d_model;
-		int seg_seq = seg_enc->dims[0];
-		int nchw_sd[] = {1, seg_d, grid_h, grid_w};
-		struct sam3_tensor *enc_nchw;
-		enc_nchw = gh_alloc_tensor(scratch, seg_enc->dtype,
-					    4, nchw_sd);
-		if (!enc_nchw) {
+		int nhwc_sd[] = {1, grid_h, grid_w, seg_d};
+		struct sam3_tensor *enc_nhwc;
+		enc_nhwc = gh_tensor_wrap(scratch, seg_enc->dtype,
+					   4, nhwc_sd, seg_enc->data);
+		if (!enc_nhwc) {
 			err = SAM3_ENOMEM;
 			goto fail;
 		}
-		{
-			const float *src = (const float *)seg_enc->data;
-			float *dst = (float *)enc_nchw->data;
-			for (int s = 0; s < seg_seq; s++)
-				for (int c = 0; c < seg_d; c++)
-					dst[c * seg_seq + s] =
-						src[s * seg_d + c];
-		}
-		sam3_log_debug("seg: enc_nchw [%d,%d,%d,%d]",
-			       1, seg_d, grid_h, grid_w);
-
-		/* Diagnostic: enc_nchw stats */
-		{
-			const float *nd = (const float *)enc_nchw->data;
-			int nn = seg_d * seg_seq;
-			float nmin = nd[0], nmax = nd[0];
-			for (int ni = 0; ni < nn; ni++) {
-				if (nd[ni] < nmin) nmin = nd[ni];
-				if (nd[ni] > nmax) nmax = nd[ni];
-			}
-			sam3_log_debug("seg: enc_nchw min=%.4f max=%.4f",
-				       nmin, nmax);
-		}
+		sam3_log_debug("seg: enc_nhwc [1,%d,%d,%d]",
+			       grid_h, grid_w, seg_d);
 
 		/*
 		 * Stage 4b: FPN pixel decoder + instance projection.
@@ -1932,83 +1919,26 @@ enum sam3_error sam3_image_model_segment(
 		{
 			sam3_graph_init(&g);
 
-			struct sam3_tensor *nchw_wrap;
-			nchw_wrap = gh_tensor_wrap(scratch,
-				enc_nchw->dtype, enc_nchw->n_dims,
-				enc_nchw->dims, enc_nchw->data);
-			if (!nchw_wrap) {
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
-
-			/* Smoothness of skip features */
-			{
-				const char *names[] = {"feat_s1(1x)",
-					"feat_s0(2x)", "feat_4x"};
-				struct sam3_tensor *skips[] = {
-					model->cached_feat_s1,
-					model->cached_feat_s0,
-					model->cached_feat_4x};
-				for (int si = 0; si < 3; si++) {
-					struct sam3_tensor *f = skips[si];
-					const float *fd =
-						(const float *)f->data;
-					int fC = f->dims[1];
-					int fH = f->dims[2];
-					int fW = f->dims[3];
-					double fa = 0, fdw = 0, fdh = 0;
-					long ca = 0, cw = 0, ch2 = 0;
-					for (int c = 0; c < fC; c++) {
-						const float *fc =
-							fd + (long)c*fH*fW;
-						for (int h = 0; h < fH; h++)
-						for (int w = 0; w < fW; w++) {
-							float v = fc[h*fW+w];
-							fa += fabs(v); ca++;
-							if (w+1<fW) {
-								fdw += fabs(v -
-								  fc[h*fW+w+1]);
-								cw++;
-							}
-							if (h+1<fH) {
-								fdh += fabs(v -
-								  fc[(h+1)*fW+w]);
-								ch2++;
-							}
-						}
-					}
-					double m = fa/ca;
-					double rw = (fdw/cw)/(m+1e-8);
-					double rh = (fdh/ch2)/(m+1e-8);
-					sam3_log_debug("seg: %s [%d,%d,%d,%d]"
-						" rw=%.3f rh=%.3f mean=%.4f",
-						names[si],
-						f->dims[0], f->dims[1],
-						f->dims[2], f->dims[3],
-						rw, rh, m);
-				}
-			}
-
-			dump_tensor("/tmp/dbg_enc_nchw.bin", enc_nchw);
+			dump_tensor("/tmp/dbg_enc_nhwc.bin", enc_nhwc);
 			dump_tensor("/tmp/dbg_feat_1x.bin",
-				model->cached_feat_s1);
+				model->cached_feat_s1_nhwc);
 			dump_tensor("/tmp/dbg_feat_2x.bin",
-				model->cached_feat_s0);
+				model->cached_feat_s0_nhwc);
 			dump_tensor("/tmp/dbg_feat_4x.bin",
-				model->cached_feat_4x);
+				model->cached_feat_4x_nhwc);
 
 			/*
 			 * Split FPN and inst_proj into two graph evals
 			 * so pixel_embed data gets copied back.
 			 */
 			{
-				/* Build FPN only → pixel_embed */
+				/* Build FPN only → pixel_embed (NHWC) */
 				struct sam3_tensor *pixel_embed;
 				pixel_embed = sam3_seg_head_build_pixel_decoder(
 					&model->seg_head, &g,
-					nchw_wrap,
-					model->cached_feat_s0,
-					model->cached_feat_4x,
+					enc_nhwc,
+					model->cached_feat_s0_nhwc,
+					model->cached_feat_4x_nhwc,
 					scratch);
 				if (!pixel_embed) {
 					sam3_log_error("seg: FPN build failed");
@@ -2034,7 +1964,7 @@ enum sam3_error sam3_image_model_segment(
 				dump_tensor("/tmp/dbg_pixel_embed.bin",
 					    pixel_embed);
 
-				/* Build inst_proj (1x1 conv) separately */
+				/* Build inst_proj (1x1 NHWC conv) */
 				sam3_arena_reset(scratch);
 				sam3_graph_init(&g);
 
@@ -2096,28 +2026,30 @@ enum sam3_error sam3_image_model_segment(
 					inst->dims[2], inst->dims[3],
 					imin, imax);
 
-				/* Spatial smoothness metric */
-				int iC = inst->dims[1];
-				int iH = inst->dims[2];
-				int iW = inst->dims[3];
+				/*
+				 * Spatial smoothness metric — inst is NHWC
+				 * [1, H, W, C], walk over channels with
+				 * stride C between spatial samples.
+				 */
+				int iH = inst->dims[1];
+				int iW = inst->dims[2];
+				int iC = inst->dims[3];
 				double adj_h = 0, adj_w = 0, aabs = 0;
 				long cnt_h = 0, cnt_w = 0, cnt_a = 0;
 				for (int c = 0; c < iC; c++) {
-					const float *ch =
-						id + (long)c * iH * iW;
 					for (int h = 0; h < iH; h++)
 					for (int w = 0; w < iW; w++) {
-						float v = ch[h*iW + w];
+						float v = id[(h*iW + w)*iC + c];
 						aabs += fabs(v);
 						cnt_a++;
 						if (w+1 < iW) {
 							adj_w += fabs(v -
-								ch[h*iW+w+1]);
+								id[(h*iW+w+1)*iC + c]);
 							cnt_w++;
 						}
 						if (h+1 < iH) {
 							adj_h += fabs(v -
-								ch[(h+1)*iW+w]);
+								id[((h+1)*iW+w)*iC + c]);
 							cnt_h++;
 						}
 					}
@@ -2193,14 +2125,16 @@ enum sam3_error sam3_image_model_segment(
 
 		/*
 		 * Stage 4d: Dot product mask logits.
-		 * mask_embed [nq, d] @ inst_flat [d, H*W] → [nq, H*W]
+		 * inst is NHWC [1, H, W, d]. Reshape to [H*W, d],
+		 * transpose to [d, H*W], then matmul:
+		 * mask_embed [nq, d] @ inst_flat_t [d, H*W] → [nq, H*W]
 		 */
 		{
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 
-			int final_h = inst->dims[2];
-			int final_w = inst->dims[3];
+			int final_h = inst->dims[1];
+			int final_w = inst->dims[2];
 			int final_hw = final_h * final_w;
 			int n_q = queries->dims[0];
 
@@ -2216,8 +2150,8 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			/* Reshape inst [1,d,H,W] → [d, H*W] */
-			int flat_dims[] = {seg_d, final_hw};
+			/* Reshape inst [1,H,W,d] → [H*W, d] */
+			int flat_dims[] = {final_hw, seg_d};
 			struct sam3_tensor *inst_flat;
 			inst_flat = gh_reshape(&g, scratch, inst_wrap,
 						2, flat_dims);
@@ -2226,9 +2160,17 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			/* masks = mask_embed @ inst_flat */
+			/* Transpose [H*W, d] → [d, H*W] */
+			struct sam3_tensor *inst_flat_t;
+			inst_flat_t = gh_transpose(&g, scratch, inst_flat);
+			if (!inst_flat_t) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+
+			/* masks = mask_embed @ inst_flat_t */
 			masks = gh_matmul(&g, scratch,
-					   me_wrap, inst_flat);
+					   me_wrap, inst_flat_t);
 			if (!masks) {
 				err = SAM3_ENOMEM;
 				goto fail;
@@ -2282,11 +2224,15 @@ enum sam3_error sam3_image_model_segment(
 						frac * 100);
 			}
 
-			/* Dump inst L2 norm spatial map */
+			/*
+			 * Dump inst L2 norm spatial map. inst is NHWC
+			 * [1, H, W, d], so channel values for pixel p
+			 * live at id[p*d + c].
+			 */
 			{
 				const float *id =
 					(const float *)inst->data;
-				int ic = inst->dims[1];
+				int ic = inst->dims[3];
 				int ihw = final_h * final_w;
 				FILE *fp = fopen("/tmp/inst_l2.pgm", "w");
 				if (fp) {
@@ -2297,7 +2243,7 @@ enum sam3_error sam3_image_model_segment(
 						for (int p = 0; p < ihw; p++) {
 							float sum = 0;
 							for (int c = 0; c < ic; c++) {
-								float v = id[c * ihw + p];
+								float v = id[p * ic + c];
 								sum += v * v;
 							}
 							l2[p] = sqrtf(sum);

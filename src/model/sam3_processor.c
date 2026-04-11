@@ -336,20 +336,21 @@ static void cpu_sinusoidal_posenc(float *out, float coord,
 }
 
 /*
- * cpu_bilinear_sample_nchw - Bilinear interpolation from NCHW features.
+ * cpu_bilinear_sample_nhwc - Bilinear interpolation from NHWC features.
  *
  * Matches PyTorch grid_sample with align_corners=False:
  *   pixel_pos = (grid_coord + 1) / 2 * size - 0.5
  *
  * @out:     Output buffer [C]
- * @data:    NCHW feature data (batch dim ignored, offset to n=0)
+ * @data:    NHWC feature data (batch dim ignored, offset to n=0);
+ *           element layout is (h, w, c) with channels innermost.
  * @C:       Number of channels
  * @H:       Height
  * @W:       Width
  * @norm_x:  Normalized x coordinate in [0,1]
  * @norm_y:  Normalized y coordinate in [0,1]
  */
-static void cpu_bilinear_sample_nchw(float *out, const float *data,
+static void cpu_bilinear_sample_nhwc(float *out, const float *data,
 				     int C, int H, int W,
 				     float norm_x, float norm_y)
 {
@@ -375,12 +376,14 @@ static void cpu_bilinear_sample_nchw(float *out, const float *data,
 	float w01 = (1.0f - dx) * dy;
 	float w11 = dx * dy;
 
+	const float *p00 = data + (y0c * W + x0c) * C;
+	const float *p10 = data + (y0c * W + x1c) * C;
+	const float *p01 = data + (y1c * W + x0c) * C;
+	const float *p11 = data + (y1c * W + x1c) * C;
+
 	for (int c = 0; c < C; c++) {
-		const float *ch = data + c * H * W;
-		out[c] = w00 * ch[y0c * W + x0c] +
-			 w10 * ch[y0c * W + x1c] +
-			 w01 * ch[y1c * W + x0c] +
-			 w11 * ch[y1c * W + x1c];
+		out[c] = w00 * p00[c] + w10 * p10[c] +
+			 w01 * p01[c] + w11 * p11[c];
 	}
 }
 
@@ -433,45 +436,49 @@ static struct sam3_tensor *project_prompts(
 	float *img_norm_buf = NULL;
 	int feat_H = 0, feat_W = 0;
 	if (n_points > 0 && enc->pool_proj_w &&
-	    model->cached_feat_s1) {
-		const struct sam3_tensor *feat = model->cached_feat_s1;
-		int C = feat->dims[1];
-		feat_H = feat->dims[2];
-		feat_W = feat->dims[3];
+	    model->cached_feat_s1_nhwc) {
+		const struct sam3_tensor *feat =
+			model->cached_feat_s1_nhwc;
+		/* NHWC: dims = [1, H, W, C] */
+		feat_H = feat->dims[1];
+		feat_W = feat->dims[2];
+		int C = feat->dims[3];
 		int HW = feat_H * feat_W;
 		const float *fd = (const float *)feat->data;
 		const float *nw = (const float *)enc->img_pre_norm_w->data;
 		const float *nb = (const float *)enc->img_pre_norm_b->data;
 
-		/* Allocate from arena for normed features [C, H, W] */
-		int norm_dims[] = {C, feat_H, feat_W};
+		/* Allocate from arena for normed features NHWC [1,H,W,C] */
+		int norm_dims[] = {1, feat_H, feat_W, C};
 		struct sam3_tensor *norm_t = gh_alloc_tensor(arena,
-			SAM3_DTYPE_F32, 3, norm_dims);
+			SAM3_DTYPE_F32, 4, norm_dims);
 		if (!norm_t)
 			return NULL;
 		img_norm_buf = (float *)norm_t->data;
 
-		/* LayerNorm per spatial position (along C axis) */
+		/* LayerNorm per spatial position (along C axis).
+		 * NHWC stores channels innermost: row = &fd[hw * C] */
 		for (int hw = 0; hw < HW; hw++) {
-			/* Gather C values for this position */
+			const float *row_in = fd + hw * C;
+			float *row_out = img_norm_buf + hw * C;
+
 			double mean = 0.0;
 			for (int c = 0; c < C; c++)
-				mean += (double)fd[c * HW + hw];
+				mean += (double)row_in[c];
 			mean /= C;
 
 			double var = 0.0;
 			for (int c = 0; c < C; c++) {
-				double diff = (double)fd[c * HW + hw] - mean;
+				double diff = (double)row_in[c] - mean;
 				var += diff * diff;
 			}
 			var /= C;
 
 			float inv_std = 1.0f / sqrtf((float)var + 1e-5f);
 			for (int c = 0; c < C; c++) {
-				float normed = ((float)(fd[c * HW + hw] -
+				float normed = ((float)(row_in[c] -
 					mean)) * inv_std;
-				img_norm_buf[c * HW + hw] =
-					normed * nw[c] + nb[c];
+				row_out[c] = normed * nw[c] + nb[c];
 			}
 		}
 		img_normed = img_norm_buf;
@@ -517,7 +524,7 @@ static struct sam3_tensor *project_prompts(
 			if (img_normed && enc->pool_proj_w) {
 				float sampled[512];
 				float proj_tmp[512];
-				cpu_bilinear_sample_nchw(sampled,
+				cpu_bilinear_sample_nhwc(sampled,
 					img_normed, d,
 					feat_H, feat_W,
 					coords[0], coords[1]);

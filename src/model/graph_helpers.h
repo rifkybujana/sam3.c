@@ -194,9 +194,12 @@ struct sam3_tensor *gh_embed(struct sam3_graph *g, struct sam3_arena *a,
 			     struct sam3_tensor *indices);
 
 /*
- * gh_upsample - Nearest-neighbor upsampling for 4D tensors.
+ * gh_upsample - Nearest-neighbor upsampling for NHWC 4D tensors.
  *
- * Input must be [N, C, H, W]. Output is [N, C, H*scale, W*scale].
+ * @input: [N, H, W, C]
+ * @scale: Integer upsample factor (same for H and W)
+ *
+ * Returns tensor [N, H*scale, W*scale, C].
  */
 struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input, int scale);
@@ -447,14 +450,14 @@ struct sam3_tensor *gh_mlp(struct sam3_graph *g, struct sam3_arena *a,
 			   enum sam3_op activation);
 
 /*
- * gh_groupnorm - Group normalization on NCHW tensor.
+ * gh_groupnorm - Group normalization on NHWC tensor.
  *
- * @input:      [N, C, H, W] tensor
+ * @input:      [N, H, W, C] tensor
  * @gamma:      Per-channel scale [C], or NULL
  * @beta:       Per-channel bias [C], or NULL
  * @num_groups: Number of groups (C must be divisible)
  *
- * Returns normalized tensor, same shape as input.
+ * Returns a normalized tensor with the same shape as input.
  */
 struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 				 struct sam3_tensor *input,
@@ -463,16 +466,15 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 				 int num_groups);
 
 /*
- * gh_conv2d - 2D convolution with optional bias.
+ * gh_conv2d - 2D convolution with NHWC input and OHWI weight.
  *
- * @input:   [N, C_in, H, W]
- * @weight:  [C_out, C_in, KH, KW]
- * @bias:    [C_out] or NULL
- * @stride:  Convolution stride
- * @padding: Zero-padding on each side
+ * @input:   [N, H, W, C_in]
+ * @weight:  [C_out, KH, KW, C_in]
+ * @bias:    [C_out] (optional, may be NULL)
+ * @stride:  same stride for H and W
+ * @padding: same padding for H and W
  *
- * Bias is added via reshape+transpose+add+transpose+reshape.
- * Returns [N, C_out, OH, OW].
+ * Returns tensor [N, OH, OW, C_out].
  */
 struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 			      struct sam3_tensor *input,
@@ -481,15 +483,17 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 			      int stride, int padding);
 
 /*
- * gh_conv_transpose2d - 2D transposed convolution with optional bias.
+ * gh_conv_transpose2d - 2D transposed conv with NHWC input and OHWI
+ * weight.
  *
- * @input:   [N, C_in, H, W]
- * @weight:  [C_in, C_out, KH, KW] (PyTorch ConvTranspose2d layout)
- * @bias:    [C_out] or NULL
- * @stride:  Transposed convolution stride
- * @padding: Zero-padding on each side
+ * @input:   [N, H, W, C_in]
+ * @weight:  [C_out, KH, KW, C_in]
+ * @bias:    [C_out] (optional, may be NULL)
+ * @stride:  same stride for H and W
+ * @padding: same padding for H and W
  *
- * Returns [N, C_out, OH, OW] where OH = (H-1)*stride - 2*pad + KH.
+ * Returns tensor [N, OH, OW, C_out] where
+ * OH = (H - 1) * stride - 2 * padding + KH.
  */
 struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 					struct sam3_arena *a,
@@ -499,16 +503,17 @@ struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 					int stride, int padding);
 
 /*
- * gh_maxpool2d - 2D max pooling.
+ * gh_maxpool2d - Non-overlapping 2D max pooling on NHWC input.
  *
- * @input:       [N, C, H, W]
- * @kernel_size: Pooling window size
- * @stride:      Pooling stride
+ * @input:       [N, H, W, C]
+ * @kernel_size: Pooling window size (same for H and W)
+ * @stride:      Pooling stride (same for H and W)
  *
- * Returns [N, C, OH, OW] where OH = (H - kernel) / stride + 1.
+ * Reshapes to [N, H/k, k, W/k, k, C] and reduces over the two k-axes
+ * directly on the NHWC layout. Returns [N, H/k, W/k, C].
  */
 struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
-				struct sam3_tensor *input,
-				int kernel_size, int stride);
+				 struct sam3_tensor *input,
+				 int kernel_size, int stride);
 
 #endif /* SAM3_MODEL_GRAPH_HELPERS_H */

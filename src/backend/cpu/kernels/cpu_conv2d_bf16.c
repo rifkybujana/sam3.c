@@ -6,6 +6,13 @@
  * path uses 4-wide float32x4_t with bf16<->f32 conversion helpers from
  * core/half.h. Scratch arena for im2col buffer and f32 accumulation.
  *
+ * Public layout (after the NHWC migration): input [N,H,W,C],
+ * weight [OC,KH,KW,IC] (OHWI), output [N,OH,OW,OC]. The public entry
+ * point transposes NHWC inputs and OHWI weights into NCHW/OIHW scratch
+ * buffers, runs the legacy NCHW body, and transposes the result back
+ * to NHWC. The CPU backend is test-only; Metal handles NHWC via MLX.
+ * Shared byte-transpose helpers come from cpu_conv2d.c.
+ *
  * Key types:  sam3_node, sam3_tensor, sam3_arena
  * Depends on: cpu_kernels.h, cpu_simd.h, core/half.h, core/tensor.h, core/alloc.h
  * Used by:    cpu_dispatch.c
@@ -22,7 +29,19 @@
 #include "util/log.h"
 #include "util/threadpool.h"
 
+#include <stdint.h>
 #include <string.h>
+
+/* Shared NHWC transpose helpers (defined in cpu_conv2d.c). */
+void sam3_cpu_nhwc_to_nchw_bytes(const uint8_t *src, uint8_t *dst,
+				 int N, int H, int W, int C,
+				 size_t elem_sz);
+void sam3_cpu_nchw_to_nhwc_bytes(const uint8_t *src, uint8_t *dst,
+				 int N, int C, int H, int W,
+				 size_t elem_sz);
+void sam3_cpu_ohwi_to_oihw_bytes(const uint8_t *src, uint8_t *dst,
+				 int OC, int KH, int KW, int IC,
+				 size_t elem_sz);
 
 /*
  * im2col_bf16 - Unroll bf16 input patches into a column matrix.
@@ -226,71 +245,35 @@ static void conv2d_matmul_bf16_fn(void *arg, int task_id, int n_tasks)
 #endif /* SAM3_HAS_NEON */
 
 /*
- * cpu_kernel_conv2d_bf16 - BF16 Conv2D via im2col + matmul.
+ * conv2d_bf16_nchw_body - Legacy NCHW BF16 body via im2col + matmul.
  *
- * @node:    Node with n_inputs>=2: input [N,C,H,W] and weight [OC,C,KH,KW],
- *           both SAM3_DTYPE_BF16. node->params[0]=stride, params[1]=padding.
- * @scratch: Scratch arena for im2col temp buffer and f32 accumulation.
- *           Offset is saved/restored.
- * @pool:    Thread pool for parallel matmul over output channels.
- *
- * Returns SAM3_OK on success, SAM3_EINVAL on bad inputs, SAM3_ENOMEM if
- * the scratch arena is too small.
+ * Operates on stack tensors prepared by the NHWC shim: input NCHW
+ * [N,C,H,W], weight OIHW [OC,C,KH,KW], output NCHW [N,OC,OH,OW],
+ * all SAM3_DTYPE_BF16. Allocates an im2col buffer and an f32
+ * accumulation buffer from scratch and restores the offset before
+ * returning.
  */
-enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
-				       struct sam3_arena *scratch,
-				       struct sam3_threadpool *pool)
+static enum sam3_error
+conv2d_bf16_nchw_body(const struct sam3_tensor *input,
+		      const struct sam3_tensor *weight,
+		      struct sam3_tensor *output,
+		      int stride, int pad,
+		      struct sam3_arena *scratch,
+		      struct sam3_threadpool *pool)
 {
-	if (node->n_inputs < 2 || !node->inputs[0] || !node->inputs[1] ||
-	    !node->output) {
-		sam3_log_error("conv2d_bf16: NULL tensor");
-		return SAM3_EINVAL;
-	}
-
-	if (!scratch) {
-		sam3_log_error("conv2d_bf16: NULL scratch arena");
-		return SAM3_EINVAL;
-	}
-
-	struct sam3_tensor *input  = node->inputs[0];
-	struct sam3_tensor *weight = node->inputs[1];
-	struct sam3_tensor *output = node->output;
-
-	if (input->dtype != SAM3_DTYPE_BF16 ||
-	    weight->dtype != SAM3_DTYPE_BF16) {
-		sam3_log_error("conv2d_bf16: unsupported dtype");
-		return SAM3_EINVAL;
-	}
-
-	if (input->n_dims != 4 || weight->n_dims != 4) {
-		sam3_log_error("conv2d_bf16: expected 4D tensors");
-		return SAM3_EINVAL;
-	}
-
 	int N_batch = input->dims[0];
 	int C       = input->dims[1];
 	int H       = input->dims[2];
 	int W       = input->dims[3];
 
 	int OC  = weight->dims[0];
-	int KC  = weight->dims[1];
 	int KH  = weight->dims[2];
 	int KW  = weight->dims[3];
 
-	if (KC != C) {
-		sam3_log_error("conv2d_bf16: channel mismatch %d != %d",
-			       KC, C);
-		return SAM3_EINVAL;
-	}
-
-	int stride = node->params[0] > 0 ? node->params[0] : 1;
-	int pad    = node->params[1];
-
-	int OH = (H + 2 * pad - KH) / stride + 1;
-	int OW = (W + 2 * pad - KW) / stride + 1;
+	int OH = output->dims[2];
+	int OW = output->dims[3];
 	int N_out = OH * OW;
 
-	/* Save scratch offset for restore */
 	size_t saved_offset = scratch->offset;
 
 	/* Allocate im2col buffer: [C*KH*KW, OH*OW] in bf16 */
@@ -343,8 +326,132 @@ enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
 					     &mctx, n_tasks);
 	}
 
-	/* Restore scratch offset — frees im2col + acc buffers */
 	scratch->offset = saved_offset;
+	return SAM3_OK;
+}
 
+enum sam3_error cpu_kernel_conv2d_bf16(const struct sam3_node *node,
+				       struct sam3_arena *scratch,
+				       struct sam3_threadpool *pool)
+{
+	if (node->n_inputs < 2 || !node->inputs[0] || !node->inputs[1] ||
+	    !node->output) {
+		sam3_log_error("conv2d_bf16: NULL tensor");
+		return SAM3_EINVAL;
+	}
+
+	if (!scratch) {
+		sam3_log_error("conv2d_bf16: NULL scratch arena");
+		return SAM3_EINVAL;
+	}
+
+	struct sam3_tensor *input  = node->inputs[0];
+	struct sam3_tensor *weight = node->inputs[1];
+	struct sam3_tensor *output = node->output;
+
+	if (input->dtype != SAM3_DTYPE_BF16 ||
+	    weight->dtype != SAM3_DTYPE_BF16) {
+		sam3_log_error("conv2d_bf16: unsupported dtype");
+		return SAM3_EINVAL;
+	}
+
+	if (input->n_dims != 4 || weight->n_dims != 4 ||
+	    output->n_dims != 4) {
+		sam3_log_error("conv2d_bf16: expected 4D tensors");
+		return SAM3_EINVAL;
+	}
+
+	int N_batch = input->dims[0];
+	int H       = input->dims[1];
+	int W       = input->dims[2];
+	int C_in    = input->dims[3];
+
+	int C_out = weight->dims[0];
+	int KH    = weight->dims[1];
+	int KW    = weight->dims[2];
+	int KIC   = weight->dims[3];
+
+	if (KIC != C_in) {
+		sam3_log_error("conv2d_bf16: channel mismatch %d != %d",
+			       KIC, C_in);
+		return SAM3_EINVAL;
+	}
+
+	int OH = output->dims[1];
+	int OW = output->dims[2];
+	if (output->dims[0] != N_batch || output->dims[3] != C_out) {
+		sam3_log_error("conv2d_bf16: output shape mismatch");
+		return SAM3_EINVAL;
+	}
+
+	int stride = node->params[0] > 0 ? node->params[0] : 1;
+	int pad    = node->params[1];
+
+	size_t elem_sz = sizeof(uint16_t);
+	size_t saved_offset = scratch->offset;
+
+	size_t in_bytes = (size_t)N_batch * C_in * H * W * elem_sz;
+	size_t wt_bytes = (size_t)C_out * C_in * KH * KW * elem_sz;
+	size_t out_bytes = (size_t)N_batch * C_out * OH * OW * elem_sz;
+
+	uint8_t *in_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							   in_bytes);
+	uint8_t *wt_oihw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							   wt_bytes);
+	uint8_t *out_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
+							    out_bytes);
+	if (!in_nchw || !wt_oihw || !out_nchw) {
+		sam3_log_error("conv2d_bf16: scratch OOM (need %zu bytes)",
+			       in_bytes + wt_bytes + out_bytes);
+		scratch->offset = saved_offset;
+		return SAM3_ENOMEM;
+	}
+
+	sam3_cpu_nhwc_to_nchw_bytes((const uint8_t *)input->data, in_nchw,
+				    N_batch, H, W, C_in, elem_sz);
+	sam3_cpu_ohwi_to_oihw_bytes((const uint8_t *)weight->data, wt_oihw,
+				    C_out, KH, KW, C_in, elem_sz);
+
+	struct sam3_tensor input_nchw = *input;
+	input_nchw.dims[0] = N_batch;
+	input_nchw.dims[1] = C_in;
+	input_nchw.dims[2] = H;
+	input_nchw.dims[3] = W;
+	input_nchw.data = in_nchw;
+	input_nchw.nbytes = in_bytes;
+	sam3_tensor_compute_strides(&input_nchw);
+
+	struct sam3_tensor weight_oihw = *weight;
+	weight_oihw.dims[0] = C_out;
+	weight_oihw.dims[1] = C_in;
+	weight_oihw.dims[2] = KH;
+	weight_oihw.dims[3] = KW;
+	weight_oihw.data = wt_oihw;
+	weight_oihw.nbytes = wt_bytes;
+	sam3_tensor_compute_strides(&weight_oihw);
+
+	struct sam3_tensor output_nchw = *output;
+	output_nchw.dims[0] = N_batch;
+	output_nchw.dims[1] = C_out;
+	output_nchw.dims[2] = OH;
+	output_nchw.dims[3] = OW;
+	output_nchw.data = out_nchw;
+	output_nchw.nbytes = out_bytes;
+	sam3_tensor_compute_strides(&output_nchw);
+
+	enum sam3_error err = conv2d_bf16_nchw_body(&input_nchw,
+						    &weight_oihw,
+						    &output_nchw,
+						    stride, pad,
+						    scratch, pool);
+	if (err != SAM3_OK) {
+		scratch->offset = saved_offset;
+		return err;
+	}
+
+	sam3_cpu_nchw_to_nhwc_bytes(out_nchw, (uint8_t *)output->data,
+				    N_batch, C_out, OH, OW, elem_sz);
+
+	scratch->offset = saved_offset;
 	return SAM3_OK;
 }

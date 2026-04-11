@@ -322,11 +322,11 @@ static void test_seg_head_pipeline(void)
 	ASSERT(enc_states != NULL);
 	fill_small_values(enc_states, 13);
 
-	/* Create backbone features at each scale (NCHW).
+	/* Create backbone features at each scale (NHWC).
 	 * FPN only uses feat_2x and feat_4x (2 stages). */
 	int d = SMOKE_D_MODEL;
-	int f2_dims[] = {1, d, seg_enc_h * 2, seg_enc_w * 2};  /* 2x */
-	int f4_dims[] = {1, d, seg_enc_h * 4, seg_enc_w * 4};  /* 4x */
+	int f2_dims[] = {1, seg_enc_h * 2, seg_enc_w * 2, d};  /* 2x */
+	int f4_dims[] = {1, seg_enc_h * 4, seg_enc_w * 4, d};  /* 4x */
 
 	struct sam3_tensor *feat_2x, *feat_4x;
 	feat_2x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
@@ -451,10 +451,10 @@ static void test_full_pipeline(void)
 	ASSERT(text_features != NULL);
 	fill_small_values(text_features, 13);
 
-	/* Backbone features (NCHW) at 2x and 4x scales */
+	/* Backbone features (NHWC) at 2x and 4x scales */
 	int d = SMOKE_D_MODEL;
-	int f2_dims[] = {1, d, full_grid_h * 2, full_grid_w * 2};  /* 2x */
-	int f4_dims[] = {1, d, full_grid_h * 4, full_grid_w * 4};  /* 4x */
+	int f2_dims[] = {1, full_grid_h * 2, full_grid_w * 2, d};  /* 2x */
+	int f4_dims[] = {1, full_grid_h * 4, full_grid_w * 4, d};  /* 4x */
 
 	struct sam3_tensor *feat_2x, *feat_4x;
 	feat_2x = gh_alloc_tensor(&g_cpu.arena, SAM3_DTYPE_F32,
