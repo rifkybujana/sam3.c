@@ -268,74 +268,6 @@ static struct sam3_tensor *tile_pos_embed(
 }
 
 /*
- * permute_patch_embed_ohwi - Copy-permute patch embed conv weight
- * from checkpoint OIHW [oc, ic, kh, kw] into OHWI
- * [oc, kh, kw, ic].
- *
- * The source tensor `src` may point into the mmap region (via
- * gh_load_mmap) which we must not mutate, or into a zero-initialised
- * arena fallback. In both cases we allocate a fresh OHWI tensor from
- * @arena and copy-permute element by element. Element width is
- * resolved from the dtype so F32 and F16 both work.
- *
- * Returns the new OHWI tensor or NULL on arena OOM. The caller
- * replaces its pointer with the return value; the original header
- * survives in the arena but is unreferenced (arenas free en masse).
- *
- * Task 12 will move this transpose into the .sam3 converter so the
- * weight lands in OHWI on disk and this helper can go away.
- */
-static struct sam3_tensor *permute_patch_embed_ohwi(
-	struct sam3_arena *arena,
-	const struct sam3_tensor *src)
-{
-	int oc = src->dims[0];
-	int ic = src->dims[1];
-	int kh = src->dims[2];
-	int kw = src->dims[3];
-	int ohwi_dims[] = {oc, kh, kw, ic};
-
-	struct sam3_tensor *dst = gh_alloc_tensor(arena, src->dtype,
-						  4, ohwi_dims);
-	if (!dst)
-		return NULL;
-
-	size_t esz = sam3_dtype_size(src->dtype);
-	if (esz == 0) {
-		sam3_log_error("patch embed: unsupported dtype %d",
-			       src->dtype);
-		return NULL;
-	}
-
-	const char *sbytes = (const char *)src->data;
-	char *dbytes = (char *)dst->data;
-
-	/*
-	 * Source strides (OIHW, contiguous): [ic*kh*kw, kh*kw, kw, 1].
-	 * Destination strides (OHWI, contiguous): [kh*kw*ic, kw*ic,
-	 * ic, 1]. Walk destination linearly; compute the matching
-	 * source offset per element.
-	 */
-	for (int o = 0; o < oc; o++) {
-		for (int y = 0; y < kh; y++) {
-			for (int x = 0; x < kw; x++) {
-				for (int c = 0; c < ic; c++) {
-					size_t s = (((size_t)o * ic + c)
-						    * kh + y) * kw + x;
-					size_t d = (((size_t)o * kh + y)
-						    * kw + x) * ic + c;
-					memcpy(dbytes + d * esz,
-					       sbytes + s * esz,
-					       esz);
-				}
-			}
-		}
-	}
-
-	return dst;
-}
-
-/*
  * fuse_3 - Load 3 separate [d, d_in] weights and fuse into [3*d, d_in].
  */
 static struct sam3_tensor *fuse_3(const struct sam3_weight_file *wf,
@@ -386,24 +318,17 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	char name[128];
 
 	/*
-	 * Patch embedding: conv2d weight. The checkpoint stores this
-	 * as OIHW [embed_dim, 3, ps, ps]; we load the mmap view and
-	 * then copy-permute to OHWI [embed_dim, ps, ps, 3] so the
-	 * conv can use gh_conv2d_nhwc. The original OIHW header is
-	 * discarded. Task 12 moves this transpose into sam3_convert.
+	 * Patch embedding Conv2d weight. sam3_convert (Task 12)
+	 * permutes the checkpoint OIHW [embed_dim, 3, ps, ps] tensor
+	 * to OHWI [embed_dim, ps, ps, 3] before writing, so the load
+	 * path maps it directly for gh_conv2d_nhwc.
 	 */
-	int pe_w_dims[] = {e, 3, ps, ps};
-	struct sam3_tensor *pe_w_oihw = gh_load_mmap(wf,
+	int pe_w_dims[] = {e, ps, ps, 3};
+	vit->patch_embed_w = gh_load_mmap(wf,
 		VIT_P "embeddings.patch_embeddings.projection.weight",
 		arena, SAM3_DTYPE_F32, 4, pe_w_dims);
-	if (!pe_w_oihw)
+	if (!vit->patch_embed_w)
 		return SAM3_ENOMEM;
-
-	vit->patch_embed_w = permute_patch_embed_ohwi(arena, pe_w_oihw);
-	if (!vit->patch_embed_w) {
-		sam3_log_error("vit: patch embed permute to OHWI failed");
-		return SAM3_ENOMEM;
-	}
 
 	/* Patch embedding bias [embed_dim] — may not exist (bias_patch_embed=False) */
 	int pe_b_dims[] = {e};

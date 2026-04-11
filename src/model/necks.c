@@ -5,9 +5,9 @@
  * For each scale stage, the pipeline is: reshape [np, dim] directly
  * to NHWC [1, gs, gs, dim], optional NHWC MaxPool, spatial rescaling
  * via NHWC ConvTranspose2d (with GELU), 1x1 NHWC conv projection to
- * d_model, 3x3 NHWC conv spatial mixing. Conv weights are permuted
- * from checkpoint OIHW/IOHW to OHWI at load time via
- * gh_permute_conv_weight_ohwi; Task 12 moves this into sam3_convert.
+ * d_model, 3x3 NHWC conv spatial mixing. Conv weights already ship
+ * in OHWI on disk (permuted by sam3_convert, Task 12), so the load
+ * path consumes them directly with no runtime transpose.
  *
  * Key types:  sam3_neck
  * Depends on: necks.h, graph_helpers.h, util/log.h
@@ -274,38 +274,18 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			compute_conv_dims(neck, i, j,
 					   &c_in, &c_out, &kh, &kw);
 
-			int w_dims[4];
-			if (neck->stages[i].is_transpose[j]) {
-				/* ConvTranspose2d: [C_in, C_out, KH, KW] */
-				w_dims[0] = c_in;
-				w_dims[1] = c_out;
-			} else {
-				/* Conv2d: [C_out, C_in, KH, KW] */
-				w_dims[0] = c_out;
-				w_dims[1] = c_in;
-			}
-			w_dims[2] = kh;
-			w_dims[3] = kw;
+			/*
+			 * Conv weights ship in OHWI [OC, KH, KW, IC]
+			 * for both Conv2d and ConvTranspose2d after
+			 * Task 12's permute in sam3_convert.
+			 */
+			int w_dims[4] = {c_out, kh, kw, c_in};
 
 			neck_weight_name(name, sizeof(name),
 					 neck, i, j, "weight");
-			struct sam3_tensor *raw_w = gh_load_mmap(
+			neck->stages[i].conv_w[j] = gh_load_mmap(
 				wf, name, arena, SAM3_DTYPE_F32,
 				4, w_dims);
-			if (!raw_w)
-				return SAM3_ENOMEM;
-
-			/*
-			 * Permute the conv weight from checkpoint
-			 * OIHW/IOHW to OHWI so gh_conv2d_nhwc /
-			 * gh_conv_transpose2d_nhwc can consume it
-			 * directly. Task 12 moves this into the
-			 * converter.
-			 */
-			neck->stages[i].conv_w[j] =
-				gh_permute_conv_weight_ohwi(
-					arena, raw_w,
-					neck->stages[i].is_transpose[j]);
 			if (!neck->stages[i].conv_w[j])
 				return SAM3_ENOMEM;
 

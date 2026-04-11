@@ -355,31 +355,26 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		return SAM3_ENOMEM;
 
 	/* ── Pixel decoder ──────────────────────────────────────── */
-	int conv1_w_dims[] = {256, 64, 2, 2};
+	/*
+	 * Pixel decoder conv weights ship in OHWI [OC, KH, KW, IC]
+	 * after Task 12's permute in sam3_convert. Source checkpoint
+	 * was IOHW for ConvTranspose2d (upscale_conv*) and OIHW for
+	 * Conv2d (conv_s*); both converge on the same OHWI layout.
+	 *
+	 * upscale_conv1: IOHW [256, 64, 2, 2] -> OHWI [64, 2, 2, 256]
+	 * upscale_conv2: IOHW [64, 32, 2, 2]  -> OHWI [32, 2, 2, 64]
+	 */
+	int conv1_w_dims[] = {64, 2, 2, 256};
 	int conv1_b_dims[] = {64};
 	int ln64_dims[] = {64};
-	int conv2_w_dims[] = {64, 32, 2, 2};
+	int conv2_w_dims[] = {32, 2, 2, 64};
 	int conv2_b_dims[] = {32};
 
-	/*
-	 * Pixel decoder conv weights are permuted to OHWI at load
-	 * time (Task 10) so the build path can feed them directly to
-	 * gh_conv_transpose2d_nhwc / gh_conv2d_nhwc without a runtime
-	 * transpose. The raw checkpoint layout is IOHW for ConvT and
-	 * OIHW for Conv2d; gh_permute_conv_weight_ohwi handles both.
-	 */
-	{
-		struct sam3_tensor *raw;
-
-		raw = gh_load_mmap(wf,
-			P "upscale_conv1.weight",
-			arena, SAM3_DTYPE_F32, 4, conv1_w_dims);
-		if (!raw)
-			return SAM3_ENOMEM;
-		dec->up_conv1_w = gh_permute_conv_weight_ohwi(arena, raw, 1);
-		if (!dec->up_conv1_w)
-			return SAM3_ENOMEM;
-	}
+	dec->up_conv1_w = gh_load_mmap(wf,
+		P "upscale_conv1.weight",
+		arena, SAM3_DTYPE_F32, 4, conv1_w_dims);
+	if (!dec->up_conv1_w)
+		return SAM3_ENOMEM;
 	dec->up_conv1_b = gh_load_mmap(wf,
 		P "upscale_conv1.bias",
 		arena, SAM3_DTYPE_F32, 1, conv1_b_dims);
@@ -397,18 +392,11 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	if (!dec->up_ln_b)
 		return SAM3_ENOMEM;
 
-	{
-		struct sam3_tensor *raw;
-
-		raw = gh_load_mmap(wf,
-			P "upscale_conv2.weight",
-			arena, SAM3_DTYPE_F32, 4, conv2_w_dims);
-		if (!raw)
-			return SAM3_ENOMEM;
-		dec->up_conv2_w = gh_permute_conv_weight_ohwi(arena, raw, 1);
-		if (!dec->up_conv2_w)
-			return SAM3_ENOMEM;
-	}
+	dec->up_conv2_w = gh_load_mmap(wf,
+		P "upscale_conv2.weight",
+		arena, SAM3_DTYPE_F32, 4, conv2_w_dims);
+	if (!dec->up_conv2_w)
+		return SAM3_ENOMEM;
 	dec->up_conv2_b = gh_load_mmap(wf,
 		P "upscale_conv2.bias",
 		arena, SAM3_DTYPE_F32, 1, conv2_b_dims);
@@ -509,26 +497,25 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 
 	/* ── Multi-scale skip connection convolutions ──────────── */
 	{
-		int s0w[] = {32, 256, 1, 1}, s0b[] = {32};
-		int s1w[] = {64, 256, 1, 1}, s1b[] = {64};
-		struct sam3_tensor *raw;
+		/* Conv2d weights ship in OHWI after Task 12's permute:
+		 * conv_s0: OIHW [32, 256, 1, 1] -> OHWI [32, 1, 1, 256]
+		 * conv_s1: OIHW [64, 256, 1, 1] -> OHWI [64, 1, 1, 256]
+		 */
+		int s0w[] = {32, 1, 1, 256}, s0b[] = {32};
+		int s1w[] = {64, 1, 1, 256}, s1b[] = {64};
 
-		raw = gh_load_mmap(wf,
+		dec->conv_s0_w = gh_load_mmap(wf,
 			P "conv_s0.weight", arena,
 			SAM3_DTYPE_F32, 4, s0w);
-		if (!raw) return SAM3_ENOMEM;
-		dec->conv_s0_w = gh_permute_conv_weight_ohwi(arena, raw, 0);
 		if (!dec->conv_s0_w) return SAM3_ENOMEM;
 		dec->conv_s0_b = gh_load_mmap(wf,
 			P "conv_s0.bias", arena,
 			SAM3_DTYPE_F32, 1, s0b);
 		if (!dec->conv_s0_b) return SAM3_ENOMEM;
 
-		raw = gh_load_mmap(wf,
+		dec->conv_s1_w = gh_load_mmap(wf,
 			P "conv_s1.weight", arena,
 			SAM3_DTYPE_F32, 4, s1w);
-		if (!raw) return SAM3_ENOMEM;
-		dec->conv_s1_w = gh_permute_conv_weight_ohwi(arena, raw, 0);
 		if (!dec->conv_s1_w) return SAM3_ENOMEM;
 		dec->conv_s1_b = gh_load_mmap(wf,
 			P "conv_s1.bias", arena,

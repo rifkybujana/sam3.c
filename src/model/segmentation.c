@@ -7,9 +7,9 @@
  * features from coarse to fine using nearest-neighbor upsampling +
  * skip add + 3×3 conv + GroupNorm(8) + ReLU. The mask prediction
  * uses a 3-layer MLP on query embeddings and a dot product with
- * instance-projected pixel features. Conv weights are permuted from
- * checkpoint OIHW to OHWI at load time via
- * gh_permute_conv_weight_ohwi; Task 12 moves this into sam3_convert.
+ * instance-projected pixel features. Conv weights already ship in
+ * OHWI on disk (permuted by sam3_convert, Task 12), so the load path
+ * consumes them directly.
  *
  * Weight prefix: detector_model.mask_decoder.*
  *
@@ -50,29 +50,22 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 	int d = head->d_model;
 	char name[128];
 
-	int conv_w_dims[] = {d, d, 3, 3};
-	int proj_w_dims[] = {d, d, 1, 1};
+	/*
+	 * Conv weights ship in OHWI [OC, KH, KW, IC] (permuted by
+	 * sam3_convert); for square dims with OC == IC the shape is
+	 * the same on both axes.
+	 */
+	int conv_w_dims[] = {d, 3, 3, d};
+	int proj_w_dims[] = {d, 1, 1, d};
 	int lin_w_dims[] = {d, d};
 	int d_dims[] = {d};
 
 	/* FPN pixel decoder: 3 stages */
 	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++) {
-		struct sam3_tensor *raw_w;
-
 		snprintf(name, sizeof(name),
 			 WP "pixel_decoder.conv_layers.%d.weight", i);
-		raw_w = gh_load_mmap(wf, name, arena,
-				     SAM3_DTYPE_F32, 4, conv_w_dims);
-		if (!raw_w)
-			return SAM3_ENOMEM;
-
-		/*
-		 * Permute Conv2d weight from checkpoint OIHW to OHWI
-		 * so gh_conv2d_nhwc can consume it directly. Task 12
-		 * moves this into the converter.
-		 */
-		head->fpn[i].conv_w = gh_permute_conv_weight_ohwi(
-			arena, raw_w, 0);
+		head->fpn[i].conv_w = gh_load_mmap(wf, name, arena,
+			SAM3_DTYPE_F32, 4, conv_w_dims);
 		if (!head->fpn[i].conv_w)
 			return SAM3_ENOMEM;
 
@@ -98,22 +91,12 @@ enum sam3_error sam3_seg_head_load(struct sam3_seg_head *head,
 			return SAM3_ENOMEM;
 	}
 
-	/* Instance projection: 1×1 conv */
-	{
-		struct sam3_tensor *raw_w;
-
-		raw_w = gh_load_mmap(wf,
-			WP "instance_projection.weight", arena,
-			SAM3_DTYPE_F32, 4, proj_w_dims);
-		if (!raw_w)
-			return SAM3_ENOMEM;
-
-		/* Permute Conv2d OIHW -> OHWI for gh_conv2d_nhwc. */
-		head->inst_proj_w = gh_permute_conv_weight_ohwi(
-			arena, raw_w, 0);
-		if (!head->inst_proj_w)
-			return SAM3_ENOMEM;
-	}
+	/* Instance projection: 1x1 Conv2d (OHWI). */
+	head->inst_proj_w = gh_load_mmap(wf,
+		WP "instance_projection.weight", arena,
+		SAM3_DTYPE_F32, 4, proj_w_dims);
+	if (!head->inst_proj_w)
+		return SAM3_ENOMEM;
 
 	head->inst_proj_b = gh_load_mmap(wf,
 		WP "instance_projection.bias", arena,

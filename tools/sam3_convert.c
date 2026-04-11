@@ -26,6 +26,7 @@
 #include "util/log.h"
 #include "util/error.h"
 #include "weight_rename.h"
+#include "weight_conv_perm.h"
 
 static void print_usage(const char *prog)
 {
@@ -351,7 +352,23 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	n = rename_reader.ops->n_tensors(&rename_reader);
+	/*
+	 * Wrap with conv_perm reader: detects conv2d / conv_transpose2d
+	 * weights by name and permutes them to OHWI on the fly, so the
+	 * .sam3 output ships with weights already in the layout the
+	 * NHWC backend kernels expect.
+	 */
+	struct weight_reader conv_perm_reader;
+	err = weight_reader_conv_perm_init(&conv_perm_reader, &rename_reader);
+	if (err != SAM3_OK) {
+		fprintf(stderr, "error: failed to init conv_perm reader: "
+			"%s\n", sam3_error_str(err));
+		rename_reader.ops->close(&rename_reader);
+		reader.ops->close(&reader);
+		return 1;
+	}
+
+	n = conv_perm_reader.ops->n_tensors(&conv_perm_reader);
 
 	/* Print conversion summary */
 	printf("sam3_convert\n");
@@ -373,7 +390,7 @@ int main(int argc, char **argv)
 	config.n_decoder_layers = args.decoder_layers;
 
 	/* Set up quantizing wrapper if requested */
-	struct weight_reader *write_reader = &rename_reader;
+	struct weight_reader *write_reader = &conv_perm_reader;
 	struct quant_reader_state qstate;
 	struct weight_reader quant_reader;
 
@@ -383,12 +400,13 @@ int main(int argc, char **argv)
 				"error: unsupported quantize type '%s' "
 				"(only \"q8_0\" is supported)\n",
 				args.quantize);
+			conv_perm_reader.ops->close(&conv_perm_reader);
 			rename_reader.ops->close(&rename_reader);
 			reader.ops->close(&reader);
 			return 1;
 		}
 
-		qstate.inner = &rename_reader;
+		qstate.inner = &conv_perm_reader;
 		qstate.nelems_threshold = 1024;
 		quant_reader.ops = &quant_reader_ops;
 		quant_reader.impl = &qstate;
@@ -402,11 +420,13 @@ int main(int argc, char **argv)
 	if (err != SAM3_OK) {
 		fprintf(stderr, "error: conversion failed: %s\n",
 			sam3_error_str(err));
+		conv_perm_reader.ops->close(&conv_perm_reader);
 		rename_reader.ops->close(&rename_reader);
 		reader.ops->close(&reader);
 		return 1;
 	}
 
+	conv_perm_reader.ops->close(&conv_perm_reader);
 	rename_reader.ops->close(&rename_reader);
 	reader.ops->close(&reader);
 	printf("Done.\n");
