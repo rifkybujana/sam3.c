@@ -80,48 +80,20 @@ much smaller intermediate.
 
 ## P1 — Medium Leverage
 
-### #3. Native NHWC Layout (Eliminate conv2d Transposes)
+### #3. Native NHWC Layout (Eliminate conv2d Transposes) ✅ SHIPPED
 
-**Why:** SAM3 stores tensors NCHW but Metal/MLX conv kernels prefer
-NHWC. The neck and seg_head insert transposes around every conv2d.
-`src/model/necks.c:374` does a single `gh_transpose` per scale to
-shuffle ViT output `[n_patches, dim]` → `[1, dim, gs, gs]`, but the
-4-stage neck and 3-stage seg_head accumulate transpose overhead.
+**Landed 2026-04-12.** Full model-level NHWC migration: patch embed,
+neck, seg_head, mask decoder, CPU and Metal backends all consume NHWC
+activations directly. Conv2d / convtranspose2d weights stored in OHWI
+order in `.sam3` v3 (see [docs/weight-format.md](docs/weight-format.md)).
+Removed -625 LOC of NCHW↔NHWC scaffolding.
 
-**Current state:**
-- `src/backend/cpu/kernels/cpu_conv2d.c:9` declares input as
-  `[N, C, H, W]` (NCHW). Metal conv2d wraps the same convention.
-- `src/model/necks.c:374` `gh_transpose` to NCHW; downstream conv ops
-  inside the neck assume NCHW.
-- `src/model/image_encoder.c:611` `gh_transpose` after the 14×14 patch
-  conv2d to flatten back to `[np, dim]`.
-
-**Approach:**
-1. Decide on the canonical layout for image-side tensors. Recommended:
-   keep NCHW in the public tensor type but teach the Metal backend's
-   `metal_conv2d_op` to transpose internally on the GPU (cheap) or to
-   call MLX conv2d in NHWC mode and absorb the transpose.
-2. Alternatively (more invasive): switch the entire image encoder /
-   neck / seg_head to NHWC and update every shape calculation.
-
-**Recommendation:** start with the backend-internal transpose
-absorption. Profile to confirm that `mlx_conv_general` with NHWC plus
-GPU-side transpose is faster than the current explicit `gh_transpose`
-ops. If yes, ship that. Only touch the model-level layout if the
-backend approach doesn't recover the win.
-
-**Files to touch:**
-- `src/backend/metal/metal_backend.c` — `metal_conv2d_op` (search for
-  it) — fold transposes into the MLX call.
-- `src/model/necks.c` — possibly remove the `gh_transpose` at line 374
-  if backend handles it.
-- `src/model/image_encoder.c:611` — same.
-- `src/model/segmentation.c` — seg_head transposes.
-
-**Estimated impact:** 10-20% of (neck+seg_head) ≈ 80-165ms.
-12.4s → ~12.25s. (Smaller absolute win but easy if the backend trick
-works.)
-**Complexity:** Medium (backend) or High (full NHWC migration).
+Wall-clock delta is neutral (+0.3 %, within thermal noise) because MLX
+already absorbs layout transposes internally on Apple Silicon. The
+architectural benefits remain: natural MLX layout at the backend,
+cleaner data flow, and future kernel work (Winograd, im2col, Metal-side
+conv fusion) can assume NHWC inputs without pre-permutes. See
+[PERFORMANCE.md](PERFORMANCE.md) for the stage delta table.
 
 ---
 
@@ -220,9 +192,10 @@ images or multiple segments — single-shot inference gets nothing.
 
 1. ~~**#11 async pipeline**~~ ✅ **SHIPPED** (-3.7s wall, fully hides
    text_encode behind image_encode)
-2. **#4 mask-free window attention** (P0, ~600-850ms, also frees
+2. ~~**#3 native NHWC layout**~~ ✅ **SHIPPED** (neutral wall-clock,
+   -625 LOC scaffolding, v3 `.sam3` with OHWI weights)
+3. **#4 mask-free window attention** (P0, ~600-850ms, also frees
    ~107 MiB of arena pressure → enables larger batch in #1)
-3. **#3 backend-side NHWC fold** (P1, easy if MLX cooperates)
 4. **#10 graph template reuse** (P1, small but cheap)
 5. **#12 text KV cache** (P2, only if interactive workloads matter)
 6. **#13 native Metal kernels** (P2, only if everything above lands
