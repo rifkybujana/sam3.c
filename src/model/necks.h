@@ -91,7 +91,9 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
  * @arena:        Arena for intermediate tensors
  *
  * Fills out_features[0..n_scales-1] with feature maps at different
- * scales. Each output is [1, d_model, H_i, W_i] in NCHW format.
+ * scales. Each output is [1, H_i, W_i, d_model] in NHWC format.
+ * Callers that still require NCHW (e.g. vl_combiner) insert a
+ * temporary NHWC->NCHW bridge permute until their consumers migrate.
  *
  * Returns SAM3_OK on success.
  */
