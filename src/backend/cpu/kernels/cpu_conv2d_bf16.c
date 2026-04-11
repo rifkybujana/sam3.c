@@ -245,18 +245,6 @@ static void conv2d_matmul_bf16_fn(void *arg, int task_id, int n_tasks)
 #endif /* SAM3_HAS_NEON */
 
 /*
- * cpu_kernel_conv2d_bf16 - BF16 Conv2D via im2col + matmul.
- *
- * @node:    Node with n_inputs>=2: input [N,C,H,W] and weight [OC,C,KH,KW],
- *           both SAM3_DTYPE_BF16. node->params[0]=stride, params[1]=padding.
- * @scratch: Scratch arena for im2col temp buffer and f32 accumulation.
- *           Offset is saved/restored.
- * @pool:    Thread pool for parallel matmul over output channels.
- *
- * Returns SAM3_OK on success, SAM3_EINVAL on bad inputs, SAM3_ENOMEM if
- * the scratch arena is too small.
- */
-/*
  * conv2d_bf16_nchw_body - Legacy NCHW BF16 body via im2col + matmul.
  *
  * Operates on stack tensors prepared by the NHWC shim: input NCHW

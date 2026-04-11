@@ -132,8 +132,6 @@ enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,
 	}
 
 	struct sam3_tensor *in = node->inputs[0];
-	struct sam3_tensor *out = node->output;
-	(void)out;
 	int num_groups = node->params[0];
 
 	if (in->n_dims != 4) {
