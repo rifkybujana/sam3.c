@@ -24,6 +24,7 @@
 
 #include "sam3/sam3.h"
 #include "sam3/internal/mask_nms.h"
+#include "sam3/internal/mask_postprocess.h"
 #include "sam3/internal/mask_resize.h"
 #include "sam3/internal/tensor_dump.h"
 #include "core/tensor.h"
@@ -83,6 +84,7 @@ struct main_args {
 	float                nms_iou_thresh;
 	int                  profile;
 	int                  verbose;
+	int                  smooth;
 	const char          *dump_dir;
 };
 
@@ -152,6 +154,8 @@ static void print_usage(const char *prog)
 	printf("  --overlay          Write color overlay PNGs\n");
 	printf("  --cutout           Write cutout PNGs\n");
 	printf("  --all              Enable all output formats\n");
+	printf("  --smooth           Apply morphological cleanup "
+	       "to masks\n");
 	printf("  --threshold <f>    Mask threshold "
 	       "(default: 0.0)\n");
 	printf("  --no-nms           Disable NMS post-processing\n");
@@ -189,6 +193,7 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 	args->nms_iou_thresh  = 0.5f;
 	args->profile       = 0;
 	args->verbose       = 0;
+	args->smooth        = 0;
 	args->dump_dir      = NULL;
 
 	for (int i = 1; i < argc; i++) {
@@ -311,6 +316,8 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 				return 1;
 			}
 			args->nms_iou_thresh = (float)atof(argv[i]);
+		} else if (strcmp(argv[i], "--smooth") == 0) {
+			args->smooth = 1;
 		} else if (strcmp(argv[i], "--dump-tensors") == 0) {
 			if (++i >= argc) {
 				fprintf(stderr,
@@ -856,6 +863,40 @@ int main(int argc, char **argv)
 		int mask_pixels = result.mask_width * result.mask_height;
 		char path_buf[1024];
 
+		/* Post-processing buffers for --smooth */
+		unsigned char *smooth_bin = NULL;
+		unsigned char *smooth_work = NULL;
+		unsigned char *smooth_out = NULL;
+		int *smooth_labels = NULL;
+		int *smooth_stack = NULL;
+		float *smooth_probs = NULL;
+
+		if (args.smooth) {
+			size_t mp = (size_t)mask_pixels;
+			smooth_bin = malloc(mp);
+			smooth_work = malloc(mp);
+			smooth_out = malloc(mp);
+			smooth_labels = malloc(mp * sizeof(int));
+			smooth_stack = malloc(mp * sizeof(int));
+			smooth_probs = malloc(mp * sizeof(float));
+			if (!smooth_bin || !smooth_work ||
+			    !smooth_out || !smooth_labels ||
+			    !smooth_stack || !smooth_probs) {
+				fprintf(stderr,
+					"warning: --smooth malloc "
+					"failed, falling back to "
+					"raw output\n");
+				free(smooth_bin);
+				free(smooth_work);
+				free(smooth_out);
+				free(smooth_labels);
+				free(smooth_stack);
+				free(smooth_probs);
+				smooth_bin = NULL;
+				args.smooth = 0;
+			}
+		}
+
 		for (int i = 0; i < result.n_masks; i++) {
 			const float *mask_data =
 				result.masks + i * mask_pixels;
@@ -876,17 +917,54 @@ int main(int argc, char **argv)
 				snprintf(path_buf, sizeof(path_buf),
 					 "%s/mask_%d.png",
 					 args.output_dir, i);
-				if (write_mask_png(path_buf, mask_data,
-						   result.mask_width,
-						   result.mask_height,
-						   args.threshold))
-					fprintf(stderr,
-						"warning: failed to "
-						"write %s\n",
-						path_buf);
-				else
-					printf("  wrote %s\n",
-					       path_buf);
+				if (args.smooth && smooth_bin) {
+					/* Binarize, morpho open, remove small */
+					for (int j = 0; j < mask_pixels; j++)
+						smooth_bin[j] =
+							(mask_data[j] >= args.threshold) ? 1 : 0;
+					sam3_mask_morpho_open(
+						smooth_bin, smooth_out,
+						result.mask_width,
+						result.mask_height,
+						smooth_work);
+					sam3_mask_remove_small(
+						smooth_out,
+						result.mask_width,
+						result.mask_height,
+						100, smooth_labels,
+						smooth_stack);
+					uint8_t *gray = malloc(
+						(size_t)mask_pixels);
+					if (gray) {
+						for (int j = 0;
+						     j < mask_pixels; j++)
+							gray[j] = smooth_out[j]
+								? 255 : 0;
+						stbi_write_png(
+							path_buf,
+							result.mask_width,
+							result.mask_height,
+							1, gray,
+							result.mask_width);
+						free(gray);
+						printf("  wrote %s "
+						       "(smoothed)\n",
+						       path_buf);
+					}
+				} else {
+					if (write_mask_png(path_buf,
+							   mask_data,
+							   result.mask_width,
+							   result.mask_height,
+							   args.threshold))
+						fprintf(stderr,
+							"warning: failed "
+							"to write %s\n",
+							path_buf);
+					else
+						printf("  wrote %s\n",
+						       path_buf);
+				}
 			}
 
 			/* Color overlay */
@@ -894,18 +972,41 @@ int main(int argc, char **argv)
 				snprintf(path_buf, sizeof(path_buf),
 					 "%s/overlay_%d.png",
 					 args.output_dir, i);
-				if (write_overlay(path_buf, mask_data,
-						  result.mask_width,
-						  result.mask_height,
-						  &orig_img,
-						  args.threshold))
-					fprintf(stderr,
-						"warning: failed to "
-						"write %s\n",
-						path_buf);
-				else
-					printf("  wrote %s\n",
-					       path_buf);
+				if (args.smooth && smooth_probs) {
+					sam3_mask_sigmoid(
+						mask_data,
+						smooth_probs,
+						mask_pixels);
+					if (write_overlay(path_buf,
+							  smooth_probs,
+							  result.mask_width,
+							  result.mask_height,
+							  &orig_img,
+							  0.5f))
+						fprintf(stderr,
+							"warning: failed "
+							"to write %s\n",
+							path_buf);
+					else
+						printf("  wrote %s "
+						       "(smooth "
+						       "overlay)\n",
+						       path_buf);
+				} else {
+					if (write_overlay(path_buf,
+							  mask_data,
+							  result.mask_width,
+							  result.mask_height,
+							  &orig_img,
+							  args.threshold))
+						fprintf(stderr,
+							"warning: failed "
+							"to write %s\n",
+							path_buf);
+					else
+						printf("  wrote %s\n",
+						       path_buf);
+				}
 			}
 
 			/* RGBA cutout */
@@ -927,6 +1028,13 @@ int main(int argc, char **argv)
 					       path_buf);
 			}
 		}
+
+		free(smooth_bin);
+		free(smooth_work);
+		free(smooth_out);
+		free(smooth_labels);
+		free(smooth_stack);
+		free(smooth_probs);
 	}
 
 	/* Profiling report */
