@@ -487,10 +487,24 @@ static int write_overlay(const char *path, const float *mask,
 		uint8_t b = img->pixels[i * 3 + 2];
 
 		if (m[i] >= threshold) {
-			/* Blend with (30, 144, 255) at 50% alpha */
-			out[i * 3 + 0] = (uint8_t)((r + 30) / 2);
-			out[i * 3 + 1] = (uint8_t)((g + 144) / 2);
-			out[i * 3 + 2] = (uint8_t)((b + 255) / 2);
+			int x = (int)(i % (size_t)w);
+			int y = (int)(i / (size_t)w);
+			/* Edge: any 4-neighbor outside mask */
+			int edge = (x == 0 || m[i - 1] < threshold ||
+				    x == w - 1 || m[i + 1] < threshold ||
+				    y == 0 || m[i - w] < threshold ||
+				    y == h - 1 || m[i + w] < threshold);
+			if (edge) {
+				/* White outline for visibility */
+				out[i * 3 + 0] = 255;
+				out[i * 3 + 1] = 255;
+				out[i * 3 + 2] = 255;
+			} else {
+				/* Blend with dodger blue at 60% */
+				out[i * 3 + 0] = (uint8_t)(r * 0.4f + 18.f);
+				out[i * 3 + 1] = (uint8_t)(g * 0.4f + 86.4f);
+				out[i * 3 + 2] = (uint8_t)(b * 0.4f + 153.f);
+			}
 		} else {
 			out[i * 3 + 0] = r;
 			out[i * 3 + 1] = g;
@@ -944,7 +958,7 @@ int main(int argc, char **argv)
 						smooth_out,
 						result.mask_width,
 						result.mask_height,
-						100, smooth_labels,
+						16, smooth_labels,
 						smooth_stack);
 					uint8_t *gray = malloc(
 						(size_t)mask_pixels);
