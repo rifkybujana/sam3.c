@@ -164,4 +164,18 @@ void sam3_profile_report(sam3_ctx *ctx);
  */
 void sam3_profile_reset(sam3_ctx *ctx);
 
+/*
+ * sam3_dump_tensors - Dump cached image features to binary files.
+ *
+ * @ctx:      Context with image already encoded (sam3_set_image called)
+ * @out_dir:  Directory to write tensor files into (must exist)
+ *
+ * Writes neck feature tensors: neck_4x.bin, neck_2x.bin, neck_1x.bin,
+ * neck_05x.bin. Requires image encoded. Does NOT dump mask/score tensors
+ * (those are in sam3_result after segment).
+ *
+ * Returns SAM3_OK on success, SAM3_EINVAL if image not encoded.
+ */
+enum sam3_error sam3_dump_tensors(sam3_ctx *ctx, const char *out_dir);
+
 #endif /* SAM3_H */

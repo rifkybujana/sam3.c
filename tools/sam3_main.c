@@ -25,6 +25,8 @@
 #include "sam3/sam3.h"
 #include "sam3/internal/mask_nms.h"
 #include "sam3/internal/mask_resize.h"
+#include "sam3/internal/tensor_dump.h"
+#include "core/tensor.h"
 #include "util/image.h"
 #include "util/log.h"
 #include "util/error.h"
@@ -81,6 +83,7 @@ struct main_args {
 	float                nms_iou_thresh;
 	int                  profile;
 	int                  verbose;
+	const char          *dump_dir;
 };
 
 /*
@@ -156,6 +159,9 @@ static void print_usage(const char *prog)
 	       "(default: 0.5)\n");
 	printf("  --nms-iou-thresh <f>   Mask IoU NMS threshold "
 	       "(default: 0.5)\n");
+	printf("\nDebug:\n");
+	printf("  --dump-tensors <dir>   Dump intermediate tensors "
+	       "for validation\n");
 	printf("\nOther:\n");
 	printf("  --profile          Print profiling report\n");
 	printf("  -v                 Verbose logging\n");
@@ -183,6 +189,7 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 	args->nms_iou_thresh  = 0.5f;
 	args->profile       = 0;
 	args->verbose       = 0;
+	args->dump_dir      = NULL;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-h") == 0 ||
@@ -304,6 +311,14 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 				return 1;
 			}
 			args->nms_iou_thresh = (float)atof(argv[i]);
+		} else if (strcmp(argv[i], "--dump-tensors") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --dump-tensors "
+					"requires a directory\n");
+				return 1;
+			}
+			args->dump_dir = argv[i];
 		} else if (strcmp(argv[i], "--profile") == 0) {
 			args->profile = 1;
 		} else if (strcmp(argv[i], "-v") == 0) {
@@ -673,6 +688,59 @@ int main(int argc, char **argv)
 	}
 	printf("  segmentation completed in %.1fms\n",
 	       (double)(t1 - t0) / 1e6);
+
+	/* Dump tensors before NMS (which compacts masks in-place) */
+	if (args.dump_dir) {
+		/* Dump cached image features via public API */
+		enum sam3_error dump_err =
+			sam3_dump_tensors(ctx, args.dump_dir);
+		if (dump_err != SAM3_OK)
+			fprintf(stderr,
+				"warning: tensor dump failed: %s\n",
+				sam3_error_str(dump_err));
+
+		/* Dump mask logits from result */
+		if (result.n_masks > 0) {
+			struct sam3_tensor mask_t = {0};
+			mask_t.dtype = SAM3_DTYPE_F32;
+			mask_t.n_dims = 3;
+			mask_t.dims[0] = result.n_masks;
+			mask_t.dims[1] = result.mask_height;
+			mask_t.dims[2] = result.mask_width;
+			mask_t.data = result.masks;
+			mask_t.nbytes =
+				(size_t)result.n_masks *
+				result.mask_height *
+				result.mask_width * sizeof(float);
+
+			char dump_path[1024];
+			snprintf(dump_path, sizeof(dump_path),
+				 "%s/mask_logits.bin",
+				 args.dump_dir);
+			sam3_tensor_dump(dump_path, &mask_t);
+			printf("  dumped mask_logits.bin [%d, %d, %d]\n",
+			       result.n_masks, result.mask_height,
+			       result.mask_width);
+		}
+
+		/* Dump IoU scores from result */
+		if (result.iou_valid && result.n_masks > 0) {
+			struct sam3_tensor score_t = {0};
+			score_t.dtype = SAM3_DTYPE_F32;
+			score_t.n_dims = 1;
+			score_t.dims[0] = result.n_masks;
+			score_t.data = result.iou_scores;
+			score_t.nbytes = (size_t)result.n_masks *
+					 sizeof(float);
+
+			char dump_path[1024];
+			snprintf(dump_path, sizeof(dump_path),
+				 "%s/scores.bin", args.dump_dir);
+			sam3_tensor_dump(dump_path, &score_t);
+			printf("  dumped scores.bin [%d]\n",
+			       result.n_masks);
+		}
+	}
 
 	/* Post-process: greedy mask NMS. kept_buf and tmp_scores
 	 * are sized to match the 512-mask cap enforced by

@@ -20,7 +20,9 @@
 #include <sys/mman.h>
 
 #include "sam3/sam3.h"
+#include "sam3/internal/tensor_dump.h"
 #include "core/weight.h"
+#include "core/tensor.h"
 #include "util/image.h"
 #include "util/log.h"
 #include "model/sam3_processor.h"
@@ -319,4 +321,58 @@ void sam3_profile_reset(sam3_ctx *ctx)
 #else
 	(void)ctx;
 #endif
+}
+
+enum sam3_error sam3_dump_tensors(sam3_ctx *ctx, const char *out_dir)
+{
+	char path[1024];
+	struct sam3_image_model *m;
+
+	if (!ctx || !out_dir || !ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	m = &ctx->proc.model;
+	if (!m->image_encoded)
+		return SAM3_EINVAL;
+
+	/* Dump neck features at each scale */
+	struct { const char *name; struct sam3_tensor *t; } dumps[] = {
+		{"neck_4x.bin",  m->cached_feat_4x_nhwc},
+		{"neck_2x.bin",  m->cached_feat_s0_nhwc},
+		{"neck_1x.bin",  m->cached_feat_s1_nhwc},
+		{"neck_05x.bin", m->cached_image_features},
+	};
+
+	for (int i = 0; i < 4; i++) {
+		if (!dumps[i].t)
+			continue;
+		snprintf(path, sizeof(path), "%s/%s",
+			 out_dir, dumps[i].name);
+		if (sam3_tensor_dump(path, dumps[i].t) != 0) {
+			sam3_log_warn("dump_tensors: failed to write %s",
+				      path);
+		} else {
+			sam3_log_info("dump_tensors: wrote %s "
+				      "[%d,%d,%d,%d]",
+				      dumps[i].name,
+				      dumps[i].t->dims[0],
+				      dumps[i].t->dims[1],
+				      dumps[i].t->dims[2],
+				      dumps[i].t->dims[3]);
+		}
+	}
+
+	/* Dump text features if available */
+	if (m->cached_text_features) {
+		snprintf(path, sizeof(path),
+			 "%s/text_features.bin", out_dir);
+		if (sam3_tensor_dump(path, m->cached_text_features) != 0)
+			sam3_log_warn("dump_tensors: failed to write "
+				      "text_features.bin");
+		else
+			sam3_log_info("dump_tensors: wrote "
+				      "text_features.bin");
+	}
+
+	return SAM3_OK;
 }
