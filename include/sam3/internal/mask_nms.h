@@ -26,6 +26,9 @@
  * @h, @w:       Mask spatial dimensions
  * @prob_thresh: Drop any mask with score <= prob_thresh before NMS
  * @iou_thresh:  Drop any mask whose IoU with a kept mask > iou_thresh
+ * @min_quality: Minimum fraction of confident pixels (|logit| > 2.0) per mask.
+ *               Masks below this threshold are rejected after NMS.
+ *               Set to 0.0 to disable quality filtering (backward compatible).
  * @kept_out:    Caller-allocated int array of size >= n_masks; filled
  *               with kept mask indices in descending-score order.
  *
@@ -37,6 +40,7 @@
 int sam3_mask_nms(const float *masks, const float *scores,
 		  int n_masks, int h, int w,
 		  float prob_thresh, float iou_thresh,
+		  float min_quality,
 		  int *kept_out);
 
 #endif /* SAM3_INTERNAL_MASK_NMS_H */

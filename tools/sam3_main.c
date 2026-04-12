@@ -82,6 +82,7 @@ struct main_args {
 	int                  nms_enabled;
 	float                nms_prob_thresh;
 	float                nms_iou_thresh;
+	float                min_mask_quality;
 	int                  profile;
 	int                  verbose;
 	int                  smooth;
@@ -163,6 +164,8 @@ static void print_usage(const char *prog)
 	       "(default: 0.5)\n");
 	printf("  --nms-iou-thresh <f>   Mask IoU NMS threshold "
 	       "(default: 0.5)\n");
+	printf("  --min-mask-quality <f>  Min confident pixel fraction "
+	       "(default: 0.0)\n");
 	printf("\nDebug:\n");
 	printf("  --dump-tensors <dir>   Dump intermediate tensors "
 	       "for validation\n");
@@ -191,6 +194,7 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 	args->nms_enabled     = 1;
 	args->nms_prob_thresh = 0.5f;
 	args->nms_iou_thresh  = 0.5f;
+	args->min_mask_quality = 0.0f;
 	args->profile       = 0;
 	args->verbose       = 0;
 	args->smooth        = 0;
@@ -316,6 +320,14 @@ static int parse_args(int argc, char **argv, struct main_args *args)
 				return 1;
 			}
 			args->nms_iou_thresh = (float)atof(argv[i]);
+		} else if (strcmp(argv[i], "--min-mask-quality") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --min-mask-quality "
+					"requires a value\n");
+				return 1;
+			}
+			args->min_mask_quality = strtof(argv[i], NULL);
 		} else if (strcmp(argv[i], "--smooth") == 0) {
 			args->smooth = 1;
 		} else if (strcmp(argv[i], "--dump-tensors") == 0) {
@@ -763,6 +775,7 @@ int main(int argc, char **argv)
 			result.mask_height, result.mask_width,
 			args.nms_prob_thresh,
 			args.nms_iou_thresh,
+			args.min_mask_quality,
 			kept_buf);
 
 		if (n_kept < 0) {

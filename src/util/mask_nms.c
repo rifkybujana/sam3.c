@@ -49,6 +49,7 @@ static int cmp_idx_score_desc(const void *pa, const void *pb)
 int sam3_mask_nms(const float *masks, const float *scores,
 		  int n_masks, int h, int w,
 		  float prob_thresh, float iou_thresh,
+		  float min_quality,
 		  int *kept_out)
 {
 	struct idx_score cand[512];
@@ -96,6 +97,24 @@ int sam3_mask_nms(const float *masks, const float *scores,
 			kept_out[n_kept] = ci;
 			n_kept++;
 		}
+	}
+
+	/* Quality filter: reject masks with too few confident pixels */
+	if (min_quality > 0.0f && n_kept > 0) {
+		int write = 0;
+		for (i = 0; i < n_kept; i++) {
+			int ki = kept_out[i];
+			const float *mk = masks + (size_t)ki * n_pix;
+			int confident = 0;
+			for (j = 0; j < n_pix; j++) {
+				if (mk[j] > 2.0f || mk[j] < -2.0f)
+					confident++;
+			}
+			float frac = (float)confident / (float)n_pix;
+			if (frac >= min_quality)
+				kept_out[write++] = ki;
+		}
+		n_kept = write;
 	}
 
 	return n_kept;

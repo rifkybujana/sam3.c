@@ -49,7 +49,7 @@ static void test_nms_keeps_highest_when_identical(void)
 	n_kept = sam3_mask_nms(masks, scores, 2, 4, 4,
 			       0.0f /* prob_thresh */,
 			       0.5f /* iou_thresh */,
-			       kept);
+			       0.0f, kept);
 
 	ASSERT_EQ(n_kept, 1);
 	ASSERT_EQ(kept[0], 0);
@@ -67,7 +67,7 @@ static void test_nms_keeps_disjoint(void)
 	fill_rect_mask(&masks[1 * 16], 2, 2, 4, 4); /* bot-right 2x2 */
 
 	n_kept = sam3_mask_nms(masks, scores, 2, 4, 4,
-			       0.0f, 0.5f, kept);
+			       0.0f, 0.5f, 0.0f, kept);
 
 	ASSERT_EQ(n_kept, 2);
 }
@@ -85,7 +85,7 @@ static void test_nms_prefilters_by_score(void)
 	fill_rect_mask(&masks[1 * 16], 2, 2, 4, 4);
 
 	n_kept = sam3_mask_nms(masks, scores, 2, 4, 4,
-			       0.5f, 0.5f, kept);
+			       0.5f, 0.5f, 0.0f, kept);
 
 	ASSERT_EQ(n_kept, 1);
 	ASSERT_EQ(kept[0], 0);
@@ -105,7 +105,7 @@ static void test_nms_orders_by_score(void)
 	fill_rect_mask(&masks[2 * 16], 2, 2, 3, 3);
 
 	n_kept = sam3_mask_nms(masks, scores, 3, 4, 4,
-			       0.0f, 0.5f, kept);
+			       0.0f, 0.5f, 0.0f, kept);
 
 	ASSERT_EQ(n_kept, 3);
 	ASSERT_EQ(kept[0], 1); /* 0.9 */
@@ -129,7 +129,7 @@ static void test_nms_drops_overlapping_lower_score(void)
 	/* IoU(A,B) = 4/16 = 0.25, IoU(A,C) = 1/16 = 0.0625,
 	 * IoU(B,C) = 0/5 = 0. With iou_thresh=0.2, B dropped. */
 	n_kept = sam3_mask_nms(masks, scores, 3, 4, 4,
-			       0.0f, 0.2f, kept);
+			       0.0f, 0.2f, 0.0f, kept);
 
 	ASSERT_EQ(n_kept, 2);
 	ASSERT_EQ(kept[0], 0);
@@ -143,20 +143,20 @@ static void test_nms_invalid_args_returns_minus_one(void)
 	float scores[1] = { 0.5f };
 	int   kept[1];
 
-	ASSERT_EQ(sam3_mask_nms(NULL, scores, 1, 4, 4, 0.0f, 0.5f, kept),
-		  -1);
-	ASSERT_EQ(sam3_mask_nms(masks, NULL, 1, 4, 4, 0.0f, 0.5f, kept),
-		  -1);
-	ASSERT_EQ(sam3_mask_nms(masks, scores, 1, 4, 4, 0.0f, 0.5f, NULL),
-		  -1);
-	ASSERT_EQ(sam3_mask_nms(masks, scores, 0, 4, 4, 0.0f, 0.5f, kept),
-		  -1);
-	ASSERT_EQ(sam3_mask_nms(masks, scores, 1, 0, 4, 0.0f, 0.5f, kept),
-		  -1);
-	ASSERT_EQ(sam3_mask_nms(masks, scores, 1, 4, 0, 0.0f, 0.5f, kept),
-		  -1);
+	ASSERT_EQ(sam3_mask_nms(NULL, scores, 1, 4, 4, 0.0f, 0.5f,
+				0.0f, kept), -1);
+	ASSERT_EQ(sam3_mask_nms(masks, NULL, 1, 4, 4, 0.0f, 0.5f,
+				0.0f, kept), -1);
+	ASSERT_EQ(sam3_mask_nms(masks, scores, 1, 4, 4, 0.0f, 0.5f,
+				0.0f, NULL), -1);
+	ASSERT_EQ(sam3_mask_nms(masks, scores, 0, 4, 4, 0.0f, 0.5f,
+				0.0f, kept), -1);
+	ASSERT_EQ(sam3_mask_nms(masks, scores, 1, 0, 4, 0.0f, 0.5f,
+				0.0f, kept), -1);
+	ASSERT_EQ(sam3_mask_nms(masks, scores, 1, 4, 0, 0.0f, 0.5f,
+				0.0f, kept), -1);
 	ASSERT_EQ(sam3_mask_nms(masks, scores, 513, 4, 4, 0.0f, 0.5f,
-				kept), -1);
+				0.0f, kept), -1);
 }
 
 static void test_nms_all_filtered_returns_zero(void)
@@ -171,7 +171,7 @@ static void test_nms_all_filtered_returns_zero(void)
 	fill_rect_mask(&masks[1 * 16], 2, 2, 4, 4);
 
 	n_kept = sam3_mask_nms(masks, scores, 2, 4, 4,
-			       0.5f, 0.5f, kept);
+			       0.5f, 0.5f, 0.0f, kept);
 
 	ASSERT_EQ(n_kept, 0);
 }
@@ -187,10 +187,54 @@ static void test_nms_single_candidate(void)
 	fill_rect_mask(&masks[0 * 16], 0, 0, 2, 2);
 
 	n_kept = sam3_mask_nms(masks, scores, 1, 4, 4,
-			       0.0f, 0.5f, kept);
+			       0.0f, 0.5f, 0.0f, kept);
 
 	ASSERT_EQ(n_kept, 1);
 	ASSERT_EQ(kept[0], 0);
+}
+
+static void test_nms_quality_floor_rejects_noisy_mask(void)
+{
+	/* Mask 0: all pixels confident (logit=5.0). Score=0.9.
+	 * Mask 1: all pixels near-zero (logit=0.01). Score=0.8.
+	 * With min_quality=0.1, mask 1 should be rejected. */
+	float masks[2 * 16];
+	float scores[2] = { 0.9f, 0.8f };
+	int kept[2];
+	int n_kept;
+
+	/* Mask 0: confident (top half positive, bottom negative) */
+	for (int i = 0; i < 16; i++)
+		masks[0 * 16 + i] = (i < 8) ? 5.0f : -5.0f;
+
+	/* Mask 1: noisy (all near zero) */
+	for (int i = 0; i < 16; i++)
+		masks[1 * 16 + i] = (i % 2) ? 0.01f : -0.01f;
+
+	n_kept = sam3_mask_nms(masks, scores, 2, 4, 4,
+			       0.0f, 0.5f, 0.1f, kept);
+
+	ASSERT_EQ(n_kept, 1);
+	ASSERT_EQ(kept[0], 0);
+}
+
+static void test_nms_quality_zero_is_noop(void)
+{
+	/* Same setup but min_quality=0 should keep both */
+	float masks[2 * 16];
+	float scores[2] = { 0.9f, 0.8f };
+	int kept[2];
+	int n_kept;
+
+	for (int i = 0; i < 16; i++)
+		masks[0 * 16 + i] = (i < 8) ? 5.0f : -5.0f;
+	for (int i = 0; i < 16; i++)
+		masks[1 * 16 + i] = (i % 2) ? 0.01f : -0.01f;
+
+	n_kept = sam3_mask_nms(masks, scores, 2, 4, 4,
+			       0.0f, 0.5f, 0.0f, kept);
+
+	ASSERT_EQ(n_kept, 2);
 }
 
 int main(void)
@@ -203,6 +247,8 @@ int main(void)
 	test_nms_invalid_args_returns_minus_one();
 	test_nms_all_filtered_returns_zero();
 	test_nms_single_candidate();
+	test_nms_quality_floor_rejects_noisy_mask();
+	test_nms_quality_zero_is_noop();
 
 	TEST_REPORT();
 }
