@@ -204,6 +204,12 @@ if(SAM3_TESTS)
 		target_compile_definitions(test_processor_async PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
+
+	# test_cli_common needs tools/ include path for cli_common.h
+	if(TARGET test_cli_common)
+		target_include_directories(test_cli_common PRIVATE
+			${CMAKE_SOURCE_DIR}/tools)
+	endif()
 endif()
 
 # Benchmarks (not included in CTest; use Release build for accurate numbers)
