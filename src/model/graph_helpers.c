@@ -42,6 +42,11 @@ struct sam3_tensor *gh_alloc_tensor(struct sam3_arena *arena,
 	int nelems = sam3_tensor_nelems(t);
 	t->nbytes = (size_t)nelems * sam3_dtype_size(dtype);
 
+	if (arena->skip_data) {
+		t->data = NULL;
+		return t;
+	}
+
 	t->data = sam3_arena_alloc_raw(arena, t->nbytes);
 	if (!t->data)
 		return NULL;

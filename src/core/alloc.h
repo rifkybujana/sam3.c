@@ -24,6 +24,7 @@ struct sam3_arena {
 	void   *base;      /* Start of allocated region */
 	size_t  size;      /* Total capacity in bytes */
 	size_t  offset;    /* Current allocation offset */
+	int     skip_data; /* When set, gh_alloc_tensor skips data allocation */
 };
 
 /* Create an arena with the given capacity. Returns SAM3_OK or SAM3_ENOMEM. */

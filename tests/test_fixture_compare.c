@@ -21,6 +21,7 @@
 
 #include "test_helpers.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -292,6 +293,63 @@ static float compare_bin_vs_fixture(const char *label,
 	return maxd;
 }
 
+/*
+ * compute_detected_mask_iou - Compare detected masks between C and Python.
+ *
+ * Uses pred_logits (from fixture) to identify which mask slots are real
+ * detections (logit > 0). For each detected Python mask, finds the C mask
+ * with highest IoU. Returns average best-IoU across detected masks.
+ */
+static float compute_detected_mask_iou(const float *c_masks,
+				       const float *py_masks,
+				       const float *pred_logits,
+				       int n_masks, int h, int w,
+				       int *out_n_detected)
+{
+	int pixels = h * w;
+	float total_iou = 0.0f;
+	int n_detected = 0;
+
+	for (int pi = 0; pi < n_masks; pi++) {
+		if (pred_logits[pi] <= 0.0f)
+			continue;
+
+		const float *pm = py_masks + pi * pixels;
+
+		/* Find best matching C mask */
+		float best_iou = 0.0f;
+		int best_ci = -1;
+		for (int ci = 0; ci < n_masks; ci++) {
+			const float *cm = c_masks + ci * pixels;
+			int inter = 0, uni = 0;
+
+			for (int j = 0; j < pixels; j++) {
+				int cp = cm[j] > 0.0f;
+				int pp = pm[j] > 0.0f;
+				inter += cp & pp;
+				uni += cp | pp;
+			}
+
+			float iou = uni > 0
+				? (float)inter / (float)uni : 0.0f;
+			if (iou > best_iou) {
+				best_iou = iou;
+				best_ci = ci;
+			}
+		}
+
+		printf("    py[%d] logit=%.2f -> c[%d] IoU=%.4f\n",
+		       pi, (double)pred_logits[pi],
+		       best_ci, (double)best_iou);
+		total_iou += best_iou;
+		n_detected++;
+	}
+
+	if (out_n_detected)
+		*out_n_detected = n_detected;
+	return n_detected > 0 ? total_iou / (float)n_detected : 0.0f;
+}
+
 /* ── Test: input normalization ─────────────────────────────────────── */
 
 static void test_input_normalization(void)
@@ -346,8 +404,10 @@ static void test_end_to_end_fixture_input(void)
 	struct sam3_processor proc;
 	float *py_image = NULL;
 	float *py_masks = NULL;
+	float *py_logits = NULL;
 	int img_ndims, img_dims[SAM3_MAX_DIMS], img_nelems;
 	int msk_ndims, msk_dims[SAM3_MAX_DIMS], msk_nelems;
+	int log_nelems;
 	struct sam3_tensor *image;
 	struct sam3_result result;
 	struct sam3_prompt prompts[2];
@@ -373,6 +433,11 @@ static void test_end_to_end_fixture_input(void)
 	ASSERT(py_masks != NULL);
 	if (!py_masks)
 		goto cleanup;
+
+	/* Load fixture pred_logits [1, 200, 1] */
+	py_logits = load_fixture_tensor(
+		FIXTURE_DIR "/10_final/tensors.safetensors",
+		"pred_logits", NULL, NULL, &log_nelems);
 
 	ASSERT_EQ(msk_ndims, 4);
 	ASSERT_EQ(msk_dims[0], 1);
@@ -533,50 +598,19 @@ static void test_end_to_end_fixture_input(void)
 		}
 		ASSERT(!any_nan);
 
-		/* Report quality level */
-		if (maxd < 0.01f)
-			printf("  quality: EXACT\n");
-		else if (maxd < 1.0f)
-			printf("  quality: GOOD\n");
-		else if (maxd < 10.0f)
-			printf("  quality: FAIR (max=%.2f)\n",
-			       (double)maxd);
-		else
-			printf("  quality: DIVERGED (max=%.2f) - "
-			       "check intermediate stages\n",
-			       (double)maxd);
-	}
-
-	/* Logit statistics */
-	{
-		int n = result.n_masks * result.mask_height *
-			result.mask_width;
-		int n_pos = 0, n_neg = 0;
-		float vmin = result.masks[0], vmax = result.masks[0];
-
-		for (int i = 0; i < n; i++) {
-			if (result.masks[i] > 0.0f) n_pos++;
-			if (result.masks[i] < 0.0f) n_neg++;
-			if (result.masks[i] < vmin) vmin = result.masks[i];
-			if (result.masks[i] > vmax) vmax = result.masks[i];
+		/* Functional validation: IoU on detected masks only */
+		if (py_logits) {
+			int n_det = 0;
+			float iou = compute_detected_mask_iou(
+				result.masks, py_masks, py_logits,
+				result.n_masks,
+				result.mask_height, result.mask_width,
+				&n_det);
+			printf("  detected masks: %d, avg IoU: %.4f\n",
+			       n_det, (double)iou);
+			ASSERT(n_det > 0);
+			ASSERT(iou > 0.5f);
 		}
-		printf("  C logits: min=%.2f max=%.2f pos=%d neg=%d\n",
-		       (double)vmin, (double)vmax, n_pos, n_neg);
-	}
-
-	/* Fixture logit statistics for comparison */
-	{
-		int n_pos = 0, n_neg = 0;
-		float vmin = py_masks[0], vmax = py_masks[0];
-
-		for (int i = 0; i < msk_nelems; i++) {
-			if (py_masks[i] > 0.0f) n_pos++;
-			if (py_masks[i] < 0.0f) n_neg++;
-			if (py_masks[i] < vmin) vmin = py_masks[i];
-			if (py_masks[i] > vmax) vmax = py_masks[i];
-		}
-		printf("  Py logits: min=%.2f max=%.2f pos=%d neg=%d\n",
-		       (double)vmin, (double)vmax, n_pos, n_neg);
 	}
 
 cleanup:
@@ -585,12 +619,244 @@ cleanup:
 	sam3_weight_close(&wf);
 	free(py_image);
 	free(py_masks);
+	free(py_logits);
+}
+
+/* ── Test: bus/person text-only fixture ─────────────────────────────── */
+
+#define BUS_FIXTURE_DIR SAM3_SOURCE_DIR "/tests/fixtures/bus_person"
+
+static int bus_fixtures_available(void)
+{
+	return access(BUS_FIXTURE_DIR "/metadata.json", F_OK) == 0;
+}
+
+static void test_bus_person_text_only(void)
+{
+	struct sam3_processor proc;
+	float *py_image = NULL;
+	float *py_masks = NULL;
+	float *py_logits = NULL;
+	int img_ndims, img_dims[SAM3_MAX_DIMS], img_nelems;
+	int msk_ndims, msk_dims[SAM3_MAX_DIMS], msk_nelems;
+	int log_nelems;
+	struct sam3_tensor *image;
+	struct sam3_result result;
+	struct sam3_prompt prompts[1];
+	enum sam3_error err;
+	int c_dims[3];
+
+	printf("\ntest_bus_person_text_only:\n");
+	memset(&result, 0, sizeof(result));
+	memset(&proc, 0, sizeof(proc));
+
+	/* Load fixture normalized image [1, 3, 1008, 1008] */
+	py_image = load_fixture_tensor(
+		BUS_FIXTURE_DIR "/00_input/tensors.safetensors",
+		"image", &img_ndims, img_dims, &img_nelems);
+	ASSERT(py_image != NULL);
+	if (!py_image)
+		return;
+
+	/* Load fixture masks from 10_final */
+	py_masks = load_fixture_tensor(
+		BUS_FIXTURE_DIR "/10_final/tensors.safetensors",
+		"pred_masks", &msk_ndims, msk_dims, &msk_nelems);
+	ASSERT(py_masks != NULL);
+	if (!py_masks)
+		goto cleanup;
+
+	/* Load fixture pred_logits [1, 200, 1] */
+	py_logits = load_fixture_tensor(
+		BUS_FIXTURE_DIR "/10_final/tensors.safetensors",
+		"pred_logits", NULL, NULL, &log_nelems);
+
+	ASSERT_EQ(msk_ndims, 4);
+	ASSERT_EQ(msk_dims[0], 1);
+
+	/* Open weight file and initialize processor */
+	struct sam3_weight_file wf;
+	memset(&wf, 0, sizeof(wf));
+	err = sam3_weight_open(&wf, MODEL_PATH);
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK)
+		goto cleanup;
+
+	err = sam3_processor_init(&proc);
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK) {
+		sam3_weight_close(&wf);
+		goto cleanup;
+	}
+
+	err = sam3_processor_load(&proc, &wf,
+				  SAM3_SOURCE_DIR "/models/bpe_simple_vocab_16e6.txt.gz");
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK) {
+		sam3_weight_close(&wf);
+		goto cleanup;
+	}
+
+	/* Inject fixture's normalized image directly */
+	sam3_arena_reset(&proc.scratch_arena);
+	c_dims[0] = 3;
+	c_dims[1] = 1008;
+	c_dims[2] = 1008;
+	image = gh_alloc_tensor(&proc.scratch_arena, SAM3_DTYPE_F32,
+				3, c_dims);
+	ASSERT(image != NULL);
+	if (!image)
+		goto cleanup;
+
+	memcpy(image->data, py_image,
+	       (size_t)3 * 1008 * 1008 * sizeof(float));
+
+	/* Encode image */
+	err = sam3_image_model_encode(&proc.model, proc.backend, image,
+				      &proc.scratch_arena,
+				      &proc.model_arena, NULL);
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK)
+		goto cleanup;
+
+	proc.image_loaded = 1;
+
+	/* ── Compare intermediate cached features ──────────────── */
+	printf("\n  Intermediate stage comparison:\n");
+
+	if (proc.model.cached_feat_4x_nhwc) {
+		compare_nhwc_fixture(
+			"neck scale_4x",
+			proc.model.cached_feat_4x_nhwc,
+			BUS_FIXTURE_DIR "/02_neck/scale_4x.safetensors",
+			"features");
+	}
+
+	if (proc.model.cached_feat_s0_nhwc) {
+		compare_nhwc_fixture(
+			"neck scale_2x",
+			proc.model.cached_feat_s0_nhwc,
+			BUS_FIXTURE_DIR "/02_neck/scale_2x.safetensors",
+			"features");
+	}
+
+	if (proc.model.cached_feat_s1_nhwc) {
+		compare_nhwc_fixture(
+			"neck scale_1x",
+			proc.model.cached_feat_s1_nhwc,
+			BUS_FIXTURE_DIR "/02_neck/scale_1x.safetensors",
+			"features");
+	}
+
+	/* ── Run segmentation (text-only) ─────────────────────── */
+	prompts[0].type = SAM3_PROMPT_TEXT;
+	prompts[0].text = "person";
+
+	err = sam3_processor_segment(&proc, prompts, 1, &result);
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK)
+		goto cleanup;
+
+	/* ── Compare debug dumps vs fixtures ───────────────────── */
+	printf("\n  Debug dump stage comparison:\n");
+
+	/* 04 Text features */
+	compare_bin_vs_fixture(
+		"text features (04)",
+		"/tmp/dbg_text_features.bin",
+		BUS_FIXTURE_DIR "/04_text_encoder/output.safetensors",
+		"language_features", 0.001f);
+
+	/* 05 Geometry encoder output (CLS-only) */
+	compare_bin_vs_fixture(
+		"geom out (05)",
+		"/tmp/dbg_geom_out.bin",
+		BUS_FIXTURE_DIR "/05_geometry_encoder/layer_02.safetensors",
+		"output", 1.0f);
+
+	/* 06 Encoder fusion layers L0-L5 */
+	{
+		char bin_path[256], fix_path[256];
+		char label[64];
+		for (int li = 0; li < 6; li++) {
+			snprintf(bin_path, sizeof(bin_path),
+				 "/tmp/dbg_enc_layer_%02d.bin", li);
+			snprintf(fix_path, sizeof(fix_path),
+				 BUS_FIXTURE_DIR
+				 "/06_encoder_fusion/layer_%02d.safetensors",
+				 li);
+			snprintf(label, sizeof(label),
+				 "enc layer %d (06)", li);
+			compare_bin_vs_fixture(label, bin_path, fix_path,
+					       "output", 15.0f);
+		}
+	}
+
+	/* 09 Seg head */
+	compare_bin_vs_fixture(
+		"pixel decoder (09)",
+		"/tmp/dbg_pixel_embed.bin",
+		BUS_FIXTURE_DIR "/09_seg_head/pixel_decoder.safetensors",
+		"pixel_features", 5.0f);
+
+	compare_bin_vs_fixture(
+		"instance proj (09)",
+		"/tmp/dbg_inst.bin",
+		BUS_FIXTURE_DIR "/09_seg_head/instance_proj.safetensors",
+		"instance_features", 5.0f);
+
+	/* ── Compare final masks ───────────────────────────────── */
+	printf("\n  Final output comparison:\n");
+
+	ASSERT_EQ(result.n_masks, msk_dims[1]);
+	ASSERT_EQ(result.mask_height, msk_dims[2]);
+	ASSERT_EQ(result.mask_width, msk_dims[3]);
+
+	{
+		int n = result.n_masks * result.mask_height *
+			result.mask_width;
+		float maxd = compare_tensors("pred_masks",
+					     result.masks, py_masks,
+					     n, 1.0f);
+
+		int any_nan = 0;
+		for (int i = 0; i < n && !any_nan; i++) {
+			if (result.masks[i] != result.masks[i])
+				any_nan = 1;
+		}
+		ASSERT(!any_nan);
+
+		/* Functional validation: IoU on detected masks only */
+		if (py_logits) {
+			int n_det = 0;
+			float iou = compute_detected_mask_iou(
+				result.masks, py_masks, py_logits,
+				result.n_masks,
+				result.mask_height, result.mask_width,
+				&n_det);
+			printf("  detected masks: %d, avg IoU: %.4f\n",
+			       n_det, (double)iou);
+			ASSERT(n_det > 0);
+			ASSERT(iou > 0.5f);
+		}
+	}
+
+cleanup:
+	sam3_result_free(&result);
+	sam3_processor_free(&proc);
+	sam3_weight_close(&wf);
+	free(py_image);
+	free(py_masks);
+	free(py_logits);
 }
 
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 int main(void)
 {
+	/* Force full F32 precision on Metal for fixture comparison */
+	setenv("SAM3_METAL_F32", "1", 1);
+
 	if (!fixtures_available()) {
 		printf("SKIP: fixtures not found at %s\n", FIXTURE_DIR);
 		printf("Run: python3 tools/gen_fixtures.py\n");
@@ -602,9 +868,15 @@ int main(void)
 
 	if (model_available()) {
 		test_end_to_end_fixture_input();
+
+		if (bus_fixtures_available())
+			test_bus_person_text_only();
+		else
+			printf("\nSKIP: bus/person fixtures not found at %s\n",
+			       BUS_FIXTURE_DIR);
 	} else {
 		printf("SKIP: model not found at %s\n", MODEL_PATH);
-		printf("  (skipping end-to-end test)\n");
+		printf("  (skipping end-to-end tests)\n");
 	}
 
 	TEST_REPORT();

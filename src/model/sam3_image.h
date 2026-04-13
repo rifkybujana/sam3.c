@@ -132,7 +132,9 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
  * between stages to keep peak memory bounded.
  *
  * @model:          Initialized, loaded, and image-encoded model
- * @be:             Backend for graph evaluation
+ * @be:             Backend for graph evaluation (GPU stages)
+ * @cpu_be:         CPU backend for decoder + scorer (deterministic).
+ *                  If NULL, @be is used for all stages.
  * @prompt_tokens:  [N, d_model] pre-projected prompt embeddings, or NULL
  *                  (must be materialized, i.e. already evaluated)
  * @text_features:  [seq_len, d_model] text encoder output, or NULL
@@ -154,6 +156,7 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 enum sam3_error sam3_image_model_segment(
 	struct sam3_image_model *model,
 	struct sam3_backend *be,
+	struct sam3_backend *cpu_be,
 	struct sam3_tensor *prompt_tokens,
 	struct sam3_tensor *text_features,
 	struct sam3_arena *scratch,

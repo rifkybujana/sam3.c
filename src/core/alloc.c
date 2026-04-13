@@ -35,6 +35,7 @@ enum sam3_error sam3_arena_init(struct sam3_arena *arena, size_t capacity)
 
 	arena->size = capacity;
 	arena->offset = 0;
+	arena->skip_data = 0;
 	SAM3_PROF_MEM_ARENA(g_alloc_profiler);
 	return SAM3_OK;
 }
@@ -65,6 +66,7 @@ void sam3_arena_reset(struct sam3_arena *arena)
 {
 	size_t freed = arena->offset;
 	arena->offset = 0;
+	arena->skip_data = 0;
 	SAM3_PROF_MEM_ARENA_RESET(g_alloc_profiler, freed);
 	(void)freed;
 }

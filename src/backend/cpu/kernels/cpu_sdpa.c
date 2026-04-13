@@ -107,6 +107,53 @@ static void sdpa_row_f32(const float *q, const float *K, const float *V,
 	}
 }
 
+/* --- Parallel dispatch --- */
+
+struct sdpa_par_ctx {
+	const float *qbase;
+	const float *kbase;
+	const float *vbase;
+	const float *mdata;
+	float       *obase;
+	int          BH;             /* B * H (4D) or 1 (2D) */
+	int          seq_q;
+	int          seq_k;
+	int          head_dim;
+	float        scale;
+	int          head_stride_q;  /* seq_q * head_dim */
+	int          head_stride_k;  /* seq_k * head_dim */
+};
+
+static void sdpa_parallel_fn(void *arg, int task_id, int n_tasks)
+{
+	struct sdpa_par_ctx *ctx = (struct sdpa_par_ctx *)arg;
+	int total = ctx->BH * ctx->seq_q;
+	int chunk = total / n_tasks;
+	int start = task_id * chunk;
+	int end   = (task_id == n_tasks - 1) ? total : start + chunk;
+
+	if (start >= end)
+		return;
+
+	for (int idx = start; idx < end; idx++) {
+		int bh = idx / ctx->seq_q;
+		int i  = idx % ctx->seq_q;
+
+		const float *qd = ctx->qbase + (size_t)bh * ctx->head_stride_q;
+		const float *kd = ctx->kbase + (size_t)bh * ctx->head_stride_k;
+		const float *vd = ctx->vbase + (size_t)bh * ctx->head_stride_k;
+		float *od       = ctx->obase + (size_t)bh * ctx->head_stride_q;
+
+		const float *mask_row = ctx->mdata
+			? ctx->mdata + (size_t)i * ctx->seq_k : NULL;
+
+		sdpa_row_f32(qd + i * ctx->head_dim,
+			     kd, vd, mask_row,
+			     od + i * ctx->head_dim,
+			     ctx->seq_k, ctx->head_dim, ctx->scale);
+	}
+}
+
 /*
  * cpu_kernel_sdpa - Tiled SDPA kernel (2D and 4D).
  *
@@ -133,69 +180,58 @@ enum sam3_error cpu_kernel_sdpa(const struct sam3_node *node,
 	int head_dim = node->params[0];
 	float scale = 1.0f / sqrtf((float)head_dim);
 
-	(void)pool;
+	int n_tasks = sam3_threadpool_n_threads(pool);
+	if (n_tasks < 1)
+		n_tasks = 1;
 
 	if (Q->n_dims == 4) {
-		/*
-		 * Batched 4D: Q[B, H, seq_q, hd], K[B, H, seq_k, hd],
-		 * V[B, H, seq_k, hd]. Loop over batch * heads.
-		 */
 		int B = Q->dims[0];
 		int H = Q->dims[1];
 		int seq_q = Q->dims[2];
 		int seq_k = K->dims[2];
-		int head_stride_q = seq_q * head_dim;
-		int head_stride_k = seq_k * head_dim;
 
-		const float *qbase = (const float *)Q->data;
-		const float *kbase = (const float *)K->data;
-		const float *vbase = (const float *)V->data;
-		float *obase = (float *)out->data;
+		struct sdpa_par_ctx ctx = {
+			.qbase         = (const float *)Q->data,
+			.kbase         = (const float *)K->data,
+			.vbase         = (const float *)V->data,
+			.mdata         = mask ? (const float *)mask->data
+					      : NULL,
+			.obase         = (float *)out->data,
+			.BH            = B * H,
+			.seq_q         = seq_q,
+			.seq_k         = seq_k,
+			.head_dim      = head_dim,
+			.scale         = scale,
+			.head_stride_q = seq_q * head_dim,
+			.head_stride_k = seq_k * head_dim,
+		};
 
-		/* mask is [seq_q, seq_k] (shared across all heads) */
-		const float *mdata = mask ? (const float *)mask->data
-					   : NULL;
-
-		for (int b = 0; b < B; b++) {
-			for (int h = 0; h < H; h++) {
-				int idx = b * H + h;
-				const float *qd = qbase + idx * head_stride_q;
-				const float *kd = kbase + idx * head_stride_k;
-				const float *vd = vbase + idx * head_stride_k;
-				float *od = obase + idx * head_stride_q;
-
-				for (int i = 0; i < seq_q; i++) {
-					const float *mask_row = mdata
-						? mdata + i * seq_k : NULL;
-					sdpa_row_f32(
-						qd + i * head_dim,
-						kd, vd, mask_row,
-						od + i * head_dim,
-						seq_k, head_dim, scale);
-				}
-			}
-		}
+		sam3_threadpool_parallel_for(pool, sdpa_parallel_fn,
+					     &ctx, n_tasks);
 		return SAM3_OK;
 	}
 
-	/* Original 2D path: Q[seq_q, hd] */
+	/* 2D path: Q[seq_q, hd] — reuse same parallel dispatch */
 	int seq_q = Q->dims[0];
 	int seq_k = K->dims[0];
 
-	const float *qdata = (const float *)Q->data;
-	const float *kdata = (const float *)K->data;
-	const float *vdata = (const float *)V->data;
-	const float *mdata = mask ? (const float *)mask->data : NULL;
-	float *odata = (float *)out->data;
+	struct sdpa_par_ctx ctx = {
+		.qbase         = (const float *)Q->data,
+		.kbase         = (const float *)K->data,
+		.vbase         = (const float *)V->data,
+		.mdata         = mask ? (const float *)mask->data : NULL,
+		.obase         = (float *)out->data,
+		.BH            = 1,
+		.seq_q         = seq_q,
+		.seq_k         = seq_k,
+		.head_dim      = head_dim,
+		.scale         = scale,
+		.head_stride_q = seq_q * head_dim,
+		.head_stride_k = seq_k * head_dim,
+	};
 
-	for (int i = 0; i < seq_q; i++) {
-		const float *mask_row = mdata
-					 ? mdata + i * seq_k : NULL;
-		sdpa_row_f32(qdata + i * head_dim,
-			     kdata, vdata, mask_row,
-			     odata + i * head_dim,
-			     seq_k, head_dim, scale);
-	}
+	sam3_threadpool_parallel_for(pool, sdpa_parallel_fn,
+				     &ctx, n_tasks);
 
 	return SAM3_OK;
 }

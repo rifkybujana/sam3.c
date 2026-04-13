@@ -21,9 +21,9 @@
 #include <string.h>
 
 /*
- * Check if b broadcasts onto a: a is [M, N], b is [N].
- * Returns the inner dimension N, or 0 if shapes match exactly,
- * or -1 on error.
+ * Check if b broadcasts onto a.
+ * Returns the inner dimension N (for bias-style [N] broadcast),
+ * 1 for scalar broadcast, 0 if shapes match exactly, or -1 on error.
  */
 static int check_broadcast(const struct sam3_tensor *a,
 			    const struct sam3_tensor *b)
@@ -33,6 +33,10 @@ static int check_broadcast(const struct sam3_tensor *a,
 
 	if (na == nb)
 		return 0;
+
+	/* Scalar broadcast: b has 1 element → multiply all of a */
+	if (nb == 1)
+		return 1;
 
 	/* b is [N], a's last dim is N */
 	if (b->n_dims == 1 && a->dims[a->n_dims - 1] == b->dims[0])

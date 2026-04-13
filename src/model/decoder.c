@@ -25,6 +25,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "decoder.h"
@@ -559,6 +560,54 @@ enum sam3_error sam3_decoder_load(struct sam3_decoder *dec,
 	if (!dec->rph_fc2_b)
 		return SAM3_ENOMEM;
 
+	/* Box-relative positional bias MLPs: embed_x and embed_y */
+	int rpb_fc1_w_dims[] = {d, 2};
+	int rpb_fc1_b_dims[] = {d};
+	int rpb_fc2_w_dims[] = {dec->n_heads, d};
+	int rpb_fc2_b_dims[] = {dec->n_heads};
+
+	dec->rpb_x_fc1_w = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_x.layers.0.weight",
+		arena, SAM3_DTYPE_F32, 2, rpb_fc1_w_dims);
+	if (!dec->rpb_x_fc1_w)
+		return SAM3_ENOMEM;
+	dec->rpb_x_fc1_b = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_x.layers.0.bias",
+		arena, SAM3_DTYPE_F32, 1, rpb_fc1_b_dims);
+	if (!dec->rpb_x_fc1_b)
+		return SAM3_ENOMEM;
+	dec->rpb_x_fc2_w = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_x.layers.1.weight",
+		arena, SAM3_DTYPE_F32, 2, rpb_fc2_w_dims);
+	if (!dec->rpb_x_fc2_w)
+		return SAM3_ENOMEM;
+	dec->rpb_x_fc2_b = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_x.layers.1.bias",
+		arena, SAM3_DTYPE_F32, 1, rpb_fc2_b_dims);
+	if (!dec->rpb_x_fc2_b)
+		return SAM3_ENOMEM;
+
+	dec->rpb_y_fc1_w = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_y.layers.0.weight",
+		arena, SAM3_DTYPE_F32, 2, rpb_fc1_w_dims);
+	if (!dec->rpb_y_fc1_w)
+		return SAM3_ENOMEM;
+	dec->rpb_y_fc1_b = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_y.layers.0.bias",
+		arena, SAM3_DTYPE_F32, 1, rpb_fc1_b_dims);
+	if (!dec->rpb_y_fc1_b)
+		return SAM3_ENOMEM;
+	dec->rpb_y_fc2_w = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_y.layers.1.weight",
+		arena, SAM3_DTYPE_F32, 2, rpb_fc2_w_dims);
+	if (!dec->rpb_y_fc2_w)
+		return SAM3_ENOMEM;
+	dec->rpb_y_fc2_b = gh_load_mmap(wf,
+		DEC_PREFIX "boxRPB_embed_y.layers.1.bias",
+		arena, SAM3_DTYPE_F32, 1, rpb_fc2_b_dims);
+	if (!dec->rpb_y_fc2_b)
+		return SAM3_ENOMEM;
+
 	return SAM3_OK;
 }
 
@@ -676,6 +725,219 @@ struct sam3_tensor *sam3_decoder_compute_query_pos(
 }
 
 /*
+ * rpb_log_transform - Apply log transform for boxRPB.
+ *
+ * sign(d*8) * log2(|d*8| + 1) / log2(8)
+ */
+static float rpb_log_transform(float d)
+{
+	float s = d * 8.0f;
+	float abs_s = fabsf(s);
+	float sign = (s > 0.0f) ? 1.0f : ((s < 0.0f) ? -1.0f : 0.0f);
+	return sign * log2f(abs_s + 1.0f) / log2f(8.0f);
+}
+
+/*
+ * rpb_mlp_2layer - Apply 2-layer MLP: Linear(2, hidden) + ReLU + Linear(hidden, n_heads).
+ *
+ * @input:  Input data [n_rows, 2]
+ * @fc1_w:  First layer weight [hidden, 2]
+ * @fc1_b:  First layer bias [hidden]
+ * @fc2_w:  Second layer weight [n_heads, hidden]
+ * @fc2_b:  Second layer bias [n_heads]
+ * @n_rows: Number of input rows
+ * @hidden: Hidden dimension (256)
+ * @n_heads: Number of attention heads (8)
+ * @out:    Output buffer [n_rows, n_heads]
+ * @tmp:    Scratch buffer [n_rows * hidden]
+ */
+static void rpb_mlp_2layer(const float *input,
+			     const float *fc1_w, const float *fc1_b,
+			     const float *fc2_w, const float *fc2_b,
+			     int n_rows, int hidden, int n_heads,
+			     float *out, float *tmp)
+{
+	/* Layer 1: [n_rows, 2] x [2, hidden]^T + bias → ReLU */
+	for (int r = 0; r < n_rows; r++) {
+		const float *row = input + r * 2;
+		float *dst = tmp + r * hidden;
+		for (int h = 0; h < hidden; h++) {
+			/* fc1_w layout: [hidden, 2] row-major */
+			float v = fc1_w[h * 2 + 0] * row[0]
+				+ fc1_w[h * 2 + 1] * row[1]
+				+ fc1_b[h];
+			dst[h] = v > 0.0f ? v : 0.0f; /* ReLU */
+		}
+	}
+
+	/* Layer 2: [n_rows, hidden] x [hidden, n_heads]^T + bias (no ReLU) */
+	for (int r = 0; r < n_rows; r++) {
+		const float *row = tmp + r * hidden;
+		float *dst = out + r * n_heads;
+		for (int nh = 0; nh < n_heads; nh++) {
+			float v = fc2_b[nh];
+			const float *wrow = fc2_w + nh * hidden;
+			for (int h = 0; h < hidden; h++)
+				v += wrow[h] * row[h];
+			dst[nh] = v;
+		}
+	}
+}
+
+void sam3_decoder_compute_rpb(const struct sam3_decoder *dec,
+			       const float *ref_boxes,
+			       int H, int W, float *out)
+{
+	int nq = dec->n_queries;
+	int n_heads = dec->n_heads;
+	int hidden = dec->d_model; /* 256 */
+
+	/*
+	 * Allocate temporaries on the stack. Max sizes:
+	 * - deltas: nq * max(H,W) * 2 floats
+	 * - mlp_out: nq * max(H,W) * n_heads floats
+	 * - mlp_tmp: nq * max(H,W) * hidden floats (largest)
+	 *
+	 * For nq=200, H=W=72, hidden=256:
+	 *   deltas:  200*72*2 = 28,800 floats (112 KB)
+	 *   mlp_out: 200*72*8 = 115,200 floats (450 KB)
+	 *   mlp_tmp: 200*72*256 = 3,686,400 floats (14 MB)
+	 *
+	 * 14 MB is too large for stack. Use heap via malloc for
+	 * the temporary. This runs once per layer (6 times total),
+	 * so malloc overhead is negligible.
+	 */
+	int max_dim = H > W ? H : W;
+	int n_total = nq * max_dim;
+
+	float *deltas = (float *)malloc((size_t)n_total * 2 * sizeof(float));
+	float *mlp_out = (float *)malloc((size_t)n_total * n_heads * sizeof(float));
+	float *mlp_tmp = (float *)malloc((size_t)n_total * hidden * sizeof(float));
+	float *dy_out = (float *)malloc((size_t)nq * H * n_heads * sizeof(float));
+	float *dx_out = (float *)malloc((size_t)nq * W * n_heads * sizeof(float));
+
+	if (!deltas || !mlp_out || !mlp_tmp || !dy_out || !dx_out) {
+		sam3_log_error("rpb: allocation failed");
+		free(deltas); free(mlp_out); free(mlp_tmp);
+		free(dy_out); free(dx_out);
+		memset(out, 0, (size_t)n_heads * nq * H * W * sizeof(float));
+		return;
+	}
+
+	/*
+	 * Convert ref_boxes from cxcywh → xyxy for each query.
+	 * ref_boxes layout: [nq, 4] as (cx, cy, w, h).
+	 * xyxy: (x1, y1, x2, y2).
+	 */
+	float *xyxy = deltas; /* reuse buffer temporarily */
+	for (int q = 0; q < nq; q++) {
+		float cx = ref_boxes[q * 4 + 0];
+		float cy = ref_boxes[q * 4 + 1];
+		float bw = ref_boxes[q * 4 + 2];
+		float bh = ref_boxes[q * 4 + 3];
+		xyxy[q * 4 + 0] = cx - bw * 0.5f; /* x1 */
+		xyxy[q * 4 + 1] = cy - bh * 0.5f; /* y1 */
+		xyxy[q * 4 + 2] = cx + bw * 0.5f; /* x2 */
+		xyxy[q * 4 + 3] = cy + bh * 0.5f; /* y2 */
+	}
+
+	/* Copy xyxy to a separate buffer since we'll overwrite deltas */
+	float *boxes = (float *)malloc((size_t)nq * 4 * sizeof(float));
+	if (!boxes) {
+		sam3_log_error("rpb: boxes alloc failed");
+		free(deltas); free(mlp_out); free(mlp_tmp);
+		free(dy_out); free(dx_out);
+		memset(out, 0, (size_t)n_heads * nq * H * W * sizeof(float));
+		return;
+	}
+	memcpy(boxes, xyxy, (size_t)nq * 4 * sizeof(float));
+
+	/*
+	 * Compute Y deltas: for each query q and row j:
+	 *   delta[q*H + j, 0] = coords_h[j] - y1[q]
+	 *   delta[q*H + j, 1] = coords_h[j] - y2[q]
+	 * Then apply log transform.
+	 */
+	for (int q = 0; q < nq; q++) {
+		float y1 = boxes[q * 4 + 1];
+		float y2 = boxes[q * 4 + 3];
+		for (int j = 0; j < H; j++) {
+			float ch = (float)j / (float)H;
+			int idx = (q * H + j) * 2;
+			deltas[idx + 0] = rpb_log_transform(ch - y1);
+			deltas[idx + 1] = rpb_log_transform(ch - y2);
+		}
+	}
+
+	/* MLP_y: [nq*H, 2] → [nq*H, n_heads] */
+	rpb_mlp_2layer(deltas,
+		       (const float *)dec->rpb_y_fc1_w->data,
+		       (const float *)dec->rpb_y_fc1_b->data,
+		       (const float *)dec->rpb_y_fc2_w->data,
+		       (const float *)dec->rpb_y_fc2_b->data,
+		       nq * H, hidden, n_heads,
+		       dy_out, mlp_tmp);
+
+	/*
+	 * Compute X deltas: for each query q and col j:
+	 *   delta[q*W + j, 0] = coords_w[j] - x1[q]
+	 *   delta[q*W + j, 1] = coords_w[j] - x2[q]
+	 * Then apply log transform.
+	 */
+	for (int q = 0; q < nq; q++) {
+		float x1 = boxes[q * 4 + 0];
+		float x2 = boxes[q * 4 + 2];
+		for (int j = 0; j < W; j++) {
+			float cw = (float)j / (float)W;
+			int idx = (q * W + j) * 2;
+			deltas[idx + 0] = rpb_log_transform(cw - x1);
+			deltas[idx + 1] = rpb_log_transform(cw - x2);
+		}
+	}
+
+	/* MLP_x: [nq*W, 2] → [nq*W, n_heads] */
+	rpb_mlp_2layer(deltas,
+		       (const float *)dec->rpb_x_fc1_w->data,
+		       (const float *)dec->rpb_x_fc1_b->data,
+		       (const float *)dec->rpb_x_fc2_w->data,
+		       (const float *)dec->rpb_x_fc2_b->data,
+		       nq * W, hidden, n_heads,
+		       dx_out, mlp_tmp);
+
+	/*
+	 * Outer sum and arrange into [n_heads, nq, H*W].
+	 *
+	 * Python:
+	 *   B = dy.unsqueeze(3) + dx.unsqueeze(2)  [bs, nq, H, W, n_heads]
+	 *   B = B.flatten(2, 3)                      [bs, nq, H*W, n_heads]
+	 *   B = B.permute(0, 3, 1, 2)                [bs, n_heads, nq, H*W]
+	 *
+	 * dy_out layout: [nq, H, n_heads] (row-major)
+	 * dx_out layout: [nq, W, n_heads] (row-major)
+	 * out layout:    [n_heads, nq, H*W] (row-major)
+	 */
+	for (int nh = 0; nh < n_heads; nh++) {
+		for (int q = 0; q < nq; q++) {
+			float *dst = out + nh * nq * H * W + q * H * W;
+			for (int h = 0; h < H; h++) {
+				float yval = dy_out[(q * H + h) * n_heads + nh];
+				for (int w = 0; w < W; w++) {
+					float xval = dx_out[(q * W + w) * n_heads + nh];
+					dst[h * W + w] = yval + xval;
+				}
+			}
+		}
+	}
+
+	free(deltas);
+	free(mlp_out);
+	free(mlp_tmp);
+	free(dy_out);
+	free(dx_out);
+	free(boxes);
+}
+
+/*
  * decoder_self_attention_with_pos - Self-attention with position embedding.
  *
  * Python: q = k = tgt + query_pos (for Q and K projections)
@@ -772,7 +1034,8 @@ static struct sam3_tensor *decoder_cross_attention_with_pos(
 	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
 	struct sam3_tensor *kv_w, struct sam3_tensor *kv_b,
 	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
-	int d_model, int n_heads)
+	int d_model, int n_heads,
+	struct sam3_tensor *rpb_mask)
 {
 	int head_dim = d_model / n_heads;
 
@@ -806,7 +1069,7 @@ static struct sam3_tensor *decoder_cross_attention_with_pos(
 	if (!sk || !sv)
 		return NULL;
 
-	/* Per-head SDPA */
+	/* Per-head SDPA with optional boxRPB mask */
 	struct sam3_tensor *head_outs[64];
 	for (int h = 0; h < n_heads; h++) {
 		int hs = h * head_dim;
@@ -819,7 +1082,21 @@ static struct sam3_tensor *decoder_cross_attention_with_pos(
 		if (!hq || !hk || !hv)
 			return NULL;
 
-		ho = gh_sdpa(g, arena, hq, hk, hv, NULL, head_dim);
+		struct sam3_tensor *hmask = NULL;
+		if (rpb_mask) {
+			/* rpb_mask: [n_heads, nq, nkv] — slice head h */
+			hmask = gh_slice(g, arena, rpb_mask, 0, h, h + 1);
+			if (!hmask)
+				return NULL;
+			int mnq = hmask->dims[1];
+			int nkv = hmask->dims[2];
+			int mask_2d[] = {mnq, nkv};
+			hmask = gh_reshape(g, arena, hmask, 2, mask_2d);
+			if (!hmask)
+				return NULL;
+		}
+
+		ho = gh_sdpa(g, arena, hq, hk, hv, hmask, head_dim);
 		if (!ho)
 			return NULL;
 		head_outs[h] = ho;
@@ -936,7 +1213,7 @@ struct sam3_tensor *sam3_decoder_build_layer(
 			dec->layers[i].ca_kv_b,
 			dec->layers[i].ca_out_w,
 			dec->layers[i].ca_out_b,
-			d, dec->n_heads);
+			d, dec->n_heads, NULL);
 	} else {
 		ca_out = gh_cross_attention(
 			g, arena,
@@ -1105,7 +1382,7 @@ struct sam3_tensor *sam3_decoder_build_ca(
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_tensor *query_pos,
 	struct sam3_tensor *enc_features, struct sam3_tensor *enc_pos,
-	struct sam3_arena *arena)
+	struct sam3_tensor *rpb_mask, struct sam3_arena *arena)
 {
 	int d = dec->d_model;
 	int i = layer_idx;
@@ -1126,7 +1403,7 @@ struct sam3_tensor *sam3_decoder_build_ca(
 			dec->layers[i].ca_kv_b,
 			dec->layers[i].ca_out_w,
 			dec->layers[i].ca_out_b,
-			d, dec->n_heads);
+			d, dec->n_heads, rpb_mask);
 	} else {
 		ca_out = gh_cross_attention(
 			g, arena,

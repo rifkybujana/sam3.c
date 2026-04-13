@@ -650,6 +650,7 @@ static struct sam3_tensor *concat_2d_persist(struct sam3_arena *persist,
 enum sam3_error sam3_image_model_segment(
 	struct sam3_image_model *model,
 	struct sam3_backend *be,
+	struct sam3_backend *cpu_be,
 	struct sam3_tensor *prompt_tokens,
 	struct sam3_tensor *text_features,
 	struct sam3_arena *scratch,
@@ -658,6 +659,22 @@ enum sam3_error sam3_image_model_segment(
 	struct sam3_tensor **out_scores,
 	struct sam3_profiler *profiler)
 {
+	/*
+	 * dec_be: backend for decoder + scorer stages.
+	 * Using CPU avoids GPU-specific float32 reduction order
+	 * divergence that compounds through 6 decoder layers,
+	 * causing scorer logits to deviate 10-15x from Python.
+	 */
+	struct sam3_backend *dec_be = cpu_be ? cpu_be : be;
+
+	/* Helper: reset dec_be arena to reclaim memory between evals.
+	 * Decoder cross-attention allocates ~33MB per layer, so without
+	 * reset the CPU arena would overflow after a few layers. */
+#define DEC_BE_ARENA_RESET() do { \
+	if (dec_be->ops->arena_reset) \
+		dec_be->ops->arena_reset(dec_be); \
+} while (0)
+
 	struct sam3_graph g;
 	struct sam3_tensor *img_2d;
 	struct sam3_tensor *geom_out = NULL;
@@ -1156,6 +1173,392 @@ enum sam3_error sam3_image_model_segment(
 		sam3_log_debug("segment: geom encoder done, "
 			       "persist %zu/%zu",
 			       persist->offset, persist->size);
+	} else if (text_features) {
+		/*
+		 * Text-only path: Python always runs the geometry encoder
+		 * even without geometric prompts. It uses _get_dummy_prompt()
+		 * which produces empty point/box sequences, so after
+		 * concat_padded_sequences only the CLS token (1 row) remains.
+		 * The CLS token then goes through:
+		 *   final_proj → LayerNorm → 3 encoder layers → encode_norm
+		 * producing a [1, d_model] output that is concatenated with
+		 * text features as context for encoder fusion.
+		 */
+		struct sam3_geometry_encoder *enc = &model->geom_enc;
+		int d = enc->d_model;
+		int n_heads = enc->n_heads;
+		int head_dim = d / n_heads;
+
+		/* Position encoding for cross-attention keys */
+		struct sam3_tensor *pe_t;
+		pe_t = sam3_pos_encoding_get(&model->backbone.pos_enc);
+		int pe_hw = pe_t->dims[0] * pe_t->dims[1];
+
+		/* img_with_pos = img_2d + pos for cross-attn keys */
+		struct sam3_tensor *img_with_pos;
+		img_with_pos = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						2, img_2d->dims);
+		if (!img_with_pos) { err = SAM3_ENOMEM; goto fail; }
+		{
+			const float *id = (const float *)img_2d->data;
+			const float *pd = (const float *)pe_t->data;
+			float *od = (float *)img_with_pos->data;
+			int n = pe_hw * d;
+			for (int j = 0; j < n; j++)
+				od[j] = id[j] + pd[j];
+		}
+
+		/* x = CLS token only [1, d_model] */
+		struct sam3_tensor *x;
+		{
+			int xdims[2] = {enc->cls_token->dims[0], d};
+			x = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+					     2, xdims);
+			if (!x) { err = SAM3_ENOMEM; goto fail; }
+			memcpy(x->data, enc->cls_token->data,
+			       (size_t)enc->cls_token->dims[0]
+			       * (size_t)d * sizeof(float));
+		}
+
+		/* Pre-encoder: final_proj (Linear) */
+		{
+			int nrows = x->dims[0];
+			struct sam3_tensor *proj;
+			proj = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						2, x->dims);
+			if (!proj) { err = SAM3_ENOMEM; goto fail; }
+
+			const float *xd = (const float *)x->data;
+			const float *wd = (const float *)enc->post_proj_w->data;
+			const float *bd = (const float *)enc->post_proj_b->data;
+			float *od = (float *)proj->data;
+
+			for (int r = 0; r < nrows; r++) {
+				for (int c = 0; c < d; c++) {
+					float sum = bd[c];
+					for (int k = 0; k < d; k++)
+						sum += xd[r * d + k] * wd[c * d + k];
+					od[r * d + c] = sum;
+				}
+			}
+			x = proj;
+		}
+
+		/* Pre-encoder: LayerNorm */
+		{
+			int nrows = x->dims[0];
+			const float *gw = (const float *)enc->norm_w->data;
+			const float *gb = (const float *)enc->norm_b->data;
+			float *xd = (float *)x->data;
+			const float eps = 1e-5f;
+
+			for (int r = 0; r < nrows; r++) {
+				float *row = xd + r * d;
+				double sum = 0.0, sum2 = 0.0;
+				for (int c = 0; c < d; c++) {
+					sum += (double)row[c];
+					sum2 += (double)row[c] * (double)row[c];
+				}
+				double mean = sum / d;
+				double var = sum2 / d - mean * mean;
+				double inv = 1.0 / sqrt(var + eps);
+				for (int c = 0; c < d; c++)
+					row[c] = (float)(((double)row[c] - mean) *
+						  inv) * gw[c] + gb[c];
+			}
+		}
+
+		/* 3-layer transformer encoder (CLS-only, nq=1) */
+		{
+		int nq = x->dims[0];    /* 1 (CLS only) */
+		int nkv = img_2d->dims[0]; /* 5184 */
+
+		size_t sa_save = persist->offset;
+		float *buf_norm = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_qkv = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * 3 * (size_t)d * sizeof(float));
+		float *buf_attn = (float *)sam3_arena_alloc(
+			persist, (size_t)n_heads * (size_t)nq * (size_t)nq * sizeof(float));
+		float *buf_sa = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_q = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_k = (float *)sam3_arena_alloc(
+			persist, (size_t)nkv * (size_t)d * sizeof(float));
+		float *buf_v = (float *)sam3_arena_alloc(
+			persist, (size_t)nkv * (size_t)d * sizeof(float));
+		float *buf_ca = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		float *buf_ff1 = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * 2048 * sizeof(float));
+		float *buf_ff2 = (float *)sam3_arena_alloc(
+			persist, (size_t)nq * (size_t)d * sizeof(float));
+		if (!buf_norm || !buf_qkv || !buf_attn || !buf_sa ||
+		    !buf_q || !buf_k || !buf_v || !buf_ca ||
+		    !buf_ff1 || !buf_ff2) {
+			err = SAM3_ENOMEM; goto fail;
+		}
+
+		float *xd = (float *)x->data;
+		const float eps = 1e-5f;
+		const float scale = 1.0f / sqrtf((float)head_dim);
+
+		for (int li = 0; li < enc->n_layers; li++) {
+			/* Self-attention: LN → QKV → SDPA → out_proj + residual */
+			{
+				const float *gw = (const float *)enc->layers[li].norm1_w->data;
+				const float *gb = (const float *)enc->layers[li].norm1_b->data;
+				for (int r = 0; r < nq; r++) {
+					const float *row = xd + r * d;
+					double s = 0, s2 = 0;
+					for (int c = 0; c < d; c++) {
+						s += (double)row[c];
+						s2 += (double)row[c] * (double)row[c];
+					}
+					double m = s / d, v2 = s2 / d - m * m;
+					double inv2 = 1.0 / sqrt(v2 + eps);
+					for (int c = 0; c < d; c++)
+						buf_norm[r * d + c] = (float)(((double)row[c] - m) * inv2) * gw[c] + gb[c];
+				}
+			}
+			{
+				const float *w = (const float *)enc->layers[li].sa_qkv_w->data;
+				const float *b = (const float *)enc->layers[li].sa_qkv_b->data;
+				int d3 = 3 * d;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d3; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_norm[r * d + k] * w[c * d + k];
+						buf_qkv[r * d3 + c] = sum;
+					}
+				}
+			}
+			for (int h = 0; h < n_heads; h++) {
+				int hs = h * head_dim;
+				for (int qi = 0; qi < nq; qi++) {
+					float maxs = -1e30f;
+					for (int ki = 0; ki < nq; ki++) {
+						float dot = 0;
+						for (int c = 0; c < head_dim; c++)
+							dot += buf_qkv[qi * 3 * d + hs + c] *
+							       buf_qkv[ki * 3 * d + d + hs + c];
+						dot *= scale;
+						buf_attn[h * nq * nq + qi * nq + ki] = dot;
+						if (dot > maxs) maxs = dot;
+					}
+					float sexp = 0;
+					for (int ki = 0; ki < nq; ki++) {
+						float e = expf(buf_attn[h * nq * nq + qi * nq + ki] - maxs);
+						buf_attn[h * nq * nq + qi * nq + ki] = e;
+						sexp += e;
+					}
+					float inv_s = 1.0f / sexp;
+					for (int ki = 0; ki < nq; ki++)
+						buf_attn[h * nq * nq + qi * nq + ki] *= inv_s;
+				}
+				for (int qi = 0; qi < nq; qi++) {
+					for (int c = 0; c < head_dim; c++) {
+						float sum = 0;
+						for (int ki = 0; ki < nq; ki++)
+							sum += buf_attn[h * nq * nq + qi * nq + ki] *
+							       buf_qkv[ki * 3 * d + 2 * d + hs + c];
+						buf_sa[qi * d + hs + c] = sum;
+					}
+				}
+			}
+			{
+				const float *w = (const float *)enc->layers[li].sa_out_w->data;
+				const float *b = (const float *)enc->layers[li].sa_out_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_sa[r * d + k] * w[c * d + k];
+						xd[r * d + c] += sum;
+					}
+				}
+			}
+
+			/* Cross-attention: LN → Q/KV → SDPA → out_proj + residual */
+			{
+				const float *gw = (const float *)enc->layers[li].ca_ln_w->data;
+				const float *gb = (const float *)enc->layers[li].ca_ln_b->data;
+				for (int r = 0; r < nq; r++) {
+					const float *row = xd + r * d;
+					double s = 0, s2 = 0;
+					for (int c = 0; c < d; c++) {
+						s += (double)row[c];
+						s2 += (double)row[c] * (double)row[c];
+					}
+					double m = s / d, v2 = s2 / d - m * m;
+					double inv2 = 1.0 / sqrt(v2 + eps);
+					for (int c = 0; c < d; c++)
+						buf_norm[r * d + c] = (float)(((double)row[c] - m) * inv2) * gw[c] + gb[c];
+				}
+			}
+			{
+				const float *w = (const float *)enc->layers[li].ca_q_w->data;
+				const float *b = (const float *)enc->layers[li].ca_q_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_norm[r * d + k] * w[c * d + k];
+						buf_q[r * d + c] = sum;
+					}
+				}
+			}
+			{
+				const float *kv_w = (const float *)enc->layers[li].ca_kv_w->data;
+				const float *kv_b = (const float *)enc->layers[li].ca_kv_b->data;
+				const float *kw = kv_w;
+				const float *vw = kv_w + d * d;
+				const float *kb = kv_b;
+				const float *vb = kv_b + d;
+				const float *img_pos_d = (const float *)img_with_pos->data;
+				const float *img_d = (const float *)img_2d->data;
+
+				for (int r = 0; r < nkv; r++) {
+					for (int c = 0; c < d; c++) {
+						float ks = kb[c], vs = vb[c];
+						for (int k = 0; k < d; k++) {
+							ks += img_pos_d[r * d + k] * kw[c * d + k];
+							vs += img_d[r * d + k] * vw[c * d + k];
+						}
+						buf_k[r * d + c] = ks;
+						buf_v[r * d + c] = vs;
+					}
+				}
+			}
+			for (int h = 0; h < n_heads; h++) {
+				int hs = h * head_dim;
+				for (int qi = 0; qi < nq; qi++) {
+					float maxs = -1e30f;
+					for (int ki = 0; ki < nkv; ki++) {
+						float dot = 0;
+						for (int c = 0; c < head_dim; c++)
+							dot += buf_q[qi * d + hs + c] *
+							       buf_k[ki * d + hs + c];
+						dot *= scale;
+						if (dot > maxs) maxs = dot;
+					}
+					float sexp = 0;
+					float vsum[64];
+					for (int c = 0; c < head_dim; c++)
+						vsum[c] = 0;
+					for (int ki = 0; ki < nkv; ki++) {
+						float dot = 0;
+						for (int c = 0; c < head_dim; c++)
+							dot += buf_q[qi * d + hs + c] *
+							       buf_k[ki * d + hs + c];
+						float e = expf(dot * scale - maxs);
+						sexp += e;
+						for (int c = 0; c < head_dim; c++)
+							vsum[c] += e * buf_v[ki * d + hs + c];
+					}
+					float inv_s = 1.0f / sexp;
+					for (int c = 0; c < head_dim; c++)
+						buf_ca[qi * d + hs + c] = vsum[c] * inv_s;
+				}
+			}
+			{
+				const float *w = (const float *)enc->layers[li].ca_out_w->data;
+				const float *b = (const float *)enc->layers[li].ca_out_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_ca[r * d + k] * w[c * d + k];
+						xd[r * d + c] += sum;
+					}
+				}
+			}
+
+			/* FFN: norm3 → fc1 → relu → fc2 → residual */
+			{
+				const float *gw = (const float *)enc->layers[li].norm3_w->data;
+				const float *gb = (const float *)enc->layers[li].norm3_b->data;
+				for (int r = 0; r < nq; r++) {
+					const float *row = xd + r * d;
+					double s = 0, s2 = 0;
+					for (int c = 0; c < d; c++) {
+						s += (double)row[c];
+						s2 += (double)row[c] * (double)row[c];
+					}
+					double m = s / d, v2 = s2 / d - m * m;
+					double inv2 = 1.0 / sqrt(v2 + eps);
+					for (int c = 0; c < d; c++)
+						buf_norm[r * d + c] = (float)(((double)row[c] - m) * inv2) * gw[c] + gb[c];
+				}
+			}
+			{
+				const float *w = (const float *)enc->layers[li].ffn_fc1_w->data;
+				const float *b = (const float *)enc->layers[li].ffn_fc1_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < 2048; c++) {
+						float sum = b[c];
+						for (int k = 0; k < d; k++)
+							sum += buf_norm[r * d + k] * w[c * d + k];
+						buf_ff1[r * 2048 + c] = sum > 0 ? sum : 0;
+					}
+				}
+			}
+			{
+				const float *w = (const float *)enc->layers[li].ffn_fc2_w->data;
+				const float *b = (const float *)enc->layers[li].ffn_fc2_b->data;
+				for (int r = 0; r < nq; r++) {
+					for (int c = 0; c < d; c++) {
+						float sum = b[c];
+						for (int k = 0; k < 2048; k++)
+							sum += buf_ff1[r * 2048 + k] * w[c * 2048 + k];
+						xd[r * d + c] += sum;
+					}
+				}
+			}
+
+			sam3_log_debug("geom (cls-only): layer %d done", li);
+		}
+		persist->offset = sa_save;
+		{
+			struct sam3_tensor *xp;
+			xp = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+					      2, x->dims);
+			if (!xp) { err = SAM3_ENOMEM; goto fail; }
+			memcpy(xp->data, x->data, x->nbytes);
+			x = xp;
+		}
+		}
+
+		/* Post-encoder: encode_norm (LayerNorm) */
+		{
+			int nrows = x->dims[0];
+			const float *gw = (const float *)enc->encode_norm_w->data;
+			const float *gb = (const float *)enc->encode_norm_b->data;
+			float *xd = (float *)x->data;
+			const float eps = 1e-5f;
+
+			for (int r = 0; r < nrows; r++) {
+				float *row = xd + r * d;
+				double sum = 0.0, sum2 = 0.0;
+				for (int c = 0; c < d; c++) {
+					sum += (double)row[c];
+					sum2 += (double)row[c] * (double)row[c];
+				}
+				double mean = sum / d;
+				double var = sum2 / d - mean * mean;
+				double inv = 1.0 / sqrt(var + eps);
+				for (int c = 0; c < d; c++)
+					row[c] = (float)(((double)row[c] - mean) *
+						  inv) * gw[c] + gb[c];
+			}
+			geom_out = x;
+		}
+
+		sam3_log_debug("segment: geom encoder (cls-only) done, "
+			       "persist %zu/%zu",
+			       persist->offset, persist->size);
 	}
 
 	SAM3_PROF_END(profiler, "geometry_encode");
@@ -1417,6 +1820,7 @@ enum sam3_error sam3_image_model_segment(
 				ref_boxes[ri] = 1.0f /
 					(1.0f + expf(-rp[ri]));
 
+			DEC_BE_ARENA_RESET();
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 
@@ -1431,7 +1835,7 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			err = be->ops->graph_eval(be, &g);
+			err = dec_be->ops->graph_eval(dec_be, &g);
 			if (err != SAM3_OK) {
 				sam3_log_error("segment: query_pos "
 					       "eval failed: %d", err);
@@ -1472,6 +1876,17 @@ enum sam3_error sam3_image_model_segment(
 		int pe_n = pos_enc_t->dims[0] * pos_enc_t->dims[1];
 		int pe_d = pos_enc_t->dims[2];
 		int pe_dims[] = {pe_n, pe_d};
+		int pe_H = pos_enc_t->dims[0];
+		int pe_W = pos_enc_t->dims[1];
+
+		/* Box-relative positional bias buffer [n_heads, nq, pe_n] */
+		int rpb_size = model->decoder.n_heads * nq * pe_n;
+		float *rpb_buf = (float *)sam3_arena_alloc(
+			persist, (size_t)rpb_size * sizeof(float));
+		if (!rpb_buf) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
 
 		for (int li = 0; li < model->decoder.n_layers; li++) {
 			/*
@@ -1510,6 +1925,8 @@ enum sam3_error sam3_image_model_segment(
 } while (0)
 
 			/* Substep A: Self-attention */
+			SAM3_PROF_BEGIN(profiler, "dec_sa");
+			DEC_BE_ARENA_RESET();
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 			DEC_WRAP_INPUTS();
@@ -1520,7 +1937,7 @@ enum sam3_error sam3_image_model_segment(
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
-			err = be->ops->graph_eval(be, &g);
+			err = dec_be->ops->graph_eval(dec_be, &g);
 			if (err != SAM3_OK) goto fail;
 			memcpy(q_buf, q_out->data,
 			       (size_t)nq * d * sizeof(float));
@@ -1539,7 +1956,11 @@ enum sam3_error sam3_image_model_segment(
 					&dt);
 			}
 
+			SAM3_PROF_END(profiler, "dec_sa");
+
 			/* Substep B: Text cross-attention */
+			SAM3_PROF_BEGIN(profiler, "dec_tca");
+			DEC_BE_ARENA_RESET();
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 			DEC_WRAP_INPUTS();
@@ -1550,7 +1971,7 @@ enum sam3_error sam3_image_model_segment(
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
-			err = be->ops->graph_eval(be, &g);
+			err = dec_be->ops->graph_eval(dec_be, &g);
 			if (err != SAM3_OK) goto fail;
 			memcpy(q_buf, q_out->data,
 			       (size_t)nq * d * sizeof(float));
@@ -1569,19 +1990,39 @@ enum sam3_error sam3_image_model_segment(
 					&dt);
 			}
 
-			/* Substep C: Vision cross-attention */
+			SAM3_PROF_END(profiler, "dec_tca");
+
+			/* Substep C: Vision cross-attention with boxRPB */
+			SAM3_PROF_BEGIN(profiler, "dec_rpb");
+			sam3_decoder_compute_rpb(&model->decoder,
+						  ref_boxes,
+						  pe_H, pe_W, rpb_buf);
+			SAM3_PROF_END(profiler, "dec_rpb");
+			SAM3_PROF_BEGIN(profiler, "dec_ca");
+			DEC_BE_ARENA_RESET();
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 			DEC_WRAP_INPUTS();
+			int rpb_dims[] = {model->decoder.n_heads,
+					   nq, pe_n};
+			struct sam3_tensor *rpb_wrap;
+			rpb_wrap = gh_tensor_wrap(scratch,
+				SAM3_DTYPE_F32, 3, rpb_dims,
+				rpb_buf);
+			if (!rpb_wrap) {
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
 			q_out = sam3_decoder_build_ca(
 				&model->decoder, li, &g,
 				q_in, qpos_in,
-				enc_wrap, enc_pos_wrap, scratch);
+				enc_wrap, enc_pos_wrap,
+				rpb_wrap, scratch);
 			if (!q_out) {
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
-			err = be->ops->graph_eval(be, &g);
+			err = dec_be->ops->graph_eval(dec_be, &g);
 			if (err != SAM3_OK) goto fail;
 			memcpy(q_buf, q_out->data,
 			       (size_t)nq * d * sizeof(float));
@@ -1600,7 +2041,11 @@ enum sam3_error sam3_image_model_segment(
 					&dt);
 			}
 
+			SAM3_PROF_END(profiler, "dec_ca");
+
 			/* Substep D: FFN */
+			SAM3_PROF_BEGIN(profiler, "dec_ffn");
+			DEC_BE_ARENA_RESET();
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 			DEC_WRAP_INPUTS();
@@ -1611,10 +2056,12 @@ enum sam3_error sam3_image_model_segment(
 				err = SAM3_ENOMEM;
 				goto fail;
 			}
-			err = be->ops->graph_eval(be, &g);
+			err = dec_be->ops->graph_eval(dec_be, &g);
 			if (err != SAM3_OK) goto fail;
 			memcpy(q_buf, q_out->data,
 			       (size_t)nq * d * sizeof(float));
+
+			SAM3_PROF_END(profiler, "dec_ffn");
 
 #undef DEC_WRAP_INPUTS
 
@@ -1662,12 +2109,15 @@ enum sam3_error sam3_image_model_segment(
 			 * copies back final graph outputs. The box head
 			 * MLP on [200, 256] is trivially fast on CPU.
 			 */
+			SAM3_PROF_BEGIN(profiler, "dec_box_refine");
 			cpu_box_refine(q_buf, &model->decoder,
 				       ref_boxes, nq, d,
 				       br_tmp1, br_tmp2);
+			SAM3_PROF_END(profiler, "dec_box_refine");
 
 			/* Recompute query_pos for next layer */
 			if (li < model->decoder.n_layers - 1) {
+				DEC_BE_ARENA_RESET();
 				sam3_arena_reset(scratch);
 				sam3_graph_init(&g);
 
@@ -1684,7 +2134,7 @@ enum sam3_error sam3_image_model_segment(
 					goto fail;
 				}
 
-				err = be->ops->graph_eval(be, &g);
+				err = dec_be->ops->graph_eval(dec_be, &g);
 				if (err != SAM3_OK) {
 					sam3_log_error("segment: "
 						"query_pos eval "
@@ -1700,6 +2150,7 @@ enum sam3_error sam3_image_model_segment(
 		}
 
 		/* Final: output layer norm */
+		DEC_BE_ARENA_RESET();
 		sam3_arena_reset(scratch);
 		sam3_graph_init(&g);
 
@@ -1719,7 +2170,7 @@ enum sam3_error sam3_image_model_segment(
 			goto fail;
 		}
 
-		err = be->ops->graph_eval(be, &g);
+		err = dec_be->ops->graph_eval(dec_be, &g);
 		if (err != SAM3_OK) {
 			sam3_log_error("segment: dec final eval failed");
 			goto fail;
@@ -2283,6 +2734,7 @@ enum sam3_error sam3_image_model_segment(
 		 * The caller should apply sigmoid to get probabilities.
 		 */
 		if (context) {
+			DEC_BE_ARENA_RESET();
 			sam3_arena_reset(scratch);
 			sam3_graph_init(&g);
 
@@ -2311,7 +2763,7 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			err = be->ops->graph_eval(be, &g);
+			err = dec_be->ops->graph_eval(dec_be, &g);
 			if (err != SAM3_OK) {
 				sam3_log_error("seg: scorer eval failed");
 				goto fail;
@@ -2323,6 +2775,7 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
+			dump_tensor("/tmp/dbg_scorer.bin", scores);
 			{
 				const float *sd =
 					(const float *)scores->data;
@@ -2356,6 +2809,8 @@ enum sam3_error sam3_image_model_segment(
 
 	/* Restore persist — inter-stage data no longer needed */
 	persist->offset = persist_save;
+
+#undef DEC_BE_ARENA_RESET
 
 	*out_masks = masks;
 	return SAM3_OK;

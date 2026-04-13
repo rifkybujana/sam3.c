@@ -40,6 +40,12 @@ struct sam3_decoder {
 	struct sam3_tensor *rph_fc1_w, *rph_fc1_b; /* ref_point_head layer 1 */
 	struct sam3_tensor *rph_fc2_w, *rph_fc2_b; /* ref_point_head layer 2 */
 
+	/* Box-relative positional bias MLPs */
+	struct sam3_tensor *rpb_x_fc1_w, *rpb_x_fc1_b; /* Linear(2, 256) */
+	struct sam3_tensor *rpb_x_fc2_w, *rpb_x_fc2_b; /* Linear(256, 8) */
+	struct sam3_tensor *rpb_y_fc1_w, *rpb_y_fc1_b; /* Linear(2, 256) */
+	struct sam3_tensor *rpb_y_fc2_w, *rpb_y_fc2_b; /* Linear(256, 8) */
+
 	/* Output layer norm applied after all layers */
 	struct sam3_tensor *output_ln_w, *output_ln_b;
 
@@ -215,7 +221,23 @@ struct sam3_tensor *sam3_decoder_build_ca(
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_tensor *query_pos,
 	struct sam3_tensor *enc_features, struct sam3_tensor *enc_pos,
-	struct sam3_arena *arena);
+	struct sam3_tensor *rpb_mask, struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_compute_rpb - Compute box-relative positional bias mask.
+ *
+ * Produces an additive attention mask [n_heads, nq, H*W] on the CPU.
+ * Called before each decoder layer's vision cross-attention.
+ *
+ * @dec:       Decoder with loaded RPB MLP weights
+ * @ref_boxes: Reference boxes after sigmoid [nq, 4] (cxcywh format)
+ * @H:         Feature map height (72)
+ * @W:         Feature map width (72)
+ * @out:       Output buffer, must hold n_heads * nq * H * W floats
+ */
+void sam3_decoder_compute_rpb(const struct sam3_decoder *dec,
+			       const float *ref_boxes,
+			       int H, int W, float *out);
 
 struct sam3_tensor *sam3_decoder_build_ffn(
 	struct sam3_decoder *dec, int layer_idx,

@@ -25,6 +25,7 @@
 #include "core/half.h"
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Dtype mapping ─────────────────────────────────────────────────── */
@@ -234,6 +235,11 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 			return *existing;
 		/* Stale entry (pointer reuse) — evict and re-wrap */
 		metal_map_evict(mtl, t);
+	}
+
+	if (!t->data) {
+		sam3_log_error("metal: wrap_tensor: no data and not in map");
+		return mlx_array_new();
 	}
 
 	mlx_dtype mtype;
@@ -1031,7 +1037,18 @@ static enum sam3_error metal_init(struct sam3_backend *be)
 		return err;
 	}
 
-	mtl->use_f16 = true;
+	/*
+	 * Default to F16 compute for reduced memory bandwidth on Metal.
+	 * Set SAM3_METAL_F32=1 to force full F32 precision (useful for
+	 * fixture comparison against CPU-generated Python references).
+	 */
+	{
+		const char *f32_env = getenv("SAM3_METAL_F32");
+		if (f32_env && f32_env[0] == '1')
+			mtl->use_f16 = false;
+		else
+			mtl->use_f16 = true;
+	}
 
 	mtl->device = mlx_device_new_type(MLX_GPU, 0);
 	mtl->stream = mlx_default_gpu_stream_new();
@@ -1041,8 +1058,8 @@ static enum sam3_error metal_init(struct sam3_backend *be)
 	mlx_set_memory_limit(&mem_limit,
 			     (size_t)(0.75 * 16ULL * 1024 * 1024 * 1024));
 
-	sam3_log_info("Metal backend initialized (MLX-C, arena: %zu bytes)",
-		      capacity);
+	sam3_log_info("Metal backend initialized (MLX-C, %s, arena: %zu bytes)",
+		      mtl->use_f16 ? "F16" : "F32", capacity);
 	return SAM3_OK;
 }
 
@@ -1346,6 +1363,7 @@ static const struct sam3_backend_ops metal_ops = {
 	.free         = metal_free,
 	.alloc_tensor = metal_alloc_tensor,
 	.graph_eval   = metal_graph_eval,
+	.arena_reset  = NULL,  /* MLX manages memory automatically */
 };
 
 const struct sam3_backend_ops *sam3_metal_backend_ops(void)

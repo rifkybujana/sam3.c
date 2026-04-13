@@ -146,11 +146,19 @@ static enum sam3_error cpu_graph_eval(struct sam3_backend *be,
 	return SAM3_OK;
 }
 
+static void cpu_arena_reset(struct sam3_backend *be)
+{
+	struct sam3_cpu_backend *cpu = (struct sam3_cpu_backend *)be;
+	sam3_arena_reset(&cpu->arena);
+	sam3_arena_reset(&cpu->scratch);
+}
+
 static const struct sam3_backend_ops cpu_ops = {
 	.init         = cpu_init,
 	.free         = cpu_free,
 	.alloc_tensor = cpu_alloc_tensor,
 	.graph_eval   = cpu_graph_eval,
+	.arena_reset  = cpu_arena_reset,
 };
 
 const struct sam3_backend_ops *sam3_cpu_backend_ops(void)

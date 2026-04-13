@@ -12,6 +12,7 @@ option(SAM3_CPU   "Enable CPU backend"   ON)
 option(SAM3_TESTS "Build tests"          ON)
 option(SAM3_PROFILE "Enable profiler"     OFF)
 option(SAM3_TRACE   "Enable dtype tracing" OFF)
+option(SAM3_DEBUG_DUMP "Enable debug tensor dumps to /tmp" OFF)
 option(SAM3_BLAS    "Use BLAS for CPU matmul (Accelerate/OpenBLAS/MKL)" ON)
 
 # Auto-detect Metal on macOS
@@ -40,6 +41,10 @@ endif()
 
 if(SAM3_TRACE)
 	add_definitions(-DSAM3_HAS_TRACE)
+endif()
+
+if(SAM3_DEBUG_DUMP)
+	add_definitions(-DSAM3_DEBUG_DUMP)
 endif()
 
 if(SAM3_BLAS)

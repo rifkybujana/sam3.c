@@ -2,11 +2,14 @@
 """
 tools/gen_fixtures.py - Generate per-layer test fixtures from reference SAM3 model.
 
-Loads the real SAM3 checkpoint, runs inference on assets/cat.jpeg with a point+text
-prompt, and saves every intermediate tensor (per-layer) as SafeTensors files.
+Loads the real SAM3 checkpoint, runs inference on an image with a text prompt
+and optional point prompt, and saves every intermediate tensor (per-layer)
+as SafeTensors files.
 
 Usage:
     cd /path/to/sam3
+
+    # Point + text prompt:
     python tools/gen_fixtures.py \
         --checkpoint models/sam3.pt \
         --bpe models/bpe_simple_vocab_16e6.txt.gz \
@@ -14,6 +17,12 @@ Usage:
         --output tests/fixtures \
         --text "cat" \
         --point 500,400,1
+
+    # Text-only prompt:
+    python tools/gen_fixtures.py \
+        --image assets/bus.jpg \
+        --text "person" \
+        --output tests/fixtures/bus_person
 
 Requires: torch, safetensors, Pillow, torchvision
           Plus the reference sam3 package (add reference/ to PYTHONPATH)
@@ -375,22 +384,26 @@ def run_and_save(model, image_tensor, text_prompt, point, output_dir, device):
     text_outputs = model.backbone.forward_text([text_prompt], device=device)
     backbone_out.update(text_outputs)
 
-    # Phase 3: build geometric prompt (point)
-    print("[3/4] Building geometric prompt...")
-    px, py, plabel = point
-    # Points are expected as normalized [0,1] coordinates, seq-first: [N_pts, B, 2]
-    point_xy = torch.tensor([[[px / 1008.0, py / 1008.0]]], device=device,
-                            dtype=torch.float32).permute(1, 0, 2)  # [1, 1, 2]
-    point_labels = torch.tensor([[plabel]], device=device, dtype=torch.long).permute(1, 0)  # [1, 1]
-    point_mask = torch.zeros(1, 1, device=device, dtype=torch.bool)  # [B=1, N_pts=1] all valid
+    # Phase 3: build geometric prompt (point or dummy for text-only)
+    if point is not None:
+        print("[3/4] Building geometric prompt (point)...")
+        px, py, plabel = point
+        # Points are expected as normalized [0,1] coordinates, seq-first: [N_pts, B, 2]
+        point_xy = torch.tensor([[[px / 1008.0, py / 1008.0]]], device=device,
+                                dtype=torch.float32).permute(1, 0, 2)  # [1, 1, 2]
+        point_labels = torch.tensor([[plabel]], device=device, dtype=torch.long).permute(1, 0)  # [1, 1]
+        point_mask = torch.zeros(1, 1, device=device, dtype=torch.bool)  # [B=1, N_pts=1] all valid
 
-    geometric_prompt = Prompt(
-        point_embeddings=point_xy,
-        point_mask=point_mask,
-        point_labels=point_labels,
-        box_embeddings=torch.zeros(0, 1, 4, device=device),
-        box_mask=torch.zeros(1, 0, device=device, dtype=torch.bool),
-    )
+        geometric_prompt = Prompt(
+            point_embeddings=point_xy,
+            point_mask=point_mask,
+            point_labels=point_labels,
+            box_embeddings=torch.zeros(0, 1, 4, device=device),
+            box_mask=torch.zeros(1, 0, device=device, dtype=torch.bool),
+        )
+    else:
+        print("[3/4] Building dummy prompt (text-only)...")
+        geometric_prompt = model._get_dummy_prompt()
 
     # Phase 4: forward_grounding (encoder + decoder + seg heads)
     print("[4/4] Running forward_grounding (encoder, decoder, seg head)...")
@@ -554,15 +567,18 @@ def main():
                         help="Output directory for fixture files")
     parser.add_argument("--text", default="cat",
                         help="Text prompt")
-    parser.add_argument("--point", default="500,400,1",
-                        help="Point prompt as x,y,label (pixel coords, label 1=pos)")
+    parser.add_argument("--point", default=None,
+                        help="Point prompt as x,y,label (pixel coords, label 1=pos). "
+                             "Omit for text-only prompts.")
     parser.add_argument("--device", default="cpu",
                         help="Device (cpu recommended for determinism)")
     args = parser.parse_args()
 
-    # Parse point
-    parts = args.point.split(",")
-    point = (int(parts[0]), int(parts[1]), int(parts[2]))
+    # Parse point (None for text-only)
+    point = None
+    if args.point is not None:
+        parts = args.point.split(",")
+        point = (int(parts[0]), int(parts[1]), int(parts[2]))
 
     # Determinism
     torch.manual_seed(0)
@@ -579,7 +595,7 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Image:      {args.image}")
     print(f"Text:       {args.text}")
-    print(f"Point:      {point}")
+    print(f"Point:      {point or '(text-only)'}")
     print(f"Device:     {args.device}")
     print(f"Output:     {args.output}")
     print()
@@ -640,7 +656,8 @@ def main():
         "original_width": orig_w,
         "original_height": orig_h,
         "text_prompt": args.text,
-        "point_prompt": list(point),
+        "point_prompt": list(point) if point else None,
+        "prompt_mode": "point_text" if point else "text_only",
         "image_size": 1008,
         "checkpoint": args.checkpoint,
         "device": args.device,

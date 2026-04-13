@@ -598,34 +598,35 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	/*
 	 * Step 2: Per-block transformer evaluation.
 	 *
-	 * For each layer, reset scratch, build one block's graph
-	 * using x_buf as input, evaluate, and copy the result back.
+	 * With skip_data=1 on Metal, intermediate tensors get no host
+	 * buffer (MLX manages GPU memory), so arena usage is ~160 KB
+	 * per batch instead of ~1.2 GB per block. This allows larger
+	 * batches (fewer GPU dispatches) without exhausting the arena.
+	 *
+	 * CPU path keeps skip_data=0 and batch=2 (needs host buffers).
 	 */
 	SAM3_PROF_BEGIN(profiler, "vit_blocks");
 	{
-		int max_batch = 4;
+		int skip_data = (be->type == SAM3_BACKEND_METAL);
+		int batch = skip_data ? 4 : 2;
 
-		for (int base = 0; base < vit->depth; ) {
-			int end = base + max_batch;
+		for (int base = 0; base < vit->depth; base += batch) {
+			int end = base + batch;
 			if (end > vit->depth)
 				end = vit->depth;
 
 			sam3_graph_init(&g);
 			sam3_arena_reset(scratch);
+			if (skip_data)
+				scratch->skip_data = 1;
 
-			/* Wrap persistent buffer as input */
 			int x_dims[] = {np, e};
 			x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
 					    2, x_dims, x_buf);
 			if (!x)
 				return NULL;
 
-			int actually_built = 0;
-
-			/* Build up to max_batch blocks into one graph */
 			for (int i = base; i < end; i++) {
-				size_t pre = scratch->offset;
-
 				/* Pre-norm for attention */
 				struct sam3_tensor *x_norm;
 				x_norm = gh_layernorm(&g, scratch, x,
@@ -647,11 +648,6 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 				struct sam3_tensor *attn;
 
 				if (is_global) {
-					/*
-					 * Global block: full attention over
-					 * all n_patches with the 5184-pos
-					 * RoPE table.
-					 */
 					attn = gh_multihead_attention_rope(
 						&g, scratch,
 						x3d, NULL, NULL,
@@ -674,21 +670,6 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 						return NULL;
 					}
 				} else {
-					/*
-					 * Mask-free windowed attention.
-					 *
-					 * Partition the pre-attn layer-norm
-					 * output from [np, e] into
-					 * [n_win, ws*ws, e], run unmasked
-					 * MHA with the small local RoPE
-					 * table, then unpartition back
-					 * to [np, e].
-					 *
-					 * The MHA helper treats dim 0 as
-					 * batch, so this runs n_win
-					 * independent windowed attentions
-					 * in parallel.
-					 */
 					struct sam3_tensor *x_win;
 					x_win = gh_window_partition(
 						&g, scratch, x_norm,
@@ -720,12 +701,6 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 						return NULL;
 					}
 
-					/*
-					 * The MHA helper returns
-					 * [bs, d_model] = [n_win*ws*ws, e].
-					 * Reshape to [n_win, ws*ws, e]
-					 * before unpartitioning.
-					 */
 					int nw = vit->grid_size /
 						 vit->window_size;
 					int win_3d[] = {
@@ -787,63 +762,23 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 				if (!x)
 					return NULL;
 
-				actually_built++;
-
-				size_t block_cost = scratch->offset - pre;
-				size_t remaining = scratch->size
-					- scratch->offset;
-
 				sam3_log_debug("vit: block %d/%d built "
-					"(arena +%zu, %zu left)",
+					"(arena %zu/%zu)",
 					i + 1, vit->depth,
-					block_cost, remaining);
-
-				/*
-				 * Stop batching if the next block
-				 * would likely overflow the arena.
-				 */
-				if (i + 1 < end
-				    && remaining < block_cost) {
-					sam3_log_debug("vit: arena low, "
-						"flushing batch at %d "
-						"blocks", actually_built);
-					break;
-				}
+					scratch->offset, scratch->size);
 			}
 
-			/* Evaluate batch */
+			/* Assign host buffer for Phase 3 readback */
+			if (skip_data)
+				x->data = x_buf;
+
 			err = be->ops->graph_eval(be, &g);
+			scratch->skip_data = 0;
 			if (err != SAM3_OK)
 				return NULL;
 
-			memcpy(x_buf, x->data, x_bytes);
-
-			sam3_log_debug("vit: blocks %d-%d/%d evaluated",
-				       base + 1,
-				       base + actually_built,
-				       vit->depth);
-
-			base += actually_built;
-
-#ifdef SAM3_DEBUG_DUMP
-			for (int i = base - actually_built;
-			     i < base; i++) {
-				if (i == 0 || i == 1 || i == 7
-				    || i == 15 || i == 23
-				    || i == 31) {
-					char path[64];
-					snprintf(path, sizeof(path),
-						 "/tmp/dbg_vit_block_%02d.bin",
-						 i);
-					FILE *dfp = fopen(path, "wb");
-					if (dfp) {
-						fwrite(x_buf, 1,
-						       x_bytes, dfp);
-						fclose(dfp);
-					}
-				}
-			}
-#endif
+			if (!skip_data)
+				memcpy(x_buf, x->data, x_bytes);
 		}
 	}
 	SAM3_PROF_END(profiler, "vit_blocks");

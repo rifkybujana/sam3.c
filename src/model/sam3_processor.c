@@ -971,6 +971,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	 */
 	SAM3_PROF_BEGIN(proc->profiler, "mask_decode");
 	err = sam3_image_model_segment(&proc->model, proc->backend,
+				       proc->text_backend,
 				       prompt_tokens, text_features,
 				       &proc->scratch_arena,
 				       &proc->model_arena,

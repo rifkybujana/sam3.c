@@ -42,6 +42,10 @@ struct sam3_backend_ops {
 	/* Evaluate a compute graph on this backend. */
 	enum sam3_error (*graph_eval)(struct sam3_backend *be,
 				     struct sam3_graph *g);
+
+	/* Reset working memory (arena) between graph evaluations.
+	 * May be NULL if the backend manages memory automatically. */
+	void (*arena_reset)(struct sam3_backend *be);
 };
 
 /* Backend instance. Backends embed this as first member. */
