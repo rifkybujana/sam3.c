@@ -104,8 +104,11 @@ void sam3_prof_stage_begin(struct sam3_profiler *p, const char *name)
 		return;
 
 	struct sam3_prof_stage *s = find_or_create_stage(p, name);
-	if (s)
+	if (s) {
+		s->depth = p->depth;
 		s->start_ns = sam3_time_ns();
+		p->depth++;
+	}
 }
 
 void sam3_prof_stage_end(struct sam3_profiler *p, const char *name)
@@ -114,6 +117,7 @@ void sam3_prof_stage_end(struct sam3_profiler *p, const char *name)
 		return;
 
 	uint64_t end = sam3_time_ns();
+	p->depth--;
 	struct sam3_prof_stage *s = find_or_create_stage(p, name);
 	if (s && s->start_ns > 0) {
 		s->total_ns += end - s->start_ns;
@@ -199,10 +203,12 @@ void sam3_profiler_report(const struct sam3_profiler *p)
 	if (!p)
 		return;
 
-	/* Compute total stage time */
+	/* Compute total stage time (top-level only to avoid double-counting) */
 	uint64_t total_stage_ns = 0;
-	for (int i = 0; i < p->n_stages; i++)
-		total_stage_ns += p->stages[i].total_ns;
+	for (int i = 0; i < p->n_stages; i++) {
+		if (p->stages[i].depth == 0)
+			total_stage_ns += p->stages[i].total_ns;
+	}
 
 	/* Compute total op time */
 	uint64_t total_op_ns = 0;

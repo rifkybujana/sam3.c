@@ -32,6 +32,7 @@ struct sam3_prof_stage {
 	uint64_t    start_ns;
 	uint64_t    total_ns;
 	int         calls;
+	int         depth;        /* Nesting depth when this stage began */
 };
 
 /* Per-op aggregate timing. */
@@ -54,6 +55,7 @@ struct sam3_profiler {
 	int                        enabled;
 	struct sam3_prof_stage     stages[SAM3_PROF_MAX_STAGES];
 	int                        n_stages;
+	int                        depth;      /* Current nesting depth */
 	struct sam3_prof_op_stats  op_stats[SAM3_OP_COUNT];
 	struct sam3_prof_mem       mem;
 };

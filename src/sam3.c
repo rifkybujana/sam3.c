@@ -23,6 +23,7 @@
 #include "sam3/internal/tensor_dump.h"
 #include "core/weight.h"
 #include "core/tensor.h"
+#include "core/alloc.h"
 #include "util/image.h"
 #include "util/log.h"
 #include "model/sam3_processor.h"
@@ -284,6 +285,7 @@ enum sam3_error sam3_profile_enable(sam3_ctx *ctx)
 			return SAM3_ENOMEM;
 	}
 	sam3_profiler_enable(ctx->profiler);
+	sam3_arena_set_profiler(ctx->profiler);
 	if (ctx->proc_ready)
 		ctx->proc.profiler = ctx->profiler;
 	return SAM3_OK;
@@ -296,8 +298,10 @@ enum sam3_error sam3_profile_enable(sam3_ctx *ctx)
 void sam3_profile_disable(sam3_ctx *ctx)
 {
 #ifdef SAM3_HAS_PROFILE
-	if (ctx && ctx->profiler)
+	if (ctx && ctx->profiler) {
 		sam3_profiler_disable(ctx->profiler);
+		sam3_arena_set_profiler(NULL);
+	}
 #else
 	(void)ctx;
 #endif
