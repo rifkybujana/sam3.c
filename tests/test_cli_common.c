@@ -13,6 +13,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <string.h>
+
 #include "cli_common.h"
 #include "test_helpers.h"
 
@@ -67,6 +69,34 @@ static void test_error_to_exit_unknown(void)
 	ASSERT_EQ(sam3_error_to_exit((enum sam3_error)-99), SAM3_EXIT_INTERNAL);
 }
 
+static void test_json_result(void)
+{
+	struct sam3_result r = {0};
+	float scores[2] = {0.95f, 0.72f};
+	float boxes[8] = {10, 20, 200, 300, 15, 25, 195, 295};
+	r.n_masks = 2;
+	r.mask_width = 256;
+	r.mask_height = 256;
+	r.best_mask = 0;
+	r.iou_valid = 1;
+	r.iou_scores = scores;
+	r.boxes_valid = 1;
+	r.boxes = boxes;
+
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp = open_memstream(&buf, &len);
+	ASSERT(fp != NULL);
+	cli_json_result(fp, &r);
+	fclose(fp);
+
+	ASSERT(strstr(buf, "\"n_masks\": 2") != NULL);
+	ASSERT(strstr(buf, "\"mask_width\": 256") != NULL);
+	ASSERT(strstr(buf, "\"best_mask\": 0") != NULL);
+	ASSERT(strstr(buf, "\"iou_score\":") != NULL);
+	free(buf);
+}
+
 int main(void)
 {
 	test_exit_code_values();
@@ -78,6 +108,7 @@ int main(void)
 	test_error_to_exit_emodel();
 	test_error_to_exit_edtype();
 	test_error_to_exit_unknown();
+	test_json_result();
 
 	TEST_REPORT();
 }

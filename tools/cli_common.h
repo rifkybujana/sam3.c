@@ -63,4 +63,37 @@ static inline int cli_is_pipe(void)
 	return !isatty(STDOUT_FILENO);
 }
 
+/*
+ * cli_json_result - Write sam3_result metadata as JSON to a file stream.
+ *
+ * @fp:     Output stream (stdout or stderr)
+ * @result: Segmentation result
+ *
+ * Writes n_masks, mask dimensions, best_mask, and per-mask iou_score
+ * and bounding box. No pixel data.
+ */
+void cli_json_result(FILE *fp, const struct sam3_result *result);
+
+/*
+ * cli_json_model_info - Write model metadata as JSON to a file stream.
+ *
+ * @fp:     Output stream
+ * @header: Weight file header
+ * @file_size: File size in bytes
+ */
+struct sam3_weight_header;
+void cli_json_model_info(FILE *fp,
+			 const struct sam3_weight_header *header,
+			 size_t file_size);
+
+/*
+ * cli_read_stdin - Read all bytes from stdin into a malloc'd buffer.
+ *
+ * @out_buf:  Set to the allocated buffer (caller frees)
+ * @out_size: Set to the number of bytes read
+ *
+ * Returns 0 on success, 1 on error.
+ */
+int cli_read_stdin(uint8_t **out_buf, size_t *out_size);
+
 #endif /* SAM3_CLI_COMMON_H */

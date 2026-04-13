@@ -205,8 +205,9 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
-	# test_cli_common needs tools/ include path for cli_common.h
+	# test_cli_common needs tools/ include path and cli_common.c
 	if(TARGET test_cli_common)
+		target_sources(test_cli_common PRIVATE tools/cli_common.c)
 		target_include_directories(test_cli_common PRIVATE
 			${CMAKE_SOURCE_DIR}/tools)
 	endif()
