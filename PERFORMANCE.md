@@ -9,41 +9,41 @@ median of 5 runs, on battery power. Scheduler QoS biased to
 
 **Model:** sam3.sam3 (3.3 GB, 1787 tensors)
 **Input:** `assets/cat.jpeg` (1008x1008 after resize), 1 text prompt ("cat")
-**Output:** 1 mask, IoU 0.6324, box=[0,54,180,282] (default NMS)
+**Output:** 1 mask, IoU 0.9800, box=[48,166,97,270] (default NMS)
 
 Top-level stages sum to wall-clock; indented sub-stages are nested
 inside their parent and are not added to the total.
 
 | Stage              | Time (ms) |    % |
 |--------------------|----------:|-----:|
-| model_load         |       657 |  7.7 |
+| model_load         |      1647 | 20.2 |
 | image_normalize    |         1 |  0.0 |
-| image_encode       |      2777 | 32.7 |
-| &nbsp;&nbsp;vit_precompute  |         4 |  0.0 |
-| &nbsp;&nbsp;vit_patch_embed |        32 |  0.4 |
-| &nbsp;&nbsp;vit_blocks      |      2340 | 27.6 |
-| &nbsp;&nbsp;neck            |       389 |  4.6 |
+| image_encode       |      4302 | 52.7 |
+| &nbsp;&nbsp;vit_precompute  |         3 |  0.0 |
+| &nbsp;&nbsp;vit_patch_embed |        30 |  0.4 |
+| &nbsp;&nbsp;vit_blocks      |      3601 | 44.1 |
+| &nbsp;&nbsp;neck            |       510 |  6.2 |
 | text_encode (join) |     <0.1  |  0.0 |
-| mask_decode        |      1023 | 12.1 |
-| &nbsp;&nbsp;geometry_encode |      <0.1 |  0.0 |
-| &nbsp;&nbsp;encoder_fusion  |       392 |  4.6 |
-| &nbsp;&nbsp;decoder         |       187 |  2.2 |
-| &nbsp;&nbsp;seg_head        |       350 |  4.1 |
-| postprocess        |        22 |  0.3 |
-| **Total (wall)**   |  **8484** |      |
+| mask_decode        |      2240 | 27.4 |
+| &nbsp;&nbsp;geometry_encode |       552 |  6.8 |
+| &nbsp;&nbsp;encoder_fusion  |       616 |  7.5 |
+| &nbsp;&nbsp;decoder         |       554 |  6.8 |
+| &nbsp;&nbsp;seg_head        |       514 |  6.3 |
+| postprocess        |        23 |  0.3 |
+| **Total (wall)**   |  **8162** |      |
 
 The `text_encode` stage measures only the pthread join — the actual text
 encoder graph runs on a CPU worker thread in parallel with the Metal
 image encoder, so its ~3.7s of work is fully hidden behind `image_encode`.
 See **Async pipeline** below.
 
-Wall-time variance: after the power-state hints landed, warm `vit_blocks`
-clusters at 2280–2382 ms (±2.2% spread) and warm total at 7765–8663 ms
-(±5.3% spread) across 5 back-to-back runs on battery. The first run in
-a cold session still pays a ~1.5 s MLX shader-cache / OS page-cache tax;
-the median above is representative of steady state. The post-#4 warm
-floor for `vit_blocks` is now ~2.3 s, down from ~3.1 s before the
-scheduler QoS hint and ~5.8–6.4 s pre-#4.
+Wall-time variance: the first run in a cold session pays a ~2–4 s MLX
+shader-cache / OS page-cache tax; warm runs 3–5 cluster at 3023–3923 ms
+for `vit_blocks` and 7069–8182 ms total (median of 5 runs above
+includes the cold outlier). The `mask_decode` stage is now ~2× longer
+than the pre-decoder-rework baseline because `geometry_encode` performs
+real cross-attention fusion (~550 ms) instead of the trivial 2-token
+point encoding it replaced.
 
 ### Optimization History
 
@@ -185,7 +185,7 @@ The seven landed optimizations:
 
 ### Stage Details
 
-**model_load** (~657ms)
+**model_load** (~1647ms)
 Open `.sam3` weight file via mmap, build FNV-1a hash table for O(1) tensor
 lookup, initialize module structs, and point tensor data pointers into the
 mmap region. After the initial sequential scan, the mmap is re-hinted
@@ -195,15 +195,15 @@ tables (global + per-window), position embed tiling, and 2D sinusoidal
 position encoding are deferred to first inference. No weight data is
 copied during load — tensors reference the mmap'd region directly.
 
-**image_encode** (~2.8s, 33%)
-- **vit_precompute** (~4ms): Lazy first-call initialization of RoPE tables
+**image_encode** (~4.3s, 53%)
+- **vit_precompute** (~3ms): Lazy first-call initialization of RoPE tables
   (global 5184-token + per-window 576-token), tiled position embeddings
   (577 -> 72x72), and 2D sinusoidal position encoding. The full-size
   5184×5184 window attention mask and matching 5184-token window RoPE
   are no longer allocated after the mask-free windowed attention rework.
-- **vit_patch_embed** (~32ms): 14x14 conv2d patch embedding, absolute
+- **vit_patch_embed** (~30ms): 14x14 conv2d patch embedding, absolute
   position embedding addition, and ln_pre LayerNorm. Single graph eval.
-- **vit_blocks** (~2.3s, 28%): 32 ViT transformer blocks (1024-dim, 16
+- **vit_blocks** (~3.6s, 44%): 32 ViT transformer blocks (1024-dim, 16
   heads, 64 head_dim). 28 of the 32 blocks use windowed attention: their
   input is partitioned from `[5184, 1024]` to `[9, 576, 1024]`, passed through
   unmasked multi-head SDPA with a precomputed 576-token window RoPE,
@@ -215,7 +215,7 @@ copied during load — tensors reference the mmap'd region directly.
   the batch=4 target is always achievable regardless of input size.
   Each block: LayerNorm, fused multi-head self-attention with RoPE
   (windowed or global), residual, LayerNorm, GELU MLP, residual.
-- **neck** (~389ms, 4.6%): 4-scale FPN producing feature maps at 4x, 2x,
+- **neck** (~510ms, 6.2%): 4-scale FPN producing feature maps at 4x, 2x,
   1x, and 0.5x resolution via conv2d, transposed conv2d, and maxpool stages.
 
 **text_encode** (<0.1 ms join — real work ~3.7 s, fully overlapped)
@@ -229,20 +229,21 @@ copied during load — tensors reference the mmap'd region directly.
   `image_encode`; the profiler stage timer measures only the pthread
   join (<0.1 ms because the worker is already done).
 
-**mask_decode** (~1023ms, 12.1%)
-- **geometry_encode** (<0.1ms): 3-layer geometry transformer for point/box
-  prompts (CPU path, typically 2 tokens). Trivial for single-prompt inputs.
-- **encoder_fusion** (~392ms, 4.6%): 6-layer DETR encoder fusing image
+**mask_decode** (~2240ms, 27.4%)
+- **geometry_encode** (~552ms, 6.8%): Geometry-aware cross-attention fusion
+  of point/box prompts with multi-scale image features from the FPN neck.
+  Runs on Metal.
+- **encoder_fusion** (~616ms, 7.5%): 6-layer DETR encoder fusing image
   features with text/geometry context. Each layer: self-attention +
   cross-attention + FFN, evaluated as separate Metal graphs.
-- **decoder** (~187ms, 2.2%): 6-layer DETR decoder with 200 learned queries.
-  Each layer: self-attention, text cross-attention, vision cross-attention,
-  FFN, with iterative box refinement between layers.
-- **seg_head** (~350ms, 4.1%): FPN pixel decoder (3-stage upsampling to
+- **decoder** (~554ms, 6.8%): 6-layer DETR decoder with 200 learned queries.
+  Each layer: self-attention, text cross-attention, RPB-augmented vision
+  cross-attention, FFN, with iterative box refinement between layers.
+- **seg_head** (~514ms, 6.3%): FPN pixel decoder (3-stage upsampling to
   288x288), instance projection (1x1 conv), mask embedder MLP, dot-product
   mask logits, and objectness scoring.
 
-**postprocess** (~22ms, 0.3%)
+**postprocess** (~23ms, 0.3%)
 Stability-based mask selection, bounding box extraction, and NMS
 (200 -> 1 masks for this input).
 
