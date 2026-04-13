@@ -5,9 +5,9 @@ A lightweight, dependency-free C11 implementation of [Segment Anything Model 3 (
 Inspired by [ggml](https://github.com/ggerganov/ggml) and [llama.cpp](https://github.com/ggerganov/llama.cpp), sam3.c implements the full SAM3 pipeline — image encoder, prompt encoder, mask decoder — in ~57K lines of portable C with zero Python dependencies.
 
 <p align="center">
-  <img src="output_bus/comparison.png" alt="sam3.c segmentation output compared to the official Python SAM3 implementation, showing IoU scores" width="800"/>
+  <img src="assets/sam3_segmentation.png" alt="sam3.c multi-object segmentation — four masks with distinct colors on a street scene" width="540"/>
   <br>
-  <em>sam3.c mask output (left) vs. official Python SAM3 (center) with per-mask IoU comparison (right)</em>
+  <em>Four-mask segmentation output from sam3.c — each object highlighted in a distinct color</em>
 </p>
 
 ## Why sam3.c?
