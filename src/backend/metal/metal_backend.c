@@ -583,12 +583,44 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		break;
 
 	case SAM3_OP_SILU: {
-		/* silu(x) = x * sigmoid(x) */
-		mlx_array sig = mlx_array_new();
-		rc = mlx_sigmoid(&sig, inputs[0], stream);
-		if (!rc)
-			rc = mlx_multiply(&result, inputs[0], sig, stream);
-		mlx_array_free(sig);
+		/* Fused SiLU via custom Metal kernel: x / (1 + exp(-x)) */
+		mlx_vector_array in_vec = mlx_vector_array_new_data(
+			inputs, 1);
+		mlx_fast_metal_kernel_config cfg =
+			mlx_fast_metal_kernel_config_new();
+
+		int ndims_in = mlx_array_ndim(inputs[0]);
+		int total = 1;
+		for (int d = 0; d < ndims_in; d++)
+			total *= mlx_array_dim(inputs[0], d);
+
+		int shape[SAM3_MAX_DIMS];
+		for (int d = 0; d < ndims_in; d++)
+			shape[d] = mlx_array_dim(inputs[0], d);
+		mlx_fast_metal_kernel_config_add_output_arg(
+			cfg, shape, (size_t)ndims_in,
+			mlx_array_dtype(inputs[0]));
+
+		int tpg = total < 256 ? total : 256;
+		mlx_fast_metal_kernel_config_set_grid(cfg, total, 1, 1);
+		mlx_fast_metal_kernel_config_set_thread_group(
+			cfg, tpg, 1, 1);
+		mlx_fast_metal_kernel_config_add_template_arg_dtype(
+			cfg, "T", mlx_array_dtype(inputs[0]));
+
+		mlx_vector_array out_vec = mlx_vector_array_new();
+		rc = mlx_fast_metal_kernel_apply(
+			&out_vec, mtl->silu_kernel, in_vec, cfg, stream);
+		if (!rc) {
+			mlx_array tmp = mlx_array_new();
+			mlx_vector_array_get(&tmp, out_vec, 0);
+			mlx_array_set(&result, tmp);
+			mlx_array_free(tmp);
+		}
+
+		mlx_vector_array_free(out_vec);
+		mlx_fast_metal_kernel_config_free(cfg);
+		mlx_vector_array_free(in_vec);
 		break;
 	}
 
@@ -1346,6 +1378,69 @@ static enum sam3_error metal_init(struct sam3_backend *be)
 	mlx_set_memory_limit(&mem_limit,
 			     (size_t)(0.75 * 16ULL * 1024 * 1024 * 1024));
 
+	/* Build fused SiLU Metal kernel (created once, reused every dispatch) */
+	{
+		static const char *in_names[] = {"x"};
+		static const char *out_names[] = {"out"};
+		mlx_vector_string ins = mlx_vector_string_new_data(
+			in_names, 1);
+		mlx_vector_string outs = mlx_vector_string_new_data(
+			out_names, 1);
+
+		static const char silu_src[] =
+			"uint i = thread_position_in_grid.x;\n"
+			"T v = x[i];\n"
+			"out[i] = v / (T(1) + metal::exp(-v));\n";
+
+		mtl->silu_kernel = mlx_fast_metal_kernel_new(
+			"silu", ins, outs, silu_src,
+			/* header= */ "",
+			/* ensure_row_contiguous= */ true,
+			/* atomic_outputs= */ false);
+
+		mlx_vector_string_free(ins);
+		mlx_vector_string_free(outs);
+	}
+
+	/* Build Q8_0→F16 dequant kernel (created once, reused per wrap) */
+	{
+		static const char *in_names[] = {"src"};
+		static const char *out_names[] = {"out"};
+		mlx_vector_string ins = mlx_vector_string_new_data(
+			in_names, 1);
+		mlx_vector_string outs = mlx_vector_string_new_data(
+			out_names, 1);
+
+		static const char dequant_header[] =
+			"struct q8_block {\n"
+			"    float scale;\n"
+			"    int8_t data[32];\n"
+			"};\n";
+
+		static const char dequant_src[] =
+			"uint tid = thread_position_in_grid.x;\n"
+			"uint block_idx = tid / 32;\n"
+			"uint elem_idx  = tid % 32;\n"
+			"device const q8_block *blocks = "
+				"(device const q8_block *)src;\n"
+			"out[tid] = half(blocks[block_idx].data[elem_idx]) "
+				"* half(blocks[block_idx].scale);\n";
+
+		mtl->dequant_q8_kernel = mlx_fast_metal_kernel_new(
+			"dequant_q8", ins, outs, dequant_src,
+			dequant_header,
+			/* ensure_row_contiguous= */ true,
+			/* atomic_outputs= */ false);
+
+		mlx_vector_string_free(ins);
+		mlx_vector_string_free(outs);
+
+		if (!mtl->dequant_q8_kernel.ctx) {
+			sam3_log_error("metal: dequant_q8 kernel create failed");
+			return SAM3_EBACKEND;
+		}
+	}
+
 	sam3_log_info("Metal backend initialized (MLX-C, %s, arena: %zu bytes)",
 		      mtl->use_f16 ? "F16" : "F32", capacity);
 	return SAM3_OK;
@@ -1366,6 +1461,10 @@ static void metal_free(struct sam3_backend *be)
 		if (mtl->gelu_one[i].ctx)
 			mlx_array_free(mtl->gelu_one[i]);
 	}
+	if (mtl->silu_kernel.ctx)
+		mlx_fast_metal_kernel_free(mtl->silu_kernel);
+	if (mtl->dequant_q8_kernel.ctx)
+		mlx_fast_metal_kernel_free(mtl->dequant_q8_kernel);
 	mlx_stream_free(mtl->stream);
 	mlx_device_free(mtl->device);
 	mlx_clear_cache();
