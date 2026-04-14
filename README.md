@@ -29,7 +29,8 @@ Inspired by [ggml](https://github.com/ggerganov/ggml) and [llama.cpp](https://gi
 - **FP16 and BF16 support** — run inference in half precision for lower memory and faster compute.
 - **Custom `.sam3` weight format** — mmap-friendly binary format with O(1) tensor lookup via hash table.
 - **Full SAM3 pipeline** — image encoder (Hiera), prompt encoder (points, boxes, masks), mask decoder, text encoder, and tokenizer.
-- **50 unit tests** — comprehensive test suite covering numerical operators, memory management, and end-to-end inference.
+- **Unified CLI** — single `sam3_cli` binary with `segment`, `convert`, and `info` subcommands. Supports stdin/stdout piping, JSON output, and multi-mask color overlays.
+- **48 unit tests** — comprehensive test suite covering numerical operators, memory management, and end-to-end inference.
 - **Built-in profiling** — latency tracing subsystem to identify bottlenecks.
 
 ## Quick Start
@@ -49,13 +50,26 @@ make -j$(nproc)
 Download a SAM3 checkpoint in SafeTensors format, then convert to the optimized `.sam3` format:
 
 ```bash
-./sam3_convert --input models/sam3.safetensors --output models/sam3.sam3
+./sam3_cli convert -i models/sam3.safetensors -o models/sam3.sam3
 ```
 
 ### Run Inference
 
 ```bash
-./sam3_main --model models/sam3.sam3 --image photo.jpg
+# Point prompt (foreground point at x=500, y=375)
+./sam3_cli segment -m models/sam3.sam3 -i photo.jpg -p 500,375,1 --overlay
+
+# Text prompt
+./sam3_cli segment -m models/sam3.sam3 -i photo.jpg -t "person" --overlay
+
+# Box prompt
+./sam3_cli segment -m models/sam3.sam3 -i photo.jpg -b 100,100,400,400 --all
+```
+
+### Inspect a Model
+
+```bash
+./sam3_cli info models/sam3.sam3
 ```
 
 ### Run Tests
@@ -81,8 +95,8 @@ sam3.c
 │   │   ├── text_encoder    Text prompt encoding
 │   │   └── tokenizer       BPE tokenizer
 │   └── util/            Logging, error codes
-├── tools/               CLI binaries (sam3_main, sam3_convert)
-└── tests/               50 test files
+├── tools/               Unified CLI (sam3_cli: segment, convert, info)
+└── tests/               48 test files
 ```
 
 ## Weight Format
@@ -92,7 +106,7 @@ Model weights use the `.sam3` binary format — a compact, mmap-friendly layout 
 - 48-byte header + 176-byte tensor descriptors + page-aligned data blob
 - FNV-1a hash table for O(1) tensor lookup by name
 - Supports FP32, FP16, BF16, I32, I8, and Q8_0 (block-quantized int8)
-- Converted from SafeTensors via `sam3_convert`
+- Converted from SafeTensors via `sam3_cli convert`
 
 See [docs/weight-format.md](docs/weight-format.md) for the full specification.
 

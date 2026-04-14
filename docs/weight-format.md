@@ -115,10 +115,10 @@ The writer (`sam3_weight_write()`) iterates a `weight_reader` vtable:
 
 ## Conversion
 
-The `sam3_convert` tool converts SafeTensors weights to `.sam3`:
+The `sam3_cli convert` subcommand converts SafeTensors weights to `.sam3`:
 
 ```
-sam3_convert model.safetensors -o model.sam3 \
+sam3_cli convert -i model.safetensors -o model.sam3 \
     --image-size 1008 --encoder-dim 1280 --decoder-dim 256 \
     --encoder-layers 32 --decoder-layers 2
 ```
@@ -141,7 +141,7 @@ The format does **not** include checksums. Integrity is ensured by:
 |----------------------------|-----------------------------------|
 | `src/core/weight.h`        | Format structs and loader API     |
 | `src/core/weight.c`        | Loader and writer implementation  |
-| `tools/sam3_convert.c`     | SafeTensors -> .sam3 converter    |
+| `tools/cli_convert.c`      | `sam3_cli convert` subcommand     |
 
 ## Changelog
 
@@ -149,7 +149,7 @@ The format does **not** include checksums. Integrity is ensured by:
 - Conv2d weights stored in OHWI: `[C_out, KH, KW, C_in]`
 - ConvTranspose2d weights stored in OHWI: `[C_out, KH, KW, C_in]`
 - Enables zero-transpose conv execution on Metal/MLX (NHWC activations)
-- Loader rejects v2 files; regenerate via `sam3_convert`
+- Loader rejects v2 files; regenerate via `sam3_cli convert`
 
 ### v2 (2026-03-31)
 - Initial format as documented above, with conv weights in OIHW / IOHW
