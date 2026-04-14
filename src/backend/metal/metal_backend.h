@@ -48,6 +48,10 @@ struct sam3_metal_backend {
 	int                       map_capacity;
 	bool                      use_f16;   /* Cast F32 -> F16 for compute */
 	mlx_array                 relu_zeros[13]; /* Per-dtype cached scalar 0 */
+	/* Per-dtype cached GELU constants: 0.5, 1/sqrt(2), 1.0 */
+	mlx_array                 gelu_half[13];
+	mlx_array                 gelu_rsqrt2[13];
+	mlx_array                 gelu_one[13];
 #endif
 };
 

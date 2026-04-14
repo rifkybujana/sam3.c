@@ -366,6 +366,31 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 
 /* ── Op dispatch ──────────────────────────────────────────────────── */
 
+/* Ensure cached GELU constants (0.5, 1/sqrt(2), 1.0) exist for the dtype. */
+static void metal_ensure_gelu_consts(struct sam3_metal_backend *mtl,
+				     mlx_dtype dt)
+{
+	if (mtl->gelu_half[dt].ctx)
+		return;
+
+	int shape[] = {1};
+	float half_val = 0.5f;
+	float rsqrt2_val = 0.7071067811865475f; /* 1/sqrt(2) */
+	float one_val = 1.0f;
+
+	mlx_array h = mlx_array_new_data(&half_val, shape, 1, MLX_FLOAT32);
+	mlx_array r = mlx_array_new_data(&rsqrt2_val, shape, 1, MLX_FLOAT32);
+	mlx_array o = mlx_array_new_data(&one_val, shape, 1, MLX_FLOAT32);
+
+	mlx_astype(&mtl->gelu_half[dt], h, dt, mtl->stream);
+	mlx_astype(&mtl->gelu_rsqrt2[dt], r, dt, mtl->stream);
+	mlx_astype(&mtl->gelu_one[dt], o, dt, mtl->stream);
+
+	mlx_array_free(o);
+	mlx_array_free(r);
+	mlx_array_free(h);
+}
+
 /* Get or create a cached scalar zero of the given mlx_dtype for ReLU. */
 static mlx_array metal_get_relu_zero(struct sam3_metal_backend *mtl,
 				     mlx_dtype dt)
@@ -427,31 +452,17 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		/*
 		 * Exact GELU matching PyTorch nn.GELU(approximate='none'):
 		 *   gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+		 *
+		 * Scalar constants (0.5, 1/sqrt(2), 1.0) are cached per
+		 * dtype to avoid 6 temporary arrays per dispatch.
 		 */
-		int scalar_shape[] = {1};
 		mlx_dtype in_dtype = mlx_array_dtype(inputs[0]);
-
-		float half_val = 0.5f;
-		float rsqrt2_val = 0.7071067811865475f; /* 1/sqrt(2) */
-		float one_val = 1.0f;
-
-		mlx_array half_arr = mlx_array_new_data(
-			&half_val, scalar_shape, 1, MLX_FLOAT32);
-		mlx_array rsqrt2_arr = mlx_array_new_data(
-			&rsqrt2_val, scalar_shape, 1, MLX_FLOAT32);
-		mlx_array one_arr = mlx_array_new_data(
-			&one_val, scalar_shape, 1, MLX_FLOAT32);
-
-		mlx_array half_cast = mlx_array_new();
-		mlx_array rsqrt2_cast = mlx_array_new();
-		mlx_array one_cast = mlx_array_new();
-		mlx_astype(&half_cast, half_arr, in_dtype, stream);
-		mlx_astype(&rsqrt2_cast, rsqrt2_arr, in_dtype, stream);
-		mlx_astype(&one_cast, one_arr, in_dtype, stream);
+		metal_ensure_gelu_consts(mtl, in_dtype);
 
 		/* x / sqrt(2) */
 		mlx_array x_scaled = mlx_array_new();
-		mlx_multiply(&x_scaled, inputs[0], rsqrt2_cast, stream);
+		mlx_multiply(&x_scaled, inputs[0],
+			     mtl->gelu_rsqrt2[in_dtype], stream);
 
 		/* erf(x / sqrt(2)) */
 		mlx_array erf_val = mlx_array_new();
@@ -459,11 +470,13 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 		/* 1 + erf(...) */
 		mlx_array one_plus_erf = mlx_array_new();
-		mlx_add(&one_plus_erf, one_cast, erf_val, stream);
+		mlx_add(&one_plus_erf, mtl->gelu_one[in_dtype],
+			erf_val, stream);
 
 		/* 0.5 * x */
 		mlx_array half_x = mlx_array_new();
-		mlx_multiply(&half_x, inputs[0], half_cast, stream);
+		mlx_multiply(&half_x, inputs[0],
+			     mtl->gelu_half[in_dtype], stream);
 
 		/* 0.5 * x * (1 + erf(...)) */
 		rc = mlx_multiply(&result, half_x, one_plus_erf, stream);
@@ -472,12 +485,6 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		mlx_array_free(one_plus_erf);
 		mlx_array_free(erf_val);
 		mlx_array_free(x_scaled);
-		mlx_array_free(one_cast);
-		mlx_array_free(rsqrt2_cast);
-		mlx_array_free(half_cast);
-		mlx_array_free(one_arr);
-		mlx_array_free(rsqrt2_arr);
-		mlx_array_free(half_arr);
 		break;
 	}
 
@@ -1162,6 +1169,12 @@ static void metal_free(struct sam3_backend *be)
 	for (int i = 0; i < 13; i++) {
 		if (mtl->relu_zeros[i].ctx)
 			mlx_array_free(mtl->relu_zeros[i]);
+		if (mtl->gelu_half[i].ctx)
+			mlx_array_free(mtl->gelu_half[i]);
+		if (mtl->gelu_rsqrt2[i].ctx)
+			mlx_array_free(mtl->gelu_rsqrt2[i]);
+		if (mtl->gelu_one[i].ctx)
+			mlx_array_free(mtl->gelu_one[i]);
 	}
 	mlx_stream_free(mtl->stream);
 	mlx_device_free(mtl->device);
