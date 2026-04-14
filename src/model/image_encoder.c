@@ -610,6 +610,23 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 		int skip_data = (be->type == SAM3_BACKEND_METAL);
 		int batch = skip_data ? 4 : 2;
 
+		/*
+		 * GPU-resident forwarding tensor. Allocated in
+		 * persist arena so it survives scratch resets.
+		 * On non-last batches, the output mlx_array stays
+		 * in the tensor map; the next batch finds it via
+		 * metal_wrap_tensor without data transfer.
+		 */
+		struct sam3_tensor *x_fwd = NULL;
+		if (skip_data) {
+			int fwd_dims[] = {np, e};
+			x_fwd = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						 2, fwd_dims);
+			if (!x_fwd)
+				return NULL;
+			x_fwd->data = x_buf;
+		}
+
 		for (int base = 0; base < vit->depth; base += batch) {
 			int end = base + batch;
 			if (end > vit->depth)
@@ -620,11 +637,17 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 			if (skip_data)
 				scratch->skip_data = 1;
 
-			int x_dims[] = {np, e};
-			x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
-					    2, x_dims, x_buf);
-			if (!x)
-				return NULL;
+			if (skip_data && base > 0) {
+				/* GPU-resident: x_fwd in tensor map */
+				x = x_fwd;
+			} else {
+				int x_dims[] = {np, e};
+				x = gh_tensor_wrap(scratch,
+						    SAM3_DTYPE_F32,
+						    2, x_dims, x_buf);
+				if (!x)
+					return NULL;
+			}
 
 			for (int i = base; i < end; i++) {
 				/* Pre-norm for attention */
@@ -773,9 +796,17 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 					scratch->offset, scratch->size);
 			}
 
-			/* Assign host buffer for Phase 3 readback */
-			if (skip_data)
-				x->data = x_buf;
+			if (skip_data) {
+				bool last = (end >= vit->depth);
+				/*
+				 * Redirect last node output to the
+				 * persistent forwarding tensor so its
+				 * mlx_array key survives scratch reset.
+				 */
+				g.nodes[g.n_nodes - 1].output = x_fwd;
+				x = x_fwd;
+				g.no_readback = !last;
+			}
 
 			err = be->ops->graph_eval(be, &g);
 			scratch->skip_data = 0;
