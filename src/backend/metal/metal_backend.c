@@ -99,6 +99,16 @@ static unsigned metal_map_slot(const struct sam3_tensor *ptr, int capacity)
 }
 
 /*
+ * metal_map_ensure_capacity - Pre-size the map if a known entry count is coming.
+ *
+ * @hint: expected number of entries that will be inserted.
+ *
+ * Doubles the map until capacity can hold @hint entries at 75% load.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int metal_map_ensure_capacity(struct sam3_metal_backend *mtl, int hint);
+
+/*
  * metal_map_rehash - Double the map capacity and reinsert all entries.
  *
  * Tombstones are dropped during rehash, compacting the table.
@@ -140,6 +150,16 @@ static int metal_map_rehash(struct sam3_metal_backend *mtl)
 
 	sam3_log_debug("metal: map rehashed to %d slots (%d entries)",
 		       new_cap, mtl->map_count);
+	return 0;
+}
+
+static int metal_map_ensure_capacity(struct sam3_metal_backend *mtl, int hint)
+{
+	int needed = (hint + mtl->map_count) * 4 / 3;
+	while (mtl->map_capacity < needed) {
+		if (metal_map_rehash(mtl) < 0)
+			return -1;
+	}
 	return 0;
 }
 
@@ -1527,6 +1547,12 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 	enum sam3_error err;
 
 	sam3_arena_reset(&mtl->scratch);
+
+	/* Pre-size tensor map: each node wraps up to ~3 input tensors */
+	if (metal_map_ensure_capacity(mtl, g->n_nodes * 3) < 0) {
+		sam3_log_error("metal_graph_eval: map pre-size failed");
+		return SAM3_ENOMEM;
+	}
 
 	/* Mask reshape cache: avoids redundant reshape for shared masks */
 	struct metal_mask_cache_entry mask_cache[METAL_MASK_CACHE_SLOTS];

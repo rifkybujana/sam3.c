@@ -1183,6 +1183,68 @@ static void test_metal_no_readback_chain(void)
 	sam3_backend_free(metal);
 }
 
+/*
+ * Test hash table pre-sizing: build a graph with many nodes and
+ * verify it evaluates correctly. Pre-sizing avoids rehash during
+ * Phase 1 dispatch.
+ */
+static void test_metal_map_presize(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	ASSERT(metal != NULL);
+	if (!metal)
+		return;
+
+	/*
+	 * Build a chain of 64 ADD nodes: t[i+1] = t[i] + ones.
+	 * With 64 nodes, pre-sizing hint = 64 * 3 = 192 new entries,
+	 * ensuring the capacity check path executes.
+	 */
+	#define CHAIN_LEN 64
+	float ones_data[] = {1.0f, 1.0f, 1.0f, 1.0f};
+	float chain_data[CHAIN_LEN + 1][4];
+	struct sam3_tensor ones_t, chain_t[CHAIN_LEN + 1];
+
+	int dims[] = {4};
+
+	memset(chain_data[0], 0, sizeof(chain_data[0]));
+	for (int i = 0; i <= CHAIN_LEN; i++) {
+		chain_t[i] = make_tensor(SAM3_DTYPE_F32, 1, dims);
+		chain_t[i].data = chain_data[i];
+		chain_t[i].nbytes = sizeof(chain_data[i]);
+		sam3_tensor_compute_strides(&chain_t[i]);
+	}
+
+	ones_t = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	ones_t.data = ones_data;
+	ones_t.nbytes = sizeof(ones_data);
+	sam3_tensor_compute_strides(&ones_t);
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	for (int i = 0; i < CHAIN_LEN; i++) {
+		g.nodes[i] = (struct sam3_node){
+			.op = SAM3_OP_ADD, .n_inputs = 2,
+			.inputs = {&chain_t[i], &ones_t},
+			.output = &chain_t[i + 1],
+		};
+	}
+	g.n_nodes = CHAIN_LEN;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g), SAM3_OK);
+
+	/* Final tensor should be {64, 64, 64, 64} */
+	float expected[] = {
+		(float)CHAIN_LEN, (float)CHAIN_LEN,
+		(float)CHAIN_LEN, (float)CHAIN_LEN,
+	};
+	ASSERT(float_arrays_match((float *)chain_t[CHAIN_LEN].data,
+				  expected, 4, 1e-6f));
+
+	sam3_backend_free(metal);
+	#undef CHAIN_LEN
+}
+
 #endif /* SAM3_HAS_METAL */
 
 /* ── Main ────────────────────────────────────────────────────────── */
@@ -1217,6 +1279,7 @@ int main(void)
 	test_metal_map_put_update();
 	test_metal_no_readback_forward();
 	test_metal_no_readback_chain();
+	test_metal_map_presize();
 #endif
 
 	TEST_REPORT();
