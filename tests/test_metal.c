@@ -642,6 +642,146 @@ static void test_metal_rope_axial_batched(void)
 	sam3_backend_free(cpu);
 }
 
+/*
+ * Test SDPA with a mask, run twice with the same mask tensor to
+ * exercise the mask reshape cache. Compares Metal vs CPU.
+ */
+static void test_metal_sdpa_mask_cache(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+	ASSERT(metal && cpu);
+	if (!metal || !cpu) {
+		sam3_backend_free(metal);
+		sam3_backend_free(cpu);
+		return;
+	}
+
+	/*
+	 * Two SDPA nodes sharing the same mask, simulating two
+	 * text encoder layers with a shared causal mask.
+	 *
+	 * Q, K, V: [2, 4] (seq=2, hd=4)
+	 * mask:    [2, 2] (seq_q=2, seq_kv=2) — lower-triangular causal
+	 */
+	int qkv_dims[] = {2, 4};
+	int mask_dims[] = {2, 2};
+
+	float q_data[] = {1, 0, 0, 0, 0, 1, 0, 0};
+	float k_data[] = {1, 0, 0, 0, 0, 1, 0, 0};
+	float v_data[] = {1, 2, 3, 4, 5, 6, 7, 8};
+	float mask_data[] = {0.0f, -1e9f, 0.0f, 0.0f};
+
+	/* --- Metal path: 2-node graph, same mask --- */
+	struct sam3_tensor mq1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor mk1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor mv1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor mmask = make_tensor(SAM3_DTYPE_F32, 2, mask_dims);
+	struct sam3_tensor mout1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+
+	struct sam3_tensor mq2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor mk2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor mv2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor mout2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+
+	metal->ops->alloc_tensor(metal, &mq1);
+	metal->ops->alloc_tensor(metal, &mk1);
+	metal->ops->alloc_tensor(metal, &mv1);
+	metal->ops->alloc_tensor(metal, &mmask);
+	metal->ops->alloc_tensor(metal, &mout1);
+	metal->ops->alloc_tensor(metal, &mq2);
+	metal->ops->alloc_tensor(metal, &mk2);
+	metal->ops->alloc_tensor(metal, &mv2);
+	metal->ops->alloc_tensor(metal, &mout2);
+
+	memcpy(mq1.data, q_data, mq1.nbytes);
+	memcpy(mk1.data, k_data, mk1.nbytes);
+	memcpy(mv1.data, v_data, mv1.nbytes);
+	memcpy(mmask.data, mask_data, mmask.nbytes);
+	memcpy(mq2.data, q_data, mq2.nbytes);
+	memcpy(mk2.data, k_data, mk2.nbytes);
+	memcpy(mv2.data, v_data, mv2.nbytes);
+
+	struct sam3_graph mg;
+	sam3_graph_init(&mg);
+	mg.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_SDPA, .n_inputs = 4,
+		.inputs = {&mq1, &mk1, &mv1, &mmask},
+		.output = &mout1,
+		.params = {4},  /* head_dim */
+	};
+	mg.nodes[1] = (struct sam3_node){
+		.op = SAM3_OP_SDPA, .n_inputs = 4,
+		.inputs = {&mq2, &mk2, &mv2, &mmask},
+		.output = &mout2,
+		.params = {4},
+	};
+	mg.n_nodes = 2;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &mg), SAM3_OK);
+
+	/* --- CPU path: same 2-node graph --- */
+	struct sam3_tensor cq1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor ck1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor cv1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor cmask = make_tensor(SAM3_DTYPE_F32, 2, mask_dims);
+	struct sam3_tensor cout1 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+
+	struct sam3_tensor cq2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor ck2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor cv2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+	struct sam3_tensor cout2 = make_tensor(SAM3_DTYPE_F32, 2, qkv_dims);
+
+	cpu->ops->alloc_tensor(cpu, &cq1);
+	cpu->ops->alloc_tensor(cpu, &ck1);
+	cpu->ops->alloc_tensor(cpu, &cv1);
+	cpu->ops->alloc_tensor(cpu, &cmask);
+	cpu->ops->alloc_tensor(cpu, &cout1);
+	cpu->ops->alloc_tensor(cpu, &cq2);
+	cpu->ops->alloc_tensor(cpu, &ck2);
+	cpu->ops->alloc_tensor(cpu, &cv2);
+	cpu->ops->alloc_tensor(cpu, &cout2);
+
+	memcpy(cq1.data, q_data, cq1.nbytes);
+	memcpy(ck1.data, k_data, ck1.nbytes);
+	memcpy(cv1.data, v_data, cv1.nbytes);
+	memcpy(cmask.data, mask_data, cmask.nbytes);
+	memcpy(cq2.data, q_data, cq2.nbytes);
+	memcpy(ck2.data, k_data, ck2.nbytes);
+	memcpy(cv2.data, v_data, cv2.nbytes);
+
+	struct sam3_graph cg;
+	sam3_graph_init(&cg);
+	cg.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_SDPA, .n_inputs = 4,
+		.inputs = {&cq1, &ck1, &cv1, &cmask},
+		.output = &cout1,
+		.params = {4},
+	};
+	cg.nodes[1] = (struct sam3_node){
+		.op = SAM3_OP_SDPA, .n_inputs = 4,
+		.inputs = {&cq2, &ck2, &cv2, &cmask},
+		.output = &cout2,
+		.params = {4},
+	};
+	cg.n_nodes = 2;
+
+	ASSERT_EQ(cpu->ops->graph_eval(cpu, &cg), SAM3_OK);
+
+	/* Both SDPA outputs should match */
+	ASSERT(float_arrays_match((float *)mout1.data, (float *)cout1.data,
+				  8, 1e-2f));
+	ASSERT(float_arrays_match((float *)mout2.data, (float *)cout2.data,
+				  8, 1e-2f));
+
+	/* Both nodes got same input → same output */
+	ASSERT(float_arrays_match((float *)mout1.data, (float *)mout2.data,
+				  8, 1e-6f));
+
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
+}
+
 /* ── Test: backend factory ───────────────────────────────────────── */
 
 static void test_backend_factory_metal(void)
@@ -693,6 +833,7 @@ int main(void)
 	test_metal_rope_axial();
 	test_metal_rope_axial_scaled();
 	test_metal_rope_axial_batched();
+	test_metal_sdpa_mask_cache();
 #endif
 
 	TEST_REPORT();
