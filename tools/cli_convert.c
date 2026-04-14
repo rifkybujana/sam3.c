@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <libgen.h>
 
 #include "sam3/sam3.h"
 #include "sam3/sam3_types.h"
@@ -339,6 +341,36 @@ int cli_convert(int argc, char **argv)
 	if (rc > 0) {
 		fprintf(stderr, "Run '%s -h' for usage.\n", argv[0]);
 		return SAM3_EXIT_USAGE;
+	}
+
+	/* Validate paths before expensive operations */
+	if (access(args.input_path, R_OK) != 0) {
+		fprintf(stderr, "error: input file not found: '%s'\n",
+			args.input_path);
+		return SAM3_EXIT_IO;
+	}
+	{
+		char *tmp = strdup(args.output_path);
+		if (tmp) {
+			const char *dir = dirname(tmp);
+			struct stat dir_st;
+			if (stat(dir, &dir_st) != 0 ||
+			    !S_ISDIR(dir_st.st_mode)) {
+				fprintf(stderr,
+					"error: output directory not "
+					"found: '%s'\n", dir);
+				free(tmp);
+				return SAM3_EXIT_IO;
+			}
+			if (access(dir, W_OK) != 0) {
+				fprintf(stderr,
+					"error: output directory not "
+					"writable: '%s'\n", dir);
+				free(tmp);
+				return SAM3_EXIT_IO;
+			}
+			free(tmp);
+		}
 	}
 
 	/* Set log level */

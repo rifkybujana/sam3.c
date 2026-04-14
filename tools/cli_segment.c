@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <pthread.h>
 #include <sys/qos.h>
@@ -557,6 +558,143 @@ static int write_overlay(const char *path, const float *mask,
 }
 
 /*
+ * write_overlay_merged - Write a single overlay with all masks in distinct colors.
+ *
+ * Each mask is blended at 40% opacity with a cycling 6-color palette.
+ * White edges are drawn where any mask boundary exists.
+ *
+ * @path:      Output PNG path
+ * @masks:     Float mask data (n_masks * mask_h * mask_w, contiguous)
+ * @n_masks:   Number of masks
+ * @mask_w:    Mask width
+ * @mask_h:    Mask height
+ * @img:       Original image (RGB)
+ * @threshold: Mask threshold
+ *
+ * Returns 0 on success, 1 on error.
+ */
+static int write_overlay_merged(const char *path,
+				const float *masks, int n_masks,
+				int mask_w, int mask_h,
+				const struct sam3_image *img,
+				float threshold)
+{
+	static const uint8_t palette[][3] = {
+		{30, 144, 255},   /* dodger blue */
+		{255, 100, 80},   /* coral red */
+		{0, 200, 100},    /* emerald green */
+		{255, 200, 0},    /* gold */
+		{200, 80, 255},   /* violet */
+		{0, 210, 210},    /* cyan */
+	};
+	static const int n_colors = 6;
+
+	int w = img->width;
+	int h = img->height;
+	size_t npix = (size_t)w * h;
+	size_t mask_npix = (size_t)mask_w * mask_h;
+
+	/* Resize all masks to image dimensions */
+	float *resized_all = NULL;
+	const float *m_base;
+	int m_w, m_h;
+
+	if (mask_w != w || mask_h != h) {
+		resized_all = malloc(npix * (size_t)n_masks *
+				     sizeof(float));
+		if (!resized_all) {
+			fprintf(stderr,
+				"error: out of memory for "
+				"merged overlay\n");
+			return 1;
+		}
+		for (int k = 0; k < n_masks; k++) {
+			sam3_mask_resize_bilinear(
+				masks + (size_t)k * mask_npix,
+				mask_w, mask_h,
+				resized_all + (size_t)k * npix,
+				w, h);
+		}
+		m_base = resized_all;
+		m_w = w;
+		m_h = h;
+	} else {
+		m_base = masks;
+		m_w = mask_w;
+		m_h = mask_h;
+	}
+
+	size_t m_npix = (size_t)m_w * m_h;
+
+	uint8_t *out = malloc(npix * 3);
+	if (!out) {
+		free(resized_all);
+		fprintf(stderr,
+			"error: out of memory for merged overlay\n");
+		return 1;
+	}
+
+	for (size_t i = 0; i < npix; i++) {
+		float r = (float)img->pixels[i * 3 + 0];
+		float g = (float)img->pixels[i * 3 + 1];
+		float b = (float)img->pixels[i * 3 + 2];
+
+		int x = (int)(i % (size_t)m_w);
+		int y = (int)(i / (size_t)m_w);
+		int any_edge = 0;
+
+		/* Blend each active mask */
+		for (int k = 0; k < n_masks; k++) {
+			const float *m = m_base + (size_t)k * m_npix;
+			if (m[i] < threshold)
+				continue;
+
+			/* Edge detection for this mask */
+			int edge = (x == 0 || m[i - 1] < threshold ||
+				    x == m_w - 1 ||
+				    m[i + 1] < threshold ||
+				    y == 0 ||
+				    m[i - m_w] < threshold ||
+				    y == m_h - 1 ||
+				    m[i + m_w] < threshold);
+			if (edge)
+				any_edge = 1;
+
+			/* 40% blend with palette color */
+			int ci = k % n_colors;
+			r = r * 0.6f + (float)palette[ci][0] * 0.4f;
+			g = g * 0.6f + (float)palette[ci][1] * 0.4f;
+			b = b * 0.6f + (float)palette[ci][2] * 0.4f;
+		}
+
+		if (any_edge) {
+			out[i * 3 + 0] = 255;
+			out[i * 3 + 1] = 255;
+			out[i * 3 + 2] = 255;
+		} else {
+			out[i * 3 + 0] = (uint8_t)(r > 255.f ? 255 :
+						    (int)r);
+			out[i * 3 + 1] = (uint8_t)(g > 255.f ? 255 :
+						    (int)g);
+			out[i * 3 + 2] = (uint8_t)(b > 255.f ? 255 :
+						    (int)b);
+		}
+	}
+
+	int ok = stbi_write_png(path, w, h, 3, out, w * 3);
+	free(out);
+	free(resized_all);
+
+	if (!ok) {
+		fprintf(stderr,
+			"error: failed to write merged overlay "
+			"'%s'\n", path);
+		return 1;
+	}
+	return 0;
+}
+
+/*
  * write_cutout - Write an RGBA cutout PNG.
  *
  * Original pixels where mask > threshold are kept; all other pixels
@@ -659,6 +797,34 @@ int cli_segment(int argc, char **argv)
 	if (rc > 0) {
 		fprintf(stderr, "Run '%s -h' for usage.\n", argv[0]);
 		return SAM3_EXIT_USAGE;
+	}
+
+	/* Validate paths before expensive operations */
+	if (!args.use_stdin && access(args.image_path, R_OK) != 0) {
+		fprintf(stderr, "error: image not found: '%s'\n",
+			args.image_path);
+		return SAM3_EXIT_IO;
+	}
+	if (access(args.model_path, R_OK) != 0) {
+		fprintf(stderr, "error: model not found: '%s'\n",
+			args.model_path);
+		return SAM3_EXIT_IO;
+	}
+	if (!args.use_stdout) {
+		struct stat dir_st;
+		if (stat(args.output_dir, &dir_st) != 0 ||
+		    !S_ISDIR(dir_st.st_mode)) {
+			fprintf(stderr,
+				"error: output directory not found: "
+				"'%s'\n", args.output_dir);
+			return SAM3_EXIT_IO;
+		}
+		if (access(args.output_dir, W_OK) != 0) {
+			fprintf(stderr,
+				"error: output directory not "
+				"writable: '%s'\n", args.output_dir);
+			return SAM3_EXIT_IO;
+		}
 	}
 
 	/*
@@ -1242,6 +1408,26 @@ int cli_segment(int argc, char **argv)
 					cli_progress("  wrote %s\n",
 						     path_buf);
 			}
+		}
+
+		/* Merged overlay with distinct colors per mask */
+		if (args.write_overlay && result.n_masks > 0) {
+			snprintf(path_buf, sizeof(path_buf),
+				 "%s/overlay_all.png",
+				 args.output_dir);
+			if (write_overlay_merged(path_buf,
+						 result.masks,
+						 result.n_masks,
+						 result.mask_width,
+						 result.mask_height,
+						 &orig_img,
+						 args.threshold))
+				fprintf(stderr,
+					"warning: failed to write "
+					"%s\n", path_buf);
+			else if (!args.quiet)
+				cli_progress("  wrote %s\n",
+					     path_buf);
 		}
 
 		free(smooth_bin);
