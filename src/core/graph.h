@@ -18,6 +18,7 @@
 #define SAM3_CORE_GRAPH_H
 
 #include "tensor.h"
+#include <stdbool.h>
 
 #define SAM3_GRAPH_MAX_NODES 16384
 #define SAM3_NODE_MAX_INPUTS 8
@@ -74,6 +75,7 @@ struct sam3_node {
 struct sam3_graph {
 	struct sam3_node nodes[SAM3_GRAPH_MAX_NODES];
 	int              n_nodes;
+	bool             no_readback; /* Skip Phase 3; keep outputs GPU-resident */
 };
 
 /* Initialize an empty compute graph. */
