@@ -138,6 +138,18 @@ if(SAM3_METAL)
 	target_link_libraries(sam3 mlxc)
 endif()
 
+# CLI tool (unified binary with subcommands)
+add_executable(sam3_cli
+	tools/sam3_cli.c
+	tools/cli_common.c
+	tools/cli_segment.c
+	tools/cli_convert.c
+	tools/cli_info.c
+	tools/weight_rename.c
+	tools/weight_conv_perm.c)
+target_include_directories(sam3_cli PRIVATE ${CMAKE_SOURCE_DIR}/tools)
+target_link_libraries(sam3_cli sam3)
+
 # CLI tools
 add_executable(sam3_main tools/sam3_main.c)
 target_link_libraries(sam3_main sam3)
