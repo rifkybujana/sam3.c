@@ -80,6 +80,27 @@ enum sam3_error sam3_image_load(const char *path, struct sam3_image *img)
 	return SAM3_OK;
 }
 
+enum sam3_error sam3_image_load_memory(const uint8_t *buf, size_t size,
+				       struct sam3_image *img)
+{
+	if (!buf || !size || !img)
+		return SAM3_EINVAL;
+
+	int w, h, channels;
+	uint8_t *data = stbi_load_from_memory(buf, (int)size,
+					      &w, &h, &channels, 3);
+	if (!data) {
+		sam3_log_error("failed to decode image from memory: %s",
+			       stbi_failure_reason());
+		return SAM3_EIO;
+	}
+
+	img->pixels = data;
+	img->width  = w;
+	img->height = h;
+	return SAM3_OK;
+}
+
 enum sam3_error sam3_image_resize(const struct sam3_image *src,
 				  struct sam3_image *dst,
 				  int target_w, int target_h)

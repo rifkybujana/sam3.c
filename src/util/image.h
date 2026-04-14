@@ -66,6 +66,18 @@ enum sam3_error sam3_image_letterbox(const struct sam3_image *src,
 				     int target_size);
 
 /*
+ * sam3_image_load_memory - Load an image from a memory buffer.
+ *
+ * @buf:  Pointer to encoded image data (PNG/JPEG/BMP)
+ * @size: Size of the buffer in bytes
+ * @img:  Output image struct (caller must call sam3_image_free)
+ *
+ * Returns SAM3_OK on success, SAM3_EIO if decoding fails.
+ */
+enum sam3_error sam3_image_load_memory(const uint8_t *buf, size_t size,
+				       struct sam3_image *img);
+
+/*
  * sam3_image_free - Free pixel data allocated by load/resize/letterbox.
  *
  * @img: Image to free (pixels set to NULL after).
