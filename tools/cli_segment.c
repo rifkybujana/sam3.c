@@ -789,8 +789,26 @@ int cli_segment(int argc, char **argv)
 			ret = (int)sam3_error_to_exit(err);
 			goto cleanup;
 		}
-		err = sam3_set_image(ctx, si.pixels, si.width, si.height);
+		/*
+		 * sam3_set_image_file() internally resizes to
+		 * image_size x image_size. Replicate that here
+		 * for the stdin path.
+		 */
+		int target = 1008;
+		struct sam3_image resized = {0};
+		err = sam3_image_resize(&si, &resized, target, target);
 		sam3_image_free(&si);
+		if (err != SAM3_OK) {
+			fprintf(stderr,
+				"error: failed to resize stdin "
+				"image: %s\n",
+				sam3_error_str(err));
+			ret = (int)sam3_error_to_exit(err);
+			goto cleanup;
+		}
+		err = sam3_set_image(ctx, resized.pixels,
+				     resized.width, resized.height);
+		sam3_image_free(&resized);
 	} else {
 		err = sam3_set_image_file(ctx, args.image_path);
 	}
