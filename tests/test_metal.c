@@ -782,6 +782,152 @@ static void test_metal_sdpa_mask_cache(void)
 	sam3_backend_free(cpu);
 }
 
+/* ── Test: SiLU fused kernel ─────────────────────────────────────── */
+
+static void test_metal_silu(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+	ASSERT(metal && cpu);
+	if (!metal || !cpu) {
+		sam3_backend_free(metal);
+		sam3_backend_free(cpu);
+		return;
+	}
+
+	/* 8 values spanning negative, zero, and positive range */
+	int dims[] = {8};
+	float data[] = {-3.0f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 2.0f, 5.0f};
+
+	struct sam3_tensor ma = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor mc = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor *m_inputs[] = {&ma};
+	const void *m_data[] = {data};
+	ASSERT_EQ(eval_single_op(metal, SAM3_OP_SILU, m_inputs, 1,
+				 m_data, &mc, NULL), SAM3_OK);
+
+	struct sam3_tensor ca = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor cc = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor *c_inputs[] = {&ca};
+	const void *c_data[] = {data};
+	ASSERT_EQ(eval_single_op(cpu, SAM3_OP_SILU, c_inputs, 1,
+				 c_data, &cc, NULL), SAM3_OK);
+
+	ASSERT(float_arrays_match((float *)mc.data, (float *)cc.data,
+				  8, 1e-3f));
+
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
+}
+
+static void test_metal_silu_large(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+	ASSERT(metal && cpu);
+	if (!metal || !cpu) {
+		sam3_backend_free(metal);
+		sam3_backend_free(cpu);
+		return;
+	}
+
+	/* 1024 elements: realistic FFN hidden-dim size */
+	int n = 1024;
+	int dims[] = {n};
+	float data[1024];
+	for (int i = 0; i < n; i++)
+		data[i] = (float)(i - 512) * 0.01f;  /* [-5.12, +5.11] */
+
+	struct sam3_tensor ma = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor mc = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor *m_inputs[] = {&ma};
+	const void *m_data[] = {data};
+	ASSERT_EQ(eval_single_op(metal, SAM3_OP_SILU, m_inputs, 1,
+				 m_data, &mc, NULL), SAM3_OK);
+
+	struct sam3_tensor ca = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor cc = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	struct sam3_tensor *c_inputs[] = {&ca};
+	const void *c_data[] = {data};
+	ASSERT_EQ(eval_single_op(cpu, SAM3_OP_SILU, c_inputs, 1,
+				 c_data, &cc, NULL), SAM3_OK);
+
+	ASSERT(float_arrays_match((float *)mc.data, (float *)cc.data,
+				  n, 1e-2f));
+
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
+}
+
+/* ── Test: Q8_0 GPU dequantization ────────────────────────────────── */
+
+/*
+ * Validate that the GPU Q8_0->F16 dequant kernel produces correct
+ * output by constructing 2 full Q8 blocks with known values, running
+ * them through Metal (which dequantizes to F16 on-GPU), casting to
+ * F32 for readback, and comparing against CPU-computed expected values.
+ */
+static void test_metal_dequant_q8_gpu(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	ASSERT(metal != NULL);
+	if (!metal)
+		return;
+
+	/*
+	 * 64 elements = 2 full Q8 blocks.
+	 * Block 0: scale=0.5,  data[i] = i     (0..31)
+	 * Block 1: scale=0.25, data[i] = -(i+1) (-1..-32)
+	 */
+	struct sam3_q8_block blocks[2];
+	memset(&blocks, 0, sizeof(blocks));
+
+	blocks[0].scale = 0.5f;
+	for (int i = 0; i < 32; i++)
+		blocks[0].data[i] = (int8_t)i;
+
+	blocks[1].scale = 0.25f;
+	for (int i = 0; i < 32; i++)
+		blocks[1].data[i] = (int8_t)(-(i + 1));
+
+	/* Expected F32 values */
+	float expected[64];
+	for (int i = 0; i < 32; i++)
+		expected[i] = (float)i * 0.5f;
+	for (int i = 0; i < 32; i++)
+		expected[32 + i] = (float)(-(i + 1)) * 0.25f;
+
+	/* Build Q8 input tensor manually */
+	int in_dims[] = {64};
+	struct sam3_tensor q8_in = make_tensor(SAM3_DTYPE_Q8_0, 1, in_dims);
+	q8_in.data = blocks;
+	q8_in.nbytes = sizeof(blocks);
+	sam3_tensor_compute_strides(&q8_in);
+
+	/* Allocate F32 output tensor via backend */
+	int out_dims[] = {64};
+	struct sam3_tensor f32_out = make_tensor(SAM3_DTYPE_F32, 1, out_dims);
+	enum sam3_error err = metal->ops->alloc_tensor(metal, &f32_out);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Build graph: CAST Q8->F32 (wraps Q8 as F16, then casts to F32) */
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	g.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_CAST, .n_inputs = 1,
+		.inputs = {&q8_in}, .output = &f32_out,
+	};
+	g.n_nodes = 1;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g), SAM3_OK);
+
+	/* Compare Metal output against expected values */
+	ASSERT(float_arrays_match((float *)f32_out.data, expected,
+				  64, 1e-2f));
+
+	sam3_backend_free(metal);
+}
+
 /* ── Test: backend factory ───────────────────────────────────────── */
 
 static void test_backend_factory_metal(void)
@@ -834,6 +980,9 @@ int main(void)
 	test_metal_rope_axial_scaled();
 	test_metal_rope_axial_batched();
 	test_metal_sdpa_mask_cache();
+	test_metal_silu();
+	test_metal_silu_large();
+	test_metal_dequant_q8_gpu();
 #endif
 
 	TEST_REPORT();
