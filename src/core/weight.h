@@ -19,6 +19,7 @@
 #define SAM3_CORE_WEIGHT_H
 
 #include <stdint.h>
+#include <pthread.h>
 #include "sam3/sam3_types.h"
 #include "core/tensor.h"
 
@@ -82,6 +83,8 @@ struct sam3_weight_file {
 	const void                           *data_base;
 	uint32_t                             *hash_table;
 	uint32_t                              hash_capacity;
+	pthread_t                             prefetch_thread;
+	int                                   prefetch_active;
 };
 
 #define SAM3_WEIGHT_HASH_EMPTY UINT32_MAX
@@ -153,6 +156,16 @@ enum sam3_error sam3_weight_to_tensor(
  * Calls madvise() on the mapped region. No-op if wf is not mapped.
  */
 void sam3_weight_madvise(struct sam3_weight_file *wf, int advice);
+
+/*
+ * sam3_weight_prefetch_wait - Wait for background prefetch to complete.
+ *
+ * @wf: Weight file handle
+ *
+ * Joins the background MADV_WILLNEED prefetch thread if one is active.
+ * No-op if no prefetch is running. Safe to call multiple times.
+ */
+void sam3_weight_prefetch_wait(struct sam3_weight_file *wf);
 
 /* ── Reader vtable (for conversion from external formats) ───────────── */
 

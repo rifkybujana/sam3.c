@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -23,6 +24,22 @@
 
 #include "weight.h"
 #include "util/log.h"
+
+/* ── Async prefetch ────────────────────────────────────────────────── */
+
+struct prefetch_args {
+	void   *addr;
+	size_t  len;
+};
+
+static void *prefetch_worker(void *arg)
+{
+	struct prefetch_args *a = arg;
+
+	madvise(a->addr, a->len, MADV_WILLNEED);
+	free(a);
+	return NULL;
+}
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
@@ -403,13 +420,29 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 	 * MADV_SEQUENTIAL would let the kernel drop those pages after
 	 * the first read, forcing re-faults on every subsequent block.
 	 *
-	 * Switch to MADV_RANDOM to discourage pre-eviction, then issue
-	 * MADV_WILLNEED to ask the kernel to prefetch the data blob
-	 * before the first inference. Both are best-effort hints.
+	 * Switch to MADV_RANDOM to discourage pre-eviction, then spawn
+	 * a background thread to issue MADV_WILLNEED so the caller can
+	 * overlap processor/module init with the prefetch I/O.
 	 */
 	madvise(mapped, file_size, MADV_RANDOM);
-	madvise((void *)wf->data_base, file_size - data_start,
-		MADV_WILLNEED);
+
+	struct prefetch_args *pa = malloc(sizeof(*pa));
+	if (pa) {
+		pa->addr = (void *)wf->data_base;
+		pa->len  = file_size - data_start;
+		if (pthread_create(&wf->prefetch_thread, NULL,
+				   prefetch_worker, pa) == 0) {
+			wf->prefetch_active = 1;
+		} else {
+			/* Thread creation failed — prefetch synchronously */
+			madvise(pa->addr, pa->len, MADV_WILLNEED);
+			free(pa);
+		}
+	} else {
+		/* Alloc failed — prefetch synchronously */
+		madvise((void *)wf->data_base, file_size - data_start,
+			MADV_WILLNEED);
+	}
 
 	sam3_log_info("opened %s: %u tensors", path, hdr->n_tensors);
 	return SAM3_OK;
@@ -420,10 +453,21 @@ fail:
 	return err;
 }
 
+void sam3_weight_prefetch_wait(struct sam3_weight_file *wf)
+{
+	if (!wf || !wf->prefetch_active)
+		return;
+
+	pthread_join(wf->prefetch_thread, NULL);
+	wf->prefetch_active = 0;
+}
+
 void sam3_weight_close(struct sam3_weight_file *wf)
 {
 	if (!wf)
 		return;
+
+	sam3_weight_prefetch_wait(wf);
 
 	if (wf->mapped && wf->mapped_size > 0)
 		munmap(wf->mapped, wf->mapped_size);

@@ -177,8 +177,8 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	}
 	ctx->proc_ready = 1;
 
-	/* Switch to random access hint for inference-time reads */
-	sam3_weight_madvise(&ctx->weights, MADV_RANDOM);
+	/* Ensure background prefetch is complete before returning */
+	sam3_weight_prefetch_wait(&ctx->weights);
 
 #ifdef SAM3_HAS_PROFILE
 	SAM3_PROF_END(ctx->profiler, "model_load");
