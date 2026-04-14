@@ -31,8 +31,7 @@ add_compile_options(
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-	add_compile_options(-fsanitize=address,undefined)
-	add_link_options(-fsanitize=address,undefined)
+	set(SAM3_SANITIZE_FLAGS "-fsanitize=address,undefined")
 endif()
 
 if(SAM3_PROFILE)
@@ -117,6 +116,12 @@ endif()
 
 # Static library
 add_library(sam3 STATIC ${SAM3_SOURCES})
+
+# Apply sanitizers only to our own code (not fetched dependencies like MLX)
+if(SAM3_SANITIZE_FLAGS)
+	target_compile_options(sam3 PRIVATE ${SAM3_SANITIZE_FLAGS})
+	target_link_options(sam3 PUBLIC ${SAM3_SANITIZE_FLAGS})
+endif()
 
 # Link pthreads
 find_package(Threads REQUIRED)
