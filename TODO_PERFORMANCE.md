@@ -84,11 +84,4 @@ or use a dedicated ReLU op if available in MLX-C.
 
 ## Both backends
 
-### 10. Hash maps: add load factor control
-**Files:** `src/backend/metal/metal_backend.c:159-176`, `src/core/weight.c`
-**Impact:** low priority (startup/load time, not inference)
-
-Both the Metal tensor-to-mlx_array map and the weight file hash table use
-open-addressing with linear probing but no rehash trigger. At high occupancy
-(>75%), probe chains degrade lookup to O(n). Add a load factor check and
-rehash when count exceeds capacity * 0.75.
+### ~~10. Hash maps: add load factor control~~ ✅ DONE
