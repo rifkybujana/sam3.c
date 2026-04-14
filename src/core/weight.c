@@ -229,6 +229,12 @@ static uint32_t next_pow2(uint32_t v)
 static int build_hash_table(struct sam3_weight_file *wf)
 {
 	uint32_t n = wf->header->n_tensors;
+
+	/*
+	 * Size table at 2x the tensor count to keep load factor ≤ 50%.
+	 * At 50% occupancy, average probe length with linear probing is
+	 * ~1.5 — well below the O(n) degradation at >75%.
+	 */
 	uint32_t min_cap = n * 2;
 
 	if (min_cap < 8)
@@ -245,6 +251,7 @@ static int build_hash_table(struct sam3_weight_file *wf)
 		wf->hash_table[i] = SAM3_WEIGHT_HASH_EMPTY;
 
 	uint32_t mask = cap - 1;
+	uint32_t max_probe = 0;
 
 	for (uint32_t i = 0; i < n; i++) {
 		uint32_t hash;
@@ -253,10 +260,20 @@ static int build_hash_table(struct sam3_weight_file *wf)
 		else
 			hash = fnv1a(wf->tensors[i].name);
 		uint32_t slot = hash & mask;
-		while (wf->hash_table[slot] != SAM3_WEIGHT_HASH_EMPTY)
+		uint32_t probe = 0;
+		while (wf->hash_table[slot] != SAM3_WEIGHT_HASH_EMPTY) {
 			slot = (slot + 1) & mask;
+			probe++;
+		}
 		wf->hash_table[slot] = i;
+		if (probe > max_probe)
+			max_probe = probe;
 	}
+
+	if (max_probe > 8)
+		sam3_log_warn("weight hash: max probe length %u "
+			      "(%u tensors, %u slots)",
+			      max_probe, n, cap);
 
 	return 0;
 }

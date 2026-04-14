@@ -31,7 +31,7 @@
 /* Default scratch arena: 64 MiB for Q8 dequantization buffers. */
 #define SAM3_METAL_SCRATCH_DEFAULT_CAPACITY (64UL * 1024 * 1024)
 
-#define SAM3_METAL_MAP_SIZE 8192  /* Must be power of 2 */
+#define SAM3_METAL_MAP_INIT_CAP 8192  /* Initial capacity, must be power of 2 */
 
 struct sam3_metal_backend {
 	struct sam3_backend  base;           /* Must be first member */
@@ -41,10 +41,11 @@ struct sam3_metal_backend {
 #ifdef SAM3_HAS_METAL
 	mlx_stream           stream;         /* GPU compute stream */
 	mlx_device           device;         /* MLX device handle */
-	/* Persistent tensor-to-mlx_array cache */
-	const struct sam3_tensor *map_keys[SAM3_METAL_MAP_SIZE];
-	mlx_array                 map_vals[SAM3_METAL_MAP_SIZE];
+	/* Persistent tensor-to-mlx_array cache (dynamic, rehashes at 75%) */
+	const struct sam3_tensor **map_keys;
+	mlx_array                *map_vals;
 	int                       map_count;
+	int                       map_capacity;
 	bool                      use_f16;   /* Cast F32 -> F16 for compute */
 #endif
 };
