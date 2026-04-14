@@ -655,18 +655,13 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 	case SAM3_OP_ROPE: {
 		/*
-		 * Rotary position embedding from primitives.
+		 * Rotary position embedding.
 		 * inputs[0] = x [batch, seq, heads, head_dim]
 		 * inputs[1] = cos [seq, head_dim/2]
 		 * inputs[2] = sin [seq, head_dim/2]
 		 * params[0] = head_dim
-		 *
-		 * Interleaved pairs: x[...,2d], x[...,2d+1]
-		 *   out_even = x_even * cos - x_odd * sin
-		 *   out_odd  = x_even * sin + x_odd * cos
-		 *
-		 * Strategy: reshape x to [..., head_dim/2, 2], split,
-		 * apply rotation, interleave back.
+		 * params[1] = grid_w (>0 = fast axial path)
+		 * params[2] = position scale (float bits)
 		 */
 		int ndim = (int)mlx_array_ndim(inputs[0]);
 		if (ndim != 4) {
@@ -680,6 +675,153 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		int heads = mlx_array_dim(inputs[0], 2);
 		int head_dim = mlx_array_dim(inputs[0], 3);
 		int half_dim = head_dim / 2;
+		int grid_w = node->params[1];
+
+		if (grid_w > 0) {
+			/*
+			 * Fast 2D axial RoPE via mlx_fast_rope_dynamic.
+			 *
+			 * Split head_dim into x-half and y-half, apply
+			 * fused RoPE to each with per-token position
+			 * offsets from grid geometry. Reshape to
+			 * [B*S, H, 1, HD/2] so each token is its own
+			 * batch element with T=1; offset[b] gives the
+			 * grid position for that token.
+			 */
+			float pos_scale;
+			memcpy(&pos_scale, &node->params[2],
+			       sizeof(float));
+			int total = batch * seq;
+
+			/* Build x/y offset arrays (one alloc) */
+			int *off_buf = (int *)malloc(
+				2 * (size_t)total * sizeof(int));
+			if (!off_buf) {
+				mlx_array_free(result);
+				return SAM3_ENOMEM;
+			}
+			int *ox = off_buf;
+			int *oy = off_buf + total;
+			for (int s = 0; s < seq; s++) {
+				ox[s] = s % grid_w;
+				oy[s] = s / grid_w;
+			}
+			for (int b = 1; b < batch; b++) {
+				memcpy(ox + b * seq, ox,
+				       (size_t)seq * sizeof(int));
+				memcpy(oy + b * seq, oy,
+				       (size_t)seq * sizeof(int));
+			}
+
+			int off_shape[] = {total};
+			mlx_array offset_x = mlx_array_new_data(
+				ox, off_shape, 1, MLX_INT32);
+			mlx_array offset_y = mlx_array_new_data(
+				oy, off_shape, 1, MLX_INT32);
+			free(off_buf);
+
+			/* Slice x-half and y-half along last axis */
+			int sx0[] = {0, 0, 0, 0};
+			int sx1[] = {batch, seq, heads, half_dim};
+			int sy0[] = {0, 0, 0, half_dim};
+			int sy1[] = {batch, seq, heads, head_dim};
+			int ss[]  = {1, 1, 1, 1};
+
+			mlx_array x_half = mlx_array_new();
+			rc = mlx_slice(&x_half, inputs[0],
+				       sx0, 4, sx1, 4, ss, 4, stream);
+			if (rc) {
+				mlx_array_free(x_half);
+				mlx_array_free(offset_x);
+				mlx_array_free(offset_y);
+				break;
+			}
+
+			mlx_array y_half = mlx_array_new();
+			rc = mlx_slice(&y_half, inputs[0],
+				       sy0, 4, sy1, 4, ss, 4, stream);
+			if (rc) {
+				mlx_array_free(x_half);
+				mlx_array_free(y_half);
+				mlx_array_free(offset_x);
+				mlx_array_free(offset_y);
+				break;
+			}
+
+			/* Reshape: [B,S,H,HD/2] -> [B*S,H,1,HD/2] */
+			int rope_shape[] = {total, heads, 1, half_dim};
+			mlx_array xr = mlx_array_new();
+			mlx_reshape(&xr, x_half, rope_shape, 4, stream);
+			mlx_array_free(x_half);
+
+			mlx_array yr = mlx_array_new();
+			mlx_reshape(&yr, y_half, rope_shape, 4, stream);
+			mlx_array_free(y_half);
+
+			/* Fused RoPE on each half */
+			mlx_optional_float base = {10000.0f, true};
+			mlx_array no_freqs = (mlx_array){0};
+
+			mlx_array x_rot = mlx_array_new();
+			rc = mlx_fast_rope_dynamic(
+				&x_rot, xr, half_dim, true,
+				base, pos_scale, offset_x,
+				no_freqs, stream);
+			mlx_array_free(xr);
+			mlx_array_free(offset_x);
+			if (rc) {
+				mlx_array_free(x_rot);
+				mlx_array_free(yr);
+				mlx_array_free(offset_y);
+				break;
+			}
+
+			mlx_array y_rot = mlx_array_new();
+			rc = mlx_fast_rope_dynamic(
+				&y_rot, yr, half_dim, true,
+				base, pos_scale, offset_y,
+				no_freqs, stream);
+			mlx_array_free(yr);
+			mlx_array_free(offset_y);
+			if (rc) {
+				mlx_array_free(x_rot);
+				mlx_array_free(y_rot);
+				break;
+			}
+
+			/* Reshape back: [B*S,H,1,HD/2] -> [B,S,H,HD/2] */
+			int half_out[] = {batch, seq, heads, half_dim};
+			mlx_array xb = mlx_array_new();
+			mlx_reshape(&xb, x_rot, half_out, 4, stream);
+			mlx_array_free(x_rot);
+
+			mlx_array yb = mlx_array_new();
+			mlx_reshape(&yb, y_rot, half_out, 4, stream);
+			mlx_array_free(y_rot);
+
+			/* Concatenate -> [B, S, H, HD] */
+			mlx_vector_array halves = mlx_vector_array_new();
+			mlx_vector_array_append_value(halves, xb);
+			mlx_vector_array_append_value(halves, yb);
+
+			rc = mlx_concatenate_axis(
+				&result, halves, -1, stream);
+			mlx_vector_array_free(halves);
+			mlx_array_free(xb);
+			mlx_array_free(yb);
+			break;
+		}
+
+		/*
+		 * Legacy manual RoPE (grid_w == 0).
+		 *
+		 * Interleaved pairs: x[...,2d], x[...,2d+1]
+		 *   out_even = x_even * cos - x_odd * sin
+		 *   out_odd  = x_even * sin + x_odd * cos
+		 *
+		 * Strategy: reshape x to [..., head_dim/2, 2], split,
+		 * apply rotation, interleave back.
+		 */
 
 		/* Reshape x to [batch, seq, heads, half_dim, 2] */
 		int shape5[] = {batch, seq, heads, half_dim, 2};

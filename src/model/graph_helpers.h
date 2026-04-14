@@ -207,16 +207,23 @@ struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 /*
  * gh_rope - Apply rotary position embedding.
  *
- * @input: [batch, seq, n_heads, head_dim] tensor
- * @cos_f: Precomputed cosine [seq, head_dim/2]
- * @sin_f: Precomputed sine [seq, head_dim/2]
+ * @input:  [batch, seq, n_heads, head_dim] tensor
+ * @cos_f:  Precomputed cosine [seq, head_dim/2]
+ * @sin_f:  Precomputed sine [seq, head_dim/2]
+ * @grid_w: Grid width for 2D axial RoPE (0 = legacy scalar path)
+ * @scale:  Position scale factor (e.g. window_size/grid_size for global)
+ *
+ * When grid_w > 0, the Metal backend uses mlx_fast_rope_dynamic with
+ * per-axis offsets derived from the grid geometry instead of the
+ * precomputed cos/sin tables. CPU backend always uses the tables.
  *
  * Returns rotated tensor, same shape as input.
  */
 struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
 			     struct sam3_tensor *input,
 			     struct sam3_tensor *cos_f,
-			     struct sam3_tensor *sin_f);
+			     struct sam3_tensor *sin_f,
+			     int grid_w, float scale);
 
 /*
  * gh_sdpa - Fused scaled dot-product attention.
@@ -290,6 +297,8 @@ struct sam3_tensor *gh_window_unpartition(struct sam3_graph *g,
  * @rope_cos: Precomputed RoPE cosine [seq, head_dim/2] or NULL
  * @rope_sin: Precomputed RoPE sine [seq, head_dim/2] or NULL
  * @attn_mask: Additive attention mask [bs, bs] or NULL
+ * @grid_w:    Grid width for 2D axial RoPE (0 = no fast path)
+ * @rope_scale: Position scale for axial RoPE (ignored when grid_w=0)
  *
  * Extends gh_multihead_attention with optional rotary position
  * embeddings applied after QKV projection and optional additive
@@ -309,7 +318,8 @@ struct sam3_tensor *gh_multihead_attention_rope(
 	int n_heads,
 	struct sam3_tensor *rope_cos,
 	struct sam3_tensor *rope_sin,
-	struct sam3_tensor *attn_mask);
+	struct sam3_tensor *attn_mask,
+	int grid_w, float rope_scale);
 
 /*
  * gh_multihead_attention_rope_sep - MHA with separate Q/K/V weights and RoPE.
@@ -345,7 +355,8 @@ struct sam3_tensor *gh_multihead_attention_rope_sep(
 	int n_heads,
 	struct sam3_tensor *rope_cos,
 	struct sam3_tensor *rope_sin,
-	struct sam3_tensor *attn_mask);
+	struct sam3_tensor *attn_mask,
+	int grid_w, float rope_scale);
 
 /*
  * gh_multihead_attention - Full multi-head attention from primitives.

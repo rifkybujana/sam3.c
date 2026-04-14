@@ -592,7 +592,8 @@ struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
 			     struct sam3_tensor *input,
 			     struct sam3_tensor *cos_f,
-			     struct sam3_tensor *sin_f)
+			     struct sam3_tensor *sin_f,
+			     int grid_w, float scale)
 {
 	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
 						  input->n_dims, input->dims);
@@ -604,8 +605,10 @@ struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
 	if (!result)
 		return NULL;
 
-	/* params[0] = head_dim (last dim of 4D input) */
-	g->nodes[g->n_nodes - 1].params[0] = input->dims[3];
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = input->dims[3];	/* head_dim */
+	node->params[1] = grid_w;		/* 0 = legacy path */
+	memcpy(&node->params[2], &scale, sizeof(float));
 	return result;
 }
 
@@ -656,7 +659,8 @@ struct sam3_tensor *gh_multihead_attention_rope(
 	int n_heads,
 	struct sam3_tensor *rope_cos,
 	struct sam3_tensor *rope_sin,
-	struct sam3_tensor *attn_mask)
+	struct sam3_tensor *attn_mask,
+	int grid_w, float rope_scale)
 {
 	int batch = q->dims[0];
 	int seq_q = q->dims[1];
@@ -703,7 +707,8 @@ struct sam3_tensor *gh_multihead_attention_rope(
 		sq_4d = gh_reshape(g, a, sq, 4, rope_4d);
 		if (!sq_4d)
 			return NULL;
-		sq_4d = gh_rope(g, a, sq_4d, rope_cos, rope_sin);
+		sq_4d = gh_rope(g, a, sq_4d, rope_cos, rope_sin,
+				grid_w, rope_scale);
 		if (!sq_4d)
 			return NULL;
 		sq = gh_reshape(g, a, sq_4d, 2, flat_dims);
@@ -714,7 +719,8 @@ struct sam3_tensor *gh_multihead_attention_rope(
 		sk_4d = gh_reshape(g, a, sk, 4, rope_4d);
 		if (!sk_4d)
 			return NULL;
-		sk_4d = gh_rope(g, a, sk_4d, rope_cos, rope_sin);
+		sk_4d = gh_rope(g, a, sk_4d, rope_cos, rope_sin,
+				grid_w, rope_scale);
 		if (!sk_4d)
 			return NULL;
 		sk = gh_reshape(g, a, sk_4d, 2, flat_dims);
@@ -815,7 +821,8 @@ struct sam3_tensor *gh_multihead_attention_rope_sep(
 	int n_heads,
 	struct sam3_tensor *rope_cos,
 	struct sam3_tensor *rope_sin,
-	struct sam3_tensor *attn_mask)
+	struct sam3_tensor *attn_mask,
+	int grid_w, float rope_scale)
 {
 	int batch = x->dims[0];
 	int seq = x->dims[1];
@@ -850,7 +857,8 @@ struct sam3_tensor *gh_multihead_attention_rope_sep(
 		sq_4d = gh_reshape(g, a, sq, 4, rope_4d);
 		if (!sq_4d)
 			return NULL;
-		sq_4d = gh_rope(g, a, sq_4d, rope_cos, rope_sin);
+		sq_4d = gh_rope(g, a, sq_4d, rope_cos, rope_sin,
+				grid_w, rope_scale);
 		if (!sq_4d)
 			return NULL;
 		sq = gh_reshape(g, a, sq_4d, 2, flat_dims);
@@ -861,7 +869,8 @@ struct sam3_tensor *gh_multihead_attention_rope_sep(
 		sk_4d = gh_reshape(g, a, sk, 4, rope_4d);
 		if (!sk_4d)
 			return NULL;
-		sk_4d = gh_rope(g, a, sk_4d, rope_cos, rope_sin);
+		sk_4d = gh_rope(g, a, sk_4d, rope_cos, rope_sin,
+				grid_w, rope_scale);
 		if (!sk_4d)
 			return NULL;
 		sk = gh_reshape(g, a, sk_4d, 2, flat_dims);
@@ -974,7 +983,7 @@ struct sam3_tensor *gh_multihead_attention(
 {
 	return gh_multihead_attention_rope(g, a, q, k, v,
 		qkv_w, qkv_b, out_w, out_b,
-		n_heads, NULL, NULL, NULL);
+		n_heads, NULL, NULL, NULL, 0, 0.0f);
 }
 
 /* ── Cross-attention ─────────────────────────────────────────────── */
@@ -1093,7 +1102,7 @@ struct sam3_tensor *gh_multihead_attention_sep(
 	return gh_multihead_attention_rope_sep(g, a, x,
 		q_w, q_b, k_w, k_b, v_w, v_b,
 		out_w, out_b, n_heads,
-		NULL, NULL, attn_mask);
+		NULL, NULL, attn_mask, 0, 0.0f);
 }
 
 struct sam3_tensor *gh_cross_attention_sep(

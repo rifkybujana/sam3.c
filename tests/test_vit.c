@@ -579,7 +579,8 @@ static void test_mha_rope_batch2(void)
 	out = gh_multihead_attention_rope(&g, &g_scratch, x,
 					  NULL, NULL,
 					  qkv_w, qkv_b, o_w, o_b,
-					  n_heads, rcos, rsin, NULL);
+					  n_heads, rcos, rsin, NULL,
+					  0, 0.0f);
 	ASSERT(out != NULL);
 	/* Output is [batch*seq, e] */
 	ASSERT_EQ(out->n_dims, 2);

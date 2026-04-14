@@ -332,7 +332,7 @@ struct sam3_tensor *sam3_text_encoder_build(
 			te->layers[i].attn_out_b,
 			te->n_heads,
 			NULL, NULL,
-			causal_mask);
+			causal_mask, 0, 0.0f);
 		if (!attn)
 			return NULL;
 
@@ -615,7 +615,7 @@ struct sam3_tensor *sam3_text_encoder_build_perblock(
 					te->layers[i].attn_out_b,
 					te->n_heads,
 					NULL, NULL,
-					mask_wrap);
+					mask_wrap, 0, 0.0f);
 				if (!attn)
 					return NULL;
 

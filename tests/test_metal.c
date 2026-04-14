@@ -382,6 +382,266 @@ static void test_metal_multi_node(void)
 
 #endif /* SAM3_HAS_CPU */
 
+/* ── Test: 2D axial RoPE (Metal fast path vs CPU manual) ──────────── */
+
+/*
+ * precompute_rope_2d - Build cos/sin tables for a 2D grid.
+ *
+ * Matches image_encoder.c precompute_rope_table() exactly.
+ */
+static void precompute_rope_2d(float *cos_out, float *sin_out,
+				int grid_w, int grid_h, int head_dim,
+				float scale, float theta)
+{
+	int half = head_dim / 2;
+	int quarter = head_dim / 4;
+
+	float freqs[16]; /* quarter <= 16 for our tests */
+	for (int i = 0; i < quarter; i++)
+		freqs[i] = 1.0f / powf(theta,
+				(float)(i * 4) / (float)head_dim);
+
+	for (int py = 0; py < grid_h; py++) {
+		for (int px = 0; px < grid_w; px++) {
+			int pos = py * grid_w + px;
+			float sx = (float)px * scale;
+			float sy = (float)py * scale;
+
+			for (int i = 0; i < quarter; i++) {
+				float ax = sx * freqs[i];
+				cos_out[pos * half + i] = cosf(ax);
+				sin_out[pos * half + i] = sinf(ax);
+			}
+			for (int i = 0; i < quarter; i++) {
+				float ay = sy * freqs[i];
+				cos_out[pos * half + quarter + i] = cosf(ay);
+				sin_out[pos * half + quarter + i] = sinf(ay);
+			}
+		}
+	}
+}
+
+static void test_metal_rope_axial(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+	ASSERT(metal && cpu);
+	if (!metal || !cpu) {
+		sam3_backend_free(metal);
+		sam3_backend_free(cpu);
+		return;
+	}
+
+	/*
+	 * Small grid: 3x2, head_dim=8, 1 head, batch=1.
+	 * seq = 6 positions, half_dim = 4, quarter = 2.
+	 */
+	int grid_w = 3, grid_h = 2;
+	int seq = grid_w * grid_h;	/* 6 */
+	int heads = 1;
+	int head_dim = 8;
+	int half_dim = head_dim / 2;
+	int batch = 1;
+	float pos_scale = 1.0f;
+
+	/* Build cos/sin tables */
+	float cos_tbl[6 * 4], sin_tbl[6 * 4]; /* [seq, half_dim] */
+	precompute_rope_2d(cos_tbl, sin_tbl, grid_w, grid_h,
+			    head_dim, pos_scale, 10000.0f);
+
+	/* Random-ish input data */
+	float x_data[6 * 8];
+	for (int i = 0; i < 6 * 8; i++)
+		x_data[i] = (float)(i + 1) * 0.1f;
+
+	/* --- CPU path (legacy, grid_w=0) --- */
+	int x_dims[] = {batch, seq, heads, head_dim};
+	int cs_dims[] = {seq, half_dim};
+	int out_dims[] = {batch, seq, heads, head_dim};
+	int cpu_params[4] = {head_dim, 0, 0, 0};
+
+	struct sam3_tensor cx = make_tensor(SAM3_DTYPE_F32, 4, x_dims);
+	struct sam3_tensor cc = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor cs = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor co = make_tensor(SAM3_DTYPE_F32, 4, out_dims);
+	struct sam3_tensor *ci[] = {&cx, &cc, &cs};
+	const void *cd[] = {x_data, cos_tbl, sin_tbl};
+	ASSERT_EQ(eval_single_op(cpu, SAM3_OP_ROPE, ci, 3,
+				  cd, &co, cpu_params), SAM3_OK);
+
+	/* --- Metal path (fast axial, grid_w>0) --- */
+	int metal_params[4];
+	metal_params[0] = head_dim;
+	metal_params[1] = grid_w;
+	memcpy(&metal_params[2], &pos_scale, sizeof(float));
+	metal_params[3] = 0;
+
+	struct sam3_tensor mx = make_tensor(SAM3_DTYPE_F32, 4, x_dims);
+	struct sam3_tensor mc = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor ms = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor mo = make_tensor(SAM3_DTYPE_F32, 4, out_dims);
+	struct sam3_tensor *mi[] = {&mx, &mc, &ms};
+	const void *md[] = {x_data, cos_tbl, sin_tbl};
+	ASSERT_EQ(eval_single_op(metal, SAM3_OP_ROPE, mi, 3,
+				  md, &mo, metal_params), SAM3_OK);
+
+	/* Compare outputs (1e-2 tolerance: Metal runs F16 internally) */
+	int nelems = batch * seq * heads * head_dim;
+	ASSERT(float_arrays_match((float *)mo.data, (float *)co.data,
+				   nelems, 1e-2f));
+
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
+}
+
+static void test_metal_rope_axial_scaled(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+	ASSERT(metal && cpu);
+	if (!metal || !cpu) {
+		sam3_backend_free(metal);
+		sam3_backend_free(cpu);
+		return;
+	}
+
+	/*
+	 * 6x6 grid with scale=0.5 (simulating global RoPE with
+	 * window_size/grid_size = 0.5).
+	 */
+	int grid_w = 6, grid_h = 6;
+	int seq = grid_w * grid_h;	/* 36 */
+	int heads = 2;
+	int head_dim = 8;
+	int half_dim = head_dim / 2;
+	int batch = 1;
+	float pos_scale = 0.5f;
+
+	float cos_tbl[36 * 4], sin_tbl[36 * 4];
+	precompute_rope_2d(cos_tbl, sin_tbl, grid_w, grid_h,
+			    head_dim, pos_scale, 10000.0f);
+
+	float x_data[36 * 2 * 8]; /* seq * heads * head_dim */
+	for (int i = 0; i < 36 * 2 * 8; i++)
+		x_data[i] = sinf((float)i * 0.37f);
+
+	int x_dims[] = {batch, seq, heads, head_dim};
+	int cs_dims[] = {seq, half_dim};
+	int out_dims[] = {batch, seq, heads, head_dim};
+	int cpu_params[4] = {head_dim, 0, 0, 0};
+
+	struct sam3_tensor cx = make_tensor(SAM3_DTYPE_F32, 4, x_dims);
+	struct sam3_tensor cc = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor cs = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor co = make_tensor(SAM3_DTYPE_F32, 4, out_dims);
+	struct sam3_tensor *ci[] = {&cx, &cc, &cs};
+	const void *cd[] = {x_data, cos_tbl, sin_tbl};
+	ASSERT_EQ(eval_single_op(cpu, SAM3_OP_ROPE, ci, 3,
+				  cd, &co, cpu_params), SAM3_OK);
+
+	int metal_params[4];
+	metal_params[0] = head_dim;
+	metal_params[1] = grid_w;
+	memcpy(&metal_params[2], &pos_scale, sizeof(float));
+	metal_params[3] = 0;
+
+	struct sam3_tensor mx = make_tensor(SAM3_DTYPE_F32, 4, x_dims);
+	struct sam3_tensor mc = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor ms = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor mo = make_tensor(SAM3_DTYPE_F32, 4, out_dims);
+	struct sam3_tensor *mi[] = {&mx, &mc, &ms};
+	const void *md[] = {x_data, cos_tbl, sin_tbl};
+	ASSERT_EQ(eval_single_op(metal, SAM3_OP_ROPE, mi, 3,
+				  md, &mo, metal_params), SAM3_OK);
+
+	/* F16 precision: use 1e-3 absolute floor for near-zero values */
+	int nelems = batch * seq * heads * head_dim;
+	{
+		float *ma = (float *)mo.data;
+		float *ca = (float *)co.data;
+		int ok = 1;
+		for (int i = 0; i < nelems; i++) {
+			float diff = fabsf(ma[i] - ca[i]);
+			float mag = fmaxf(fabsf(ma[i]), fabsf(ca[i]));
+			float tol = fmaxf(1e-2f * mag, 1e-3f);
+			if (diff > tol)
+				ok = 0;
+		}
+		ASSERT(ok);
+	}
+
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
+}
+
+static void test_metal_rope_axial_batched(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+	ASSERT(metal && cpu);
+	if (!metal || !cpu) {
+		sam3_backend_free(metal);
+		sam3_backend_free(cpu);
+		return;
+	}
+
+	/*
+	 * Simulate windowed attention: batch=4 (4 windows),
+	 * seq=4 (2x2 window), 1 head, head_dim=8.
+	 */
+	int grid_w = 2, grid_h = 2;
+	int seq = grid_w * grid_h;	/* 4 */
+	int heads = 1;
+	int head_dim = 8;
+	int half_dim = head_dim / 2;
+	int batch = 4;
+	float pos_scale = 1.0f;
+
+	float cos_tbl[4 * 4], sin_tbl[4 * 4];
+	precompute_rope_2d(cos_tbl, sin_tbl, grid_w, grid_h,
+			    head_dim, pos_scale, 10000.0f);
+
+	float x_data[4 * 4 * 1 * 8]; /* batch * seq * heads * hd */
+	for (int i = 0; i < 4 * 4 * 8; i++)
+		x_data[i] = cosf((float)i * 0.13f);
+
+	int x_dims[] = {batch, seq, heads, head_dim};
+	int cs_dims[] = {seq, half_dim};
+	int out_dims[] = {batch, seq, heads, head_dim};
+	int cpu_params[4] = {head_dim, 0, 0, 0};
+
+	struct sam3_tensor cx = make_tensor(SAM3_DTYPE_F32, 4, x_dims);
+	struct sam3_tensor cc = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor cs = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor co = make_tensor(SAM3_DTYPE_F32, 4, out_dims);
+	struct sam3_tensor *ci[] = {&cx, &cc, &cs};
+	const void *cd[] = {x_data, cos_tbl, sin_tbl};
+	ASSERT_EQ(eval_single_op(cpu, SAM3_OP_ROPE, ci, 3,
+				  cd, &co, cpu_params), SAM3_OK);
+
+	int metal_params[4];
+	metal_params[0] = head_dim;
+	metal_params[1] = grid_w;
+	memcpy(&metal_params[2], &pos_scale, sizeof(float));
+	metal_params[3] = 0;
+
+	struct sam3_tensor mx = make_tensor(SAM3_DTYPE_F32, 4, x_dims);
+	struct sam3_tensor mc = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor ms = make_tensor(SAM3_DTYPE_F32, 2, cs_dims);
+	struct sam3_tensor mo = make_tensor(SAM3_DTYPE_F32, 4, out_dims);
+	struct sam3_tensor *mi[] = {&mx, &mc, &ms};
+	const void *md[] = {x_data, cos_tbl, sin_tbl};
+	ASSERT_EQ(eval_single_op(metal, SAM3_OP_ROPE, mi, 3,
+				  md, &mo, metal_params), SAM3_OK);
+
+	int nelems = batch * seq * heads * head_dim;
+	ASSERT(float_arrays_match((float *)mo.data, (float *)co.data,
+				   nelems, 1e-2f));
+
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
+}
+
 /* ── Test: backend factory ───────────────────────────────────────── */
 
 static void test_backend_factory_metal(void)
@@ -430,6 +690,9 @@ int main(void)
 	test_metal_softmax();
 	test_metal_reshape();
 	test_metal_multi_node();
+	test_metal_rope_axial();
+	test_metal_rope_axial_scaled();
+	test_metal_rope_axial_batched();
 #endif
 
 	TEST_REPORT();

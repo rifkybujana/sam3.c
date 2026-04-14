@@ -658,7 +658,10 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 						vit->n_heads,
 						vit->rope_glo_cos,
 						vit->rope_glo_sin,
-						NULL);
+						NULL,
+						vit->grid_size,
+						(float)vit->window_size /
+						(float)vit->grid_size);
 					if (!attn) {
 						sam3_log_error("vit: "
 							"block %d "
@@ -689,7 +692,9 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 						vit->n_heads,
 						vit->rope_win_local_cos,
 						vit->rope_win_local_sin,
-						NULL);
+						NULL,
+						vit->window_size,
+						1.0f);
 					if (!attn_win) {
 						sam3_log_error("vit: "
 							"block %d "
