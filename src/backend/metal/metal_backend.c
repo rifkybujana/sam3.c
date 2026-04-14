@@ -408,13 +408,35 @@ static mlx_array metal_get_relu_zero(struct sam3_metal_backend *mtl,
 }
 
 /*
+ * Stack-local cache for reshaped SDPA masks.
+ *
+ * The text encoder passes the same causal mask through 24 layers.
+ * Each SDPA dispatch reshapes it from [seq_q, seq_kv] to
+ * [1, 1, seq_q, seq_kv]. This cache avoids 23 redundant reshapes.
+ */
+#define METAL_MASK_CACHE_SLOTS 4
+
+struct metal_mask_cache_entry {
+	const struct sam3_tensor *key;
+	mlx_array val;
+};
+
+/*
  * metal_dispatch_node - Translate one sam3_node into MLX-C lazy ops.
+ *
+ * @mtl:        Metal backend state.
+ * @node:       Node to dispatch.
+ * @mask_cache: Per-graph-eval cache of reshaped SDPA masks. Caller
+ *              owns the array; entries are freed by metal_graph_eval
+ *              after the dispatch loop. Must point to an array of
+ *              METAL_MASK_CACHE_SLOTS zero-initialized entries.
  *
  * The result mlx_array is stored in the map keyed by node->output.
  * Returns SAM3_OK on success.
  */
 static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
-					   const struct sam3_node *node)
+					   const struct sam3_node *node,
+					   struct metal_mask_cache_entry *mask_cache)
 {
 	mlx_array result = mlx_array_new();
 	mlx_array inputs[SAM3_NODE_MAX_INPUTS];
@@ -982,26 +1004,52 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 		/* Prepare mask if present */
 		mlx_array mask4d = (mlx_array){0};
+		bool mask_cached = false;
 		const char *mask_mode = "";
 		if (node->n_inputs > 3 && node->inputs[3]) {
-			mask4d = mlx_array_new();
-			int seq_q = (ndims == 4)
-				? node->inputs[0]->dims[2]
-				: node->inputs[0]->dims[0];
-			int seq_kv = (ndims == 4)
-				? node->inputs[1]->dims[2]
-				: node->inputs[1]->dims[0];
-			int mshape[] = {1, 1, seq_q, seq_kv};
-			rc = mlx_reshape(&mask4d, inputs[3], mshape, 4,
-					  stream);
-			if (rc) {
-				if (ndims != 4) {
-					mlx_array_free(q_in);
-					mlx_array_free(k_in);
-					mlx_array_free(v_in);
+			/* Check mask cache first */
+			const struct sam3_tensor *mask_key = node->inputs[3];
+			mlx_array cached = (mlx_array){0};
+			for (int mc = 0; mc < METAL_MASK_CACHE_SLOTS; mc++) {
+				if (mask_cache[mc].key == mask_key) {
+					cached = mask_cache[mc].val;
+					break;
 				}
-				mlx_array_free(mask4d);
-				break;
+			}
+
+			if (cached.ctx) {
+				mask4d = cached;
+				mask_cached = true;
+			} else {
+				mask4d = mlx_array_new();
+				int seq_q = (ndims == 4)
+					? node->inputs[0]->dims[2]
+					: node->inputs[0]->dims[0];
+				int seq_kv = (ndims == 4)
+					? node->inputs[1]->dims[2]
+					: node->inputs[1]->dims[0];
+				int mshape[] = {1, 1, seq_q, seq_kv};
+				rc = mlx_reshape(&mask4d, inputs[3],
+						  mshape, 4, stream);
+				if (rc) {
+					if (ndims != 4) {
+						mlx_array_free(q_in);
+						mlx_array_free(k_in);
+						mlx_array_free(v_in);
+					}
+					mlx_array_free(mask4d);
+					break;
+				}
+
+				/* Store in first free cache slot */
+				for (int mc = 0; mc < METAL_MASK_CACHE_SLOTS; mc++) {
+					if (!mask_cache[mc].key) {
+						mask_cache[mc].key = mask_key;
+						mask_cache[mc].val = mask4d;
+						mask_cached = true;
+						break;
+					}
+				}
 			}
 			mask_mode = "array";
 		}
@@ -1017,7 +1065,7 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 			mlx_array_free(k_in);
 			mlx_array_free(v_in);
 		}
-		if (mask4d.ctx)
+		if (mask4d.ctx && !mask_cached)
 			mlx_array_free(mask4d);
 
 		if (rc) {
@@ -1379,13 +1427,27 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 
 	sam3_arena_reset(&mtl->scratch);
 
+	/* Mask reshape cache: avoids redundant reshape for shared masks */
+	struct metal_mask_cache_entry mask_cache[METAL_MASK_CACHE_SLOTS];
+	memset(mask_cache, 0, sizeof(mask_cache));
+
 	/* Phase 1: translate all nodes to MLX lazy ops */
 	for (int i = 0; i < g->n_nodes; i++) {
-		err = metal_dispatch_node(mtl, &g->nodes[i]);
+		err = metal_dispatch_node(mtl, &g->nodes[i], mask_cache);
 		if (err != SAM3_OK) {
 			sam3_log_error("metal_graph_eval: node %d failed", i);
+			for (int mc = 0; mc < METAL_MASK_CACHE_SLOTS; mc++) {
+				if (mask_cache[mc].val.ctx)
+					mlx_array_free(mask_cache[mc].val);
+			}
 			return err;
 		}
+	}
+
+	/* Free cached mask arrays — no longer needed after dispatch */
+	for (int mc = 0; mc < METAL_MASK_CACHE_SLOTS; mc++) {
+		if (mask_cache[mc].val.ctx)
+			mlx_array_free(mask_cache[mc].val);
 	}
 
 	/*
