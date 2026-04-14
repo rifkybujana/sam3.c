@@ -4,7 +4,8 @@
  * Implements the Metal compute backend by translating SAM3 compute graphs
  * into MLX-C lazy operations. Each graph_eval builds an MLX op graph,
  * calls mlx_eval() once for a single GPU dispatch, then copies results
- * back to SAM3 tensors. Q8_0 tensors are dequantized to F16 on host.
+ * back to SAM3 tensors. Q8_0 tensors are dequantized to F16 on GPU
+ * via a custom Metal kernel.
  *
  * Key types:  sam3_metal_backend
  * Depends on: metal_backend.h, core/tensor.h, core/quant.h,
