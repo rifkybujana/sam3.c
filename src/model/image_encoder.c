@@ -620,8 +620,10 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 		struct sam3_tensor *x_fwd = NULL;
 		if (skip_data) {
 			int fwd_dims[] = {np, e};
+			persist->skip_data = 1;
 			x_fwd = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 						 2, fwd_dims);
+			persist->skip_data = 0;
 			if (!x_fwd)
 				return NULL;
 			x_fwd->data = x_buf;

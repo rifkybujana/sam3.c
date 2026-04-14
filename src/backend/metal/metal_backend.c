@@ -1654,170 +1654,173 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 	 * via metal_wrap_tensor.
 	 */
 	if (g->no_readback) {
+		int n_kept = 0;
 		for (int i = 0; i < g->n_nodes; i++) {
 			struct sam3_tensor *out_t = g->nodes[i].output;
 			if (is_intermediate[i] || !out_t->data)
 				metal_map_evict(mtl, out_t);
+			else
+				n_kept++;
 		}
 		sam3_log_debug("metal_eval: no_readback, kept %d "
-			"final outputs GPU-resident", g->n_nodes);
+			"final outputs GPU-resident", n_kept);
 	} else {
-			int n_copied = 0, n_skip_inter = 0, n_skip_nodata = 0;
+		int n_copied = 0, n_skip_inter = 0, n_skip_nodata = 0;
 
-			/* Count final outputs for scratch allocation */
-			int n_final = 0;
-			for (int i = 0; i < g->n_nodes; i++) {
-				if (is_intermediate[i])
-					continue;
-				mlx_array *out_a = metal_map_get(
-					mtl, g->nodes[i].output);
-				if (out_a && g->nodes[i].output->data)
-					n_final++;
-			}
-
-			mlx_array *readback = NULL;
-			int *rb_idx = NULL;
-
-			if (n_final > 0) {
-				readback = sam3_arena_alloc(
-					&mtl->scratch,
-					(size_t)n_final * sizeof(mlx_array));
-				rb_idx = sam3_arena_alloc(
-					&mtl->scratch,
-					(size_t)n_final * sizeof(int));
-				if (!readback || !rb_idx) {
-					sam3_log_error("metal: scratch OOM for "
-						"readback batch");
-					return SAM3_ENOMEM;
-				}
-			}
-
-			/*
-			 * Pass 1: build lazy contiguous arrays with optional
-			 * F16->F32 cast. Evict intermediate and no-data nodes.
-			 */
-			int rb_count = 0;
-			bool build_ok = true;
-			for (int i = 0; i < g->n_nodes; i++) {
-				struct sam3_tensor *out_t = g->nodes[i].output;
-				mlx_array *out_a = metal_map_get(mtl, out_t);
-				if (!out_a || !out_t->data) {
-					n_skip_nodata++;
-					goto evict_p3;
-				}
-
-				if (is_intermediate[i]) {
-					n_skip_inter++;
-					goto evict_p3;
-				}
-
-				{
-					mlx_array contig = mlx_array_new();
-					int crc = mlx_contiguous(
-						&contig, *out_a,
-						false, /* allow_col_major */
-						mtl->stream);
-					if (crc) {
-						mlx_array_free(contig);
-						sam3_log_error(
-							"metal: contiguous failed");
-						build_ok = false;
-						break;
-					}
-
-					/*
-					 * If Metal computed in F16 but SAM3
-					 * tensor expects F32, add lazy cast.
-					 */
-					if (mlx_array_dtype(contig) == MLX_FLOAT16
-					    && out_t->dtype == SAM3_DTYPE_F32) {
-						mlx_array f32 = mlx_array_new();
-						int cast_rc = mlx_astype(
-							&f32, contig,
-							MLX_FLOAT32,
-							mtl->stream);
-						if (cast_rc == 0) {
-							mlx_array_free(contig);
-							contig = f32;
-						} else {
-							mlx_array_free(f32);
-						}
-					}
-
-					readback[rb_count] = contig;
-					rb_idx[rb_count] = i;
-					rb_count++;
-				}
+		/* Count final outputs for scratch allocation */
+		int n_final = 0;
+		for (int i = 0; i < g->n_nodes; i++) {
+			if (is_intermediate[i])
 				continue;
+			mlx_array *out_a = metal_map_get(
+				mtl, g->nodes[i].output);
+			if (out_a && g->nodes[i].output->data)
+				n_final++;
+		}
 
-			evict_p3:
-				metal_map_evict(mtl, out_t);
+		mlx_array *readback = NULL;
+		int *rb_idx = NULL;
+
+		if (n_final > 0) {
+			readback = sam3_arena_alloc(
+				&mtl->scratch,
+				(size_t)n_final * sizeof(mlx_array));
+			rb_idx = sam3_arena_alloc(
+				&mtl->scratch,
+				(size_t)n_final * sizeof(int));
+			if (!readback || !rb_idx) {
+				sam3_log_error("metal: scratch OOM for "
+					"readback batch");
+				return SAM3_ENOMEM;
+			}
+		}
+
+		/*
+		 * Pass 1: build lazy contiguous arrays with optional
+		 * F16->F32 cast. Evict intermediate and no-data nodes.
+		 */
+		int rb_count = 0;
+		bool build_ok = true;
+		for (int i = 0; i < g->n_nodes; i++) {
+			struct sam3_tensor *out_t = g->nodes[i].output;
+			mlx_array *out_a = metal_map_get(mtl, out_t);
+			if (!out_a || !out_t->data) {
+				n_skip_nodata++;
+				goto evict_p3;
 			}
 
-			/* Single batched eval for all readback arrays */
-			if (build_ok && rb_count > 0) {
-				mlx_vector_array va =
-					mlx_vector_array_new();
-				for (int j = 0; j < rb_count; j++)
-					mlx_vector_array_append_value(
-						va, readback[j]);
-				int eval_rc = mlx_eval(va);
-				mlx_vector_array_free(va);
-				if (eval_rc != 0) {
+			if (is_intermediate[i]) {
+				n_skip_inter++;
+				goto evict_p3;
+			}
+
+			{
+				mlx_array contig = mlx_array_new();
+				int crc = mlx_contiguous(
+					&contig, *out_a,
+					false, /* allow_col_major */
+					mtl->stream);
+				if (crc) {
+					mlx_array_free(contig);
 					sam3_log_error(
-						"metal: readback eval failed");
+						"metal: contiguous failed");
 					build_ok = false;
+					break;
 				}
-			}
 
-			/* Pass 2: copy data to host and clean up */
-			for (int j = 0; j < rb_count; j++) {
-				struct sam3_tensor *out_t =
-					g->nodes[rb_idx[j]].output;
-				const void *src = NULL;
-
-				if (build_ok) {
-					mlx_dtype mtype =
-						mlx_array_dtype(readback[j]);
-					switch (mtype) {
-					case MLX_FLOAT32:
-						src = mlx_array_data_float32(
-							readback[j]);
-						break;
-					case MLX_FLOAT16:
-						src = mlx_array_data_float16(
-							readback[j]);
-						break;
-					case MLX_BFLOAT16:
-						src = mlx_array_data_bfloat16(
-							readback[j]);
-						break;
-					case MLX_INT32:
-						src = mlx_array_data_int32(
-							readback[j]);
-						break;
-					case MLX_INT8:
-						src = mlx_array_data_int8(
-							readback[j]);
-						break;
-					default:
-						sam3_log_error("metal: unsupported "
-							"output dtype");
-						break;
+				/*
+				 * If Metal computed in F16 but SAM3
+				 * tensor expects F32, add lazy cast.
+				 */
+				if (mlx_array_dtype(contig) == MLX_FLOAT16
+				    && out_t->dtype == SAM3_DTYPE_F32) {
+					mlx_array f32 = mlx_array_new();
+					int cast_rc = mlx_astype(
+						&f32, contig,
+						MLX_FLOAT32,
+						mtl->stream);
+					if (cast_rc == 0) {
+						mlx_array_free(contig);
+						contig = f32;
+					} else {
+						mlx_array_free(f32);
 					}
 				}
 
-				if (src) {
-					memcpy(out_t->data, src,
-					       out_t->nbytes);
-					n_copied++;
+				readback[rb_count] = contig;
+				rb_idx[rb_count] = i;
+				rb_count++;
+			}
+			continue;
+
+		evict_p3:
+			metal_map_evict(mtl, out_t);
+		}
+
+		/* Single batched eval for all readback arrays */
+		if (build_ok && rb_count > 0) {
+			mlx_vector_array va =
+				mlx_vector_array_new();
+			for (int j = 0; j < rb_count; j++)
+				mlx_vector_array_append_value(
+					va, readback[j]);
+			int eval_rc = mlx_eval(va);
+			mlx_vector_array_free(va);
+			if (eval_rc != 0) {
+				sam3_log_error(
+					"metal: readback eval failed");
+				build_ok = false;
+			}
+		}
+
+		/* Pass 2: copy data to host and clean up */
+		for (int j = 0; j < rb_count; j++) {
+			struct sam3_tensor *out_t =
+				g->nodes[rb_idx[j]].output;
+			const void *src = NULL;
+
+			if (build_ok) {
+				mlx_dtype mtype =
+					mlx_array_dtype(readback[j]);
+				switch (mtype) {
+				case MLX_FLOAT32:
+					src = mlx_array_data_float32(
+						readback[j]);
+					break;
+				case MLX_FLOAT16:
+					src = mlx_array_data_float16(
+						readback[j]);
+					break;
+				case MLX_BFLOAT16:
+					src = mlx_array_data_bfloat16(
+						readback[j]);
+					break;
+				case MLX_INT32:
+					src = mlx_array_data_int32(
+						readback[j]);
+					break;
+				case MLX_INT8:
+					src = mlx_array_data_int8(
+						readback[j]);
+					break;
+				default:
+					sam3_log_error("metal: unsupported "
+						"output dtype");
+					break;
 				}
-				mlx_array_free(readback[j]);
-				metal_map_evict(mtl, out_t);
 			}
 
-			sam3_log_debug("metal_eval: phase3 copied=%d "
-				"skip_inter=%d skip_nodata=%d",
+			if (src) {
+				memcpy(out_t->data, src,
+				       out_t->nbytes);
+				n_copied++;
+			}
+			mlx_array_free(readback[j]);
+			metal_map_evict(mtl, out_t);
+		}
+
+		sam3_log_debug("metal_eval: phase3 copied=%d "
+			"skip_inter=%d skip_nodata=%d",
 				n_copied, n_skip_inter, n_skip_nodata);
 	}
 
