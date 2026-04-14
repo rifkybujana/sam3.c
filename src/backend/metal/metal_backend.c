@@ -176,16 +176,32 @@ static int metal_map_put(struct sam3_metal_backend *mtl,
 	int cap = mtl->map_capacity;
 	unsigned mask = (unsigned)(cap - 1);
 	unsigned idx = metal_map_slot(key, cap);
+	int first_empty = -1;
 
 	for (int i = 0; i < cap; i++) {
 		unsigned slot = (idx + (unsigned)i) & mask;
-		if (!mtl->map_keys[slot] ||
-		    mtl->map_keys[slot] == METAL_MAP_TOMBSTONE) {
-			mtl->map_keys[slot] = key;
+		if (mtl->map_keys[slot] == key) {
+			/* Update existing entry in-place */
+			mlx_array_free(mtl->map_vals[slot]);
 			mtl->map_vals[slot] = val;
-			mtl->map_count++;
 			return 0;
 		}
+		if (!mtl->map_keys[slot]) {
+			if (first_empty < 0)
+				first_empty = (int)slot;
+			break;
+		}
+		if (mtl->map_keys[slot] == METAL_MAP_TOMBSTONE
+		    && first_empty < 0) {
+			first_empty = (int)slot;
+		}
+	}
+
+	if (first_empty >= 0) {
+		mtl->map_keys[first_empty] = key;
+		mtl->map_vals[first_empty] = val;
+		mtl->map_count++;
+		return 0;
 	}
 	sam3_log_error("metal: tensor map full (%d entries)",
 		       mtl->map_count);

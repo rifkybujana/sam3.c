@@ -952,6 +952,82 @@ static void test_backend_factory_cpu(void)
 }
 #endif
 
+/*
+ * Test that metal_map_put handles updates: when a tensor's mlx_array
+ * is already in the map (from a previous no_readback eval), a second
+ * graph_eval that outputs to the same tensor must overwrite the entry,
+ * not create a duplicate.
+ */
+static void test_metal_map_put_update(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	ASSERT(metal != NULL);
+	if (!metal)
+		return;
+
+	/*
+	 * Tensors: a=[1,2,3,4], b=[10,20,30,40], c=forwarding,
+	 *          d=[100,200,300,400]
+	 */
+	float a_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+	float b_data[] = {10.0f, 20.0f, 30.0f, 40.0f};
+	float c_data[4] = {0};
+	float d_data[] = {100.0f, 200.0f, 300.0f, 400.0f};
+
+	int dims[] = {4};
+	struct sam3_tensor a = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	a.data = a_data; a.nbytes = sizeof(a_data);
+	sam3_tensor_compute_strides(&a);
+
+	struct sam3_tensor b = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	b.data = b_data; b.nbytes = sizeof(b_data);
+	sam3_tensor_compute_strides(&b);
+
+	struct sam3_tensor c = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	c.data = c_data; c.nbytes = sizeof(c_data);
+	sam3_tensor_compute_strides(&c);
+
+	struct sam3_tensor d = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	d.data = d_data; d.nbytes = sizeof(d_data);
+	sam3_tensor_compute_strides(&d);
+
+	/*
+	 * Graph 1: c = a + b (no_readback)
+	 * c's mlx_array stays in the tensor map.
+	 */
+	struct sam3_graph g1;
+	sam3_graph_init(&g1);
+	g1.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_ADD, .n_inputs = 2,
+		.inputs = {&a, &b}, .output = &c,
+	};
+	g1.n_nodes = 1;
+	g1.no_readback = true;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g1), SAM3_OK);
+
+	/*
+	 * Graph 2: c = c + d (readback)
+	 * c is BOTH input (from map) and output (overwrite).
+	 * metal_map_put must update, not duplicate.
+	 */
+	struct sam3_graph g2;
+	sam3_graph_init(&g2);
+	g2.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_ADD, .n_inputs = 2,
+		.inputs = {&c, &d}, .output = &c,
+	};
+	g2.n_nodes = 1;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g2), SAM3_OK);
+
+	/* c should be (a + b) + d = {111, 222, 333, 444} */
+	float expected[] = {111.0f, 222.0f, 333.0f, 444.0f};
+	ASSERT(float_arrays_match((float *)c.data, expected, 4, 1e-6f));
+
+	sam3_backend_free(metal);
+}
+
 #endif /* SAM3_HAS_METAL */
 
 /* ── Main ────────────────────────────────────────────────────────── */
@@ -983,6 +1059,7 @@ int main(void)
 	test_metal_silu();
 	test_metal_silu_large();
 	test_metal_dequant_q8_gpu();
+	test_metal_map_put_update();
 #endif
 
 	TEST_REPORT();
