@@ -395,6 +395,14 @@ wrap_groupnorm(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_groupnorm(node, pool);
 }
 
+static enum sam3_error
+wrap_batchnorm(const struct sam3_node *node, struct sam3_arena *scratch,
+	       struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_batchnorm(node, pool);
+}
+
 /*
  * wrap_bias_add - NHWC bias add.
  *
@@ -549,6 +557,9 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_GROUPNORM] = {
 		[SAM3_DTYPE_F32]  = wrap_groupnorm,
+	},
+	[SAM3_OP_BATCHNORM] = {
+		[SAM3_DTYPE_F32]  = wrap_batchnorm,
 	},
 };
 

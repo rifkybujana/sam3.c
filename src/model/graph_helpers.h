@@ -477,6 +477,24 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 				 int num_groups);
 
 /*
+ * gh_batchnorm - Batch normalization (eval) with running statistics.
+ *
+ * @input:        NHWC tensor or any tensor with C as last dim
+ * @gamma:        Per-channel scale [C], or NULL
+ * @beta:         Per-channel bias [C], or NULL
+ * @running_mean: Per-channel running mean [C]
+ * @running_var:  Per-channel running variance [C]
+ *
+ * Returns a normalized tensor with the same shape as input.
+ */
+struct sam3_tensor *gh_batchnorm(struct sam3_graph *g, struct sam3_arena *a,
+				 struct sam3_tensor *input,
+				 struct sam3_tensor *gamma,
+				 struct sam3_tensor *beta,
+				 struct sam3_tensor *running_mean,
+				 struct sam3_tensor *running_var);
+
+/*
  * gh_conv2d - 2D convolution with NHWC input and OHWI weight.
  *
  * @input:   [N, H, W, C_in]

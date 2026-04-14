@@ -59,6 +59,12 @@ enum sam3_op {
 				  * inputs[1]=gamma[C], inputs[2]=beta[C].
 				  * params[0]=num_groups.
 				  * output: same shape as x.              */
+	SAM3_OP_BATCHNORM,     /* BatchNorm (eval) on NHWC input.
+				  * inputs[0]=x, inputs[1]=gamma[C],
+				  * inputs[2]=beta[C],
+				  * inputs[3]=running_mean[C],
+				  * inputs[4]=running_var[C].
+				  * eps=1e-5. output: same shape as x.    */
 	SAM3_OP_COUNT,  /* must be last */
 };
 

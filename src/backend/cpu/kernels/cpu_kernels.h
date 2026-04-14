@@ -212,4 +212,11 @@ enum sam3_error cpu_kernel_sdpa(const struct sam3_node *node,
 enum sam3_error cpu_kernel_groupnorm(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
+/* Batch normalization (eval mode) on NHWC input.
+ * inputs[0]=x, inputs[1]=gamma[C], inputs[2]=beta[C],
+ * inputs[3]=running_mean[C], inputs[4]=running_var[C]. eps=1e-5.
+ */
+enum sam3_error cpu_kernel_batchnorm(const struct sam3_node *node,
+				     struct sam3_threadpool *pool);
+
 #endif /* SAM3_CPU_KERNELS_H */

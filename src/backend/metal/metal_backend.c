@@ -1306,6 +1306,73 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		break;
 	}
 
+	case SAM3_OP_BATCHNORM: {
+		/*
+		 * BatchNorm (eval) on NHWC input [N, H, W, C].
+		 * inputs[0]=x, inputs[1]=gamma[C], inputs[2]=beta[C],
+		 * inputs[3]=running_mean[C], inputs[4]=running_var[C].
+		 *
+		 * out = (x - mean) / sqrt(var + eps) * gamma + beta
+		 *     = (x - mean) * rsqrt(var + eps) * gamma + beta
+		 *
+		 * Channel dim is last, so [C] broadcasts over [N,H,W,C].
+		 */
+		float bn_eps = 1e-5f;
+		int bn_shape[] = {1};
+		mlx_array bn_eps_arr = mlx_array_new_data(
+			&bn_eps, bn_shape, 1, MLX_FLOAT32);
+
+		/* var + eps */
+		mlx_array bn_var_eps = mlx_array_new();
+		rc = mlx_add(&bn_var_eps, inputs[4], bn_eps_arr, stream);
+		mlx_array_free(bn_eps_arr);
+		if (rc) { mlx_array_free(bn_var_eps); break; }
+
+		/* rsqrt(var + eps) */
+		mlx_array bn_inv_std = mlx_array_new();
+		rc = mlx_rsqrt(&bn_inv_std, bn_var_eps, stream);
+		mlx_array_free(bn_var_eps);
+		if (rc) { mlx_array_free(bn_inv_std); break; }
+
+		/* x - mean */
+		mlx_array bn_centered = mlx_array_new();
+		rc = mlx_subtract(&bn_centered, inputs[0], inputs[3],
+				  stream);
+		if (rc) {
+			mlx_array_free(bn_inv_std);
+			mlx_array_free(bn_centered);
+			break;
+		}
+
+		/* (x - mean) * rsqrt(var + eps) */
+		mlx_array bn_normed = mlx_array_new();
+		rc = mlx_multiply(&bn_normed, bn_centered, bn_inv_std,
+				  stream);
+		mlx_array_free(bn_centered);
+		mlx_array_free(bn_inv_std);
+		if (rc) { mlx_array_free(bn_normed); break; }
+
+		/* * gamma */
+		if (node->n_inputs > 1 && node->inputs[1]) {
+			mlx_array bn_scaled = mlx_array_new();
+			rc = mlx_multiply(&bn_scaled, bn_normed,
+					  inputs[1], stream);
+			mlx_array_free(bn_normed);
+			if (rc) { mlx_array_free(bn_scaled); break; }
+			bn_normed = bn_scaled;
+		}
+
+		/* + beta */
+		if (node->n_inputs > 2 && node->inputs[2]) {
+			rc = mlx_add(&result, bn_normed, inputs[2],
+				     stream);
+			mlx_array_free(bn_normed);
+		} else {
+			result = bn_normed;
+		}
+		break;
+	}
+
 	case SAM3_OP_BIAS_ADD: {
 		/*
 		 * Bias add on NHWC x[N,H,W,C] + bias[C]. Broadcast by

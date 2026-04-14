@@ -1236,6 +1236,32 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 	return out;
 }
 
+/* ── Batch normalization ─────────────────────────────────────────── */
+
+struct sam3_tensor *gh_batchnorm(struct sam3_graph *g, struct sam3_arena *a,
+				 struct sam3_tensor *input,
+				 struct sam3_tensor *gamma,
+				 struct sam3_tensor *beta,
+				 struct sam3_tensor *running_mean,
+				 struct sam3_tensor *running_var)
+{
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  input->n_dims, input->dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[5];
+	int n_inputs = 1;
+	inputs[0] = input;
+	if (gamma) { inputs[1] = gamma; n_inputs = 2; }
+	if (beta)  { inputs[2] = beta;  n_inputs = 3; }
+	if (running_mean) { inputs[3] = running_mean; n_inputs = 4; }
+	if (running_var)  { inputs[4] = running_var;  n_inputs = 5; }
+
+	return sam3_graph_add_op(g, SAM3_OP_BATCHNORM,
+				 inputs, n_inputs, out);
+}
+
 /* ── Convolution helpers ──────────────────────────────────────────── */
 
 /*

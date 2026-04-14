@@ -71,6 +71,7 @@ const char *sam3_op_str(enum sam3_op op)
 		[SAM3_OP_SDPA]            = "SDPA",
 		[SAM3_OP_BIAS_ADD]        = "BIAS_ADD",
 		[SAM3_OP_GROUPNORM]       = "GROUPNORM",
+		[SAM3_OP_BATCHNORM]       = "BATCHNORM",
 	};
 	if (op >= 0 && op < SAM3_OP_COUNT)
 		return names[op];
