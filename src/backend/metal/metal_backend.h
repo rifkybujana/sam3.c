@@ -28,7 +28,7 @@
 /* Default arena capacity: 256 MiB. */
 #define SAM3_METAL_ARENA_DEFAULT_CAPACITY (256UL * 1024 * 1024)
 
-/* Default scratch arena: 64 MiB for Q8 dequantization buffers. */
+/* Default scratch arena: 64 MiB for graph_eval working buffers. */
 #define SAM3_METAL_SCRATCH_DEFAULT_CAPACITY (64UL * 1024 * 1024)
 
 #define SAM3_METAL_MAP_INIT_CAP 8192  /* Initial capacity, must be power of 2 */
@@ -36,7 +36,7 @@
 struct sam3_metal_backend {
 	struct sam3_backend  base;           /* Must be first member */
 	struct sam3_arena    arena;          /* Host-side tensor data */
-	struct sam3_arena    scratch;        /* Q8 dequant scratch space */
+	struct sam3_arena    scratch;        /* graph_eval working space */
 	size_t               arena_capacity; /* 0 = use default */
 #ifdef SAM3_HAS_METAL
 	mlx_stream           stream;         /* GPU compute stream */

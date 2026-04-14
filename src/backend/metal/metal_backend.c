@@ -7,7 +7,7 @@
  * back to SAM3 tensors. Q8_0 tensors are dequantized to F16 on host.
  *
  * Key types:  sam3_metal_backend
- * Depends on: metal_backend.h, core/tensor.h, core/quant.h, core/half.h,
+ * Depends on: metal_backend.h, core/tensor.h, core/quant.h,
  *             util/log.h
  * Used by:    backend.h (registered at init)
  *
@@ -22,7 +22,6 @@
 #ifdef SAM3_HAS_METAL
 
 #include "core/quant.h"
-#include "core/half.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -33,7 +32,7 @@
 /*
  * metal_map_dtype - Convert sam3_dtype to mlx_dtype.
  *
- * Returns MLX_FLOAT16 for Q8_0 (caller must dequantize first).
+ * Returns MLX_FLOAT16 for Q8_0 (cache validation only; wrap uploads raw bytes).
  * Returns -1 for unknown dtypes.
  */
 static int metal_map_dtype(enum sam3_dtype dt, mlx_dtype *out)
@@ -46,65 +45,6 @@ static int metal_map_dtype(enum sam3_dtype dt, mlx_dtype *out)
 	case SAM3_DTYPE_I8:   *out = MLX_INT8;     return 0;
 	case SAM3_DTYPE_Q8_0: *out = MLX_FLOAT16;  return 0;
 	default: return -1;
-	}
-}
-
-/* ── Q8_0 dequantization to F16 ───────────────────────────────────── */
-
-/*
- * metal_dequant_q8_to_f16 - Dequantize Q8_0 blocks directly to F16.
- *
- * Single-pass: converts Q8 blocks to fp16 without an intermediate
- * f32 buffer. NEON-accelerated on aarch64, scalar fallback otherwise.
- *
- * @src:    Q8 block array
- * @dst:    Destination F16 buffer (caller-allocated, nelems * 2 bytes)
- * @nelems: Number of elements
- */
-static void metal_dequant_q8_to_f16(const struct sam3_q8_block *src,
-				     uint16_t *dst, int nelems)
-{
-	int nblocks = nelems / SAM3_Q8_BLOCK_SIZE;
-	int tail = nelems % SAM3_Q8_BLOCK_SIZE;
-
-#if defined(SAM3_HAS_NEON) || \
-	(defined(__aarch64__) && defined(__ARM_NEON))
-	for (int b = 0; b < nblocks; b++) {
-		const struct sam3_q8_block *blk = &src[b];
-		uint16_t *out = &dst[b * SAM3_Q8_BLOCK_SIZE];
-		float32x4_t vscale = vdupq_n_f32(blk->scale);
-
-		for (int i = 0; i < SAM3_Q8_BLOCK_SIZE; i += 8) {
-			int8x8_t d8 = vld1_s8(&blk->data[i]);
-			int16x8_t d16 = vmovl_s8(d8);
-			float32x4_t flo = vmulq_f32(
-				vcvtq_f32_s32(
-					vmovl_s16(vget_low_s16(d16))),
-				vscale);
-			float32x4_t fhi = vmulq_f32(
-				vcvtq_f32_s32(
-					vmovl_s16(vget_high_s16(d16))),
-				vscale);
-			f32x4x2_to_fp16x8(&out[i], flo, fhi);
-		}
-	}
-#else
-	for (int b = 0; b < nblocks; b++) {
-		const struct sam3_q8_block *blk = &src[b];
-		uint16_t *out = &dst[b * SAM3_Q8_BLOCK_SIZE];
-		float scale = blk->scale;
-
-		for (int i = 0; i < SAM3_Q8_BLOCK_SIZE; i++)
-			out[i] = f32_to_fp16((float)blk->data[i] * scale);
-	}
-#endif
-
-	if (tail > 0) {
-		const struct sam3_q8_block *blk = &src[nblocks];
-		uint16_t *out = &dst[nblocks * SAM3_Q8_BLOCK_SIZE];
-		float scale = blk->scale;
-		for (int i = 0; i < tail; i++)
-			out[i] = f32_to_fp16((float)blk->data[i] * scale);
 	}
 }
 
@@ -331,16 +271,61 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 
 	if (t->dtype == SAM3_DTYPE_Q8_0) {
 		int nelems = sam3_tensor_nelems(t);
-		uint16_t *fp16_buf = sam3_arena_alloc(&mtl->scratch,
-					(size_t)nelems * sizeof(uint16_t));
-		if (!fp16_buf) {
-			sam3_log_error("metal: scratch OOM for Q8 wrap");
+		int nblocks = (nelems + SAM3_Q8_BLOCK_SIZE - 1)
+			      / SAM3_Q8_BLOCK_SIZE;
+		int raw_bytes = nblocks
+				* (int)sizeof(struct sam3_q8_block);
+
+		/* Upload raw Q8 blocks as uint8 byte buffer */
+		int raw_shape[] = {raw_bytes};
+		mlx_array raw = mlx_array_new_data(
+			t->data, raw_shape, 1, MLX_UINT8);
+
+		mlx_vector_array in_vec =
+			mlx_vector_array_new_data(&raw, 1);
+		mlx_fast_metal_kernel_config cfg =
+			mlx_fast_metal_kernel_config_new();
+
+		int out_shape[] = {nelems};
+		mlx_fast_metal_kernel_config_add_output_arg(
+			cfg, out_shape, 1, MLX_FLOAT16);
+
+		int tpg = nelems < 256 ? nelems : 256;
+		mlx_fast_metal_kernel_config_set_grid(
+			cfg, nelems, 1, 1);
+		mlx_fast_metal_kernel_config_set_thread_group(
+			cfg, tpg, 1, 1);
+
+		mlx_vector_array out_vec = mlx_vector_array_new();
+		int rc = mlx_fast_metal_kernel_apply(
+			&out_vec, mtl->dequant_q8_kernel,
+			in_vec, cfg, mtl->stream);
+
+		mlx_array flat_f16 = mlx_array_new();
+		if (!rc)
+			mlx_vector_array_get(&flat_f16, out_vec, 0);
+
+		mlx_vector_array_free(out_vec);
+		mlx_fast_metal_kernel_config_free(cfg);
+		mlx_vector_array_free(in_vec);
+		mlx_array_free(raw);
+
+		if (rc) {
+			mlx_array_free(flat_f16);
+			sam3_log_error("metal: Q8 dequant kernel failed");
 			return mlx_array_new();
 		}
-		metal_dequant_q8_to_f16(
-			(const struct sam3_q8_block *)t->data,
-			fp16_buf, nelems);
-		data = fp16_buf;
+
+		/* Reshape flat [nelems] to original tensor dims */
+		mlx_array arr = mlx_array_new();
+		mlx_reshape(&arr, flat_f16, t->dims, t->n_dims,
+			    mtl->stream);
+		mlx_array_free(flat_f16);
+
+		if (metal_map_put(mtl, t, arr) < 0)
+			sam3_log_warn("metal: wrap_tensor: map full, "
+				      "array not cached");
+		return arr;
 	}
 
 	mlx_array arr = mlx_array_new_data(data, t->dims, t->n_dims, mtype);
