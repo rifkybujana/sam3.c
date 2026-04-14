@@ -150,17 +150,6 @@ add_executable(sam3_cli
 target_include_directories(sam3_cli PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_cli sam3)
 
-# CLI tools
-add_executable(sam3_main tools/sam3_main.c)
-target_link_libraries(sam3_main sam3)
-
-add_executable(sam3_convert
-	tools/sam3_convert.c
-	tools/weight_rename.c
-	tools/weight_conv_perm.c)
-target_include_directories(sam3_convert PRIVATE ${CMAKE_SOURCE_DIR}/tools)
-target_link_libraries(sam3_convert sam3)
-
 add_executable(gen_nhwc_fixtures tools/gen_nhwc_fixtures.c)
 target_link_libraries(gen_nhwc_fixtures sam3)
 
