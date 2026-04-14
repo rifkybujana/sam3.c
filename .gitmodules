@@ -1,3 +1,6 @@
-[submodule "reference"]
-	path = reference
+[submodule "reference/sam3"]
+	path = reference/sam3
 	url = https://github.com/facebookresearch/sam3
+[submodule "reference/efficientsam3"]
+	path = reference/efficientsam3
+	url = https://github.com/SimonZeng7108/efficientsam3
