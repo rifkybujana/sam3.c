@@ -366,6 +366,22 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 
 /* ── Op dispatch ──────────────────────────────────────────────────── */
 
+/* Get or create a cached scalar zero of the given mlx_dtype for ReLU. */
+static mlx_array metal_get_relu_zero(struct sam3_metal_backend *mtl,
+				     mlx_dtype dt)
+{
+	if (!mtl->relu_zeros[dt].ctx) {
+		int shape[] = {1};
+		float zero = 0.0f;
+		mlx_array f32_zero = mlx_array_new_data(
+			&zero, shape, 1, MLX_FLOAT32);
+		mlx_astype(&mtl->relu_zeros[dt], f32_zero, dt,
+			   mtl->stream);
+		mlx_array_free(f32_zero);
+	}
+	return mtl->relu_zeros[dt];
+}
+
 /*
  * metal_dispatch_node - Translate one sam3_node into MLX-C lazy ops.
  *
@@ -401,16 +417,9 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		break;
 
 	case SAM3_OP_RELU: {
-		int scalar_shape[] = {1};
-		float zero = 0.0f;
-		mlx_array zero_arr = mlx_array_new_data(
-			&zero, scalar_shape, 1, MLX_FLOAT32);
 		mlx_dtype in_dtype = mlx_array_dtype(inputs[0]);
-		mlx_array zero_cast = mlx_array_new();
-		mlx_astype(&zero_cast, zero_arr, in_dtype, stream);
-		rc = mlx_maximum(&result, inputs[0], zero_cast, stream);
-		mlx_array_free(zero_cast);
-		mlx_array_free(zero_arr);
+		mlx_array zero = metal_get_relu_zero(mtl, in_dtype);
+		rc = mlx_maximum(&result, inputs[0], zero, stream);
 		break;
 	}
 
@@ -1150,6 +1159,10 @@ static void metal_free(struct sam3_backend *be)
 	struct sam3_metal_backend *mtl = (struct sam3_metal_backend *)be;
 
 	metal_map_free(mtl);
+	for (int i = 0; i < 13; i++) {
+		if (mtl->relu_zeros[i].ctx)
+			mlx_array_free(mtl->relu_zeros[i]);
+	}
 	mlx_stream_free(mtl->stream);
 	mlx_device_free(mtl->device);
 	mlx_clear_cache();

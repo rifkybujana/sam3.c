@@ -47,6 +47,7 @@ struct sam3_metal_backend {
 	int                       map_count;
 	int                       map_capacity;
 	bool                      use_f16;   /* Cast F32 -> F16 for compute */
+	mlx_array                 relu_zeros[13]; /* Per-dtype cached scalar 0 */
 #endif
 };
 

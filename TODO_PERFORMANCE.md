@@ -70,13 +70,7 @@ The GELU dispatch creates 12 intermediate `mlx_array` objects to compose
 `0.5 * x * (1 + erf(x / sqrt(2)))`. If MLX-C exposes `mlx_nn_gelu` or
 equivalent, one call replaces all 12 allocations and frees.
 
-### 7. ReLU: cache the scalar zero tensor
-**File:** `src/backend/metal/metal_backend.c:324-336`
-**Impact:** minor per-node overhead reduction
-
-Each ReLU dispatch allocates a scalar `0.0f` array, casts it to input dtype,
-then calls `mlx_maximum`. Cache a per-dtype zero tensor on the backend struct,
-or use a dedicated ReLU op if available in MLX-C.
+### ~~7. ReLU: cache the scalar zero tensor~~ ✅ DONE
 
 ### ~~8. graph_eval phase 3: batch mlx_eval calls~~ ✅ DONE
 
