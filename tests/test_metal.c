@@ -1028,6 +1028,161 @@ static void test_metal_map_put_update(void)
 	sam3_backend_free(metal);
 }
 
+/*
+ * Test GPU-resident forwarding: graph 1 skips readback, graph 2
+ * finds the output in the tensor map and uses it directly.
+ */
+static void test_metal_no_readback_forward(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	ASSERT(metal != NULL);
+	if (!metal)
+		return;
+
+	float a_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+	float b_data[] = {10.0f, 20.0f, 30.0f, 40.0f};
+	float d_data[] = {100.0f, 200.0f, 300.0f, 400.0f};
+
+	int dims[] = {4};
+	struct sam3_tensor a = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	a.data = a_data; a.nbytes = sizeof(a_data);
+	sam3_tensor_compute_strides(&a);
+
+	struct sam3_tensor b = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	b.data = b_data; b.nbytes = sizeof(b_data);
+	sam3_tensor_compute_strides(&b);
+
+	/* Forwarding tensor: persists across both graphs */
+	float c_data[4] = {0};
+	struct sam3_tensor c = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	c.data = c_data; c.nbytes = sizeof(c_data);
+	sam3_tensor_compute_strides(&c);
+
+	struct sam3_tensor d = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	d.data = d_data; d.nbytes = sizeof(d_data);
+	sam3_tensor_compute_strides(&d);
+
+	float e_data[4] = {0};
+	struct sam3_tensor e = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	e.data = e_data; e.nbytes = sizeof(e_data);
+	sam3_tensor_compute_strides(&e);
+
+	/* Graph 1: c = a + b (no_readback) */
+	struct sam3_graph g1;
+	sam3_graph_init(&g1);
+	g1.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_ADD, .n_inputs = 2,
+		.inputs = {&a, &b}, .output = &c,
+	};
+	g1.n_nodes = 1;
+	g1.no_readback = true;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g1), SAM3_OK);
+
+	/* c host data should be unchanged (no readback) */
+	ASSERT(c_data[0] == 0.0f);
+
+	/* Graph 2: e = c + d (readback) */
+	struct sam3_graph g2;
+	sam3_graph_init(&g2);
+	g2.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_ADD, .n_inputs = 2,
+		.inputs = {&c, &d}, .output = &e,
+	};
+	g2.n_nodes = 1;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g2), SAM3_OK);
+
+	/* e = (1+10)+100, (2+20)+200, ... = {111, 222, 333, 444} */
+	float expected[] = {111.0f, 222.0f, 333.0f, 444.0f};
+	ASSERT(float_arrays_match((float *)e.data, expected, 4, 1e-6f));
+
+	sam3_backend_free(metal);
+}
+
+/*
+ * Test multi-hop GPU-resident forwarding (simulates ViT batch chain).
+ * g1: c = a + b (no_readback)
+ * g2: c = c + d (no_readback, c reused as input+output)
+ * g3: e = c + a (readback)
+ * Expected: e = ((a+b)+d) + a = {112, 224, 336, 448}
+ */
+static void test_metal_no_readback_chain(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	ASSERT(metal != NULL);
+	if (!metal)
+		return;
+
+	float a_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+	float b_data[] = {10.0f, 20.0f, 30.0f, 40.0f};
+	float d_data[] = {100.0f, 200.0f, 300.0f, 400.0f};
+
+	int dims[] = {4};
+	struct sam3_tensor a = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	a.data = a_data; a.nbytes = sizeof(a_data);
+	sam3_tensor_compute_strides(&a);
+
+	struct sam3_tensor b = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	b.data = b_data; b.nbytes = sizeof(b_data);
+	sam3_tensor_compute_strides(&b);
+
+	float c_data[4] = {0};
+	struct sam3_tensor c = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	c.data = c_data; c.nbytes = sizeof(c_data);
+	sam3_tensor_compute_strides(&c);
+
+	struct sam3_tensor d = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	d.data = d_data; d.nbytes = sizeof(d_data);
+	sam3_tensor_compute_strides(&d);
+
+	float e_data[4] = {0};
+	struct sam3_tensor e = make_tensor(SAM3_DTYPE_F32, 1, dims);
+	e.data = e_data; e.nbytes = sizeof(e_data);
+	sam3_tensor_compute_strides(&e);
+
+	/* g1: c = a + b (no_readback) */
+	struct sam3_graph g1;
+	sam3_graph_init(&g1);
+	g1.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_ADD, .n_inputs = 2,
+		.inputs = {&a, &b}, .output = &c,
+	};
+	g1.n_nodes = 1;
+	g1.no_readback = true;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g1), SAM3_OK);
+
+	/* g2: c = c + d (no_readback, c is input+output) */
+	struct sam3_graph g2;
+	sam3_graph_init(&g2);
+	g2.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_ADD, .n_inputs = 2,
+		.inputs = {&c, &d}, .output = &c,
+	};
+	g2.n_nodes = 1;
+	g2.no_readback = true;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g2), SAM3_OK);
+
+	/* g3: e = c + a (readback) */
+	struct sam3_graph g3;
+	sam3_graph_init(&g3);
+	g3.nodes[0] = (struct sam3_node){
+		.op = SAM3_OP_ADD, .n_inputs = 2,
+		.inputs = {&c, &a}, .output = &e,
+	};
+	g3.n_nodes = 1;
+
+	ASSERT_EQ(metal->ops->graph_eval(metal, &g3), SAM3_OK);
+
+	/* e = ((1+10)+100)+1 = 112, etc. */
+	float expected[] = {112.0f, 224.0f, 336.0f, 448.0f};
+	ASSERT(float_arrays_match((float *)e.data, expected, 4, 1e-6f));
+
+	sam3_backend_free(metal);
+}
+
 #endif /* SAM3_HAS_METAL */
 
 /* ── Main ────────────────────────────────────────────────────────── */
@@ -1060,6 +1215,8 @@ int main(void)
 	test_metal_silu_large();
 	test_metal_dequant_q8_gpu();
 	test_metal_map_put_update();
+	test_metal_no_readback_forward();
+	test_metal_no_readback_chain();
 #endif
 
 	TEST_REPORT();
