@@ -143,6 +143,7 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->config.decoder_dim      = h->decoder_dim;
 	ctx->config.n_encoder_layers = h->n_encoder_layers;
 	ctx->config.n_decoder_layers = h->n_decoder_layers;
+	ctx->config.backbone_type    = (int)h->reserved[0];
 
 	ctx->loaded = 1;
 

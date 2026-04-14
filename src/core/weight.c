@@ -94,6 +94,7 @@ enum sam3_error sam3_weight_write(const char *output_path,
 	hdr.decoder_dim      = config->decoder_dim;
 	hdr.n_encoder_layers = config->n_encoder_layers;
 	hdr.n_decoder_layers = config->n_decoder_layers;
+	hdr.reserved[0]      = (uint32_t)config->backbone_type;
 
 	/* Build tensor descriptors */
 	descs = calloc((size_t)n, sizeof(*descs));

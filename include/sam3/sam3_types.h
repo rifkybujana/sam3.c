@@ -96,6 +96,12 @@ struct sam3_result {
 	int    best_mask;    /* Stability-selected best mask index, -1 if N/A */
 };
 
+/* Vision backbone type. */
+enum sam3_backbone_type {
+	SAM3_BACKBONE_HIERA        = 0,
+	SAM3_BACKBONE_EFFICIENTVIT = 1,
+};
+
 /* Model configuration loaded from weights file. */
 struct sam3_model_config {
 	int image_size;       /* Input image size (e.g., 1024) */
@@ -103,6 +109,7 @@ struct sam3_model_config {
 	int decoder_dim;      /* Mask decoder dimension */
 	int n_encoder_layers;
 	int n_decoder_layers;
+	int backbone_type;    /* enum sam3_backbone_type */
 };
 
 /* Opaque context handle. */

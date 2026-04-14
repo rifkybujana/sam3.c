@@ -48,6 +48,8 @@ static void print_usage(const char *prog)
 	       "(default: 32)\n");
 	printf("  --decoder-layers <N> Decoder layer count "
 	       "(default: 2)\n");
+	printf("  --backbone <type>    Vision backbone: "
+	       "\"hiera\" (default), \"efficientvit\"\n");
 	printf("  --quantize <type>    Quantize weights: "
 	       "\"q8_0\" (default: none)\n");
 	printf("  -v                   Verbose output "
@@ -59,12 +61,14 @@ struct convert_args {
 	const char *input_path;
 	const char *output_path;
 	const char *format;
+	const char *backbone;   /* "hiera" or "efficientvit" */
 	const char *quantize;   /* NULL or "q8_0" */
 	int         image_size;
 	int         encoder_dim;
 	int         decoder_dim;
 	int         encoder_layers;
 	int         decoder_layers;
+	int         backbone_type;
 	int         verbose;
 };
 
@@ -73,12 +77,14 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->input_path     = NULL;
 	args->output_path    = NULL;
 	args->format         = "safetensors";
+	args->backbone       = "hiera";
 	args->quantize       = NULL;
 	args->image_size     = 1008;
-	args->encoder_dim    = 1280;
+	args->encoder_dim    = -1; /* -1 = use backbone default */
 	args->decoder_dim    = 256;
-	args->encoder_layers = 32;
+	args->encoder_layers = -1; /* -1 = use backbone default */
 	args->decoder_layers = 2;
+	args->backbone_type  = SAM3_BACKBONE_HIERA;
 	args->verbose        = 0;
 
 	for (int i = 1; i < argc; i++) {
@@ -139,6 +145,14 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 				return 1;
 			}
 			args->decoder_layers = atoi(argv[i]);
+		} else if (strcmp(argv[i], "--backbone") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --backbone requires a "
+					"type\n");
+				return 1;
+			}
+			args->backbone = argv[i];
 		} else if (strcmp(argv[i], "--quantize") == 0) {
 			if (++i >= argc) {
 				fprintf(stderr,
@@ -161,6 +175,27 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	}
 	if (!args->output_path) {
 		fprintf(stderr, "error: -o <output> is required\n");
+		return 1;
+	}
+
+	/* Resolve backbone type and apply defaults */
+	if (strcmp(args->backbone, "hiera") == 0) {
+		args->backbone_type = SAM3_BACKBONE_HIERA;
+		if (args->encoder_dim < 0)
+			args->encoder_dim = 1280;
+		if (args->encoder_layers < 0)
+			args->encoder_layers = 32;
+	} else if (strcmp(args->backbone, "efficientvit") == 0) {
+		args->backbone_type = SAM3_BACKBONE_EFFICIENTVIT;
+		if (args->encoder_dim < 0)
+			args->encoder_dim = 384;
+		if (args->encoder_layers < 0)
+			args->encoder_layers = 20;
+	} else {
+		fprintf(stderr,
+			"error: unsupported backbone '%s' "
+			"(use \"hiera\" or \"efficientvit\")\n",
+			args->backbone);
 		return 1;
 	}
 
@@ -375,6 +410,7 @@ int main(int argc, char **argv)
 	printf("  input:          %s\n", args.input_path);
 	printf("  output:         %s\n", args.output_path);
 	printf("  format:         %s\n", args.format);
+	printf("  backbone:       %s\n", args.backbone);
 	printf("  tensors:        %d (after rename/split)\n", n);
 	printf("  image_size:     %d\n", args.image_size);
 	printf("  encoder_dim:    %d\n", args.encoder_dim);
@@ -388,6 +424,7 @@ int main(int argc, char **argv)
 	config.decoder_dim      = args.decoder_dim;
 	config.n_encoder_layers = args.encoder_layers;
 	config.n_decoder_layers = args.decoder_layers;
+	config.backbone_type    = args.backbone_type;
 
 	/* Set up quantizing wrapper if requested */
 	struct weight_reader *write_reader = &conv_perm_reader;

@@ -122,6 +122,131 @@ static int add_q_kv_split(struct rename_entry *out, int inner_idx,
  */
 
 /*
+ * EfficientViT backbone: detector.backbone.vision_backbone.trunk.model.*
+ * -> detector_model.vision_encoder.backbone.*
+ *
+ * Maps EfficientViT-B2 module hierarchy (input_stem, stages with MBConv
+ * and LiteMLA attention blocks) and projection head to C model names.
+ * BN running stats (running_mean, running_var, num_batches_tracked) are
+ * passed through since EfficientViT uses BatchNorm at inference.
+ */
+static int handle_efficientvit(struct rename_entry *out, int inner_idx,
+			       const char *rest)
+{
+	char buf[SAM3_WEIGHT_NAME_MAX];
+	const char *prefix = "detector_model.vision_encoder.backbone.";
+	const char *r, *s;
+
+	/* === Backbone trunk: backbone.model.* === */
+	r = strip_prefix(rest, "backbone.model.");
+	if (r) {
+		/* input_stem.op_list.{i}.* -> input_stem.{i}.* */
+		s = strip_prefix(r, "input_stem.op_list.");
+		if (s) {
+			snprintf(buf, sizeof(buf),
+				 "%sinput_stem.%s", prefix, s);
+			return add_entry(out, inner_idx, buf);
+		}
+
+		/* stages.{s}.op_list.{i}.* with sub-rules */
+		s = strip_prefix(r, "stages.");
+		if (s) {
+			int stage, consumed;
+			if (sscanf(s, "%d.%n", &stage, &consumed) < 1)
+				goto passthrough;
+			const char *after_stage = s + consumed;
+			const char *after_oplist =
+				strip_prefix(after_stage, "op_list.");
+			if (!after_oplist)
+				goto passthrough;
+
+			int blk, blk_consumed;
+			if (sscanf(after_oplist, "%d.%n",
+				   &blk, &blk_consumed) < 1)
+				goto passthrough;
+			const char *attr = after_oplist + blk_consumed;
+
+			/* context_module.main.* -> context.* */
+			const char *cm;
+			cm = strip_prefix(attr, "context_module.main.");
+			if (cm) {
+				snprintf(buf, sizeof(buf),
+					 "%sstages.%d.blocks.%d."
+					 "context.%s",
+					 prefix, stage, blk, cm);
+				return add_entry(out, inner_idx, buf);
+			}
+
+			/* local_module.main.* -> local.* */
+			cm = strip_prefix(attr, "local_module.main.");
+			if (cm) {
+				snprintf(buf, sizeof(buf),
+					 "%sstages.%d.blocks.%d."
+					 "local.%s",
+					 prefix, stage, blk, cm);
+				return add_entry(out, inner_idx, buf);
+			}
+
+			/* main.* -> strip "main." (MBConv blocks) */
+			cm = strip_prefix(attr, "main.");
+			if (cm) {
+				snprintf(buf, sizeof(buf),
+					 "%sstages.%d.blocks.%d.%s",
+					 prefix, stage, blk, cm);
+				return add_entry(out, inner_idx, buf);
+			}
+
+			/* Passthrough within block */
+			snprintf(buf, sizeof(buf),
+				 "%sstages.%d.blocks.%d.%s",
+				 prefix, stage, blk, attr);
+			return add_entry(out, inner_idx, buf);
+		}
+
+		/* Other backbone.model.* tensors: passthrough */
+		snprintf(buf, sizeof(buf), "%s%s", prefix, r);
+		return add_entry(out, inner_idx, buf);
+	}
+
+	/* === Projection head: head.* === */
+	r = strip_prefix(rest, "head.");
+	if (r) {
+		/* head.0.* -> projection.conv1.* (1x1 conv) */
+		s = strip_prefix(r, "0.");
+		if (s) {
+			snprintf(buf, sizeof(buf),
+				 "%sprojection.conv1.%s", prefix, s);
+			return add_entry(out, inner_idx, buf);
+		}
+
+		/* head.1.* -> projection.bn.* (BatchNorm) */
+		s = strip_prefix(r, "1.");
+		if (s) {
+			snprintf(buf, sizeof(buf),
+				 "%sprojection.bn.%s", prefix, s);
+			return add_entry(out, inner_idx, buf);
+		}
+
+		/* head.3.* -> projection.conv2.* (3x3 conv) */
+		s = strip_prefix(r, "3.");
+		if (s) {
+			snprintf(buf, sizeof(buf),
+				 "%sprojection.conv2.%s", prefix, s);
+			return add_entry(out, inner_idx, buf);
+		}
+
+		/* Passthrough within head */
+		snprintf(buf, sizeof(buf),
+			 "%sprojection.%s", prefix, r);
+		return add_entry(out, inner_idx, buf);
+	}
+
+passthrough:
+	snprintf(buf, sizeof(buf), "%s%s", prefix, rest);
+	return add_entry(out, inner_idx, buf);
+}
+
+/*
  * ViT backbone: detector.backbone.vision_backbone.trunk.*
  * -> detector_model.vision_encoder.backbone.*
  */
@@ -236,6 +361,81 @@ static int handle_neck(struct rename_entry *out, int inner_idx,
 	int idx, consumed;
 
 	/* convs.{i}.X -> fpn_layers.{i}.{renamed}.X */
+	if (sscanf(rest, "%d.%n", &idx, &consumed) < 1)
+		goto passthrough;
+
+	const char *attr = rest + consumed;
+
+	char fpn_prefix[SAM3_WEIGHT_NAME_MAX];
+	snprintf(fpn_prefix, sizeof(fpn_prefix), "%s%d.", prefix, idx);
+
+	/* dconv_2x2_0.X -> scale_layers.0.X */
+	r = strip_prefix(attr, "dconv_2x2_0.");
+	if (r) {
+		snprintf(buf, sizeof(buf),
+			 "%sscale_layers.0.%s", fpn_prefix, r);
+		return add_entry(out, inner_idx, buf);
+	}
+
+	/* dconv_2x2_1.X -> scale_layers.2.X (NOT 1!) */
+	r = strip_prefix(attr, "dconv_2x2_1.");
+	if (r) {
+		snprintf(buf, sizeof(buf),
+			 "%sscale_layers.2.%s", fpn_prefix, r);
+		return add_entry(out, inner_idx, buf);
+	}
+
+	/* dconv_2x2.X -> scale_layers.0.X (single deconv for 2x) */
+	r = strip_prefix(attr, "dconv_2x2.");
+	if (r) {
+		snprintf(buf, sizeof(buf),
+			 "%sscale_layers.0.%s", fpn_prefix, r);
+		return add_entry(out, inner_idx, buf);
+	}
+
+	/* conv_1x1.X -> proj1.X */
+	r = strip_prefix(attr, "conv_1x1.");
+	if (r) {
+		snprintf(buf, sizeof(buf),
+			 "%sproj1.%s", fpn_prefix, r);
+		return add_entry(out, inner_idx, buf);
+	}
+
+	/* conv_3x3.X -> proj2.X */
+	r = strip_prefix(attr, "conv_3x3.");
+	if (r) {
+		snprintf(buf, sizeof(buf),
+			 "%sproj2.%s", fpn_prefix, r);
+		return add_entry(out, inner_idx, buf);
+	}
+
+	/* Passthrough within FPN layer */
+	snprintf(buf, sizeof(buf), "%s%s", fpn_prefix, attr);
+	return add_entry(out, inner_idx, buf);
+
+passthrough:
+	snprintf(buf, sizeof(buf), "%s%s", prefix, rest);
+	return add_entry(out, inner_idx, buf);
+}
+
+/*
+ * SAM2 FPN neck: detector.backbone.vision_backbone.sam2_convs.{i}.*
+ * -> detector_model.vision_encoder.neck.sam2_fpn_layers.*
+ *
+ * Identical structure to handle_neck() (dconv_2x2, conv_1x1, conv_3x3)
+ * but writes to sam2_fpn_layers instead of fpn_layers. This duplicate
+ * FPN is used by the tracker in EfficientSAM3 checkpoints.
+ */
+static int handle_sam2_neck(struct rename_entry *out, int inner_idx,
+			    const char *rest)
+{
+	char buf[SAM3_WEIGHT_NAME_MAX];
+	const char *prefix =
+		"detector_model.vision_encoder.neck.sam2_fpn_layers.";
+	const char *r;
+	int idx, consumed;
+
+	/* sam2_convs.{i}.X -> sam2_fpn_layers.{i}.{renamed}.X */
 	if (sscanf(rest, "%d.%n", &idx, &consumed) < 1)
 		goto passthrough;
 
@@ -1321,8 +1521,12 @@ struct prefix_rule {
  * Maps PyTorch .pt key prefixes to C model names.
  */
 static const struct prefix_rule prefix_table[] = {
+	{"detector.backbone.vision_backbone.trunk.model.",
+		handle_efficientvit},
 	{"detector.backbone.vision_backbone.trunk.",
 		handle_vit},
+	{"detector.backbone.vision_backbone.sam2_convs.",
+		handle_sam2_neck},
 	{"detector.backbone.vision_backbone.convs.",
 		handle_neck},
 	{"detector.backbone.language_backbone.",
