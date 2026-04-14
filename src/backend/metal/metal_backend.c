@@ -117,36 +117,100 @@ static void metal_dequant_q8_to_f16(const struct sam3_q8_block *src,
  */
 #define METAL_MAP_TOMBSTONE ((const struct sam3_tensor *)(uintptr_t)1)
 
-static void metal_map_init(struct sam3_metal_backend *mtl)
+static int metal_map_init(struct sam3_metal_backend *mtl)
 {
-	memset(mtl->map_keys, 0, sizeof(mtl->map_keys));
+	int cap = SAM3_METAL_MAP_INIT_CAP;
+
+	mtl->map_keys = calloc((size_t)cap, sizeof(*mtl->map_keys));
+	mtl->map_vals = calloc((size_t)cap, sizeof(*mtl->map_vals));
+	if (!mtl->map_keys || !mtl->map_vals) {
+		free(mtl->map_keys);
+		free(mtl->map_vals);
+		mtl->map_keys = NULL;
+		mtl->map_vals = NULL;
+		return -1;
+	}
 	mtl->map_count = 0;
+	mtl->map_capacity = cap;
+	return 0;
 }
 
 static void metal_map_free(struct sam3_metal_backend *mtl)
 {
-	for (int i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
+	for (int i = 0; i < mtl->map_capacity; i++) {
 		if (mtl->map_keys[i] &&
 		    mtl->map_keys[i] != METAL_MAP_TOMBSTONE)
 			mlx_array_free(mtl->map_vals[i]);
 	}
-	memset(mtl->map_keys, 0, sizeof(mtl->map_keys));
+	free(mtl->map_keys);
+	free(mtl->map_vals);
+	mtl->map_keys = NULL;
+	mtl->map_vals = NULL;
 	mtl->map_count = 0;
+	mtl->map_capacity = 0;
 }
 
-static unsigned metal_map_hash(const struct sam3_tensor *ptr)
+static unsigned metal_map_slot(const struct sam3_tensor *ptr, int capacity)
 {
 	uintptr_t v = (uintptr_t)ptr;
 	v = (v >> 4) ^ (v >> 16);
-	return (unsigned)(v & (SAM3_METAL_MAP_SIZE - 1));
+	return (unsigned)(v & (unsigned)(capacity - 1));
+}
+
+/*
+ * metal_map_rehash - Double the map capacity and reinsert all entries.
+ *
+ * Tombstones are dropped during rehash, compacting the table.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int metal_map_rehash(struct sam3_metal_backend *mtl)
+{
+	int old_cap = mtl->map_capacity;
+	int new_cap = old_cap * 2;
+	unsigned mask = (unsigned)(new_cap - 1);
+
+	const struct sam3_tensor **new_keys =
+		calloc((size_t)new_cap, sizeof(*new_keys));
+	mlx_array *new_vals =
+		calloc((size_t)new_cap, sizeof(*new_vals));
+
+	if (!new_keys || !new_vals) {
+		free(new_keys);
+		free(new_vals);
+		return -1;
+	}
+
+	for (int i = 0; i < old_cap; i++) {
+		if (!mtl->map_keys[i] ||
+		    mtl->map_keys[i] == METAL_MAP_TOMBSTONE)
+			continue;
+		unsigned slot = metal_map_slot(mtl->map_keys[i], new_cap);
+		while (new_keys[slot])
+			slot = (slot + 1) & mask;
+		new_keys[slot] = mtl->map_keys[i];
+		new_vals[slot] = mtl->map_vals[i];
+	}
+
+	free(mtl->map_keys);
+	free(mtl->map_vals);
+	mtl->map_keys = new_keys;
+	mtl->map_vals = new_vals;
+	mtl->map_capacity = new_cap;
+
+	sam3_log_debug("metal: map rehashed to %d slots (%d entries)",
+		       new_cap, mtl->map_count);
+	return 0;
 }
 
 static mlx_array *metal_map_get(struct sam3_metal_backend *mtl,
 				const struct sam3_tensor *key)
 {
-	unsigned idx = metal_map_hash(key);
-	for (unsigned i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
-		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
+	int cap = mtl->map_capacity;
+	unsigned mask = (unsigned)(cap - 1);
+	unsigned idx = metal_map_slot(key, cap);
+
+	for (int i = 0; i < cap; i++) {
+		unsigned slot = (idx + (unsigned)i) & mask;
 		if (mtl->map_keys[slot] == key)
 			return &mtl->map_vals[slot];
 		if (!mtl->map_keys[slot])
@@ -159,9 +223,21 @@ static mlx_array *metal_map_get(struct sam3_metal_backend *mtl,
 static int metal_map_put(struct sam3_metal_backend *mtl,
 			 const struct sam3_tensor *key, mlx_array val)
 {
-	unsigned idx = metal_map_hash(key);
-	for (unsigned i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
-		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
+	/* Rehash at 75% load factor to keep probe chains short */
+	if (mtl->map_count >= mtl->map_capacity * 3 / 4) {
+		if (metal_map_rehash(mtl) < 0) {
+			sam3_log_error("metal: map rehash failed at %d/%d",
+				       mtl->map_count, mtl->map_capacity);
+			return -1;
+		}
+	}
+
+	int cap = mtl->map_capacity;
+	unsigned mask = (unsigned)(cap - 1);
+	unsigned idx = metal_map_slot(key, cap);
+
+	for (int i = 0; i < cap; i++) {
+		unsigned slot = (idx + (unsigned)i) & mask;
 		if (!mtl->map_keys[slot] ||
 		    mtl->map_keys[slot] == METAL_MAP_TOMBSTONE) {
 			mtl->map_keys[slot] = key;
@@ -178,9 +254,12 @@ static int metal_map_put(struct sam3_metal_backend *mtl,
 static void metal_map_evict(struct sam3_metal_backend *mtl,
 			    const struct sam3_tensor *key)
 {
-	unsigned idx = metal_map_hash(key);
-	for (unsigned i = 0; i < SAM3_METAL_MAP_SIZE; i++) {
-		unsigned slot = (idx + i) & (SAM3_METAL_MAP_SIZE - 1);
+	int cap = mtl->map_capacity;
+	unsigned mask = (unsigned)(cap - 1);
+	unsigned idx = metal_map_slot(key, cap);
+
+	for (int i = 0; i < cap; i++) {
+		unsigned slot = (idx + (unsigned)i) & mask;
 		if (mtl->map_keys[slot] == key) {
 			mlx_array_free(mtl->map_vals[slot]);
 			mtl->map_keys[slot] = METAL_MAP_TOMBSTONE;
@@ -1052,7 +1131,10 @@ static enum sam3_error metal_init(struct sam3_backend *be)
 
 	mtl->device = mlx_device_new_type(MLX_GPU, 0);
 	mtl->stream = mlx_default_gpu_stream_new();
-	metal_map_init(mtl);
+	if (metal_map_init(mtl) < 0) {
+		sam3_log_error("metal: map alloc failed");
+		return SAM3_ENOMEM;
+	}
 
 	size_t mem_limit = 0;
 	mlx_set_memory_limit(&mem_limit,
@@ -1230,28 +1312,64 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 		return SAM3_EBACKEND;
 	}
 
-	/* Phase 3: copy only final results back to host tensors */
+	/*
+	 * Phase 3: copy final results back to host tensors.
+	 *
+	 * Build all contiguous + F16-to-F32 cast operations lazily,
+	 * then evaluate them in a single batched mlx_eval call
+	 * instead of one GPU dispatch per tensor.
+	 */
 	{
 		int n_copied = 0, n_skip_inter = 0, n_skip_nodata = 0;
+
+		/* Count final outputs for scratch allocation */
+		int n_final = 0;
+		for (int i = 0; i < g->n_nodes; i++) {
+			if (is_intermediate[i])
+				continue;
+			mlx_array *out_a = metal_map_get(
+				mtl, g->nodes[i].output);
+			if (out_a && g->nodes[i].output->data)
+				n_final++;
+		}
+
+		mlx_array *readback = NULL;
+		int *rb_idx = NULL;
+
+		if (n_final > 0) {
+			readback = sam3_arena_alloc(
+				&mtl->scratch,
+				(size_t)n_final * sizeof(mlx_array));
+			rb_idx = sam3_arena_alloc(
+				&mtl->scratch,
+				(size_t)n_final * sizeof(int));
+			if (!readback || !rb_idx) {
+				sam3_log_error("metal: scratch OOM for "
+					"readback batch");
+				return SAM3_ENOMEM;
+			}
+		}
+
+		/*
+		 * Pass 1: build lazy contiguous arrays with optional
+		 * F16->F32 cast. Evict intermediate and no-data nodes.
+		 */
+		int rb_count = 0;
+		bool build_ok = true;
 		for (int i = 0; i < g->n_nodes; i++) {
 			struct sam3_tensor *out_t = g->nodes[i].output;
 			mlx_array *out_a = metal_map_get(mtl, out_t);
 			if (!out_a || !out_t->data) {
 				n_skip_nodata++;
-				goto evict;
+				goto evict_p3;
 			}
 
 			if (is_intermediate[i]) {
 				n_skip_inter++;
-				goto evict;
+				goto evict_p3;
 			}
 
 			{
-				/*
-				 * MLX transpose/reshape create views with
-				 * non-standard strides. Force row-major
-				 * contiguous layout before reading data.
-				 */
 				mlx_array contig = mlx_array_new();
 				int crc = mlx_contiguous(
 					&contig, *out_a,
@@ -1259,78 +1377,103 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 					mtl->stream);
 				if (crc) {
 					mlx_array_free(contig);
-					sam3_log_error("metal: contiguous failed");
+					sam3_log_error(
+						"metal: contiguous failed");
+					build_ok = false;
 					break;
 				}
-				{
-					mlx_vector_array va =
-						mlx_vector_array_new();
-					mlx_vector_array_append_value(va,
-								       contig);
-					mlx_eval(va);
-					mlx_vector_array_free(va);
-				}
-
-				const void *src = NULL;
-				mlx_dtype mtype = mlx_array_dtype(contig);
 
 				/*
-				 * If Metal computed in F16 but SAM3 tensor
-				 * expects F32, cast back for host readback.
+				 * If Metal computed in F16 but SAM3
+				 * tensor expects F32, add lazy cast.
 				 */
-				if (mtype == MLX_FLOAT16
+				if (mlx_array_dtype(contig) == MLX_FLOAT16
 				    && out_t->dtype == SAM3_DTYPE_F32) {
 					mlx_array f32 = mlx_array_new();
 					int cast_rc = mlx_astype(
-						&f32, contig, MLX_FLOAT32,
+						&f32, contig,
+						MLX_FLOAT32,
 						mtl->stream);
 					if (cast_rc == 0) {
 						mlx_array_free(contig);
 						contig = f32;
-						mtype = MLX_FLOAT32;
-						/* Eval the F16->F32 cast */
-						mlx_vector_array va2 =
-							mlx_vector_array_new();
-						mlx_vector_array_append_value(
-							va2, contig);
-						mlx_eval(va2);
-						mlx_vector_array_free(va2);
 					} else {
 						mlx_array_free(f32);
 					}
 				}
 
-				switch (mtype) {
-				case MLX_FLOAT32:
-					src = mlx_array_data_float32(contig);
-					break;
-				case MLX_FLOAT16:
-					src = mlx_array_data_float16(contig);
-					break;
-				case MLX_BFLOAT16:
-					src = mlx_array_data_bfloat16(contig);
-					break;
-				case MLX_INT32:
-					src = mlx_array_data_int32(contig);
-					break;
-				case MLX_INT8:
-					src = mlx_array_data_int8(contig);
-					break;
-				default:
-					sam3_log_error("metal: unsupported output dtype");
-					break;
-				}
-
-				if (src) {
-					memcpy(out_t->data, src, out_t->nbytes);
-					n_copied++;
-				}
-				mlx_array_free(contig);
+				readback[rb_count] = contig;
+				rb_idx[rb_count] = i;
+				rb_count++;
 			}
+			continue;
 
-		evict:
+		evict_p3:
 			metal_map_evict(mtl, out_t);
 		}
+
+		/* Single batched eval for all readback arrays */
+		if (build_ok && rb_count > 0) {
+			mlx_vector_array va =
+				mlx_vector_array_new();
+			for (int j = 0; j < rb_count; j++)
+				mlx_vector_array_append_value(
+					va, readback[j]);
+			int eval_rc = mlx_eval(va);
+			mlx_vector_array_free(va);
+			if (eval_rc != 0) {
+				sam3_log_error(
+					"metal: readback eval failed");
+				build_ok = false;
+			}
+		}
+
+		/* Pass 2: copy data to host and clean up */
+		for (int j = 0; j < rb_count; j++) {
+			struct sam3_tensor *out_t =
+				g->nodes[rb_idx[j]].output;
+			const void *src = NULL;
+
+			if (build_ok) {
+				mlx_dtype mtype =
+					mlx_array_dtype(readback[j]);
+				switch (mtype) {
+				case MLX_FLOAT32:
+					src = mlx_array_data_float32(
+						readback[j]);
+					break;
+				case MLX_FLOAT16:
+					src = mlx_array_data_float16(
+						readback[j]);
+					break;
+				case MLX_BFLOAT16:
+					src = mlx_array_data_bfloat16(
+						readback[j]);
+					break;
+				case MLX_INT32:
+					src = mlx_array_data_int32(
+						readback[j]);
+					break;
+				case MLX_INT8:
+					src = mlx_array_data_int8(
+						readback[j]);
+					break;
+				default:
+					sam3_log_error("metal: unsupported "
+						"output dtype");
+					break;
+				}
+			}
+
+			if (src) {
+				memcpy(out_t->data, src,
+				       out_t->nbytes);
+				n_copied++;
+			}
+			mlx_array_free(readback[j]);
+			metal_map_evict(mtl, out_t);
+		}
+
 		sam3_log_debug("metal_eval: phase3 copied=%d "
 			"skip_inter=%d skip_nodata=%d",
 			n_copied, n_skip_inter, n_skip_nodata);
