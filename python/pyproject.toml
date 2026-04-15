@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sam3"
+version = "0.1.0"
+description = "Python bindings for the SAM3 inference engine"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = [
+    "cffi>=1.15",
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
