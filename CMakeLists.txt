@@ -14,6 +14,7 @@ option(SAM3_PROFILE "Enable profiler"     OFF)
 option(SAM3_TRACE   "Enable dtype tracing" OFF)
 option(SAM3_DEBUG_DUMP "Enable debug tensor dumps to /tmp" OFF)
 option(SAM3_BLAS    "Use BLAS for CPU matmul (Accelerate/OpenBLAS/MKL)" ON)
+option(SAM3_BENCH   "Build benchmarking harness" OFF)
 
 # Auto-detect Metal on macOS
 if(APPLE AND NOT DEFINED SAM3_METAL)
@@ -143,6 +144,14 @@ if(SAM3_METAL)
 	target_link_libraries(sam3 mlxc)
 endif()
 
+# Benchmark harness library
+if(SAM3_BENCH)
+	add_definitions(-DSAM3_HAS_BENCH)
+	file(GLOB_RECURSE SAM3_BENCH_SOURCES "src/bench/*.c")
+	add_library(sam3_bench STATIC ${SAM3_BENCH_SOURCES})
+	target_link_libraries(sam3_bench sam3)
+endif()
+
 # CLI tool (unified binary with subcommands)
 add_executable(sam3_cli
 	tools/sam3_cli.c
@@ -154,6 +163,9 @@ add_executable(sam3_cli
 	tools/weight_conv_perm.c)
 target_include_directories(sam3_cli PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_cli sam3)
+if(SAM3_BENCH)
+	target_link_libraries(sam3_cli sam3_bench)
+endif()
 
 add_executable(gen_nhwc_fixtures tools/gen_nhwc_fixtures.c)
 target_link_libraries(gen_nhwc_fixtures sam3)
@@ -216,6 +228,11 @@ if(SAM3_TESTS)
 		target_sources(test_cli_common PRIVATE tools/cli_common.c)
 		target_include_directories(test_cli_common PRIVATE
 			${CMAKE_SOURCE_DIR}/tools)
+	endif()
+
+	# test_bench needs the bench harness library
+	if(SAM3_BENCH AND TARGET test_bench)
+		target_link_libraries(test_bench sam3_bench)
 	endif()
 endif()
 
