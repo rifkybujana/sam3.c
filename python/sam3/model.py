@@ -60,6 +60,7 @@ class Model:
     """
 
     def __init__(self, model_path, bpe_path=None):
+        self._closed = True
         self._ctx = lib.sam3_init()
         if self._ctx == ffi.NULL:
             raise Sam3Error(0, "Failed to initialize sam3 context")

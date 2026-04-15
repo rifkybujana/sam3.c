@@ -114,4 +114,7 @@ ffi.cdef("""
     void sam3_profile_disable(sam3_ctx *ctx);
     void sam3_profile_report(sam3_ctx *ctx);
     void sam3_profile_reset(sam3_ctx *ctx);
+
+    /* Debug */
+    enum sam3_error sam3_dump_tensors(sam3_ctx *ctx, const char *out_dir);
 """)
