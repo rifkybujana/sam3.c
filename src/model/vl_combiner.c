@@ -28,10 +28,11 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 {
 	enum sam3_error err;
 	int grid_size;
-	int backbone_dim = 1024;
+	int backbone_dim;
 
 	vl->scalp = 1;
 	vl->backbone_type = backbone_type;
+	vl->has_sam2_neck = 0;
 
 	switch (backbone_type) {
 	case SAM3_BACKBONE_HIERA:
@@ -47,6 +48,7 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 		if (err != SAM3_OK)
 			return err;
 		grid_size = vl->enc.vit.grid_size;
+		backbone_dim = vl->enc.vit.embed_dim;
 		break;
 
 	case SAM3_BACKBONE_EFFICIENTVIT: {
@@ -61,6 +63,7 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 		if (err != SAM3_OK)
 			return err;
 		grid_size = vl->enc.evit.grid_size;
+		backbone_dim = vl->enc.evit.embed_dim;
 		break;
 	}
 
@@ -76,6 +79,19 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 			      grid_size, 4, scales);
 	if (err != SAM3_OK)
 		return err;
+
+	/*
+	 * EfficientSAM3 checkpoints carry a second FPN (sam2_fpn_layers)
+	 * used by the tracker. Init with same config; loading will
+	 * pick up the sam2_fpn_layers.* tensors if present.
+	 */
+	if (backbone_type == SAM3_BACKBONE_EFFICIENTVIT) {
+		err = sam3_neck_init(&vl->sam2_neck, 256, backbone_dim,
+				      grid_size, 4, scales);
+		if (err != SAM3_OK)
+			return err;
+		vl->has_sam2_neck = 1;
+	}
 
 	/* Init tokenizer (byte-level fallback vocab) */
 	err = sam3_tokenizer_init(&vl->tokenizer);
@@ -128,6 +144,18 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 	err = sam3_neck_load(&vl->neck, wf, arena);
 	if (err != SAM3_OK)
 		return err;
+
+	if (vl->has_sam2_neck) {
+		err = sam3_neck_load_prefixed(
+			&vl->sam2_neck, wf, arena,
+			"detector_model.vision_encoder.neck."
+			"sam2_fpn_layers.");
+		if (err != SAM3_OK)
+			return err;
+		sam3_log_info("vl_backbone: sam2_fpn_layers loaded "
+			      "(backbone_dim=%d)",
+			      vl->sam2_neck.backbone_dim);
+	}
 
 	err = sam3_text_encoder_load(&vl->text_enc, wf, arena);
 	if (err != SAM3_OK)

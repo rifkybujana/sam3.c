@@ -33,6 +33,8 @@ struct sam3_vl_backbone {
 		struct sam3_efficientvit evit;
 	} enc;
 	struct sam3_neck neck;
+	struct sam3_neck sam2_neck;	/* sam2_fpn_layers (EfficientSAM3) */
+	int has_sam2_neck;		/* 1 if sam2_neck is initialized */
 	struct sam3_text_encoder text_enc;
 	struct sam3_tokenizer tokenizer;
 	struct sam3_pos_encoding pos_enc;

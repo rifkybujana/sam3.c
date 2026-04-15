@@ -70,15 +70,31 @@ enum sam3_error sam3_neck_init(struct sam3_neck *neck,
  * @wf:    Open weight file (may be NULL for zero-init fallback)
  * @arena: Arena for weight tensor allocation
  *
- * Looks up weight tensors by name and populates the struct. When a
- * weight is not found (or wf is NULL), a zero-initialized tensor of
- * the correct shape is allocated as a fallback.
+ * Loads from the default prefix "...neck.fpn_layers.". When a weight
+ * is not found (or wf is NULL), a zero-initialized tensor of the
+ * correct shape is allocated as a fallback.
  *
  * Returns SAM3_OK on success, SAM3_ENOMEM if the arena is full.
  */
 enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			       const struct sam3_weight_file *wf,
 			       struct sam3_arena *arena);
+
+/*
+ * sam3_neck_load_prefixed - Load neck weights with a custom prefix.
+ *
+ * @neck:   Initialized neck struct
+ * @wf:     Open weight file (may be NULL for zero-init fallback)
+ * @arena:  Arena for weight tensor allocation
+ * @prefix: Weight name prefix (e.g. "...neck.sam2_fpn_layers.")
+ *
+ * Same as sam3_neck_load but uses the given prefix for tensor lookups.
+ * Returns SAM3_OK on success, SAM3_ENOMEM if the arena is full.
+ */
+enum sam3_error sam3_neck_load_prefixed(struct sam3_neck *neck,
+					const struct sam3_weight_file *wf,
+					struct sam3_arena *arena,
+					const char *prefix);
 
 /*
  * sam3_neck_build - Build neck compute graph.

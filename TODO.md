@@ -60,8 +60,8 @@ Model builder is hardcoded to Hiera. Need runtime backbone routing.
 
 `vl_combiner.c` hardcodes `backbone_dim=1024` (Hiera). EfficientViT-B2 outputs 384.
 
-- [ ] Make `backbone_dim` configurable per backbone type in `sam3_vl_backbone_init`
-- [ ] Verify sam2_fpn_layers tensors are loaded when present
+- [x] Make `backbone_dim` configurable per backbone type in `sam3_vl_backbone_init`
+- [x] Verify sam2_fpn_layers tensors are loaded when present
 
 ## Tests
 

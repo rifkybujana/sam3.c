@@ -227,21 +227,24 @@ static void compute_conv_dims(struct sam3_neck *neck, int i, int j,
 }
 
 /*
- * Weight name prefix for neck weights in the .sam3 file.
+ * Default weight name prefix for neck weights in the .sam3 file.
  * Original PyTorch: detector_model.vision_encoder.neck.fpn_layers.*
  */
 #define NECK_P "detector_model.vision_encoder.neck.fpn_layers."
 
 /*
- * neck_weight_name - Build correct weight name for a neck conv layer.
+ * neck_weight_name_ex - Build weight name for a neck conv layer.
  *
  * Maps internal (stage, conv_idx) to PyTorch naming convention:
  *   - ConvTranspose2d layers → scale_layers.{seq_idx}
  *   - Last two Conv2d layers → proj1 and proj2
+ *
+ * @prefix: weight name prefix (e.g. NECK_P or sam2 variant)
  */
-static void neck_weight_name(char *buf, size_t buflen,
-			     struct sam3_neck *neck,
-			     int stage, int j, const char *suffix)
+static void neck_weight_name_ex(char *buf, size_t buflen,
+				const char *prefix,
+				struct sam3_neck *neck,
+				int stage, int j, const char *suffix)
 {
 	int n = neck->stages[stage].n_convs;
 
@@ -249,22 +252,23 @@ static void neck_weight_name(char *buf, size_t buflen,
 		/* Scale layers: ConvTranspose2d for upsampling */
 		int seq = neck->stages[stage].seq_idx[j];
 		snprintf(buf, buflen,
-			 NECK_P "%d.scale_layers.%d.%s",
-			 stage, seq, suffix);
+			 "%s%d.scale_layers.%d.%s",
+			 prefix, stage, seq, suffix);
 	} else if (j == n - 2) {
 		/* Second-to-last non-transpose conv → proj1 (1x1) */
 		snprintf(buf, buflen,
-			 NECK_P "%d.proj1.%s", stage, suffix);
+			 "%s%d.proj1.%s", prefix, stage, suffix);
 	} else {
 		/* Last conv → proj2 (3x3) */
 		snprintf(buf, buflen,
-			 NECK_P "%d.proj2.%s", stage, suffix);
+			 "%s%d.proj2.%s", prefix, stage, suffix);
 	}
 }
 
-enum sam3_error sam3_neck_load(struct sam3_neck *neck,
-			       const struct sam3_weight_file *wf,
-			       struct sam3_arena *arena)
+enum sam3_error sam3_neck_load_prefixed(struct sam3_neck *neck,
+					const struct sam3_weight_file *wf,
+					struct sam3_arena *arena,
+					const char *prefix)
 {
 	char name[128];
 
@@ -281,8 +285,8 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 			 */
 			int w_dims[4] = {c_out, kh, kw, c_in};
 
-			neck_weight_name(name, sizeof(name),
-					 neck, i, j, "weight");
+			neck_weight_name_ex(name, sizeof(name), prefix,
+					     neck, i, j, "weight");
 			neck->stages[i].conv_w[j] = gh_load_mmap(
 				wf, name, arena, SAM3_DTYPE_F32,
 				4, w_dims);
@@ -290,8 +294,8 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 				return SAM3_ENOMEM;
 
 			int b_dims[] = {c_out};
-			neck_weight_name(name, sizeof(name),
-					 neck, i, j, "bias");
+			neck_weight_name_ex(name, sizeof(name), prefix,
+					     neck, i, j, "bias");
 			neck->stages[i].conv_b[j] = gh_load_mmap(
 				wf, name, arena, SAM3_DTYPE_F32,
 				1, b_dims);
@@ -301,6 +305,13 @@ enum sam3_error sam3_neck_load(struct sam3_neck *neck,
 	}
 
 	return SAM3_OK;
+}
+
+enum sam3_error sam3_neck_load(struct sam3_neck *neck,
+			       const struct sam3_weight_file *wf,
+			       struct sam3_arena *arena)
+{
+	return sam3_neck_load_prefixed(neck, wf, arena, NECK_P);
 }
 
 /*
