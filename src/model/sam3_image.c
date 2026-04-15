@@ -452,7 +452,7 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 					x = gh_conv2d(&g_stage, scratch, x,
 						model->backbone.neck.stages[si].conv_w[j],
 						model->backbone.neck.stages[si].conv_b[j],
-						1, pad);
+						1, pad, 1);
 				}
 				if (!x) return SAM3_ENOMEM;
 
@@ -2434,7 +2434,7 @@ enum sam3_error sam3_image_model_segment(
 						  pe_wrap,
 						  model->seg_head.inst_proj_w,
 						  model->seg_head.inst_proj_b,
-						  1, 0);
+						  1, 0, 1);
 				if (!inst) {
 					sam3_log_error("seg: inst proj build failed");
 					err = SAM3_ENOMEM;

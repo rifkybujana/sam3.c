@@ -554,7 +554,7 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	struct sam3_tensor *conv_out;
 	conv_out = gh_conv2d(&g, scratch, image_nhwc,
 				  vit->patch_embed_w, NULL,
-				  vit->patch_size, 0);
+				  vit->patch_size, 0, 1);
 	if (!conv_out)
 		return NULL;
 

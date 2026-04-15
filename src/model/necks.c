@@ -342,7 +342,7 @@ static struct sam3_tensor *build_stage(struct sam3_neck *neck,
 			x = gh_conv2d(g, arena, x,
 				neck->stages[stage].conv_w[j],
 				neck->stages[stage].conv_b[j],
-				1, padding);
+				1, padding, 1);
 		}
 		if (!x)
 			return NULL;

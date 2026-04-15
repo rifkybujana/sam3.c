@@ -1048,7 +1048,7 @@ enum sam3_error sam3_mask_decoder_build(
 		struct sam3_tensor *skip1;
 		skip1 = gh_conv2d(g, arena, feat_s1,
 					dec->conv_s1_w, dec->conv_s1_b,
-					1, 0);
+					1, 0, 1);
 		if (!skip1)
 			return SAM3_ENOMEM;
 		px = gh_add(g, arena, px, skip1);
@@ -1102,7 +1102,7 @@ enum sam3_error sam3_mask_decoder_build(
 		struct sam3_tensor *skip0;
 		skip0 = gh_conv2d(g, arena, feat_s0,
 					dec->conv_s0_w, dec->conv_s0_b,
-					1, 0);
+					1, 0, 1);
 		if (!skip0)
 			return SAM3_ENOMEM;
 		px = gh_add(g, arena, px, skip0);

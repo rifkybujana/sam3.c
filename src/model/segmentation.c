@@ -310,7 +310,7 @@ static struct sam3_tensor *build_pixel_decoder(
 		prev = gh_conv2d(g, a, prev,
 				      head->fpn[i].conv_w,
 				      head->fpn[i].conv_b,
-				      1, 1);
+				      1, 1, 1);
 		if (!prev) {
 			sam3_log_error("seg: FPN stage %d conv fail", i);
 			return NULL;
@@ -412,7 +412,7 @@ struct sam3_tensor *sam3_seg_head_build_fpn(
 	struct sam3_tensor *inst = gh_conv2d(g, arena, pixel_embed,
 						  head->inst_proj_w,
 						  head->inst_proj_b,
-						  1, 0);
+						  1, 0, 1);
 	return inst;
 }
 
@@ -495,7 +495,7 @@ struct sam3_tensor *sam3_seg_head_build(
 	struct sam3_tensor *inst = gh_conv2d(g, arena, pixel_embed,
 						  head->inst_proj_w,
 						  head->inst_proj_b,
-						  1, 0);
+						  1, 0, 1);
 	if (!inst) {
 		sam3_log_error("seg: instance projection failed");
 		return NULL;

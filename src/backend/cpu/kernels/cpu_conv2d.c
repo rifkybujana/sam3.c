@@ -332,7 +332,7 @@ static enum sam3_error
 conv2d_nchw_body_f32(const struct sam3_tensor *input,
 		     const struct sam3_tensor *weight,
 		     struct sam3_tensor *output,
-		     int stride, int pad,
+		     int stride, int pad, int groups,
 		     struct sam3_arena *scratch,
 		     struct sam3_threadpool *pool)
 {
@@ -352,10 +352,14 @@ conv2d_nchw_body_f32(const struct sam3_tensor *input,
 	int OH = (H + 2 * pad - KH) / stride + 1;
 	int OW = (W + 2 * pad - KW) / stride + 1;
 
+	int cpg_in = C / groups;
+	int cpg_out = OC / groups;
+
 	size_t saved_offset = scratch->offset;
 
-	/* Allocate im2col buffer: [C*KH*KW, OH*OW] */
-	size_t col_size = (size_t)(C * KH * KW) * (OH * OW) * sizeof(float);
+	/* Allocate im2col buffer: [cpg_in*KH*KW, OH*OW] */
+	size_t col_size = (size_t)(cpg_in * KH * KW) * (OH * OW) *
+			  sizeof(float);
 	float *col = (float *)sam3_arena_alloc(scratch, col_size);
 	if (!col) {
 		sam3_log_error("conv2d: scratch OOM (%zu bytes)", col_size);
@@ -366,33 +370,42 @@ conv2d_nchw_body_f32(const struct sam3_tensor *input,
 	const float *w_data = (const float *)weight->data;
 
 	for (int n = 0; n < N_batch; n++) {
-		const float *in_n = (const float *)input->data +
-				    n * C * H * W;
-		float *out_n = (float *)output->data +
-			       n * OC * OH * OW;
+		for (int g = 0; g < groups; g++) {
+			const float *in_n = (const float *)input->data +
+					    n * C * H * W +
+					    g * cpg_in * H * W;
+			float *out_n = (float *)output->data +
+				       n * OC * OH * OW +
+				       g * cpg_out * OH * OW;
+			const float *w_g = w_data +
+					   g * cpg_out * cpg_in * KH * KW;
 
-		im2col_f32(in_n, col, C, H, W, KH, KW, stride, pad, OH, OW);
+			im2col_f32(in_n, col, cpg_in, H, W, KH, KW,
+				   stride, pad, OH, OW);
 
 #ifdef SAM3_HAS_BLAS
-		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-			    OC, OH * OW, C * KH * KW,
-			    1.0f,
-			    w_data, C * KH * KW,
-			    col, OH * OW,
-			    0.0f,
-			    out_n, OH * OW);
+			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+				    cpg_out, OH * OW, cpg_in * KH * KW,
+				    1.0f,
+				    w_g, cpg_in * KH * KW,
+				    col, OH * OW,
+				    0.0f,
+				    out_n, OH * OW);
 #else
-		/* Parallel matmul: weight [OC, C*KH*KW] @ col -> out [OC, OH*OW] */
-		struct conv2d_matmul_ctx mctx = {
-			.a = w_data, .b = col, .c = out_n,
-			.M = OC, .K = C * KH * KW, .N = OH * OW,
-		};
-		int n_tasks = sam3_threadpool_n_threads(pool);
-		if (n_tasks < 1)
-			n_tasks = 1;
-		sam3_threadpool_parallel_for(pool, conv2d_matmul_parallel_fn,
-					     &mctx, n_tasks);
+			struct conv2d_matmul_ctx mctx = {
+				.a = w_g, .b = col, .c = out_n,
+				.M = cpg_out,
+				.K = cpg_in * KH * KW,
+				.N = OH * OW,
+			};
+			int n_tasks = sam3_threadpool_n_threads(pool);
+			if (n_tasks < 1)
+				n_tasks = 1;
+			sam3_threadpool_parallel_for(pool,
+						     conv2d_matmul_parallel_fn,
+						     &mctx, n_tasks);
 #endif
+		}
 	}
 
 	scratch->offset = saved_offset;
@@ -447,9 +460,18 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 	int KW = weight->dims[2];
 	int KIC = weight->dims[3];
 
-	if (KIC != C_in) {
-		sam3_log_error("conv2d: channel mismatch %d != %d",
-			       KIC, C_in);
+	int stride = node->params[0] > 0 ? node->params[0] : 1;
+	int pad = node->params[1];
+	int groups = node->params[2] > 0 ? node->params[2] : 1;
+
+	if (KIC * groups != C_in) {
+		sam3_log_error("conv2d: channel mismatch %d*%d != %d",
+			       KIC, groups, C_in);
+		return SAM3_EINVAL;
+	}
+
+	if (C_in % groups != 0 || C_out % groups != 0) {
+		sam3_log_error("conv2d: channels not divisible by groups");
 		return SAM3_EINVAL;
 	}
 
@@ -460,14 +482,11 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	int stride = node->params[0] > 0 ? node->params[0] : 1;
-	int pad = node->params[1];
-
 	size_t elem_sz = sizeof(float);
 	size_t saved_offset = scratch->offset;
 
 	size_t in_bytes = (size_t)N_batch * C_in * H * W * elem_sz;
-	size_t wt_bytes = (size_t)C_out * C_in * KH * KW * elem_sz;
+	size_t wt_bytes = (size_t)C_out * KIC * KH * KW * elem_sz;
 	size_t out_bytes = (size_t)N_batch * C_out * OH * OW * elem_sz;
 
 	uint8_t *in_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
@@ -486,7 +505,7 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 	sam3_cpu_nhwc_to_nchw_bytes((const uint8_t *)input->data, in_nchw,
 				    N_batch, H, W, C_in, elem_sz);
 	sam3_cpu_ohwi_to_oihw_bytes((const uint8_t *)weight->data, wt_oihw,
-				    C_out, KH, KW, C_in, elem_sz);
+				    C_out, KH, KW, KIC, elem_sz);
 
 	struct sam3_tensor input_nchw = *input;
 	input_nchw.dims[0] = N_batch;
@@ -499,7 +518,7 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 
 	struct sam3_tensor weight_oihw = *weight;
 	weight_oihw.dims[0] = C_out;
-	weight_oihw.dims[1] = C_in;
+	weight_oihw.dims[1] = KIC;
 	weight_oihw.dims[2] = KH;
 	weight_oihw.dims[3] = KW;
 	weight_oihw.data = wt_oihw;
@@ -518,7 +537,7 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 	enum sam3_error err = conv2d_nchw_body_f32(&input_nchw,
 						   &weight_oihw,
 						   &output_nchw,
-						   stride, pad,
+						   stride, pad, groups,
 						   scratch, pool);
 	if (err != SAM3_OK) {
 		scratch->offset = saved_offset;
