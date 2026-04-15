@@ -111,6 +111,7 @@ struct sam3_efficientvit {
 	int expand_ratio;	/* MBConv expansion ratio (4) */
 	int img_size;		/* input image size (512 or 1024) */
 	int grid_size;		/* output spatial size = img_size / 32 */
+	int embed_dim;		/* projection output dim (1024 for SAM3) */
 
 	/* Input stem: Conv2d(3->w0, s=2) + BN + HSwish */
 	struct sam3_evit_conv_weights stem_conv;
@@ -125,10 +126,10 @@ struct sam3_efficientvit {
 	/* Stages 1-4 (indices 0-3, corresponding to width_list[1..4]) */
 	struct sam3_evit_stage stages[4];
 
-	/* Projection head: Conv1x1 -> BN -> Conv3x3 */
-	struct sam3_evit_conv_weights proj_conv1;	/* 1x1 */
-	struct sam3_evit_conv_weights proj_bn;		/* BN only (no conv) */
-	struct sam3_evit_conv_weights proj_conv2;	/* 3x3 */
+	/* Projection head: Conv1x1 -> BN -> GELU -> Conv3x3 */
+	struct sam3_evit_conv_weights proj_conv1;	/* 1x1, final_ch -> embed_dim */
+	struct sam3_evit_conv_weights proj_bn;		/* BN(embed_dim) */
+	struct sam3_evit_conv_weights proj_conv2;	/* 3x3, embed_dim -> embed_dim + bias */
 };
 
 /*
@@ -140,6 +141,7 @@ struct sam3_efficientvit {
  * @attn_dim:     LiteMLA head dimension (32)
  * @expand_ratio: MBConv expansion ratio (4)
  * @img_size:     Input image size (512 or 1024)
+ * @embed_dim:    Projection output dimension (1024 for SAM3)
  *
  * Sets dimensions, computes grid_size (img_size/32), configures which
  * stages use attention blocks. Returns SAM3_OK on success.
@@ -149,7 +151,8 @@ enum sam3_error sam3_efficientvit_init(struct sam3_efficientvit *evit,
 				       const int *depth_list,
 				       int attn_dim,
 				       int expand_ratio,
-				       int img_size);
+				       int img_size,
+				       int embed_dim);
 
 /*
  * sam3_efficientvit_load - Load EfficientViT weights from weight file.

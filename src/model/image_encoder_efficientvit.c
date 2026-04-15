@@ -24,6 +24,7 @@
 #include "image_encoder_efficientvit.h"
 #include "graph_helpers.h"
 #include "util/log.h"
+#include "util/profile.h"
 
 #define EVIT_PREFIX "detector_model.vision_encoder.backbone."
 
@@ -34,7 +35,8 @@ enum sam3_error sam3_efficientvit_init(struct sam3_efficientvit *evit,
 				       const int *depth_list,
 				       int attn_dim,
 				       int expand_ratio,
-				       int img_size)
+				       int img_size,
+				       int embed_dim)
 {
 	memset(evit, 0, sizeof(*evit));
 
@@ -58,6 +60,7 @@ enum sam3_error sam3_efficientvit_init(struct sam3_efficientvit *evit,
 	evit->expand_ratio = expand_ratio;
 	evit->img_size = img_size;
 	evit->grid_size = img_size / 32;
+	evit->embed_dim = embed_dim;
 
 	/* Input stem has depth_list[0] residual DSConv blocks */
 	evit->n_stem_blocks = depth_list[0];
@@ -413,16 +416,17 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 	/* ── Projection head ─────────────────────────────────────── */
 
 	/*
-	 * Projection: conv1(1x1) -> BN -> conv2(3x3, pad=1).
-	 * The BN here uses a different naming convention:
-	 *   projection.bn.weight (not projection.bn.norm.weight)
+	 * Projection: conv1(1x1, final_ch -> embed_dim) -> BN(embed_dim)
+	 *             -> GELU -> conv2(3x3, embed_dim -> embed_dim + bias).
+	 * BN uses naming: projection.bn.{weight,bias,...} (not .norm.).
 	 */
 	int final_ch = evit->width_list[4];
+	int ed = evit->embed_dim;
 
-	/* proj_conv1: 1x1, no BN, no bias */
+	/* proj_conv1: 1x1, final_ch -> embed_dim, no BN, no bias */
 	{
 		char name[256];
-		int w_dims[] = {final_ch, 1, 1, final_ch};
+		int w_dims[] = {ed, 1, 1, final_ch};
 		snprintf(name, sizeof(name),
 			 EVIT_PREFIX "projection.conv1.weight");
 		evit->proj_conv1.conv_w = gh_load_mmap(wf, name, arena,
@@ -432,10 +436,10 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 			return SAM3_ENOMEM;
 	}
 
-	/* proj_bn: BN with projection.bn.{weight,bias,running_mean,running_var} */
+	/* proj_bn: BN(embed_dim) */
 	{
 		char name[256];
-		int bn_dims[] = {final_ch};
+		int bn_dims[] = {ed};
 
 		snprintf(name, sizeof(name),
 			 EVIT_PREFIX "projection.bn.weight");
@@ -470,16 +474,25 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 			return SAM3_ENOMEM;
 	}
 
-	/* proj_conv2: 3x3, no BN, no bias */
+	/* proj_conv2: 3x3, embed_dim -> embed_dim, with bias, no BN */
 	{
 		char name[256];
-		int w_dims[] = {final_ch, 3, 3, final_ch};
+		int w_dims[] = {ed, 3, 3, ed};
 		snprintf(name, sizeof(name),
 			 EVIT_PREFIX "projection.conv2.weight");
 		evit->proj_conv2.conv_w = gh_load_mmap(wf, name, arena,
 							 SAM3_DTYPE_F32,
 							 4, w_dims);
 		if (!evit->proj_conv2.conv_w)
+			return SAM3_ENOMEM;
+
+		int b_dims[] = {ed};
+		snprintf(name, sizeof(name),
+			 EVIT_PREFIX "projection.conv2.bias");
+		evit->proj_conv2.conv_b = gh_load_mmap(wf, name, arena,
+							 SAM3_DTYPE_F32,
+							 1, b_dims);
+		if (!evit->proj_conv2.conv_b)
 			return SAM3_ENOMEM;
 	}
 
@@ -490,7 +503,288 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 	return SAM3_OK;
 }
 
-/* ── Graph construction (stub) ───────────────────────────────────── */
+/* ── Graph construction helpers ──────────────────────────────────── */
+
+/*
+ * evit_conv_bn - Apply conv2d + optional BN (no activation).
+ *
+ * Caller applies activation (HSwish, GELU) separately.
+ */
+static struct sam3_tensor *evit_conv_bn(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *x,
+	const struct sam3_evit_conv_weights *cw,
+	int stride, int padding, int groups)
+{
+	x = gh_conv2d(g, a, x, cw->conv_w, cw->conv_b,
+		      stride, padding, groups);
+	if (!x)
+		return NULL;
+
+	if (cw->bn_w) {
+		x = gh_batchnorm(g, a, x, cw->bn_w, cw->bn_b,
+				   cw->bn_mean, cw->bn_var);
+		if (!x)
+			return NULL;
+	}
+
+	return x;
+}
+
+/*
+ * evit_mbconv_forward - Evaluate one MBConv block.
+ *
+ * inverted_conv(1x1) -> depth_conv(3x3 DW) -> point_conv(1x1).
+ * Activation (HSwish) after inverted and depth convs.
+ * No activation after point conv.
+ */
+static struct sam3_tensor *evit_mbconv_forward(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *x,
+	const struct sam3_evit_block *block,
+	int stride, int mid_ch)
+{
+	/* inverted_conv: 1x1 */
+	x = evit_conv_bn(g, a, x, &block->inverted_conv, 1, 0, 1);
+	if (!x)
+		return NULL;
+	x = gh_hswish(g, a, x);
+	if (!x)
+		return NULL;
+
+	/* depth_conv: 3x3 depthwise */
+	x = evit_conv_bn(g, a, x, &block->depth_conv,
+			   stride, 1, mid_ch);
+	if (!x)
+		return NULL;
+	x = gh_hswish(g, a, x);
+	if (!x)
+		return NULL;
+
+	/* point_conv: 1x1, no activation */
+	x = evit_conv_bn(g, a, x, &block->point_conv, 1, 0, 1);
+	return x;
+}
+
+/*
+ * evit_litemla_head - Linear attention for a single head.
+ *
+ * @qkv_2d:  QKV data for this head [H*W, 3*dim]
+ * @ones_1d: Pre-allocated ones vector [H*W]
+ * @dim:     Attention head dimension
+ *
+ * Returns attention output [H*W, dim].
+ */
+static struct sam3_tensor *evit_litemla_head(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *qkv_2d,
+	struct sam3_tensor *ones_1d,
+	int dim)
+{
+	/* Split q, k, v: each [H*W, dim] */
+	struct sam3_tensor *q, *k, *v;
+	q = gh_slice(g, a, qkv_2d, 1, 0, dim);
+	if (!q)
+		return NULL;
+	k = gh_slice(g, a, qkv_2d, 1, dim, 2 * dim);
+	if (!k)
+		return NULL;
+	v = gh_slice(g, a, qkv_2d, 1, 2 * dim, 3 * dim);
+	if (!v)
+		return NULL;
+
+	/* ReLU kernel */
+	q = gh_relu(g, a, q);
+	if (!q)
+		return NULL;
+	k = gh_relu(g, a, k);
+	if (!k)
+		return NULL;
+
+	/*
+	 * Ones-padding trick for normalization:
+	 * v_pad = concat([v, ones], axis=1) → [H*W, dim+1]
+	 */
+	int hw = qkv_2d->dims[0];
+	int ones_dims[] = {hw, 1};
+	struct sam3_tensor *ones_col;
+	ones_col = gh_reshape(g, a, ones_1d, 2, ones_dims);
+	if (!ones_col)
+		return NULL;
+
+	struct sam3_tensor *cat_inputs[] = {v, ones_col};
+	struct sam3_tensor *v_pad;
+	v_pad = gh_concat(g, a, cat_inputs, 2, 1); /* [H*W, dim+1] */
+	if (!v_pad)
+		return NULL;
+
+	/*
+	 * Linear attention matmuls:
+	 *   v_padT @ k  → [dim+1, dim]
+	 *   (v_padT@k) @ qT → [dim+1, H*W]
+	 */
+	struct sam3_tensor *v_padT = gh_transpose(g, a, v_pad);
+	if (!v_padT)
+		return NULL;
+	struct sam3_tensor *qT = gh_transpose(g, a, q);
+	if (!qT)
+		return NULL;
+
+	struct sam3_tensor *vk = gh_matmul(g, a, v_padT, k);
+	if (!vk)
+		return NULL;
+
+	struct sam3_tensor *out = gh_matmul(g, a, vk, qT);
+	if (!out)
+		return NULL;
+	/* out: [dim+1, H*W] */
+
+	/* Split numerator / denominator */
+	struct sam3_tensor *numer, *denom;
+	numer = gh_slice(g, a, out, 0, 0, dim);     /* [dim, H*W] */
+	if (!numer)
+		return NULL;
+	denom = gh_slice(g, a, out, 0, dim, dim + 1); /* [1, H*W] */
+	if (!denom)
+		return NULL;
+
+	/* Reshape denom to 1D for broadcasting: [H*W] */
+	int denom_1d_dims[] = {hw};
+	denom = gh_reshape(g, a, denom, 1, denom_1d_dims);
+	if (!denom)
+		return NULL;
+
+	/* Normalize: numer / denom with last-dim broadcast */
+	struct sam3_tensor *result = gh_div(g, a, numer, denom);
+	if (!result)
+		return NULL;
+	/* result: [dim, H*W] */
+
+	/* Transpose back to [H*W, dim] */
+	result = gh_transpose(g, a, result);
+	return result;
+}
+
+/*
+ * evit_litemla_forward - Full LiteMLA context module.
+ *
+ * @x:       Input [1, H, W, channels] NHWC
+ * @ctx:     LiteMLA weights
+ * @channels: Channel count
+ * @attn_dim: Head dimension
+ *
+ * Returns LiteMLA output [1, H, W, channels] after proj + BN.
+ * Does NOT add skip connection — caller handles that.
+ */
+static struct sam3_tensor *evit_litemla_forward(
+	struct sam3_graph *g, struct sam3_arena *a,
+	struct sam3_tensor *x,
+	const struct sam3_evit_litemla_weights *ctx,
+	int channels, int attn_dim)
+{
+	int H = x->dims[1];
+	int W = x->dims[2];
+	int hw = H * W;
+	int n_heads = channels / attn_dim;
+	int qkv_ch = 3 * channels;
+	int n_scales = 2; /* identity + 1 aggregated scale */
+	int total_heads = n_scales * n_heads;
+
+	/* qkv: Conv1x1(channels, 3*channels) — no BN, no act */
+	struct sam3_tensor *qkv;
+	qkv = gh_conv2d(g, a, x, ctx->qkv.conv_w, NULL, 1, 0, 1);
+	if (!qkv)
+		return NULL;
+	/* qkv: [1, H, W, qkv_ch] */
+
+	/* aggreg: DWConv(5x5) + PWConv(1x1, grouped) */
+	struct sam3_tensor *agg;
+	agg = gh_conv2d(g, a, qkv, ctx->aggreg_dw.conv_w, NULL,
+			  1, 2, qkv_ch); /* 5x5 DW, pad=2, groups=qkv_ch */
+	if (!agg)
+		return NULL;
+	agg = gh_conv2d(g, a, agg, ctx->aggreg_pw.conv_w, NULL,
+			  1, 0, 3 * n_heads); /* 1x1, groups=3*n_heads */
+	if (!agg)
+		return NULL;
+	/* agg: [1, H, W, qkv_ch] */
+
+	/* concat identity qkv + aggregated: [1, H, W, 2*qkv_ch] */
+	struct sam3_tensor *cat_inputs[] = {qkv, agg};
+	struct sam3_tensor *multi;
+	multi = gh_concat(g, a, cat_inputs, 2, 3); /* concat on C axis */
+	if (!multi)
+		return NULL;
+
+	/*
+	 * Flatten spatial and reshape for per-head processing:
+	 * [1, H, W, 2*qkv_ch] → [H*W, total_heads, 3*dim]
+	 */
+	int flat_dims[] = {hw, total_heads, 3 * attn_dim};
+	multi = gh_reshape(g, a, multi, 3, flat_dims);
+	if (!multi)
+		return NULL;
+
+	/*
+	 * Create ones vector [H*W] for the padding trick.
+	 * Only the struct is allocated from scratch; we fill data
+	 * directly since this runs once per build.
+	 */
+	int ones_dims[] = {hw};
+	struct sam3_tensor *ones_1d;
+	ones_1d = gh_alloc_tensor(a, SAM3_DTYPE_F32, 1, ones_dims);
+	if (!ones_1d)
+		return NULL;
+	{
+		float *od = (float *)ones_1d->data;
+		for (int i = 0; i < hw; i++)
+			od[i] = 1.0f;
+	}
+
+	/*
+	 * Per-head linear attention.
+	 * Slice each head [H*W, 3*dim], compute attention, collect.
+	 */
+	struct sam3_tensor *head_outputs[128]; /* 2*n_heads, max ~24 */
+	for (int h = 0; h < total_heads; h++) {
+		/* Slice head h from dim 1: [H*W, 3*dim] */
+		int h_dims[] = {hw, 3 * attn_dim};
+		struct sam3_tensor *head_qkv;
+
+		/* multi is [H*W, total_heads, 3*dim] — slice dim 1 */
+		head_qkv = gh_slice(g, a, multi, 1, h, h + 1);
+		if (!head_qkv)
+			return NULL;
+		/* [H*W, 1, 3*dim] → reshape to [H*W, 3*dim] */
+		head_qkv = gh_reshape(g, a, head_qkv, 2, h_dims);
+		if (!head_qkv)
+			return NULL;
+
+		head_outputs[h] = evit_litemla_head(g, a, head_qkv,
+						      ones_1d, attn_dim);
+		if (!head_outputs[h])
+			return NULL;
+		/* head_outputs[h]: [H*W, dim] */
+	}
+
+	/* Concat all heads: [H*W, total_heads * dim] = [H*W, 2*channels] */
+	struct sam3_tensor *attn_out;
+	attn_out = gh_concat(g, a, head_outputs, total_heads, 1);
+	if (!attn_out)
+		return NULL;
+
+	/* Reshape back to spatial: [1, H, W, 2*channels] */
+	int spatial_dims[] = {1, H, W, n_scales * channels};
+	attn_out = gh_reshape(g, a, attn_out, 4, spatial_dims);
+	if (!attn_out)
+		return NULL;
+
+	/* proj: Conv1x1(2*channels -> channels) + BN */
+	attn_out = evit_conv_bn(g, a, attn_out, &ctx->proj, 1, 0, 1);
+	return attn_out;
+}
+
+/* ── Main graph construction ─────────────────────────────────────── */
 
 struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 					     struct sam3_backend *be,
@@ -499,14 +793,197 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 					     struct sam3_arena *persist,
 					     struct sam3_profiler *profiler)
 {
-	(void)be;
-	(void)image;
-	(void)scratch;
-	(void)persist;
-	(void)profiler;
+	struct sam3_graph g;
+	enum sam3_error err;
+	int gs = evit->grid_size;
+	int w0 = evit->width_list[0];
 
-	sam3_log_error("evit_build: not yet implemented "
-		       "(grid=%d, final_ch=%d)",
-		       evit->grid_size, evit->width_list[4]);
-	return NULL;
+	sam3_graph_init(&g);
+
+	SAM3_PROF_BEGIN(profiler, "evit_build");
+
+	/*
+	 * Image preprocessing: CHW [3, img, img] → NHWC [1, img, img, 3].
+	 * Matches the Hiera ViT input convention.
+	 */
+	int nchw_dims[] = {1, 3, evit->img_size, evit->img_size};
+	struct sam3_tensor *x;
+	x = gh_reshape(&g, scratch, image, 4, nchw_dims);
+	if (!x)
+		return NULL;
+	int chw_to_hwc[] = {0, 2, 3, 1};
+	x = gh_permute(&g, scratch, x, chw_to_hwc);
+	if (!x)
+		return NULL;
+	/* x: [1, img, img, 3] NHWC */
+
+	/* ── Input stem ──────────────────────────────────────────── */
+
+	/* Conv2d(3 -> w0, k=3, s=2, p=1) + BN + HSwish */
+	x = evit_conv_bn(&g, scratch, x, &evit->stem_conv, 2, 1, 1);
+	if (!x)
+		return NULL;
+	x = gh_hswish(&g, scratch, x);
+	if (!x)
+		return NULL;
+	/* x: [1, img/2, img/2, w0] */
+
+	/* Stem residual DSConv blocks */
+	for (int i = 0; i < evit->n_stem_blocks; i++) {
+		struct sam3_tensor *skip = x;
+
+		/* depth_conv: 3x3 DW + BN + HSwish */
+		x = evit_conv_bn(&g, scratch, x,
+				   &evit->stem_blocks[i].depth_conv,
+				   1, 1, w0);
+		if (!x)
+			return NULL;
+		x = gh_hswish(&g, scratch, x);
+		if (!x)
+			return NULL;
+
+		/* point_conv: 1x1 + BN (no act) */
+		x = evit_conv_bn(&g, scratch, x,
+				   &evit->stem_blocks[i].point_conv,
+				   1, 0, 1);
+		if (!x)
+			return NULL;
+
+		/* Residual */
+		x = gh_add(&g, scratch, x, skip);
+		if (!x)
+			return NULL;
+	}
+
+	/* ── Stages 1-4 ──────────────────────────────────────────── */
+
+	for (int s = 0; s < 4; s++) {
+		struct sam3_evit_stage *stage = &evit->stages[s];
+		int in_ch = evit->width_list[s];
+		int out_ch = evit->width_list[s + 1];
+		int mid_ch = in_ch * evit->expand_ratio;
+
+		/*
+		 * Block 0: downsample MBConv (stride 2).
+		 * No residual (shape change).
+		 */
+		x = evit_mbconv_forward(&g, scratch, x,
+					  &stage->blocks[0], 2, mid_ch);
+		if (!x)
+			return NULL;
+
+		/* Remaining blocks */
+		mid_ch = out_ch * evit->expand_ratio;
+
+		for (int b = 1; b < stage->n_blocks; b++) {
+			struct sam3_tensor *skip = x;
+
+			if (stage->blocks[b].is_evit_block) {
+				/*
+				 * EfficientViTBlock:
+				 * context_module (LiteMLA + residual)
+				 * then local_module (MBConv + residual)
+				 */
+
+				/* Context: LiteMLA + skip */
+				struct sam3_tensor *ctx_out;
+				ctx_out = evit_litemla_forward(
+					&g, scratch, x,
+					&stage->blocks[b].context,
+					out_ch, evit->attn_dim);
+				if (!ctx_out)
+					return NULL;
+				x = gh_add(&g, scratch, ctx_out, skip);
+				if (!x)
+					return NULL;
+
+				/* Local: MBConv (fewer_norm) + skip */
+				skip = x;
+				x = evit_mbconv_forward(
+					&g, scratch, x,
+					&stage->blocks[b],
+					1, mid_ch);
+				if (!x)
+					return NULL;
+				x = gh_add(&g, scratch, x, skip);
+				if (!x)
+					return NULL;
+			} else {
+				/* Standard MBConv + residual */
+				x = evit_mbconv_forward(
+					&g, scratch, x,
+					&stage->blocks[b],
+					1, mid_ch);
+				if (!x)
+					return NULL;
+				x = gh_add(&g, scratch, x, skip);
+				if (!x)
+					return NULL;
+			}
+		}
+	}
+	/* x: [1, gs, gs, final_ch] */
+
+	/* ── Projection head ─────────────────────────────────────── */
+
+	/* Conv1x1(final_ch -> embed_dim), no bias, no BN */
+	x = gh_conv2d(&g, scratch, x, evit->proj_conv1.conv_w,
+		      NULL, 1, 0, 1);
+	if (!x)
+		return NULL;
+
+	/* BN(embed_dim) */
+	x = gh_batchnorm(&g, scratch, x,
+			   evit->proj_bn.bn_w, evit->proj_bn.bn_b,
+			   evit->proj_bn.bn_mean, evit->proj_bn.bn_var);
+	if (!x)
+		return NULL;
+
+	/* GELU activation */
+	x = gh_gelu(&g, scratch, x);
+	if (!x)
+		return NULL;
+
+	/* Conv3x3(embed_dim, embed_dim, pad=1) + bias */
+	x = gh_conv2d(&g, scratch, x, evit->proj_conv2.conv_w,
+		      evit->proj_conv2.conv_b, 1, 1, 1);
+	if (!x)
+		return NULL;
+	/* x: [1, gs, gs, embed_dim] */
+
+	/*
+	 * Flatten to [n_patches, embed_dim] for compatibility with
+	 * the FPN neck, which expects the same shape as Hiera output.
+	 */
+	int out_dims[] = {gs * gs, evit->embed_dim};
+	x = gh_reshape(&g, scratch, x, 2, out_dims);
+	if (!x)
+		return NULL;
+
+	/* ── Evaluate graph ──────────────────────────────────────── */
+
+	err = be->ops->graph_eval(be, &g);
+	if (err != SAM3_OK) {
+		sam3_log_error("evit_build: graph_eval failed (%d)", err);
+		return NULL;
+	}
+
+	/* Copy result to persist arena */
+	size_t out_bytes = (size_t)gs * gs * evit->embed_dim *
+			   sam3_dtype_size(SAM3_DTYPE_F32);
+	void *out_buf = sam3_arena_alloc(persist, out_bytes);
+	if (!out_buf)
+		return NULL;
+	memcpy(out_buf, x->data, out_bytes);
+
+	struct sam3_tensor *result;
+	result = gh_tensor_wrap(persist, SAM3_DTYPE_F32,
+				  2, out_dims, out_buf);
+
+	SAM3_PROF_END(profiler, "evit_build");
+
+	sam3_log_info("evit_build: output [%d, %d] (%d nodes evaluated)",
+		      gs * gs, evit->embed_dim, g.n_nodes);
+
+	return result;
 }
