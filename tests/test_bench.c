@@ -2,12 +2,13 @@
  * tests/test_bench.c - Unit tests for benchmark harness
  *
  * Tests config defaults, timing loop with statistics, environment
- * detection, filter matching, and JSON round-trip serialization.
- * Uses a trivial callback that burns CPU cycles to produce
- * measurable timings.
+ * detection, filter matching, JSON round-trip serialization, and
+ * baseline comparison with regression detection. Uses a trivial
+ * callback that burns CPU cycles to produce measurable timings.
  *
  * Key types:  sam3_bench_config, sam3_bench_result, sam3_bench_env
- * Depends on: bench/bench.h, bench/bench_json.h, test_helpers.h
+ * Depends on: bench/bench.h, bench/bench_json.h, bench/bench_compare.h,
+ *             test_helpers.h
  * Used by:    CTest
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -17,6 +18,7 @@
 #include "test_helpers.h"
 #include "bench/bench.h"
 #include "bench/bench_json.h"
+#include "bench/bench_compare.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -317,6 +319,78 @@ static void test_json_write_read_roundtrip(void)
 	remove(TEST_JSON_PATH);
 }
 
+/* --- Comparison tests --- */
+
+/* Helper to build a result with given timing values. */
+static void fill_result(struct sam3_bench_result *r, const char *name,
+			double mean, double stddev)
+{
+	memset(r, 0, sizeof(*r));
+	snprintf(r->name, sizeof(r->name), "%s", name);
+	snprintf(r->suite, sizeof(r->suite), "kernel");
+	r->mean_ms = mean;
+	r->min_ms = mean * 0.95;
+	r->max_ms = mean * 1.05;
+	r->stddev_ms = stddev;
+	r->iterations = 50;
+}
+
+static void test_compare_no_regression(void)
+{
+	/* Baseline: 1.00ms, current: 1.03ms -> 3% delta, below 5% threshold. */
+	struct sam3_bench_result base, cur;
+	fill_result(&base, "test_op", 1.00, 0.0);
+	fill_result(&cur, "test_op", 1.03, 0.0);
+
+	int reg = sam3_bench_compare_results(&base, 1, &cur, 1, 5.0, false);
+	ASSERT_EQ(reg, 0);
+}
+
+static void test_compare_with_regression(void)
+{
+	/* Baseline: 1.00ms, current: 1.10ms -> 10% delta, above 5% threshold. */
+	struct sam3_bench_result base, cur;
+	fill_result(&base, "test_op", 1.00, 0.0);
+	fill_result(&cur, "test_op", 1.10, 0.0);
+
+	int reg = sam3_bench_compare_results(&base, 1, &cur, 1, 5.0, false);
+	ASSERT_EQ(reg, 1);
+}
+
+static void test_compare_improvement(void)
+{
+	/* Baseline: 1.00ms, current: 0.80ms -> -20% (faster), no regression. */
+	struct sam3_bench_result base, cur;
+	fill_result(&base, "test_op", 1.00, 0.0);
+	fill_result(&cur, "test_op", 0.80, 0.0);
+
+	int reg = sam3_bench_compare_results(&base, 1, &cur, 1, 5.0, false);
+	ASSERT_EQ(reg, 0);
+}
+
+static void test_compare_statistical(void)
+{
+	/* Baseline: mean=1.00, stddev=0.05. Limit = 1.00 + 2*0.05 = 1.10. */
+	struct sam3_bench_result base;
+	fill_result(&base, "test_op", 1.00, 0.05);
+
+	/* Current 1.08 is within limit (1.08 < 1.10) -> no regression. */
+	struct sam3_bench_result cur1;
+	fill_result(&cur1, "test_op", 1.08, 0.0);
+
+	int reg1 = sam3_bench_compare_results(&base, 1, &cur1, 1,
+					      5.0, true);
+	ASSERT_EQ(reg1, 0);
+
+	/* Current 1.15 exceeds limit (1.15 > 1.10) -> regression. */
+	struct sam3_bench_result cur2;
+	fill_result(&cur2, "test_op", 1.15, 0.0);
+
+	int reg2 = sam3_bench_compare_results(&base, 1, &cur2, 1,
+					      5.0, true);
+	ASSERT_EQ(reg2, 1);
+}
+
 int main(void)
 {
 	test_config_defaults();
@@ -329,6 +403,12 @@ int main(void)
 
 	/* JSON serialization tests. */
 	test_json_write_read_roundtrip();
+
+	/* Comparison tests. */
+	test_compare_no_regression();
+	test_compare_with_regression();
+	test_compare_improvement();
+	test_compare_statistical();
 
 	TEST_REPORT();
 }
