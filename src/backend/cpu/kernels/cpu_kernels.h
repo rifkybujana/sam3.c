@@ -36,6 +36,10 @@ enum sam3_error cpu_kernel_add(const struct sam3_node *node,
 enum sam3_error cpu_kernel_mul(const struct sam3_node *node,
 			       struct sam3_threadpool *pool);
 
+/* Element-wise divide with broadcasting: inputs[0] / inputs[1] -> output */
+enum sam3_error cpu_kernel_div(const struct sam3_node *node,
+			       struct sam3_threadpool *pool);
+
 /* Row-wise softmax along last dimension */
 enum sam3_error cpu_kernel_softmax(const struct sam3_node *node,
 				   struct sam3_threadpool *pool);

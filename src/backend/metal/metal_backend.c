@@ -481,6 +481,10 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		rc = mlx_multiply(&result, inputs[0], inputs[1], stream);
 		break;
 
+	case SAM3_OP_DIV:
+		rc = mlx_divide(&result, inputs[0], inputs[1], stream);
+		break;
+
 	case SAM3_OP_SOFTMAX:
 		rc = mlx_softmax_axis(&result, inputs[0], -1, true, stream);
 		break;

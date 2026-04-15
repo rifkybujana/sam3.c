@@ -217,6 +217,18 @@ struct sam3_tensor *gh_mul(struct sam3_graph *g, struct sam3_arena *a,
 				 (struct sam3_tensor *[]){x, b}, 2, out);
 }
 
+struct sam3_tensor *gh_div(struct sam3_graph *g, struct sam3_arena *a,
+			   struct sam3_tensor *x, struct sam3_tensor *y)
+{
+	struct sam3_tensor *out = gh_alloc_tensor(a, x->dtype,
+						  x->n_dims, x->dims);
+	if (!out)
+		return NULL;
+
+	return sam3_graph_add_op(g, SAM3_OP_DIV,
+				 (struct sam3_tensor *[]){x, y}, 2, out);
+}
+
 /* ── Matrix multiply ─────────────────────────────────────────────── */
 
 struct sam3_tensor *gh_matmul(struct sam3_graph *g, struct sam3_arena *a,

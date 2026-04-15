@@ -73,6 +73,7 @@ const char *sam3_op_str(enum sam3_op op)
 		[SAM3_OP_GROUPNORM]       = "GROUPNORM",
 		[SAM3_OP_BATCHNORM]       = "BATCHNORM",
 		[SAM3_OP_HSWISH]          = "HSWISH",
+		[SAM3_OP_DIV]             = "DIV",
 	};
 	if (op >= 0 && op < SAM3_OP_COUNT)
 		return names[op];

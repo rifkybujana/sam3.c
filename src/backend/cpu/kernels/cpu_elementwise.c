@@ -1,7 +1,7 @@
 /*
- * src/backend/cpu/kernels/cpu_elementwise.c - Elementwise add, mul, relu
+ * src/backend/cpu/kernels/cpu_elementwise.c - Elementwise add, mul, div, relu
  *
- * Implements add, mul with [M,N]+[N] broadcasting (bias add pattern),
+ * Implements add, mul, div with [M,N]+[N] broadcasting (bias add pattern),
  * and ReLU activation. Each op has scalar and NEON/AVX2 paths.
  *
  * Key types:  sam3_node, sam3_tensor
@@ -73,6 +73,18 @@ static void mul_f32_scalar(const float *a, const float *b, float *out,
 	}
 }
 
+static void div_f32_scalar(const float *a, const float *b, float *out,
+			   int broadcast_n, int start, int end)
+{
+	if (broadcast_n <= 0) {
+		for (int i = start; i < end; i++)
+			out[i] = a[i] / b[i];
+	} else {
+		for (int i = start; i < end; i++)
+			out[i] = a[i] / b[i % broadcast_n];
+	}
+}
+
 static void relu_f32_scalar(const float *in, float *out,
 			    int start, int end)
 {
@@ -137,6 +149,33 @@ static void mul_f32_neon(const float *a, const float *b, float *out,
 			}
 			for (; j < broadcast_n; j++)
 				out[base + j] = a[base + j] * b[j];
+		}
+	}
+}
+
+static void div_f32_neon(const float *a, const float *b, float *out,
+			 int broadcast_n, int start, int end)
+{
+	if (broadcast_n <= 0) {
+		int i = start;
+		for (; i + 4 <= end; i += 4) {
+			float32x4_t va = vld1q_f32(a + i);
+			float32x4_t vb = vld1q_f32(b + i);
+			vst1q_f32(out + i, vdivq_f32(va, vb));
+		}
+		for (; i < end; i++)
+			out[i] = a[i] / b[i];
+	} else {
+		for (int r = start; r < end; r++) {
+			int base = r * broadcast_n;
+			int j = 0;
+			for (; j + 4 <= broadcast_n; j += 4) {
+				float32x4_t va = vld1q_f32(a + base + j);
+				float32x4_t vb = vld1q_f32(b + j);
+				vst1q_f32(out + base + j, vdivq_f32(va, vb));
+			}
+			for (; j < broadcast_n; j++)
+				out[base + j] = a[base + j] / b[j];
 		}
 	}
 }
@@ -213,6 +252,34 @@ static void mul_f32_avx2(const float *a, const float *b, float *out,
 			}
 			for (; j < broadcast_n; j++)
 				out[base + j] = a[base + j] * b[j];
+		}
+	}
+}
+
+static void div_f32_avx2(const float *a, const float *b, float *out,
+			  int broadcast_n, int start, int end)
+{
+	if (broadcast_n <= 0) {
+		int i = start;
+		for (; i + 8 <= end; i += 8) {
+			__m256 va = _mm256_loadu_ps(a + i);
+			__m256 vb = _mm256_loadu_ps(b + i);
+			_mm256_storeu_ps(out + i, _mm256_div_ps(va, vb));
+		}
+		for (; i < end; i++)
+			out[i] = a[i] / b[i];
+	} else {
+		for (int r = start; r < end; r++) {
+			int base = r * broadcast_n;
+			int j = 0;
+			for (; j + 8 <= broadcast_n; j += 8) {
+				__m256 va = _mm256_loadu_ps(a + base + j);
+				__m256 vb = _mm256_loadu_ps(b + j);
+				_mm256_storeu_ps(out + base + j,
+						 _mm256_div_ps(va, vb));
+			}
+			for (; j < broadcast_n; j++)
+				out[base + j] = a[base + j] / b[j];
 		}
 	}
 }
@@ -330,6 +397,36 @@ static void mul_parallel_fn(void *arg, int task_id, int n_tasks)
 #endif
 }
 
+static void div_parallel_fn(void *arg, int task_id, int n_tasks)
+{
+	struct binop_par_ctx *ctx = (struct binop_par_ctx *)arg;
+	int total, start, end;
+
+	if (ctx->broadcast_n <= 0) {
+		total = ctx->n;
+	} else {
+		total = ctx->n / ctx->broadcast_n;
+	}
+
+	int chunk = total / n_tasks;
+	start = task_id * chunk;
+	end = (task_id == n_tasks - 1) ? total : start + chunk;
+
+	if (start >= end)
+		return;
+
+#if SAM3_HAS_NEON
+	div_f32_neon(ctx->a, ctx->b, ctx->out,
+		     ctx->broadcast_n, start, end);
+#elif SAM3_HAS_AVX2
+	div_f32_avx2(ctx->a, ctx->b, ctx->out,
+		     ctx->broadcast_n, start, end);
+#else
+	div_f32_scalar(ctx->a, ctx->b, ctx->out,
+		       ctx->broadcast_n, start, end);
+#endif
+}
+
 struct relu_par_ctx {
 	const float *in;
 	float       *out;
@@ -401,6 +498,31 @@ enum sam3_error cpu_kernel_mul(const struct sam3_node *node,
 		n_tasks = 1;
 
 	sam3_threadpool_parallel_for(pool, mul_parallel_fn, &ctx, n_tasks);
+
+	return SAM3_OK;
+}
+
+enum sam3_error cpu_kernel_div(const struct sam3_node *node,
+			       struct sam3_threadpool *pool)
+{
+	int broadcast_n;
+	enum sam3_error err = validate_binary_op(node, &broadcast_n);
+	if (err != SAM3_OK)
+		return err;
+
+	struct binop_par_ctx ctx = {
+		.a           = (const float *)node->inputs[0]->data,
+		.b           = (const float *)node->inputs[1]->data,
+		.out         = (float *)node->output->data,
+		.n           = sam3_tensor_nelems(node->inputs[0]),
+		.broadcast_n = broadcast_n,
+	};
+
+	int n_tasks = sam3_threadpool_n_threads(pool);
+	if (n_tasks < 1)
+		n_tasks = 1;
+
+	sam3_threadpool_parallel_for(pool, div_parallel_fn, &ctx, n_tasks);
 
 	return SAM3_OK;
 }

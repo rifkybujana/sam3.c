@@ -59,6 +59,14 @@ wrap_mul(const struct sam3_node *node, struct sam3_arena *scratch,
 }
 
 static enum sam3_error
+wrap_div(const struct sam3_node *node, struct sam3_arena *scratch,
+	 struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_div(node, pool);
+}
+
+static enum sam3_error
 wrap_softmax(const struct sam3_node *node, struct sam3_arena *scratch,
 	     struct sam3_threadpool *pool)
 {
@@ -471,6 +479,9 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 		[SAM3_DTYPE_F32]  = wrap_mul,
 		[SAM3_DTYPE_F16]  = wrap_mul_f16,
 		[SAM3_DTYPE_BF16] = wrap_mul_bf16,
+	},
+	[SAM3_OP_DIV] = {
+		[SAM3_DTYPE_F32]  = wrap_div,
 	},
 	[SAM3_OP_SOFTMAX] = {
 		[SAM3_DTYPE_F32]  = wrap_softmax,

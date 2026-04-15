@@ -110,6 +110,9 @@ struct sam3_tensor *gh_add(struct sam3_graph *g, struct sam3_arena *a,
 struct sam3_tensor *gh_mul(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *x, struct sam3_tensor *b);
 
+struct sam3_tensor *gh_div(struct sam3_graph *g, struct sam3_arena *a,
+			   struct sam3_tensor *x, struct sam3_tensor *y);
+
 /*
  * gh_matmul - Matrix multiply: output [..., M, N] from
  *             [..., M, K] @ [..., K, N].

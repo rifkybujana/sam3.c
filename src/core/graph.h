@@ -67,6 +67,9 @@ enum sam3_op {
 				  * eps=1e-5. output: same shape as x.    */
 	SAM3_OP_HSWISH,        /* Hard Swish: x * clamp(x+3, 0, 6) / 6.
 				  * inputs[0]=x. output: same shape as x. */
+	SAM3_OP_DIV,           /* Element-wise divide: x / y with broadcast.
+				  * inputs[0]=x, inputs[1]=y.
+				  * output: same shape as x.              */
 	SAM3_OP_COUNT,  /* must be last */
 };
 
