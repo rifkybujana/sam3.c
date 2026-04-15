@@ -95,6 +95,22 @@ static int is_conv2d_weight(const char *name)
 	    str_ends_with(name, ".mask_decoder.conv_s1.weight"))
 		return 1;
 
+	/*
+	 * EfficientViT backbone Conv2d weights:
+	 *   input_stem.*.conv.weight  (stem conv + DSConv blocks)
+	 *   stages.*.conv.weight      (MBConv + LiteMLA proj via ConvLayer)
+	 *   context.aggreg.0.{0,1}.weight  (LiteMLA DW/PW raw Conv2d)
+	 *   context.qkv.conv.weight   (LiteMLA QKV)
+	 *   projection.conv1/2.weight (projection head raw Conv2d)
+	 */
+	if (strstr(name, ".vision_encoder.backbone.") &&
+	    (str_ends_with(name, ".conv.weight") ||
+	     str_ends_with(name, ".aggreg.0.0.weight") ||
+	     str_ends_with(name, ".aggreg.0.1.weight") ||
+	     str_ends_with(name, ".projection.conv1.weight") ||
+	     str_ends_with(name, ".projection.conv2.weight")))
+		return 1;
+
 	return 0;
 }
 

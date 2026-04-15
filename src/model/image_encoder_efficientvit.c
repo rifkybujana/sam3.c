@@ -42,7 +42,7 @@ enum sam3_error sam3_efficientvit_init(struct sam3_efficientvit *evit,
 
 	/* Validate bounds */
 	for (int i = 0; i < 5; i++) {
-		if (depth_list[i] > SAM3_EVIT_MAX_DEPTH) {
+		if (depth_list[i] >= SAM3_EVIT_MAX_DEPTH) {
 			sam3_log_error("evit_init: depth_list[%d]=%d "
 				       "exceeds MAX_DEPTH=%d",
 				       i, depth_list[i],
@@ -654,6 +654,19 @@ static struct sam3_tensor *evit_litemla_head(
 	if (!denom)
 		return NULL;
 
+	/* Guard div-by-zero: denom += eps before dividing */
+	{
+		int eps_dims[] = {1};
+		struct sam3_tensor *eps;
+		eps = gh_alloc_tensor(a, SAM3_DTYPE_F32, 1, eps_dims);
+		if (!eps)
+			return NULL;
+		*(float *)eps->data = 1e-6f;
+		denom = gh_add(g, a, denom, eps);
+		if (!denom)
+			return NULL;
+	}
+
 	/* Normalize: numer / denom with last-dim broadcast */
 	struct sam3_tensor *result = gh_div(g, a, numer, denom);
 	if (!result)
@@ -745,6 +758,12 @@ static struct sam3_tensor *evit_litemla_forward(
 	 * Per-head linear attention.
 	 * Slice each head [H*W, 3*dim], compute attention, collect.
 	 */
+	if (total_heads > 128) {
+		sam3_log_error("evit_litemla: total_heads=%d exceeds "
+			       "stack limit", total_heads);
+		return NULL;
+	}
+
 	struct sam3_tensor *head_outputs[128]; /* 2*n_heads, max ~24 */
 	for (int h = 0; h < total_heads; h++) {
 		/* Slice head h from dim 1: [H*W, 3*dim] */
@@ -786,6 +805,16 @@ static struct sam3_tensor *evit_litemla_forward(
 
 /* ── Main graph construction ─────────────────────────────────────── */
 
+/*
+ * sam3_efficientvit_build - Build and evaluate the EfficientViT encoder.
+ *
+ * Evaluates per-stage to bound scratch arena usage. Each stage builds
+ * a subgraph, evaluates it, copies the result to a persist buffer,
+ * then resets scratch for the next stage. This mirrors the per-block
+ * batching strategy used by the Hiera ViT encoder.
+ *
+ * Phases: preprocess+stem, stage 0-3, projection.
+ */
 struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 					     struct sam3_backend *be,
 					     struct sam3_tensor *image,
@@ -797,10 +826,27 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 	enum sam3_error err;
 	int gs = evit->grid_size;
 	int w0 = evit->width_list[0];
-
-	sam3_graph_init(&g);
+	int total_nodes = 0;
 
 	SAM3_PROF_BEGIN(profiler, "evit_build");
+
+	/*
+	 * Allocate persist buffer for intermediate activations.
+	 * Max size is after stem: [1, img/2, img/2, width_list[0]].
+	 * Reused across all stages; each stage output fits within.
+	 */
+	int cur_h = evit->img_size / 2;
+	int cur_w = cur_h;
+	int cur_ch = w0;
+	size_t max_bytes = (size_t)cur_h * cur_w * cur_ch *
+			   sam3_dtype_size(SAM3_DTYPE_F32);
+	void *x_buf = sam3_arena_alloc(persist, max_bytes);
+	if (!x_buf)
+		return NULL;
+
+	/* ── Phase 0: Preprocess + Stem ─────────────────────────── */
+
+	sam3_graph_init(&g);
 
 	/*
 	 * Image preprocessing: CHW [3, img, img] → NHWC [1, img, img, 3].
@@ -817,8 +863,6 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 		return NULL;
 	/* x: [1, img, img, 3] NHWC */
 
-	/* ── Input stem ──────────────────────────────────────────── */
-
 	/* Conv2d(3 -> w0, k=3, s=2, p=1) + BN + HSwish */
 	x = evit_conv_bn(&g, scratch, x, &evit->stem_conv, 2, 1, 1);
 	if (!x)
@@ -832,7 +876,6 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 	for (int i = 0; i < evit->n_stem_blocks; i++) {
 		struct sam3_tensor *skip = x;
 
-		/* depth_conv: 3x3 DW + BN + HSwish */
 		x = evit_conv_bn(&g, scratch, x,
 				   &evit->stem_blocks[i].depth_conv,
 				   1, 1, w0);
@@ -842,26 +885,50 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 		if (!x)
 			return NULL;
 
-		/* point_conv: 1x1 + BN (no act) */
 		x = evit_conv_bn(&g, scratch, x,
 				   &evit->stem_blocks[i].point_conv,
 				   1, 0, 1);
 		if (!x)
 			return NULL;
 
-		/* Residual */
 		x = gh_add(&g, scratch, x, skip);
 		if (!x)
 			return NULL;
 	}
 
-	/* ── Stages 1-4 ──────────────────────────────────────────── */
+	err = be->ops->graph_eval(be, &g);
+	if (err != SAM3_OK) {
+		sam3_log_error("evit_build: stem eval failed (%d)", err);
+		return NULL;
+	}
+
+	memcpy(x_buf, x->data,
+	       (size_t)cur_h * cur_w * cur_ch *
+	       sam3_dtype_size(SAM3_DTYPE_F32));
+	total_nodes += g.n_nodes;
+
+	sam3_log_debug("evit_build: stem done [1,%d,%d,%d] (%d nodes, "
+		       "scratch %zu/%zu)",
+		       cur_h, cur_w, cur_ch, g.n_nodes,
+		       scratch->offset, scratch->size);
+
+	/* ── Phases 1-4: Stages ─────────────────────────────────── */
 
 	for (int s = 0; s < 4; s++) {
 		struct sam3_evit_stage *stage = &evit->stages[s];
 		int in_ch = evit->width_list[s];
 		int out_ch = evit->width_list[s + 1];
 		int mid_ch = in_ch * evit->expand_ratio;
+
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		/* Wrap persist buffer as input tensor */
+		int x_dims[] = {1, cur_h, cur_w, cur_ch};
+		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+				     4, x_dims, x_buf);
+		if (!x)
+			return NULL;
 
 		/*
 		 * Block 0: downsample MBConv (stride 2).
@@ -879,13 +946,6 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 			struct sam3_tensor *skip = x;
 
 			if (stage->blocks[b].is_evit_block) {
-				/*
-				 * EfficientViTBlock:
-				 * context_module (LiteMLA + residual)
-				 * then local_module (MBConv + residual)
-				 */
-
-				/* Context: LiteMLA + skip */
 				struct sam3_tensor *ctx_out;
 				ctx_out = evit_litemla_forward(
 					&g, scratch, x,
@@ -897,7 +957,6 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 				if (!x)
 					return NULL;
 
-				/* Local: MBConv (fewer_norm) + skip */
 				skip = x;
 				x = evit_mbconv_forward(
 					&g, scratch, x,
@@ -909,7 +968,6 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 				if (!x)
 					return NULL;
 			} else {
-				/* Standard MBConv + residual */
 				x = evit_mbconv_forward(
 					&g, scratch, x,
 					&stage->blocks[b],
@@ -921,10 +979,43 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 					return NULL;
 			}
 		}
-	}
-	/* x: [1, gs, gs, final_ch] */
 
-	/* ── Projection head ─────────────────────────────────────── */
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("evit_build: stage %d eval "
+				       "failed (%d)", s, err);
+			return NULL;
+		}
+
+		/* Update shape: spatial halved, channels changed */
+		cur_h /= 2;
+		cur_w /= 2;
+		cur_ch = out_ch;
+
+		memcpy(x_buf, x->data,
+		       (size_t)cur_h * cur_w * cur_ch *
+		       sam3_dtype_size(SAM3_DTYPE_F32));
+		total_nodes += g.n_nodes;
+
+		sam3_log_debug("evit_build: stage %d done [1,%d,%d,%d] "
+			       "(%d nodes, scratch %zu/%zu)",
+			       s, cur_h, cur_w, cur_ch, g.n_nodes,
+			       scratch->offset, scratch->size);
+	}
+	/* x_buf: [1, gs, gs, final_ch] */
+
+	/* ── Phase 5: Projection head ───────────────────────────── */
+
+	sam3_arena_reset(scratch);
+	sam3_graph_init(&g);
+
+	{
+		int x_dims[] = {1, gs, gs, cur_ch};
+		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+				     4, x_dims, x_buf);
+		if (!x)
+			return NULL;
+	}
 
 	/* Conv1x1(final_ch -> embed_dim), no bias, no BN */
 	x = gh_conv2d(&g, scratch, x, evit->proj_conv1.conv_w,
@@ -960,13 +1051,13 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 	if (!x)
 		return NULL;
 
-	/* ── Evaluate graph ──────────────────────────────────────── */
-
 	err = be->ops->graph_eval(be, &g);
 	if (err != SAM3_OK) {
-		sam3_log_error("evit_build: graph_eval failed (%d)", err);
+		sam3_log_error("evit_build: projection eval failed (%d)",
+			       err);
 		return NULL;
 	}
+	total_nodes += g.n_nodes;
 
 	/* Copy result to persist arena */
 	size_t out_bytes = (size_t)gs * gs * evit->embed_dim *
@@ -983,7 +1074,7 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 	SAM3_PROF_END(profiler, "evit_build");
 
 	sam3_log_info("evit_build: output [%d, %d] (%d nodes evaluated)",
-		      gs * gs, evit->embed_dim, g.n_nodes);
+		      gs * gs, evit->embed_dim, total_nodes);
 
 	return result;
 }

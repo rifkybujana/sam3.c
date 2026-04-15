@@ -53,7 +53,7 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 
 	case SAM3_BACKBONE_EFFICIENTVIT: {
 		int width_list[] = {24, 48, 96, 192, 384};
-		int depth_list[] = {1, 3, 4, 4, 6};
+		int depth_list[] = {1, 2, 3, 4, 6};
 		err = sam3_efficientvit_init(&vl->enc.evit,
 					      width_list, depth_list,
 					      32,	/* attn_dim */
