@@ -164,6 +164,7 @@ add_executable(sam3_cli
 target_include_directories(sam3_cli PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_cli sam3)
 if(SAM3_BENCH)
+	target_sources(sam3_cli PRIVATE tools/cli_bench.c)
 	target_link_libraries(sam3_cli sam3_bench)
 endif()
 
