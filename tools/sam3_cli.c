@@ -21,6 +21,9 @@
 #include "cli_segment.h"
 #include "cli_convert.h"
 #include "cli_info.h"
+#ifdef SAM3_HAS_BENCH
+#include "cli_bench.h"
+#endif
 
 static void print_usage(const char *prog)
 {
@@ -30,6 +33,9 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  segment    Run segmentation inference\n");
 	fprintf(stderr, "  convert    Convert model weights to .sam3\n");
 	fprintf(stderr, "  info       Print model file metadata\n");
+#ifdef SAM3_HAS_BENCH
+	fprintf(stderr, "  bench      Run performance benchmarks\n");
+#endif
 	fprintf(stderr, "\nOptions:\n");
 	fprintf(stderr, "  --version  Print version and exit\n");
 	fprintf(stderr, "  --help     Show this help\n");
@@ -63,6 +69,10 @@ int main(int argc, char **argv)
 		return cli_convert(argc - 1, argv + 1);
 	if (strcmp(cmd, "info") == 0)
 		return cli_info(argc - 1, argv + 1);
+#ifdef SAM3_HAS_BENCH
+	if (strcmp(cmd, "bench") == 0)
+		return cli_bench(argc - 1, argv + 1);
+#endif
 
 	/*
 	 * Backward compat: if first arg starts with '-', assume
