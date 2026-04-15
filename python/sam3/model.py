@@ -189,12 +189,12 @@ class Model:
                 _keepalive.append(mask_arr)
 
         if text:
-            encoded = text.encode()
+            c_text = ffi.new("char[]", text.encode())
             p = ffi.new("struct sam3_prompt *")
             p.type = lib.SAM3_PROMPT_TEXT
-            p.text = encoded
+            p.text = c_text
             prompt_list.append(p)
-            _keepalive.append(encoded)
+            _keepalive.append(c_text)
 
         if not prompt_list:
             raise ValueError("At least one prompt is required")
