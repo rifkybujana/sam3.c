@@ -148,6 +148,10 @@ enum sam3_error cpu_kernel_silu_f16(const struct sam3_node *node,
 enum sam3_error cpu_kernel_silu_bf16(const struct sam3_node *node,
 				     struct sam3_threadpool *pool);
 
+/* Element-wise Hard Swish: x * clamp(x+3, 0, 6) / 6 */
+enum sam3_error cpu_kernel_hswish(const struct sam3_node *node,
+				  struct sam3_threadpool *pool);
+
 /* Embedding table lookup: table[indices[i], :] -> output[i, :] */
 enum sam3_error cpu_kernel_embed(const struct sam3_node *node,
 				 struct sam3_threadpool *pool);

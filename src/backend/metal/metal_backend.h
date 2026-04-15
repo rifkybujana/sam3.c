@@ -53,6 +53,7 @@ struct sam3_metal_backend {
 	mlx_array                 gelu_rsqrt2[13];
 	mlx_array                 gelu_one[13];
 	mlx_fast_metal_kernel     silu_kernel; /* Fused SiLU Metal kernel */
+	mlx_fast_metal_kernel     hswish_kernel; /* Fused Hard Swish kernel */
 	mlx_fast_metal_kernel     dequant_q8_kernel; /* Q8_0→F16 GPU dequant */
 #endif
 };

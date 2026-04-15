@@ -33,7 +33,7 @@ enum sam3_op {
 	SAM3_OP_RELU,
 	SAM3_OP_GELU,
 	SAM3_OP_LAYERNORM,
-	SAM3_OP_CONV2D,
+	SAM3_OP_CONV2D,     /* params[0]=stride, [1]=padding, [2]=groups (0→1) */
 	SAM3_OP_RESHAPE,
 	SAM3_OP_TRANSPOSE,
 	SAM3_OP_CAST,
@@ -65,6 +65,8 @@ enum sam3_op {
 				  * inputs[3]=running_mean[C],
 				  * inputs[4]=running_var[C].
 				  * eps=1e-5. output: same shape as x.    */
+	SAM3_OP_HSWISH,        /* Hard Swish: x * clamp(x+3, 0, 6) / 6.
+				  * inputs[0]=x. output: same shape as x. */
 	SAM3_OP_COUNT,  /* must be last */
 };
 

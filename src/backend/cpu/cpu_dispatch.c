@@ -310,6 +310,14 @@ wrap_silu_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
 }
 
 static enum sam3_error
+wrap_hswish(const struct sam3_node *node, struct sam3_arena *scratch,
+	    struct sam3_threadpool *pool)
+{
+	(void)scratch;
+	return cpu_kernel_hswish(node, pool);
+}
+
+static enum sam3_error
 wrap_embed(const struct sam3_node *node, struct sam3_arena *scratch,
 	   struct sam3_threadpool *pool)
 {
@@ -560,6 +568,9 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 	[SAM3_OP_BATCHNORM] = {
 		[SAM3_DTYPE_F32]  = wrap_batchnorm,
+	},
+	[SAM3_OP_HSWISH] = {
+		[SAM3_DTYPE_F32]  = wrap_hswish,
 	},
 };
 

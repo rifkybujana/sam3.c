@@ -179,6 +179,12 @@ struct sam3_tensor *gh_silu(struct sam3_graph *g, struct sam3_arena *a,
 	return gh_unary(g, a, SAM3_OP_SILU, input);
 }
 
+struct sam3_tensor *gh_hswish(struct sam3_graph *g, struct sam3_arena *a,
+			      struct sam3_tensor *input)
+{
+	return gh_unary(g, a, SAM3_OP_HSWISH, input);
+}
+
 struct sam3_tensor *gh_softmax(struct sam3_graph *g, struct sam3_arena *a,
 			       struct sam3_tensor *input)
 {
@@ -1288,7 +1294,7 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 			      struct sam3_tensor *input,
 			      struct sam3_tensor *weight,
 			      struct sam3_tensor *bias,
-			      int stride, int padding)
+			      int stride, int padding, int groups)
 {
 	int N = input->dims[0];
 	int H = input->dims[1];
@@ -1314,6 +1320,7 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
 	node->params[0] = stride;
 	node->params[1] = padding;
+	node->params[2] = groups;
 
 	if (bias)
 		out = conv_add_bias(g, a, out, bias);

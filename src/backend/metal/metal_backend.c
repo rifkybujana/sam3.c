@@ -551,14 +551,16 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		 *
 		 * params[0] = stride (same for H and W)
 		 * params[1] = padding (same for H and W)
+		 * params[2] = groups (0 means 1)
 		 */
 		int stride = node->params[0] ? node->params[0] : 1;
 		int pad = node->params[1];
+		int groups = node->params[2] > 0 ? node->params[2] : 1;
 
 		rc = mlx_conv2d(&result, inputs[0], inputs[1],
 				stride, stride, pad, pad,
 				1, 1,  /* dilation */
-				1,     /* groups */
+				groups,
 				stream);
 		break;
 	}
@@ -633,6 +635,49 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		mlx_vector_array out_vec = mlx_vector_array_new();
 		rc = mlx_fast_metal_kernel_apply(
 			&out_vec, mtl->silu_kernel, in_vec, cfg, stream);
+		if (!rc) {
+			mlx_array tmp = mlx_array_new();
+			mlx_vector_array_get(&tmp, out_vec, 0);
+			mlx_array_set(&result, tmp);
+			mlx_array_free(tmp);
+		}
+
+		mlx_vector_array_free(out_vec);
+		mlx_fast_metal_kernel_config_free(cfg);
+		mlx_vector_array_free(in_vec);
+		break;
+	}
+
+	case SAM3_OP_HSWISH: {
+		/* Fused Hard Swish via custom Metal kernel:
+		 * x * clamp(x+3, 0, 6) / 6 */
+		mlx_vector_array in_vec = mlx_vector_array_new_data(
+			inputs, 1);
+		mlx_fast_metal_kernel_config cfg =
+			mlx_fast_metal_kernel_config_new();
+
+		int ndims_in = mlx_array_ndim(inputs[0]);
+		int total = 1;
+		for (int d = 0; d < ndims_in; d++)
+			total *= mlx_array_dim(inputs[0], d);
+
+		int shape[SAM3_MAX_DIMS];
+		for (int d = 0; d < ndims_in; d++)
+			shape[d] = mlx_array_dim(inputs[0], d);
+		mlx_fast_metal_kernel_config_add_output_arg(
+			cfg, shape, (size_t)ndims_in,
+			mlx_array_dtype(inputs[0]));
+
+		int tpg = total < 256 ? total : 256;
+		mlx_fast_metal_kernel_config_set_grid(cfg, total, 1, 1);
+		mlx_fast_metal_kernel_config_set_thread_group(
+			cfg, tpg, 1, 1);
+		mlx_fast_metal_kernel_config_add_template_arg_dtype(
+			cfg, "T", mlx_array_dtype(inputs[0]));
+
+		mlx_vector_array out_vec = mlx_vector_array_new();
+		rc = mlx_fast_metal_kernel_apply(
+			&out_vec, mtl->hswish_kernel, in_vec, cfg, stream);
 		if (!rc) {
 			mlx_array tmp = mlx_array_new();
 			mlx_vector_array_get(&tmp, out_vec, 0);
@@ -1491,6 +1536,32 @@ static enum sam3_error metal_init(struct sam3_backend *be)
 		mlx_vector_string_free(outs);
 	}
 
+	/* Build fused Hard Swish kernel (created once, reused every dispatch) */
+	{
+		static const char *in_names[] = {"x"};
+		static const char *out_names[] = {"out"};
+		mlx_vector_string ins = mlx_vector_string_new_data(
+			in_names, 1);
+		mlx_vector_string outs = mlx_vector_string_new_data(
+			out_names, 1);
+
+		static const char hswish_src[] =
+			"uint i = thread_position_in_grid.x;\n"
+			"T v = x[i];\n"
+			"T t = v + T(3);\n"
+			"t = metal::clamp(t, T(0), T(6));\n"
+			"out[i] = v * t / T(6);\n";
+
+		mtl->hswish_kernel = mlx_fast_metal_kernel_new(
+			"hswish", ins, outs, hswish_src,
+			/* header= */ "",
+			/* ensure_row_contiguous= */ true,
+			/* atomic_outputs= */ false);
+
+		mlx_vector_string_free(ins);
+		mlx_vector_string_free(outs);
+	}
+
 	/* Build Q8_0→F16 dequant kernel (created once, reused per wrap) */
 	{
 		static const char *in_names[] = {"src"};
@@ -1552,6 +1623,8 @@ static void metal_free(struct sam3_backend *be)
 	}
 	if (mtl->silu_kernel.ctx)
 		mlx_fast_metal_kernel_free(mtl->silu_kernel);
+	if (mtl->hswish_kernel.ctx)
+		mlx_fast_metal_kernel_free(mtl->hswish_kernel);
 	if (mtl->dequant_q8_kernel.ctx)
 		mlx_fast_metal_kernel_free(mtl->dequant_q8_kernel);
 	mlx_stream_free(mtl->stream);

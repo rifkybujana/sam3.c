@@ -96,6 +96,9 @@ struct sam3_tensor *gh_sigmoid(struct sam3_graph *g, struct sam3_arena *a,
 struct sam3_tensor *gh_silu(struct sam3_graph *g, struct sam3_arena *a,
 			    struct sam3_tensor *input);
 
+struct sam3_tensor *gh_hswish(struct sam3_graph *g, struct sam3_arena *a,
+			      struct sam3_tensor *input);
+
 struct sam3_tensor *gh_softmax(struct sam3_graph *g, struct sam3_arena *a,
 			       struct sam3_tensor *input);
 
@@ -498,10 +501,11 @@ struct sam3_tensor *gh_batchnorm(struct sam3_graph *g, struct sam3_arena *a,
  * gh_conv2d - 2D convolution with NHWC input and OHWI weight.
  *
  * @input:   [N, H, W, C_in]
- * @weight:  [C_out, KH, KW, C_in]
+ * @weight:  [C_out, KH, KW, C_in/groups]
  * @bias:    [C_out] (optional, may be NULL)
  * @stride:  same stride for H and W
  * @padding: same padding for H and W
+ * @groups:  number of groups (1 = standard conv, C_in = depthwise)
  *
  * Returns tensor [N, OH, OW, C_out].
  */
@@ -509,7 +513,7 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 			      struct sam3_tensor *input,
 			      struct sam3_tensor *weight,
 			      struct sam3_tensor *bias,
-			      int stride, int padding);
+			      int stride, int padding, int groups);
 
 /*
  * gh_conv_transpose2d - 2D transposed conv with NHWC input and OHWI
