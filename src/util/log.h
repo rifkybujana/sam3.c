@@ -16,12 +16,7 @@
 #ifndef SAM3_UTIL_LOG_H
 #define SAM3_UTIL_LOG_H
 
-enum sam3_log_level {
-	SAM3_LOG_DEBUG,
-	SAM3_LOG_INFO,
-	SAM3_LOG_WARN,
-	SAM3_LOG_ERROR,
-};
+#include "sam3/sam3_types.h"
 
 /* Set the minimum log level. Messages below this level are suppressed. */
 void sam3_log_set_level(enum sam3_log_level level);

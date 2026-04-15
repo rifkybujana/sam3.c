@@ -32,6 +32,14 @@ enum sam3_error {
 	SAM3_EDTYPE   = -6,  /* Unsupported or mismatched dtype */
 };
 
+/* Log severity levels. */
+enum sam3_log_level {
+	SAM3_LOG_DEBUG,
+	SAM3_LOG_INFO,
+	SAM3_LOG_WARN,
+	SAM3_LOG_ERROR,
+};
+
 /* Supported tensor data types. */
 enum sam3_dtype {
 	SAM3_DTYPE_F32,

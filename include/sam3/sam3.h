@@ -152,6 +152,23 @@ int sam3_get_image_size(const sam3_ctx *ctx);
  */
 const char *sam3_version(void);
 
+/*
+ * sam3_error_str - Return a human-readable string for an error code.
+ *
+ * @err: Error code to describe.
+ *
+ * Returns a static string. Never returns NULL.
+ */
+const char *sam3_error_str(enum sam3_error err);
+
+/*
+ * sam3_log_set_level - Set the minimum log level.
+ *
+ * @level: Messages below this level are suppressed.
+ *         Default is SAM3_LOG_INFO.
+ */
+void sam3_log_set_level(enum sam3_log_level level);
+
 
 /* --- Profiling API --- */
 
