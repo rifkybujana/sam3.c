@@ -254,29 +254,43 @@ static enum sam3_error load_litemla_weights(
 
 	/*
 	 * aggreg: depthwise 5x5 + pointwise 1x1 grouped.
-	 * Both have no BN and no bias.
-	 * DW groups = total_kv_channels, PW groups = n_heads.
+	 * Both are raw nn.Conv2d (not ConvLayer), so tensor names
+	 * use ".weight" directly, not ".conv.weight".
+	 * No bias, no BN.
+	 * DW groups = qkv_ch, PW groups = 3*n_heads.
 	 */
-	int kv_ch = 2 * n_heads * attn_dim;
+	{
+		char name[256];
 
-	snprintf(sub, sizeof(sub), "%scontext.aggreg.0.0.", prefix);
-	err = load_conv_weights(&ctx->aggreg_dw, wf, arena, sub,
-				  kv_ch, 5, 5, 1,
-				  0, 0);
-	if (err != SAM3_OK)
-		return err;
+		/* aggreg_dw: depthwise 5x5, qkv_ch channels */
+		int dw_dims[] = {qkv_ch, 5, 5, 1};
+		snprintf(name, sizeof(name),
+			 "%scontext.aggreg.0.0.weight", prefix);
+		ctx->aggreg_dw.conv_w = gh_load_mmap(wf, name, arena,
+						       SAM3_DTYPE_F32,
+						       4, dw_dims);
+		if (!ctx->aggreg_dw.conv_w)
+			return SAM3_ENOMEM;
 
-	snprintf(sub, sizeof(sub), "%scontext.aggreg.0.1.", prefix);
-	err = load_conv_weights(&ctx->aggreg_pw, wf, arena, sub,
-				  kv_ch, 1, 1, attn_dim,
-				  0, 0);
-	if (err != SAM3_OK)
-		return err;
+		/* aggreg_pw: grouped 1x1, qkv_ch channels */
+		int pw_dims[] = {qkv_ch, 1, 1, attn_dim};
+		snprintf(name, sizeof(name),
+			 "%scontext.aggreg.0.1.weight", prefix);
+		ctx->aggreg_pw.conv_w = gh_load_mmap(wf, name, arena,
+						       SAM3_DTYPE_F32,
+						       4, pw_dims);
+		if (!ctx->aggreg_pw.conv_w)
+			return SAM3_ENOMEM;
+	}
 
-	/* proj: 1x1 conv + BN, no bias */
+	/*
+	 * proj: 1x1 ConvLayer + BN, no bias.
+	 * Input is concatenated identity + aggregated = 2*channels.
+	 */
+	int proj_in = channels * 2;
 	snprintf(sub, sizeof(sub), "%scontext.proj.", prefix);
 	err = load_conv_weights(&ctx->proj, wf, arena, sub,
-				  channels, 1, 1, channels,
+				  channels, 1, 1, proj_in,
 				  0, 1);
 	if (err != SAM3_OK)
 		return err;
