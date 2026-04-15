@@ -960,7 +960,9 @@ int cli_segment(int argc, char **argv)
 		 * image_size x image_size. Replicate that here
 		 * for the stdin path.
 		 */
-		int target = 1008;
+		int target = sam3_get_image_size(ctx);
+		int orig_w = si.width;
+		int orig_h = si.height;
 		struct sam3_image resized = {0};
 		err = sam3_image_resize(&si, &resized, target, target);
 		sam3_image_free(&si);
@@ -975,6 +977,8 @@ int cli_segment(int argc, char **argv)
 		err = sam3_set_image(ctx, resized.pixels,
 				     resized.width, resized.height);
 		sam3_image_free(&resized);
+		if (err == SAM3_OK)
+			sam3_set_prompt_space(ctx, orig_w, orig_h);
 	} else {
 		err = sam3_set_image_file(ctx, args.image_path);
 	}

@@ -85,6 +85,19 @@ enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
 enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path);
 
 /*
+ * sam3_set_prompt_space - Set the coordinate space for point/box prompts.
+ *
+ * @ctx:    Context with image set
+ * @width:  Width of the image in the user's coordinate space
+ * @height: Height of the image in the user's coordinate space
+ *
+ * sam3_set_image_file() automatically sets this to the original file
+ * dimensions. Call this only when using sam3_set_image() with a
+ * pre-resized image while providing prompts in the original coordinates.
+ */
+void sam3_set_prompt_space(sam3_ctx *ctx, int width, int height);
+
+/*
  * sam3_set_text - Pre-tokenize and asynchronously encode a text prompt.
  *
  * @ctx:  Initialized context with loaded model
@@ -123,6 +136,16 @@ enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
  * @result: Result struct to free (fields set to NULL/0 after).
  */
 void sam3_result_free(struct sam3_result *result);
+
+/*
+ * sam3_get_image_size - Return the model's input image size.
+ *
+ * @ctx: Context with loaded model.
+ *
+ * Returns the image size the model expects (e.g. 512 for EfficientViT,
+ * 1008 for Hiera). Returns 0 if no model is loaded.
+ */
+int sam3_get_image_size(const sam3_ctx *ctx);
 
 /*
  * sam3_version - Return the sam3 version string.

@@ -39,7 +39,7 @@ static void print_usage(const char *prog)
 	printf("  -f <format>          Input format: "
 	       "\"safetensors\" (default)\n");
 	printf("  --image-size <N>     Image input size "
-	       "(default: 1008)\n");
+	       "(default: 1008, 512 for efficientvit)\n");
 	printf("  --encoder-dim <N>    Encoder dimension "
 	       "(default: 1280)\n");
 	printf("  --decoder-dim <N>    Decoder dimension "
@@ -79,7 +79,7 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->format         = "safetensors";
 	args->backbone       = "hiera";
 	args->quantize       = NULL;
-	args->image_size     = 1008;
+	args->image_size     = -1; /* -1 = use backbone default */
 	args->encoder_dim    = -1; /* -1 = use backbone default */
 	args->decoder_dim    = 256;
 	args->encoder_layers = -1; /* -1 = use backbone default */
@@ -197,6 +197,18 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 			"(use \"hiera\" or \"efficientvit\")\n",
 			args->backbone);
 		return 1;
+	}
+
+	/*
+	 * Apply backbone-aware image_size default when the user did
+	 * not specify --image-size. EfficientViT hardcodes 512;
+	 * Hiera and TinyViT use 1008.
+	 */
+	if (args->image_size < 0) {
+		if (args->backbone_type == SAM3_BACKBONE_EFFICIENTVIT)
+			args->image_size = 512;
+		else
+			args->image_size = 1008;
 	}
 
 	return 0;

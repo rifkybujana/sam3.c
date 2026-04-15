@@ -183,6 +183,11 @@ enum sam3_error sam3_processor_load(struct sam3_processor *proc,
 				     &proc->model_arena);
 }
 
+int sam3_processor_img_size(const struct sam3_processor *proc)
+{
+	return sam3_vl_backbone_img_size(&proc->model.backbone);
+}
+
 void sam3_processor_free(struct sam3_processor *proc)
 {
 	if (!proc)
@@ -255,6 +260,15 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 		return err;
 
 	proc->image_loaded = 1;
+
+	/*
+	 * Default prompt coordinate space to the provided pixel dims.
+	 * sam3_set_image_file() overrides with original image dims so
+	 * that point/box prompts in user space map correctly.
+	 */
+	proc->prompt_w = width;
+	proc->prompt_h = height;
+
 	return SAM3_OK;
 }
 
@@ -405,6 +419,7 @@ static struct sam3_tensor *project_prompts(
 	struct sam3_image_model *model,
 	const struct sam3_prompt *prompts,
 	int n_prompts,
+	int prompt_w, int prompt_h,
 	struct sam3_arena *arena)
 {
 	struct sam3_geometry_encoder *enc = &model->geom_enc;
@@ -412,15 +427,8 @@ static struct sam3_tensor *project_prompts(
 	int n_points, n_boxes;
 	int pi = 0, bi = 0;
 	int i;
-	float img_size;
-	switch (model->backbone.backbone_type) {
-	case SAM3_BACKBONE_EFFICIENTVIT:
-		img_size = (float)model->backbone.enc.evit.img_size;
-		break;
-	default: /* SAM3_BACKBONE_HIERA */
-		img_size = (float)model->backbone.enc.vit.img_size;
-		break;
-	}
+	float norm_w = (float)prompt_w;
+	float norm_h = (float)prompt_h;
 
 	count_prompts_by_type(prompts, n_prompts, &n_points, &n_boxes);
 
@@ -505,8 +513,8 @@ static struct sam3_tensor *project_prompts(
 				continue;
 
 			float coords[2] = {
-				prompts[i].point.x / img_size,
-				prompts[i].point.y / img_size
+				prompts[i].point.x / norm_w,
+				prompts[i].point.y / norm_h
 			};
 
 			/* 1. Direct: out = coords @ W^T + b */
@@ -569,10 +577,10 @@ static struct sam3_tensor *project_prompts(
 				continue;
 
 			float coords[4] = {
-				prompts[i].box.x1 / img_size,
-				prompts[i].box.y1 / img_size,
-				prompts[i].box.x2 / img_size,
-				prompts[i].box.y2 / img_size
+				prompts[i].box.x1 / norm_w,
+				prompts[i].box.y1 / norm_h,
+				prompts[i].box.x2 / norm_w,
+				prompts[i].box.y2 / norm_h
 			};
 
 			/* Linear: out = coords @ W^T + b */
@@ -959,7 +967,9 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 			SAM3_PROF_BEGIN(proc->profiler, "prompt_project");
 			prompt_tokens = project_prompts(
 				&proc->model, prompts,
-				n_prompts, &proc->model_arena);
+				n_prompts,
+				proc->prompt_w, proc->prompt_h,
+				&proc->model_arena);
 			SAM3_PROF_END(proc->profiler, "prompt_project");
 			if (!prompt_tokens) {
 				err = SAM3_ENOMEM;

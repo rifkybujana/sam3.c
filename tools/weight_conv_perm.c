@@ -102,9 +102,16 @@ static int is_conv2d_weight(const char *name)
 	 *   context.aggreg.0.{0,1}.weight  (LiteMLA DW/PW raw Conv2d)
 	 *   context.qkv.conv.weight   (LiteMLA QKV)
 	 *   projection.conv1/2.weight (projection head raw Conv2d)
+	 *
+	 * TinyViT backbone Conv2d weights (Conv2d_BN naming):
+	 *   patch_embed.seq.{0,2}.c.weight  (stem convs)
+	 *   layers.*.blocks.*.conv{1,2,3}.c.weight  (MBConv + local_conv)
+	 *   layers.*.downsample.conv{1,2,3}.c.weight  (PatchMerging)
+	 *   projection.conv{1,2}.c.weight  (projection head)
 	 */
 	if (strstr(name, ".vision_encoder.backbone.") &&
 	    (str_ends_with(name, ".conv.weight") ||
+	     str_ends_with(name, ".c.weight") ||
 	     str_ends_with(name, ".aggreg.0.0.weight") ||
 	     str_ends_with(name, ".aggreg.0.1.weight") ||
 	     str_ends_with(name, ".projection.conv1.weight") ||

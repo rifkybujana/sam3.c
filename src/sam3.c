@@ -178,6 +178,15 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	}
 	ctx->proc_ready = 1;
 
+	/*
+	 * Override config.image_size with the backbone's actual
+	 * img_size. The weight file header may carry a stale default
+	 * (e.g. 1008) even for backbones that expect a different
+	 * resolution (EfficientViT = 512). sam3_set_image_file reads
+	 * config.image_size for the resize target, so this must match.
+	 */
+	ctx->config.image_size = sam3_processor_img_size(&ctx->proc);
+
 	/* Ensure background prefetch is complete before returning */
 	sam3_weight_prefetch_wait(&ctx->weights);
 
@@ -197,6 +206,13 @@ enum sam3_error sam3_load_bpe(sam3_ctx *ctx, const char *path)
 
 	return sam3_tokenizer_load_bpe(
 		&ctx->proc.model.backbone.tokenizer, path);
+}
+
+int sam3_get_image_size(const sam3_ctx *ctx)
+{
+	if (!ctx || !ctx->proc_ready)
+		return 0;
+	return ctx->config.image_size;
 }
 
 enum sam3_error sam3_set_image(sam3_ctx *ctx, const uint8_t *pixels,
@@ -229,6 +245,9 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
 	 * reference: v2.Resize(size=(resolution, resolution)).
 	 * No letterboxing — squash to square like the reference.
 	 */
+	int orig_w = raw.width;
+	int orig_h = raw.height;
+
 	struct sam3_image resized = {0};
 	err = sam3_image_resize(&raw, &resized, target, target);
 	sam3_image_free(&raw);
@@ -238,7 +257,26 @@ enum sam3_error sam3_set_image_file(sam3_ctx *ctx, const char *path)
 	err = sam3_set_image(ctx, resized.pixels,
 			     resized.width, resized.height);
 	sam3_image_free(&resized);
-	return err;
+	if (err)
+		return err;
+
+	/*
+	 * Override prompt coordinate space with original image dims.
+	 * sam3_set_image stored the resized (square) dims, but users
+	 * provide point/box coordinates in the original image space.
+	 */
+	ctx->proc.prompt_w = orig_w;
+	ctx->proc.prompt_h = orig_h;
+
+	return SAM3_OK;
+}
+
+void sam3_set_prompt_space(sam3_ctx *ctx, int width, int height)
+{
+	if (!ctx || !ctx->proc_ready)
+		return;
+	ctx->proc.prompt_w = width;
+	ctx->proc.prompt_h = height;
 }
 
 enum sam3_error sam3_set_text(sam3_ctx *ctx, const char *text)

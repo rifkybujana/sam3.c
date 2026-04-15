@@ -21,6 +21,7 @@
 
 #include "image_encoder.h"
 #include "image_encoder_efficientvit.h"
+#include "image_encoder_tinyvit.h"
 #include "necks.h"
 #include "text_encoder.h"
 #include "tokenizer.h"
@@ -31,6 +32,7 @@ struct sam3_vl_backbone {
 	union {
 		struct sam3_vit vit;
 		struct sam3_efficientvit evit;
+		struct sam3_tinyvit tvit;
 	} enc;
 	struct sam3_neck neck;
 	struct sam3_neck sam2_neck;	/* sam2_fpn_layers (EfficientSAM3) */
@@ -80,6 +82,16 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
  * use arena allocation and do not need explicit freeing.
  */
 void sam3_vl_backbone_free(struct sam3_vl_backbone *vl);
+
+/*
+ * sam3_vl_backbone_img_size - Return the encoder's actual input image size.
+ *
+ * @vl: Initialized VL backbone.
+ *
+ * Returns the img_size that the image encoder was configured with
+ * (e.g. 512 for EfficientViT, 1008 for Hiera/TinyViT).
+ */
+int sam3_vl_backbone_img_size(const struct sam3_vl_backbone *vl);
 
 /*
  * sam3_vl_backbone_build_vision - Run vision pipeline with per-block eval.

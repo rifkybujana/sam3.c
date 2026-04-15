@@ -41,6 +41,8 @@ struct sam3_processor {
 	struct sam3_arena model_arena;    /* weights + cached features */
 	struct sam3_arena scratch_arena;  /* per-inference temp */
 	int image_loaded;
+	int prompt_w;			 /* user-space image width for coord norm */
+	int prompt_h;			 /* user-space image height for coord norm */
 	struct sam3_profiler *profiler;   /* NULL when profiling disabled */
 
 	/*
@@ -116,6 +118,16 @@ enum sam3_error sam3_processor_load(struct sam3_processor *proc,
  * the worker is still running will SEGV.
  */
 void sam3_processor_free(struct sam3_processor *proc);
+
+/*
+ * sam3_processor_img_size - Return the backbone's actual input image size.
+ *
+ * @proc: Initialized processor.
+ *
+ * Returns the img_size the encoder was configured with (e.g. 512 for
+ * EfficientViT, 1008 for Hiera/TinyViT).
+ */
+int sam3_processor_img_size(const struct sam3_processor *proc);
 
 /*
  * sam3_processor_set_image - Set image and run vision encoder.

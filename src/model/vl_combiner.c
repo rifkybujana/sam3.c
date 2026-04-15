@@ -2,7 +2,7 @@
  * src/model/vl_combiner.c - Vision-language backbone combiner
  *
  * Implements the composite VL backbone that wires together the image
- * encoder (Hiera ViT or EfficientViT), feature pyramid neck, CLIP text
+ * encoder (Hiera ViT, EfficientViT, or TinyViT), feature pyramid neck, CLIP text
  * encoder, BPE tokenizer, and 2D position encoding. Dispatches to the
  * correct encoder based on backbone_type. This module does not add new
  * computation -- it organizes the sub-modules and provides unified
@@ -67,6 +67,25 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 		break;
 	}
 
+	case SAM3_BACKBONE_TINYVIT: {
+		int embed_dims[] = {96, 192, 384, 576};
+		int depths[] = {2, 2, 6, 2};
+		int num_heads[] = {3, 6, 12, 18};
+		int window_sizes[] = {7, 7, 14, 7};
+		err = sam3_tinyvit_init(&vl->enc.tvit,
+					 embed_dims, depths,
+					 num_heads, window_sizes,
+					 4,	/* n_layers */
+					 1008,	/* img_size */
+					 1024,	/* embed_dim */
+					 4);	/* mlp_ratio */
+		if (err != SAM3_OK)
+			return err;
+		grid_size = vl->enc.tvit.grid_size;
+		backbone_dim = vl->enc.tvit.embed_dim;
+		break;
+	}
+
 	default:
 		sam3_log_error("vl_backbone: unknown backbone_type %d",
 			       backbone_type);
@@ -85,7 +104,8 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	 * used by the tracker. Init with same config; loading will
 	 * pick up the sam2_fpn_layers.* tensors if present.
 	 */
-	if (backbone_type == SAM3_BACKBONE_EFFICIENTVIT) {
+	if (backbone_type == SAM3_BACKBONE_EFFICIENTVIT ||
+	    backbone_type == SAM3_BACKBONE_TINYVIT) {
 		err = sam3_neck_init(&vl->sam2_neck, 256, backbone_dim,
 				      grid_size, 4, scales);
 		if (err != SAM3_OK)
@@ -134,6 +154,9 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 	case SAM3_BACKBONE_EFFICIENTVIT:
 		err = sam3_efficientvit_load(&vl->enc.evit, wf, arena);
 		break;
+	case SAM3_BACKBONE_TINYVIT:
+		err = sam3_tinyvit_load(&vl->enc.tvit, wf, arena);
+		break;
 	default:
 		err = SAM3_EINVAL;
 		break;
@@ -162,6 +185,20 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 		return err;
 
 	return SAM3_OK;
+}
+
+int sam3_vl_backbone_img_size(const struct sam3_vl_backbone *vl)
+{
+	switch (vl->backbone_type) {
+	case SAM3_BACKBONE_HIERA:
+		return vl->enc.vit.img_size;
+	case SAM3_BACKBONE_EFFICIENTVIT:
+		return vl->enc.evit.img_size;
+	case SAM3_BACKBONE_TINYVIT:
+		return vl->enc.tvit.img_size;
+	default:
+		return 0;
+	}
 }
 
 void sam3_vl_backbone_free(struct sam3_vl_backbone *vl)
@@ -194,6 +231,10 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 	case SAM3_BACKBONE_EFFICIENTVIT:
 		enc_out = sam3_efficientvit_build(&vl->enc.evit, be, image,
 						   scratch, persist, profiler);
+		break;
+	case SAM3_BACKBONE_TINYVIT:
+		enc_out = sam3_tinyvit_build(&vl->enc.tvit, be, image,
+					       scratch, persist, profiler);
 		break;
 	default:
 		enc_out = NULL;

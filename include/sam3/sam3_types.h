@@ -100,6 +100,7 @@ struct sam3_result {
 enum sam3_backbone_type {
 	SAM3_BACKBONE_HIERA        = 0,
 	SAM3_BACKBONE_EFFICIENTVIT = 1,
+	SAM3_BACKBONE_TINYVIT      = 2,
 };
 
 /* Model configuration loaded from weights file. */

@@ -310,6 +310,17 @@ struct sam3_tensor *gh_reshape(struct sam3_graph *g, struct sam3_arena *a,
 			       struct sam3_tensor *input,
 			       int n_dims, const int *dims)
 {
+	/* Validate element count: input and output must match. */
+	int in_elems = sam3_tensor_nelems(input);
+	int out_elems = 1;
+	for (int i = 0; i < n_dims; i++)
+		out_elems *= dims[i];
+	if (in_elems != out_elems) {
+		sam3_log_error("gh_reshape: element count mismatch "
+			       "(input %d != output %d)", in_elems, out_elems);
+		return NULL;
+	}
+
 	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
 						   n_dims, dims);
 	if (!out)

@@ -44,7 +44,7 @@ static void print_usage(const char *prog)
 	printf("  -f <format>          Input format: "
 	       "\"safetensors\" (default)\n");
 	printf("  --image-size <N>     Image input size "
-	       "(default: 1008)\n");
+	       "(default: 1008, 512 for efficientvit)\n");
 	printf("  --encoder-dim <N>    Encoder dimension "
 	       "(default: 1280)\n");
 	printf("  --decoder-dim <N>    Decoder dimension "
@@ -54,7 +54,8 @@ static void print_usage(const char *prog)
 	printf("  --decoder-layers <N> Decoder layer count "
 	       "(default: 2)\n");
 	printf("  --backbone <type>    Vision backbone: "
-	       "\"hiera\" (default), \"efficientvit\"\n");
+	       "\"hiera\" (default), \"efficientvit\", "
+	       "\"tinyvit\"\n");
 	printf("  --quantize <type>    Quantize weights: "
 	       "\"q8_0\" (default: none)\n");
 	printf("  -v                   Verbose output "
@@ -69,7 +70,7 @@ struct convert_args {
 	const char *input_path;
 	const char *output_path;
 	const char *format;
-	const char *backbone;   /* "hiera" or "efficientvit" */
+	const char *backbone;   /* "hiera", "efficientvit", or "tinyvit" */
 	const char *quantize;   /* NULL or "q8_0" */
 	int         image_size;
 	int         encoder_dim;
@@ -94,7 +95,7 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->format         = "safetensors";
 	args->backbone       = "hiera";
 	args->quantize       = NULL;
-	args->image_size     = 1008;
+	args->image_size     = -1; /* -1 = use backbone default */
 	args->encoder_dim    = -1; /* -1 = use backbone default */
 	args->decoder_dim    = 256;
 	args->encoder_layers = -1; /* -1 = use backbone default */
@@ -212,12 +213,31 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 			args->encoder_dim = 384;
 		if (args->encoder_layers < 0)
 			args->encoder_layers = 20;
+	} else if (strcmp(args->backbone, "tinyvit") == 0) {
+		args->backbone_type = SAM3_BACKBONE_TINYVIT;
+		if (args->encoder_dim < 0)
+			args->encoder_dim = 576;
+		if (args->encoder_layers < 0)
+			args->encoder_layers = 12;
 	} else {
 		fprintf(stderr,
 			"error: unsupported backbone '%s' "
-			"(use \"hiera\" or \"efficientvit\")\n",
+			"(use \"hiera\", \"efficientvit\", "
+			"or \"tinyvit\")\n",
 			args->backbone);
 		return 1;
+	}
+
+	/*
+	 * Apply backbone-aware image_size default when the user did
+	 * not specify --image-size. EfficientViT hardcodes 512;
+	 * Hiera and TinyViT use 1008.
+	 */
+	if (args->image_size < 0) {
+		if (args->backbone_type == SAM3_BACKBONE_EFFICIENTVIT)
+			args->image_size = 512;
+		else
+			args->image_size = 1008;
 	}
 
 	return 0;
