@@ -25,6 +25,7 @@
 #include "sam3/sam3.h"
 #include "sam3/internal/mask_nms.h"
 #include "sam3/internal/mask_postprocess.h"
+#include "sam3/internal/mask_boxes.h"
 #include "sam3/internal/mask_resize.h"
 #include "sam3/internal/tensor_dump.h"
 #include "core/tensor.h"
@@ -435,11 +436,80 @@ static int write_mask_png(const char *path, const float *data,
 }
 
 /*
+ * draw_box_rgb - Draw a bounding box rectangle on an RGB buffer.
+ *
+ * Draws a 2-pixel thick rectangle at the given xyxy coordinates.
+ * Coordinates are clamped to image bounds.
+ *
+ * @buf:  RGB pixel buffer (w * h * 3)
+ * @w:    Image width
+ * @h:    Image height
+ * @x0:   Left edge (inclusive)
+ * @y0:   Top edge (inclusive)
+ * @x1:   Right edge (exclusive)
+ * @y1:   Bottom edge (exclusive)
+ * @r, @g, @b: Box color
+ */
+static void draw_box_rgb(uint8_t *buf, int w, int h,
+			 int x0, int y0, int x1, int y1,
+			 uint8_t r, uint8_t g, uint8_t b)
+{
+	/* Clamp to image bounds */
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > w) x1 = w;
+	if (y1 > h) y1 = h;
+	if (x0 >= x1 || y0 >= y1)
+		return;
+
+	/* 2-pixel thick lines */
+	for (int t = 0; t < 2; t++) {
+		/* Top edge */
+		if (y0 + t < y1) {
+			for (int x = x0; x < x1; x++) {
+				size_t idx = ((size_t)(y0 + t) * w + x) * 3;
+				buf[idx + 0] = r;
+				buf[idx + 1] = g;
+				buf[idx + 2] = b;
+			}
+		}
+		/* Bottom edge */
+		if (y1 - 1 - t >= y0) {
+			for (int x = x0; x < x1; x++) {
+				size_t idx = ((size_t)(y1 - 1 - t) * w + x) * 3;
+				buf[idx + 0] = r;
+				buf[idx + 1] = g;
+				buf[idx + 2] = b;
+			}
+		}
+		/* Left edge */
+		if (x0 + t < x1) {
+			for (int y = y0; y < y1; y++) {
+				size_t idx = ((size_t)y * w + (x0 + t)) * 3;
+				buf[idx + 0] = r;
+				buf[idx + 1] = g;
+				buf[idx + 2] = b;
+			}
+		}
+		/* Right edge */
+		if (x1 - 1 - t >= x0) {
+			for (int y = y0; y < y1; y++) {
+				size_t idx = ((size_t)y * w + (x1 - 1 - t)) * 3;
+				buf[idx + 0] = r;
+				buf[idx + 1] = g;
+				buf[idx + 2] = b;
+			}
+		}
+	}
+}
+
+/*
  * write_overlay - Write a color overlay PNG on the original image.
  *
  * Overlays a semi-transparent blue (30, 144, 255) at 50% alpha on
- * pixels where the mask exceeds the threshold. The mask is resized
- * to match the original image dimensions if needed.
+ * pixels where the mask exceeds the threshold. Draws a bounding box
+ * around the mask region. The mask is resized to match the original
+ * image dimensions if needed.
  *
  * @path:      Output PNG path
  * @mask:      Float mask data (mask_h * mask_w)
@@ -510,6 +580,16 @@ static int write_overlay(const char *path, const float *mask,
 			out[i * 3 + 1] = g;
 			out[i * 3 + 2] = b;
 		}
+	}
+
+	/* Draw bounding box around mask region */
+	float box[4];
+	if (sam3_masks_to_boxes(m, 1, h, w, box) == 0 &&
+	    (box[2] > box[0] || box[3] > box[1])) {
+		draw_box_rgb(out, w, h,
+			     (int)box[0], (int)box[1],
+			     (int)box[2], (int)box[3],
+			     30, 144, 255);
 	}
 
 	int ok = stbi_write_png(path, w, h, 3, out, w * 3);
