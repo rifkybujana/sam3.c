@@ -14,19 +14,38 @@
  */
 
 #include "cpu_kernels.h"
+#include "cpu_simd.h"
 #include "core/tensor.h"
 #include "util/log.h"
 #include "util/threadpool.h"
 
 #include <math.h>
 
-/* --- Scalar path --- */
+/* --- Compute path (NEON + scalar tail) --- */
 
-static void sigmoid_f32_scalar(const float *in, float *out,
-			       int start, int end)
+static void sigmoid_f32_impl(const float *in, float *out,
+			      int start, int end)
 {
+#if SAM3_HAS_NEON
+	int i = start;
+	for (; i + 4 <= end; i += 4) {
+		float32x4_t vx = vld1q_f32(in + i);
+		float tmp[4];
+		float32x4_t neg_vx = vnegq_f32(vx);
+		vst1q_f32(tmp, neg_vx);
+		for (int k = 0; k < 4; k++)
+			tmp[k] = expf(tmp[k]);
+		float32x4_t vexp = vld1q_f32(tmp);
+		float32x4_t vone = vdupq_n_f32(1.0f);
+		float32x4_t vdenom = vaddq_f32(vone, vexp);
+		vst1q_f32(out + i, vdivq_f32(vone, vdenom));
+	}
+	for (; i < end; i++)
+		out[i] = 1.0f / (1.0f + expf(-in[i]));
+#else
 	for (int i = start; i < end; i++)
 		out[i] = 1.0f / (1.0f + expf(-in[i]));
+#endif
 }
 
 /* --- Parallel dispatch --- */
@@ -47,7 +66,7 @@ static void sigmoid_parallel_fn(void *arg, int task_id, int n_tasks)
 	if (start >= end)
 		return;
 
-	sigmoid_f32_scalar(ctx->in, ctx->out, start, end);
+	sigmoid_f32_impl(ctx->in, ctx->out, start, end);
 }
 
 enum sam3_error cpu_kernel_sigmoid(const struct sam3_node *node,

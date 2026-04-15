@@ -155,6 +155,14 @@ enum sam3_error cpu_kernel_silu_bf16(const struct sam3_node *node,
 /* Element-wise Hard Swish: x * clamp(x+3, 0, 6) / 6 */
 enum sam3_error cpu_kernel_hswish(const struct sam3_node *node,
 				  struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_hswish_bf16(const struct sam3_node *node,
+				       struct sam3_threadpool *pool);
+
+/* NHWC bias add: x[N,H,W,C] + bias[C] -> output[N,H,W,C] */
+enum sam3_error cpu_kernel_bias_add(const struct sam3_node *node,
+				    struct sam3_threadpool *pool);
+enum sam3_error cpu_kernel_bias_add_bf16(const struct sam3_node *node,
+					 struct sam3_threadpool *pool);
 
 /* Embedding table lookup: table[indices[i], :] -> output[i, :] */
 enum sam3_error cpu_kernel_embed(const struct sam3_node *node,

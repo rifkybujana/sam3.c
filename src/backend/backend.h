@@ -46,6 +46,13 @@ struct sam3_backend_ops {
 	/* Reset working memory (arena) between graph evaluations.
 	 * May be NULL if the backend manages memory automatically. */
 	void (*arena_reset)(struct sam3_backend *be);
+
+	/* Invalidate cached state for tensors whose address falls in
+	 * [start, start + len). Called when arena memory is recycled
+	 * so that backends with tensor caches do not return stale data.
+	 * May be NULL if the backend has no persistent tensor cache. */
+	void (*cache_invalidate)(struct sam3_backend *be,
+				 const void *start, size_t len);
 };
 
 /* Backend instance. Backends embed this as first member. */

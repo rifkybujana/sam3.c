@@ -75,7 +75,17 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 			return SAM3_ENOMEM;
 		cpu->base.type = SAM3_BACKEND_CPU;
 		cpu->base.ops = sam3_cpu_backend_ops();
-		cpu->arena_capacity = 512UL * 1024 * 1024;
+		/*
+		 * CPU inference path: the backend arena is unused during
+		 * normal inference (model code allocates from processor
+		 * arenas via gh_alloc_tensor), so keep it minimal.
+		 * The backend scratch handles conv2d im2col buffers;
+		 * native NHWC kernels eliminated layout conversions,
+		 * so the FPN 3×3 conv on 288×288×256 now needs only
+		 * the im2col buffer (~729 MiB).
+		 */
+		cpu->arena_capacity = 64UL * 1024 * 1024;
+		cpu->scratch_capacity = 1024UL * 1024 * 1024;
 		err = cpu->base.ops->init(&cpu->base);
 		if (err != SAM3_OK) {
 			free(cpu);
@@ -84,22 +94,36 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 		proc->backend = &cpu->base;
 	}
 
-	/* Model arena: 2 GiB for tensor structs, QKV fused weights
-	 * (~700 MiB for ViT + text encoder), tiled pos embed,
-	 * precomputed tables, and cached features. Weight data
-	 * lives in the mmap region, not the arena. */
-	err = sam3_arena_init(&proc->model_arena, 2048UL * 1024 * 1024);
+	/*
+	 * Arena sizes are backend-aware. The Metal path uses skip_data
+	 * for intermediate tensors (MLX manages GPU memory), so arenas
+	 * hold mostly tensor structs and need large capacity for the
+	 * combined graph metadata. The CPU path allocates actual data
+	 * buffers but resets between stages, so per-stage peak is the
+	 * binding constraint.
+	 *
+	 * CPU model_arena must hold fused QKV weights (Hiera: 32 layers
+	 * × 3×1024×1024 f32 = 384 MiB), tiled pos_embed (20 MiB),
+	 * plus neck, decoder, and per-segment persistent data. The full
+	 * Hiera model needs ~600 MiB; 1.5 GiB gives headroom.
+	 *
+	 * CPU scratch_arena must hold a full ViT block batch. Hiera
+	 * with batch=2 peaks at ~2.1 GiB per batch (attention scores
+	 * dominate: 9 windows × 16 heads × 576×576 × 4B = 188 MiB
+	 * per block, plus MLP expansion at 94 MiB). 2.5 GiB gives
+	 * headroom for the FPN pixel decoder as well.
+	 */
+	int is_cpu = (proc->backend->type == SAM3_BACKEND_CPU);
+	size_t model_cap = is_cpu ? 1536UL * 1024 * 1024
+				  : 2048UL * 1024 * 1024;
+	size_t scratch_cap = is_cpu ? 2560UL * 1024 * 1024
+				    : 3072UL * 1024 * 1024;
+
+	err = sam3_arena_init(&proc->model_arena, model_cap);
 	if (err != SAM3_OK)
 		goto cleanup_backend;
 
-	/*
-	 * Scratch arena: 3 GiB. Per-stage evaluation keeps peak memory
-	 * bounded to the largest single stage. The encoder fusion is
-	 * the most expensive at ~1.9 GiB (6 self-attention + cross-
-	 * attention layers). The segmentation head is ~2 GiB with
-	 * 3-stage upsampling to 288x288 + mask logits.
-	 */
-	err = sam3_arena_init(&proc->scratch_arena, 3072UL * 1024 * 1024);
+	err = sam3_arena_init(&proc->scratch_arena, scratch_cap);
 	if (err != SAM3_OK)
 		goto cleanup_model_arena;
 
@@ -136,7 +160,7 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 		if (cpu_t) {
 			cpu_t->base.type = SAM3_BACKEND_CPU;
 			cpu_t->base.ops  = sam3_cpu_backend_ops();
-			cpu_t->arena_capacity = 256UL * 1024 * 1024;
+			cpu_t->arena_capacity = 64UL * 1024 * 1024;
 			if (cpu_t->base.ops->init(&cpu_t->base) == SAM3_OK)
 				proc->text_backend = &cpu_t->base;
 			else
@@ -179,8 +203,14 @@ enum sam3_error sam3_processor_load(struct sam3_processor *proc,
 				    const struct sam3_weight_file *wf,
 				    const char *vocab_path)
 {
-	return sam3_image_model_load(&proc->model, wf, vocab_path,
+	enum sam3_error err;
+
+	err = sam3_image_model_load(&proc->model, wf, vocab_path,
 				     &proc->model_arena);
+	if (err == SAM3_OK)
+		proc->weights_end = proc->model_arena.offset;
+
+	return err;
 }
 
 int sam3_processor_img_size(const struct sam3_processor *proc)
@@ -228,6 +258,27 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 
 	if (!proc || !pixels || width <= 0 || height <= 0)
 		return SAM3_EINVAL;
+
+	/*
+	 * Roll back model_arena to the post-weight-load offset so that
+	 * encoder outputs from a previous set_image call are discarded.
+	 * Without this, repeated calls (e.g. benchmarks) accumulate
+	 * persistent data and eventually exhaust the arena.
+	 *
+	 * Invalidate the backend's tensor cache for the freed region
+	 * so that stale GPU-resident arrays are evicted.
+	 */
+	if (proc->model_arena.offset > proc->weights_end) {
+		char *base = (char *)proc->model_arena.base;
+		size_t old_off = proc->model_arena.offset;
+		proc->model_arena.offset = proc->weights_end;
+		if (proc->backend->ops->cache_invalidate) {
+			proc->backend->ops->cache_invalidate(
+				proc->backend,
+				base + proc->weights_end,
+				old_off - proc->weights_end);
+		}
+	}
 
 	/* Reset scratch arena for this encode pass */
 	sam3_arena_reset(&proc->scratch_arena);
@@ -1109,11 +1160,34 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 
 	SAM3_PROF_END(proc->profiler, "postprocess");
 
-	/* Roll back inter-stage persist data */
-	proc->model_arena.offset = persist_save;
+	/* Roll back inter-stage persist data and invalidate stale
+	 * backend cache entries for the freed arena region. */
+	{
+		size_t end_off = proc->model_arena.offset;
+		proc->model_arena.offset = persist_save;
+		if (end_off > persist_save &&
+		    proc->backend->ops->cache_invalidate) {
+			char *base = (char *)proc->model_arena.base;
+			proc->backend->ops->cache_invalidate(
+				proc->backend,
+				base + persist_save,
+				end_off - persist_save);
+		}
+	}
 	return SAM3_OK;
 
 fail:
-	proc->model_arena.offset = persist_save;
+	{
+		size_t end_off = proc->model_arena.offset;
+		proc->model_arena.offset = persist_save;
+		if (end_off > persist_save &&
+		    proc->backend->ops->cache_invalidate) {
+			char *base = (char *)proc->model_arena.base;
+			proc->backend->ops->cache_invalidate(
+				proc->backend,
+				base + persist_save,
+				end_off - persist_save);
+		}
+	}
 	return err;
 }

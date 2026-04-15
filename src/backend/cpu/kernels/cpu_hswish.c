@@ -16,21 +16,43 @@
  */
 
 #include "cpu_kernels.h"
+#include "cpu_simd.h"
 #include "core/tensor.h"
 #include "util/log.h"
 #include "util/threadpool.h"
 
 #include <math.h>
 
-/* --- Scalar path --- */
+/* --- Compute path (NEON + scalar tail) --- */
 
-static void hswish_f32_scalar(const float *in, float *out,
-			      int start, int end)
+static void hswish_f32_impl(const float *in, float *out,
+			     int start, int end)
 {
+#if SAM3_HAS_NEON
+	float32x4_t v3 = vdupq_n_f32(3.0f);
+	float32x4_t v6 = vdupq_n_f32(6.0f);
+	float32x4_t v0 = vdupq_n_f32(0.0f);
+	float32x4_t vinv6 = vdupq_n_f32(1.0f / 6.0f);
+	int i = start;
+	for (; i + 4 <= end; i += 4) {
+		float32x4_t vx = vld1q_f32(in + i);
+		float32x4_t vc = vminq_f32(
+			vmaxq_f32(vaddq_f32(vx, v3), v0), v6);
+		vst1q_f32(out + i,
+			  vmulq_f32(vmulq_f32(vx, vc), vinv6));
+	}
+	for (; i < end; i++) {
+		float v = in[i];
+		out[i] = v * fminf(fmaxf(v + 3.0f, 0.0f), 6.0f)
+			 * (1.0f / 6.0f);
+	}
+#else
 	for (int i = start; i < end; i++) {
 		float v = in[i];
-		out[i] = v * fminf(fmaxf(v + 3.0f, 0.0f), 6.0f) * (1.0f / 6.0f);
+		out[i] = v * fminf(fmaxf(v + 3.0f, 0.0f), 6.0f)
+			 * (1.0f / 6.0f);
 	}
+#endif
 }
 
 /* --- Parallel dispatch --- */
@@ -51,7 +73,7 @@ static void hswish_parallel_fn(void *arg, int task_id, int n_tasks)
 	if (start >= end)
 		return;
 
-	hswish_f32_scalar(ctx->in, ctx->out, start, end);
+	hswish_f32_impl(ctx->in, ctx->out, start, end);
 }
 
 enum sam3_error cpu_kernel_hswish(const struct sam3_node *node,

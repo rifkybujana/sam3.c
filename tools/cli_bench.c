@@ -126,6 +126,9 @@ int cli_bench(int argc, char **argv)
 #endif
 	}
 
+	if (cfg.verbose)
+		sam3_log_set_level(SAM3_LOG_DEBUG);
+
 	bool run_kernels = strcmp(suite, "kernels") == 0 ||
 			   strcmp(suite, "all") == 0;
 	bool run_pipeline = strcmp(suite, "pipeline") == 0 ||

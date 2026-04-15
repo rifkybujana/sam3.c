@@ -249,6 +249,50 @@ static void metal_map_evict(struct sam3_metal_backend *mtl,
 	}
 }
 
+/*
+ * metal_cache_invalidate_range - Evict cached entries in a memory range.
+ *
+ * Scans the tensor-to-mlx_array map and evicts any entry whose tensor
+ * pointer falls within [start, start + len). Called when arena memory
+ * is recycled so that subsequent wrap calls create fresh mlx_arrays
+ * from the new host data instead of returning stale GPU-resident arrays.
+ */
+static void metal_cache_invalidate_range(struct sam3_metal_backend *mtl,
+					  const void *start, size_t len)
+{
+	if (!mtl->map_keys || len == 0)
+		return;
+
+	const char *lo = (const char *)start;
+	const char *hi = lo + len;
+	int evicted = 0;
+
+	for (int i = 0; i < mtl->map_capacity; i++) {
+		const struct sam3_tensor *key = mtl->map_keys[i];
+		if (!key || key == METAL_MAP_TOMBSTONE)
+			continue;
+		const char *addr = (const char *)key;
+		if (addr >= lo && addr < hi) {
+			mlx_array_free(mtl->map_vals[i]);
+			mtl->map_keys[i] = METAL_MAP_TOMBSTONE;
+			mtl->map_count--;
+			evicted++;
+		}
+	}
+
+	if (evicted > 0)
+		sam3_log_debug("metal: cache_invalidate evicted %d "
+			       "entries in range [%p, +%zu)",
+			       evicted, start, len);
+}
+
+static void metal_cache_invalidate(struct sam3_backend *be,
+				    const void *start, size_t len)
+{
+	struct sam3_metal_backend *mtl = (struct sam3_metal_backend *)be;
+	metal_cache_invalidate_range(mtl, start, len);
+}
+
 /* ── Tensor wrapping ──────────────────────────────────────────────── */
 
 /*
@@ -294,7 +338,15 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 	}
 
 	if (!t->data) {
-		sam3_log_error("metal: wrap_tensor: no data and not in map");
+		sam3_log_error("metal: wrap_tensor: no data and not in map "
+			       "(tensor %p, ndims=%d, dims=[%d,%d,%d,%d], "
+			       "dtype=%d)",
+			       (const void *)t, t->n_dims,
+			       t->n_dims > 0 ? t->dims[0] : 0,
+			       t->n_dims > 1 ? t->dims[1] : 0,
+			       t->n_dims > 2 ? t->dims[2] : 0,
+			       t->n_dims > 3 ? t->dims[3] : 0,
+			       t->dtype);
 		return mlx_array_new();
 	}
 
@@ -465,8 +517,17 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 	mlx_stream stream = mtl->stream;
 	int rc;
 
-	for (int i = 0; i < node->n_inputs; i++)
-		inputs[i] = metal_wrap_tensor(mtl, node->inputs[i]);
+	for (int i = 0; i < node->n_inputs; i++) {
+		const struct sam3_tensor *inp = node->inputs[i];
+		if (!inp->data && !metal_map_get(mtl, inp)) {
+			sam3_log_error("metal: dispatch op=%d input[%d]: "
+				       "tensor %p ndims=%d data=%p "
+				       "(will fail wrap)",
+				       node->op, i, (const void *)inp,
+				       inp->n_dims, (const void *)inp->data);
+		}
+		inputs[i] = metal_wrap_tensor(mtl, inp);
+	}
 
 	switch (node->op) {
 	case SAM3_OP_MATMUL:
@@ -2017,11 +2078,12 @@ static enum sam3_error metal_graph_eval(struct sam3_backend *be,
 }
 
 static const struct sam3_backend_ops metal_ops = {
-	.init         = metal_init,
-	.free         = metal_free,
-	.alloc_tensor = metal_alloc_tensor,
-	.graph_eval   = metal_graph_eval,
-	.arena_reset  = NULL,  /* MLX manages memory automatically */
+	.init              = metal_init,
+	.free              = metal_free,
+	.alloc_tensor      = metal_alloc_tensor,
+	.graph_eval        = metal_graph_eval,
+	.arena_reset       = NULL,  /* MLX manages memory automatically */
+	.cache_invalidate  = metal_cache_invalidate,
 };
 
 const struct sam3_backend_ops *sam3_metal_backend_ops(void)

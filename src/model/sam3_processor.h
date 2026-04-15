@@ -40,6 +40,7 @@ struct sam3_processor {
 	struct sam3_backend *backend;
 	struct sam3_arena model_arena;    /* weights + cached features */
 	struct sam3_arena scratch_arena;  /* per-inference temp */
+	size_t weights_end;              /* model_arena offset after load */
 	int image_loaded;
 	int prompt_w;			 /* user-space image width for coord norm */
 	int prompt_h;			 /* user-space image height for coord norm */

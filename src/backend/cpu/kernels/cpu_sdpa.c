@@ -11,7 +11,7 @@
  * (one tile of scores).
  *
  * Key types:  sam3_node, sam3_tensor
- * Depends on: cpu_kernels.h, core/tensor.h
+ * Depends on: cpu_kernels.h, cpu_simd.h, core/tensor.h
  * Used by:    cpu_dispatch.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -19,6 +19,7 @@
  */
 
 #include "cpu_kernels.h"
+#include "cpu_simd.h"
 #include "core/tensor.h"
 #include "util/log.h"
 #include "util/threadpool.h"
@@ -62,11 +63,25 @@ static void sdpa_row_f32(const float *q, const float *K, const float *V,
 
 		for (j = t; j < tile_end; j++) {
 			/* Compute dot(q, K[j]) * scale */
-			float score = 0.0f;
 			const float *kj = K + j * head_dim;
+			float score;
 
+#if SAM3_HAS_NEON
+			float32x4_t vsum = vdupq_n_f32(0);
+			d = 0;
+			for (; d + 4 <= head_dim; d += 4) {
+				float32x4_t vq = vld1q_f32(q + d);
+				float32x4_t vk = vld1q_f32(kj + d);
+				vsum = vfmaq_f32(vsum, vq, vk);
+			}
+			score = neon_hsum_f32(vsum);
+			for (; d < head_dim; d++)
+				score += q[d] * kj[d];
+#else
+			score = 0.0f;
 			for (d = 0; d < head_dim; d++)
 				score += q[d] * kj[d];
+#endif
 			score *= scale;
 
 			/* Add mask if present */
@@ -86,15 +101,40 @@ static void sdpa_row_f32(const float *q, const float *K, const float *V,
 			if (score > row_max) {
 				float correction = expf(row_max - score);
 				row_sum *= correction;
+#if SAM3_HAS_NEON
+				float32x4_t vcorr = vdupq_n_f32(correction);
+				d = 0;
+				for (; d + 4 <= head_dim; d += 4) {
+					float32x4_t vo = vld1q_f32(out + d);
+					vst1q_f32(out + d,
+						  vmulq_f32(vo, vcorr));
+				}
+				for (; d < head_dim; d++)
+					out[d] *= correction;
+#else
 				for (d = 0; d < head_dim; d++)
 					out[d] *= correction;
+#endif
 				row_max = score;
 			}
 
 			float w = expf(score - row_max);
 			const float *vj = V + j * head_dim;
+#if SAM3_HAS_NEON
+			float32x4_t vw = vdupq_n_f32(w);
+			d = 0;
+			for (; d + 4 <= head_dim; d += 4) {
+				float32x4_t va = vld1q_f32(out + d);
+				float32x4_t vv = vld1q_f32(vj + d);
+				vst1q_f32(out + d,
+					  vfmaq_f32(va, vw, vv));
+			}
+			for (; d < head_dim; d++)
+				out[d] += w * vj[d];
+#else
 			for (d = 0; d < head_dim; d++)
 				out[d] += w * vj[d];
+#endif
 			row_sum += w;
 		}
 	}
@@ -102,8 +142,19 @@ static void sdpa_row_f32(const float *q, const float *K, const float *V,
 	/* Normalize by sum */
 	if (row_sum > 0.0f) {
 		float inv_sum = 1.0f / row_sum;
+#if SAM3_HAS_NEON
+		float32x4_t vinv = vdupq_n_f32(inv_sum);
+		d = 0;
+		for (; d + 4 <= head_dim; d += 4) {
+			float32x4_t vo = vld1q_f32(out + d);
+			vst1q_f32(out + d, vmulq_f32(vo, vinv));
+		}
+		for (; d < head_dim; d++)
+			out[d] *= inv_sum;
+#else
 		for (d = 0; d < head_dim; d++)
 			out[d] *= inv_sum;
+#endif
 	}
 }
 

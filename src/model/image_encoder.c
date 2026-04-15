@@ -488,6 +488,13 @@ static enum sam3_error vit_lazy_precompute(struct sam3_vit *vit)
 	return SAM3_OK;
 }
 
+enum sam3_error sam3_vit_precompute(struct sam3_vit *vit)
+{
+	if (vit->precomputed)
+		return SAM3_OK;
+	return vit_lazy_precompute(vit);
+}
+
 struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 				    struct sam3_backend *be,
 				    struct sam3_tensor *image,
@@ -603,12 +610,18 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	 * per batch instead of ~1.2 GB per block. This allows larger
 	 * batches (fewer GPU dispatches) without exhausting the arena.
 	 *
-	 * CPU path keeps skip_data=0 and batch=2 (needs host buffers).
+	 * CPU batch size depends on per-block scratch cost: each block
+	 * allocates ~(np * mlp_dim * 4) bytes for the MLP expansion
+	 * plus smaller attention tensors. Hiera (5184×4736) needs
+	 * ~294 MiB/block → batch=2 fits in 1 GiB scratch. Smaller
+	 * backbones (EfficientViT, TinyViT) use batch=4.
 	 */
 	SAM3_PROF_BEGIN(profiler, "vit_blocks");
 	{
 		int skip_data = (be->type == SAM3_BACKEND_METAL);
-		int batch = skip_data ? 4 : 2;
+		size_t block_bytes = (size_t)np * vit->mlp_dim * 4 * 3;
+		int batch = (skip_data || block_bytes < 256UL * 1024 * 1024)
+			  ? 4 : 2;
 
 		/*
 		 * GPU-resident forwarding tensor. Allocated in

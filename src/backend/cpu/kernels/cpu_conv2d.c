@@ -1,21 +1,17 @@
 /*
- * src/backend/cpu/kernels/cpu_conv2d.c - Conv2D via im2col + matmul
+ * src/backend/cpu/kernels/cpu_conv2d.c - Native NHWC Conv2D via im2col + matmul
  *
- * Implements 2D convolution using the im2col approach: unroll input
- * patches into a column matrix, then matrix-multiply with the weight
- * matrix. Scratch arena is used for the im2col buffer with save/restore
- * of offset so the temp buffer is freed automatically.
+ * Implements 2D convolution directly in NHWC layout: unrolls input
+ * patches from channels-last memory into a column matrix, then
+ * matrix-multiplies with the OHWI weight to produce NHWC output
+ * with zero layout conversions. The OHWI weight [OC,KH,KW,IC]
+ * is treated as [OC, KH*KW*IC] and the matmul computes col × W^T.
  *
- * Public layout (after the NHWC migration): input [N,H,W,C],
- * weight [OC,KH,KW,IC] (OHWI), output [N,OH,OW,OC].
- * node->params[0]=stride, params[1]=padding.
+ * Public layout: input [N,H,W,C], weight [OC,KH,KW,IC] (OHWI),
+ * output [N,OH,OW,OC]. node->params[0]=stride, params[1]=padding.
  *
- * The public entry point transposes NHWC inputs and OHWI weights into
- * NCHW/OIHW scratch buffers, runs the legacy NCHW im2col body, and
- * transposes the result back to NHWC. The CPU backend is test-only;
- * Metal handles the NHWC path natively via MLX. Byte-level transpose
- * helpers are shared across the f16 / bf16 / conv_transpose2d /
- * maxpool kernels via file-scope exports.
+ * Byte-level transpose helpers are retained for the f16 / bf16 /
+ * conv_transpose2d / maxpool kernels which still use the NCHW shim.
  *
  * Key types:  sam3_node, sam3_tensor, sam3_arena
  * Depends on: cpu_kernels.h, core/tensor.h, core/alloc.h
@@ -45,123 +41,92 @@
 #endif
 
 /*
- * im2col - Unroll input patches into a column matrix.
+ * im2col_nhwc_f32 - Unroll NHWC input patches into a column matrix.
  *
- * Input: [C, H, W]
- * Output: [C*KH*KW, OH*OW] (column-major patches)
+ * Input:  [H, W, C] (one batch slice, channels-last)
+ * Output: [OH*OW, C_grp*KH*KW] (one row per output position)
  *
- * Splits oh/ow iteration into boundary (needs padding) and interior
- * (no bounds check) regions.  Interior rows with stride=1 use memcpy.
+ * For grouped convolutions, c_off selects the starting channel
+ * and C_grp copies only that group's channels per pixel. Each
+ * copy moves C_grp contiguous floats — cache-friendly for NHWC
+ * since channels are innermost.
  */
-static void im2col_f32(const float *in, float *col,
-		       int C, int H, int W,
-		       int KH, int KW,
-		       int stride, int pad,
-		       int OH, int OW)
+static void im2col_nhwc_f32(const float *in, float *col,
+			     int C, int H, int W,
+			     int KH, int KW,
+			     int stride, int pad,
+			     int OH, int OW,
+			     int c_off, int C_grp)
 {
-	int col_cols = OH * OW;
+	size_t K = (size_t)C_grp * KH * KW;
+	size_t grp_bytes = (size_t)C_grp * sizeof(float);
 
-	for (int c = 0; c < C; c++) {
-		const float *in_c = in + c * H * W;
-		for (int kh = 0; kh < KH; kh++) {
-			for (int kw = 0; kw < KW; kw++) {
-				int col_row = (c * KH + kh) * KW + kw;
-				float *dst_row = col + col_row * col_cols;
-
-				/* oh range where ih = oh*stride+kh-pad is in [0,H) */
-				int oh_start = 0;
-				int oh_end = OH;
-				if (kh - pad < 0)
-					oh_start = (-kh + pad + stride - 1) / stride;
-				if (kh - pad + (OH - 1) * stride >= H)
-					oh_end = (H - kh + pad + stride - 1) / stride;
-				if (oh_end > OH)
-					oh_end = OH;
-				if (oh_start > OH)
-					oh_start = OH;
-
-				/* ow range where iw = ow*stride+kw-pad is in [0,W) */
-				int ow_start = 0;
-				int ow_end = OW;
-				if (kw - pad < 0)
-					ow_start = (-kw + pad + stride - 1) / stride;
-				if (kw - pad + (OW - 1) * stride >= W)
-					ow_end = (W - kw + pad + stride - 1) / stride;
-				if (ow_end > OW)
-					ow_end = OW;
-				if (ow_start > OW)
-					ow_start = OW;
-
-				/* Top boundary rows: all zeros */
-				for (int oh = 0; oh < oh_start; oh++)
-					memset(dst_row + oh * OW, 0,
-					       (size_t)OW * sizeof(float));
-
-				/* Interior rows */
-				for (int oh = oh_start; oh < oh_end; oh++) {
-					int ih = oh * stride + kh - pad;
-					float *dst = dst_row + oh * OW;
-
-					/* Left pad */
-					if (ow_start > 0)
-						memset(dst, 0,
-						       (size_t)ow_start * sizeof(float));
-
-					/* Interior: no bounds check needed */
-					int iw_base = ow_start * stride + kw - pad;
-					if (stride == 1) {
-						memcpy(dst + ow_start,
-						       in_c + ih * W + iw_base,
-						       (size_t)(ow_end - ow_start) * sizeof(float));
+	for (int oh = 0; oh < OH; oh++) {
+		for (int ow = 0; ow < OW; ow++) {
+			float *dst = col + (size_t)(oh * OW + ow) * K;
+			for (int kh = 0; kh < KH; kh++) {
+				int ih = oh * stride + kh - pad;
+				for (int kw = 0; kw < KW; kw++) {
+					int iw = ow * stride + kw - pad;
+					float *d = dst +
+						((size_t)kh * KW + kw) *
+						C_grp;
+					if ((unsigned)ih < (unsigned)H &&
+					    (unsigned)iw < (unsigned)W) {
+						memcpy(d,
+						       in + ((size_t)ih * W +
+							     iw) * C +
+						       c_off,
+						       grp_bytes);
 					} else {
-						for (int ow = ow_start; ow < ow_end; ow++) {
-							int iw = ow * stride + kw - pad;
-							dst[ow] = in_c[ih * W + iw];
-						}
+						memset(d, 0, grp_bytes);
 					}
-
-					/* Right pad */
-					if (ow_end < OW)
-						memset(dst + ow_end, 0,
-						       (size_t)(OW - ow_end) * sizeof(float));
 				}
-
-				/* Bottom boundary rows: all zeros */
-				for (int oh = oh_end; oh < OH; oh++)
-					memset(dst_row + oh * OW, 0,
-					       (size_t)OW * sizeof(float));
 			}
 		}
 	}
 }
 
-struct conv2d_matmul_ctx {
-	const float *a;
-	const float *b;
-	float       *c;
-	int          M;
-	int          K;
-	int          N;
+struct conv2d_nhwc_matmul_ctx {
+	const float *col;     /* [M, K] im2col output */
+	const float *weight;  /* [N, K] OHWI reshaped per-group */
+	float       *output;  /* NHWC output base (may be offset for groups) */
+	int          M;       /* OH * OW */
+	int          K;       /* cpg_in * KH * KW */
+	int          N;       /* cpg_out */
+	int          ldc;     /* C_out (output row stride for groups) */
 };
 
-static void conv2d_matmul_parallel_fn(void *arg, int task_id, int n_tasks)
+/*
+ * Parallel matmul: output = col × weight^T.
+ *
+ * col [M, K], weight [N, K] → output [M, ldc] with N cols written.
+ * Splits work over M rows (output spatial positions).
+ */
+static void conv2d_nhwc_matmul_fn(void *arg, int task_id, int n_tasks)
 {
-	struct conv2d_matmul_ctx *ctx = (struct conv2d_matmul_ctx *)arg;
+	struct conv2d_nhwc_matmul_ctx *ctx =
+		(struct conv2d_nhwc_matmul_ctx *)arg;
 	int chunk = ctx->M / n_tasks;
 	int m_start = task_id * chunk;
-	int m_end = (task_id == n_tasks - 1) ? ctx->M : m_start + chunk;
+	int m_end = (task_id == n_tasks - 1)
+		  ? ctx->M : m_start + chunk;
 
 	if (m_start >= m_end)
 		return;
 
-	memset(ctx->c + (size_t)m_start * ctx->N, 0,
-	       (size_t)(m_end - m_start) * ctx->N * sizeof(float));
+	int K = ctx->K;
+	int N = ctx->N;
+	int ldc = ctx->ldc;
 
 	for (int i = m_start; i < m_end; i++) {
-		for (int k = 0; k < ctx->K; k++) {
-			float aik = ctx->a[i * ctx->K + k];
-			for (int j = 0; j < ctx->N; j++)
-				ctx->c[i * ctx->N + j] += aik * ctx->b[k * ctx->N + j];
+		float *out = ctx->output + (size_t)i * ldc;
+		memset(out, 0, (size_t)N * sizeof(float));
+		for (int k = 0; k < K; k++) {
+			float cik = ctx->col[(size_t)i * K + k];
+			for (int j = 0; j < N; j++)
+				out[j] += cik *
+					ctx->weight[(size_t)j * K + k];
 		}
 	}
 }
@@ -169,12 +134,12 @@ static void conv2d_matmul_parallel_fn(void *arg, int task_id, int n_tasks)
 /* ── NHWC transpose helpers (dtype-generic, file-scope linkage) ──── */
 
 /*
- * These helpers are used by cpu_kernel_conv2d below and also by the
- * NHWC shim in cpu_kernel_conv2d_f16 / _bf16 / cpu_kernel_conv_transpose2d.
- * They have external linkage under the sam3_cpu_nhwc_* prefix so sibling
- * kernel files can reuse them without duplication. They are not declared
- * in cpu_kernels.h because they are an implementation detail of the
- * test-only CPU NHWC path; other callers must not rely on them.
+ * These helpers are used by cpu_kernel_conv2d_f16 / _bf16 /
+ * cpu_kernel_conv_transpose2d / cpu_kernel_maxpool2d which still use
+ * the NCHW shim. They have external linkage under the sam3_cpu_nhwc_*
+ * prefix so sibling kernel files can reuse them without duplication.
+ * They are not declared in cpu_kernels.h because they are an
+ * implementation detail of the CPU spatial-op NCHW paths.
  */
 
 /*
@@ -320,102 +285,14 @@ void sam3_cpu_ohwi_to_iohw_bytes(const uint8_t *src, uint8_t *dst,
 	}
 }
 
-/*
- * conv2d_nchw_body_f32 - Legacy NCHW F32 conv2d via im2col + matmul.
- *
- * Operates on stack tensors prepared by the NHWC shim: input NCHW
- * [N,C,H,W], weight OIHW [OC,C,KH,KW], output NCHW [N,OC,OH,OW].
- * Allocates an im2col buffer from scratch and restores the offset
- * before returning.
- */
-static enum sam3_error
-conv2d_nchw_body_f32(const struct sam3_tensor *input,
-		     const struct sam3_tensor *weight,
-		     struct sam3_tensor *output,
-		     int stride, int pad, int groups,
-		     struct sam3_arena *scratch,
-		     struct sam3_threadpool *pool)
+enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
+				  struct sam3_arena *scratch,
+				  struct sam3_threadpool *pool)
 {
 #ifdef SAM3_HAS_BLAS
 	(void)pool;
 #endif
 
-	int N_batch = input->dims[0];
-	int C = input->dims[1];
-	int H = input->dims[2];
-	int W = input->dims[3];
-
-	int OC = weight->dims[0];
-	int KH = weight->dims[2];
-	int KW = weight->dims[3];
-
-	int OH = (H + 2 * pad - KH) / stride + 1;
-	int OW = (W + 2 * pad - KW) / stride + 1;
-
-	int cpg_in = C / groups;
-	int cpg_out = OC / groups;
-
-	size_t saved_offset = scratch->offset;
-
-	/* Allocate im2col buffer: [cpg_in*KH*KW, OH*OW] */
-	size_t col_size = (size_t)(cpg_in * KH * KW) * (OH * OW) *
-			  sizeof(float);
-	float *col = (float *)sam3_arena_alloc(scratch, col_size);
-	if (!col) {
-		sam3_log_error("conv2d: scratch OOM (%zu bytes)", col_size);
-		scratch->offset = saved_offset;
-		return SAM3_ENOMEM;
-	}
-
-	const float *w_data = (const float *)weight->data;
-
-	for (int n = 0; n < N_batch; n++) {
-		for (int g = 0; g < groups; g++) {
-			const float *in_n = (const float *)input->data +
-					    n * C * H * W +
-					    g * cpg_in * H * W;
-			float *out_n = (float *)output->data +
-				       n * OC * OH * OW +
-				       g * cpg_out * OH * OW;
-			const float *w_g = w_data +
-					   g * cpg_out * cpg_in * KH * KW;
-
-			im2col_f32(in_n, col, cpg_in, H, W, KH, KW,
-				   stride, pad, OH, OW);
-
-#ifdef SAM3_HAS_BLAS
-			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-				    cpg_out, OH * OW, cpg_in * KH * KW,
-				    1.0f,
-				    w_g, cpg_in * KH * KW,
-				    col, OH * OW,
-				    0.0f,
-				    out_n, OH * OW);
-#else
-			struct conv2d_matmul_ctx mctx = {
-				.a = w_g, .b = col, .c = out_n,
-				.M = cpg_out,
-				.K = cpg_in * KH * KW,
-				.N = OH * OW,
-			};
-			int n_tasks = sam3_threadpool_n_threads(pool);
-			if (n_tasks < 1)
-				n_tasks = 1;
-			sam3_threadpool_parallel_for(pool,
-						     conv2d_matmul_parallel_fn,
-						     &mctx, n_tasks);
-#endif
-		}
-	}
-
-	scratch->offset = saved_offset;
-	return SAM3_OK;
-}
-
-enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
-				  struct sam3_arena *scratch,
-				  struct sam3_threadpool *pool)
-{
 	if (node->n_inputs < 2 || !node->inputs[0] || !node->inputs[1] ||
 	    !node->output) {
 		sam3_log_error("conv2d: NULL tensor");
@@ -444,11 +321,11 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 	}
 
 	/*
-	 * NHWC input [N,H,W,C_in]; OHWI weight [C_out,KH,KW,C_in];
-	 * NHWC output [N,OH,OW,C_out]. The CPU body is NCHW-only, so
-	 * we transpose both inputs into scratch, run the body, and
-	 * transpose the result back to NHWC. No production path runs
-	 * here — Metal handles conv2d natively via MLX.
+	 * Native NHWC conv2d: input [N,H,W,C_in], weight [OC,KH,KW,IC]
+	 * (OHWI), output [N,OH,OW,OC]. im2col unrolls directly from
+	 * NHWC producing [OH*OW, IC*KH*KW], then matmul computes
+	 * col × W^T → [OH*OW, OC] which is already NHWC. Zero layout
+	 * conversions.
 	 */
 	int N_batch = input->dims[0];
 	int H = input->dims[1];
@@ -482,70 +359,73 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	size_t elem_sz = sizeof(float);
+	int cpg_in = C_in / groups;
+	int cpg_out = C_out / groups;
+
 	size_t saved_offset = scratch->offset;
 
-	size_t in_bytes = (size_t)N_batch * C_in * H * W * elem_sz;
-	size_t wt_bytes = (size_t)C_out * KIC * KH * KW * elem_sz;
-	size_t out_bytes = (size_t)N_batch * C_out * OH * OW * elem_sz;
-
-	uint8_t *in_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
-							   in_bytes);
-	uint8_t *wt_oihw = (uint8_t *)sam3_arena_alloc_raw(scratch,
-							   wt_bytes);
-	uint8_t *out_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
-							    out_bytes);
-	if (!in_nchw || !wt_oihw || !out_nchw) {
-		sam3_log_error("conv2d: scratch OOM (need %zu bytes)",
-			       in_bytes + wt_bytes + out_bytes);
+	/* im2col buffer: [OH*OW, cpg_in*KH*KW] */
+	size_t K = (size_t)cpg_in * KH * KW;
+	size_t col_size = (size_t)(OH * OW) * K * sizeof(float);
+	float *col = (float *)sam3_arena_alloc(scratch, col_size);
+	if (!col) {
+		sam3_log_error("conv2d: scratch OOM for im2col "
+			       "(%zu bytes)", col_size);
 		scratch->offset = saved_offset;
 		return SAM3_ENOMEM;
 	}
 
-	sam3_cpu_nhwc_to_nchw_bytes((const uint8_t *)input->data, in_nchw,
-				    N_batch, H, W, C_in, elem_sz);
-	sam3_cpu_ohwi_to_oihw_bytes((const uint8_t *)weight->data, wt_oihw,
-				    C_out, KH, KW, KIC, elem_sz);
+	int M = OH * OW;
+	const float *w_data = (const float *)weight->data;
 
-	struct sam3_tensor input_nchw = *input;
-	input_nchw.dims[0] = N_batch;
-	input_nchw.dims[1] = C_in;
-	input_nchw.dims[2] = H;
-	input_nchw.dims[3] = W;
-	input_nchw.data = in_nchw;
-	input_nchw.nbytes = in_bytes;
-	sam3_tensor_compute_strides(&input_nchw);
+	for (int n = 0; n < N_batch; n++) {
+		const float *in_n = (const float *)input->data +
+				    (size_t)n * H * W * C_in;
+		float *out_n = (float *)output->data +
+			       (size_t)n * OH * OW * C_out;
 
-	struct sam3_tensor weight_oihw = *weight;
-	weight_oihw.dims[0] = C_out;
-	weight_oihw.dims[1] = KIC;
-	weight_oihw.dims[2] = KH;
-	weight_oihw.dims[3] = KW;
-	weight_oihw.data = wt_oihw;
-	weight_oihw.nbytes = wt_bytes;
-	sam3_tensor_compute_strides(&weight_oihw);
+		for (int g = 0; g < groups; g++) {
+			im2col_nhwc_f32(in_n, col,
+					C_in, H, W, KH, KW,
+					stride, pad, OH, OW,
+					g * cpg_in, cpg_in);
 
-	struct sam3_tensor output_nchw = *output;
-	output_nchw.dims[0] = N_batch;
-	output_nchw.dims[1] = C_out;
-	output_nchw.dims[2] = OH;
-	output_nchw.dims[3] = OW;
-	output_nchw.data = out_nchw;
-	output_nchw.nbytes = out_bytes;
-	sam3_tensor_compute_strides(&output_nchw);
+			/* OHWI weight for group g: contiguous
+			 * [cpg_out, KH*KW*KIC] block */
+			const float *w_g = w_data +
+				(size_t)g * cpg_out * KH * KW * KIC;
 
-	enum sam3_error err = conv2d_nchw_body_f32(&input_nchw,
-						   &weight_oihw,
-						   &output_nchw,
-						   stride, pad, groups,
-						   scratch, pool);
-	if (err != SAM3_OK) {
-		scratch->offset = saved_offset;
-		return err;
+#ifdef SAM3_HAS_BLAS
+			/* output = col × weight^T
+			 * col [M, K], weight [cpg_out, K]
+			 * → output [M, cpg_out] with ldc = C_out */
+			cblas_sgemm(CblasRowMajor,
+				    CblasNoTrans, CblasTrans,
+				    M, cpg_out, (int)K,
+				    1.0f,
+				    col, (int)K,
+				    w_g, (int)K,
+				    0.0f,
+				    out_n + g * cpg_out, C_out);
+#else
+			struct conv2d_nhwc_matmul_ctx mctx = {
+				.col = col,
+				.weight = w_g,
+				.output = out_n + g * cpg_out,
+				.M = M,
+				.K = (int)K,
+				.N = cpg_out,
+				.ldc = C_out,
+			};
+			int n_tasks = sam3_threadpool_n_threads(pool);
+			if (n_tasks < 1)
+				n_tasks = 1;
+			sam3_threadpool_parallel_for(pool,
+						     conv2d_nhwc_matmul_fn,
+						     &mctx, n_tasks);
+#endif
+		}
 	}
-
-	sam3_cpu_nchw_to_nhwc_bytes(out_nchw, (uint8_t *)output->data,
-				    N_batch, C_out, OH, OW, elem_sz);
 
 	scratch->offset = saved_offset;
 	return SAM3_OK;

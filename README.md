@@ -36,11 +36,13 @@ Inspired by [ggml](https://github.com/ggerganov/ggml) and [llama.cpp](https://gi
 
 ## Supported Models
 
-| Backbone | Input Size | Mask Resolution | Parameters | Use Case |
-|---|---|---|---|---|
-| **Hiera** | 1008x1008 | 288x288 | ~600M | Full accuracy |
-| **TinyViT-21M** | 1008x1008 | 128x128 | ~21M | Balanced quality/speed |
-| **EfficientViT-B1** | 512x512 | 64x64 | ~9M | Fastest, lightweight |
+| Backbone | Input Size | Mask Resolution | Parameters | Encode (ms) | Segment (ms) | Use Case |
+|---|---|---|---|---:|---:|---|
+| **Hiera** | 1008x1008 | 288x288 | 1.6B | 2336 | 1224 | Full accuracy |
+| **TinyViT-21M** | 1008x1008 | 128x128 | 0.8B | 487 | 363 | Balanced quality/speed |
+| **EfficientViT-B1** | 512x512 | 64x64 | 0.8B | 70 | 177 | Fastest, interactive |
+
+Timings on Apple M4 (10-core GPU, Metal backend, Release build). Encode = `sam3_set_image`, Segment = `sam3_segment` with a box prompt. See [BENCHMARK.md](BENCHMARK.md) for full results.
 
 All backbones share the same prompt encoder, mask decoder, and text encoder. The backbone is selected automatically based on the checkpoint.
 
@@ -114,6 +116,22 @@ sam3.c
 ├── tools/               Unified CLI (sam3_cli: segment, convert, info)
 └── tests/               48 test files
 ```
+
+## Performance
+
+On an Apple M4 with the Metal backend, EfficientViT delivers end-to-end
+image-to-mask in ~250 ms (4 FPS), making interactive point-and-click
+segmentation practical. Once the image is encoded, each additional prompt on
+the same image resolves in under 200 ms.
+
+Hiera-Large trades speed for accuracy at 3.6 s per image with 5184 patches and
+32 transformer blocks. Multi-prompt workflows amortize the 2.3 s encode cost.
+
+The Metal backend achieves 90.8% of theoretical F32 peak (3086 / 3400 GFLOPS)
+on matmul microbenchmarks and up to 149x speedup over CPU for F16 workloads.
+
+Full kernel-level and pipeline benchmark results are in
+[BENCHMARK.md](BENCHMARK.md).
 
 ## Weight Format
 

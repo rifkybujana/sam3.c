@@ -45,21 +45,90 @@ static void matmul_q8_rows(const float *a,
 
 	for (int i = m_start; i < m_end; i++) {
 		const float *a_row = a + i * K;
+		float *c_row = c + i * N;
 
-		for (int j = 0; j < N; j++) {
-			float sum = 0.0f;
+		memset(c_row, 0, (size_t)N * sizeof(float));
 
-			for (int k = 0; k < K; k++) {
-				int lin = k * N + j;
-				int blk_idx = lin / SAM3_Q8_BLOCK_SIZE;
-				int blk_off = lin % SAM3_Q8_BLOCK_SIZE;
-				float bval =
-					(float)b_blocks[blk_idx].data[blk_off]
-					* b_blocks[blk_idx].scale;
-				sum += a_row[k] * bval;
+		/* k-outer, j-inner for sequential B access */
+		for (int k = 0; k < K; k++) {
+			float a_val = a_row[k];
+			int base_lin = k * N;
+			int j = 0;
+
+#if SAM3_HAS_NEON
+			float32x4_t va = vdupq_n_f32(a_val);
+
+			for (; j + 16 <= N; j += 16) {
+				int lin = base_lin + j;
+				int bi = lin / SAM3_Q8_BLOCK_SIZE;
+				int bo = lin % SAM3_Q8_BLOCK_SIZE;
+
+				/*
+				 * Fast path: all 16 elements within
+				 * one Q8 block (block size 32).
+				 */
+				if (bo + 16 <= SAM3_Q8_BLOCK_SIZE) {
+					float32x4_t vs = vdupq_n_f32(
+						b_blocks[bi].scale);
+					float32x4_t vas = vmulq_f32(va, vs);
+					int8x16_t vq = vld1q_s8(
+						b_blocks[bi].data + bo);
+
+					int16x8_t lo16 = vmovl_s8(
+						vget_low_s8(vq));
+					int16x8_t hi16 = vmovl_s8(
+						vget_high_s8(vq));
+
+					float32x4_t f0 = vcvtq_f32_s32(
+						vmovl_s16(
+						vget_low_s16(lo16)));
+					float32x4_t f1 = vcvtq_f32_s32(
+						vmovl_s16(
+						vget_high_s16(lo16)));
+					float32x4_t f2 = vcvtq_f32_s32(
+						vmovl_s16(
+						vget_low_s16(hi16)));
+					float32x4_t f3 = vcvtq_f32_s32(
+						vmovl_s16(
+						vget_high_s16(hi16)));
+
+					vst1q_f32(c_row + j,
+						vfmaq_f32(
+						vld1q_f32(c_row + j),
+						vas, f0));
+					vst1q_f32(c_row + j + 4,
+						vfmaq_f32(
+						vld1q_f32(c_row + j + 4),
+						vas, f1));
+					vst1q_f32(c_row + j + 8,
+						vfmaq_f32(
+						vld1q_f32(c_row + j + 8),
+						vas, f2));
+					vst1q_f32(c_row + j + 12,
+						vfmaq_f32(
+						vld1q_f32(c_row + j + 12),
+						vas, f3));
+				} else {
+					/* Block boundary: scalar */
+					for (int jj = 0; jj < 16; jj++) {
+						int l = base_lin + j + jj;
+						int b2 = l / SAM3_Q8_BLOCK_SIZE;
+						int o2 = l % SAM3_Q8_BLOCK_SIZE;
+						c_row[j + jj] += a_val
+							* (float)b_blocks[b2].data[o2]
+							* b_blocks[b2].scale;
+					}
+				}
 			}
-
-			c[i * N + j] = sum;
+#endif
+			for (; j < N; j++) {
+				int lin = base_lin + j;
+				int bi = lin / SAM3_Q8_BLOCK_SIZE;
+				int bo = lin % SAM3_Q8_BLOCK_SIZE;
+				c_row[j] += a_val
+					* (float)b_blocks[bi].data[bo]
+					* b_blocks[bi].scale;
+			}
 		}
 	}
 }

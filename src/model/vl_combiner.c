@@ -141,6 +141,32 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	return SAM3_OK;
 }
 
+/*
+ * Force eager computation of all lazy-init data (RoPE tables,
+ * tiled pos_embed, 2D position encoding) so that it is included
+ * in the arena offset before weights_end is saved. Without this,
+ * arena rollbacks on repeated set_image/segment calls would
+ * destroy lazily-computed data while stale pointers remain.
+ */
+static enum sam3_error precompute_lazy_data(struct sam3_vl_backbone *vl)
+{
+	/* Hiera: RoPE tables + tiled pos_embed */
+	if (vl->backbone_type == SAM3_BACKBONE_HIERA) {
+		enum sam3_error err = sam3_vit_precompute(&vl->enc.vit);
+		if (err != SAM3_OK)
+			return err;
+	}
+
+	/* 2D sinusoidal position encoding (all backbones) */
+	if (!sam3_pos_encoding_get(&vl->pos_enc)) {
+		sam3_log_error("vl_backbone: failed to precompute "
+			       "position encoding");
+		return SAM3_ENOMEM;
+	}
+
+	return SAM3_OK;
+}
+
 enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 				      const struct sam3_weight_file *wf,
 				      struct sam3_arena *arena)
@@ -184,7 +210,9 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 	if (err != SAM3_OK)
 		return err;
 
-	return SAM3_OK;
+	/* Force lazy-init data to be computed now so that arena
+	 * rollbacks in set_image/segment do not destroy them. */
+	return precompute_lazy_data(vl);
 }
 
 int sam3_vl_backbone_img_size(const struct sam3_vl_backbone *vl)

@@ -1,17 +1,15 @@
 /*
- * src/backend/cpu/kernels/cpu_conv2d_f16.c - FP16 Conv2D via im2col + matmul
+ * src/backend/cpu/kernels/cpu_conv2d_f16.c - Native NHWC FP16 Conv2D
  *
- * 2D convolution for fp16 tensors using im2col + matrix multiply. NEON fp16
- * path uses native float16x8_t arithmetic with 8x8x64 tiling. Scalar fallback
- * accumulates in f32 to avoid per-element read-back conversions. Scratch arena
- * for im2col buffer and (scalar path) f32 accumulation.
+ * 2D convolution for fp16 tensors directly in NHWC layout. Unrolls
+ * input patches from channels-last memory, transposes the small OHWI
+ * weight to [K,N] for vectorization-friendly access, then matmuls
+ * col × weight_T to produce NHWC output with zero input/output layout
+ * conversions. NEON fp16 path uses native float16x8_t with 8x8x64
+ * tiling. Scalar fallback accumulates in f32.
  *
- * Public layout (after the NHWC migration): input [N,H,W,C],
- * weight [OC,KH,KW,IC] (OHWI), output [N,OH,OW,OC]. The public entry
- * point transposes NHWC inputs and OHWI weights into NCHW/OIHW scratch
- * buffers, runs the legacy NCHW body, and transposes the result back
- * to NHWC. The CPU backend is test-only; Metal handles NHWC via MLX.
- * Shared byte-transpose helpers come from cpu_conv2d.c.
+ * Public layout: input [N,H,W,C], weight [OC,KH,KW,IC] (OHWI),
+ * output [N,OH,OW,OC]. node->params[0]=stride, params[1]=padding.
  *
  * Key types:  sam3_node, sam3_tensor, sam3_arena
  * Depends on: cpu_kernels.h, cpu_simd_f16.h, core/half.h, core/tensor.h, core/alloc.h
@@ -32,171 +30,162 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Shared NHWC transpose helpers (defined in cpu_conv2d.c). */
-void sam3_cpu_nhwc_to_nchw_bytes(const uint8_t *src, uint8_t *dst,
-				 int N, int H, int W, int C,
-				 size_t elem_sz);
-void sam3_cpu_nchw_to_nhwc_bytes(const uint8_t *src, uint8_t *dst,
-				 int N, int C, int H, int W,
-				 size_t elem_sz);
-void sam3_cpu_ohwi_to_oihw_bytes(const uint8_t *src, uint8_t *dst,
-				 int OC, int KH, int KW, int IC,
-				 size_t elem_sz);
-
 #define TILE_M 8
 #define TILE_N 8
 #define TILE_K 64
 
 /*
- * im2col_f16 - Unroll fp16 input patches into a column matrix.
+ * im2col_nhwc_f16 - Unroll NHWC fp16 input patches into a column matrix.
  *
- * Input:  [C, H, W] as uint16_t*
- * Output: [C*KH*KW, OH*OW] column-major patches, kept as fp16.
+ * Input:  [H, W, C] (one batch slice, channels-last, as uint16_t)
+ * Output: [OH*OW, C_grp*KH*KW] (one row per output position)
  *
- * Pre-computes valid oh/ow ranges to eliminate per-element bounds checks.
- * Uses memcpy for contiguous interior when stride==1, memset for padding.
- * Works for both NEON and scalar paths since im2col does no arithmetic.
+ * For grouped convolutions, c_off selects the starting channel.
  */
-static void im2col_f16(const uint16_t *in, uint16_t *col,
-		       int C, int H, int W, int KH, int KW,
-		       int stride, int pad, int OH, int OW)
+static void im2col_nhwc_f16(const uint16_t *in, uint16_t *col,
+			     int C, int H, int W,
+			     int KH, int KW,
+			     int stride, int pad,
+			     int OH, int OW,
+			     int c_off, int C_grp)
 {
-	int col_cols = OH * OW;
+	size_t K = (size_t)C_grp * KH * KW;
+	size_t grp_bytes = (size_t)C_grp * sizeof(uint16_t);
 
-	for (int c = 0; c < C; c++) {
-		const uint16_t *in_c = in + c * H * W;
-		for (int kh = 0; kh < KH; kh++) {
-			/* Valid oh range: ih = oh*stride+kh-pad in [0,H) */
-			int oh_s = (pad > kh)
-				 ? (pad - kh + stride - 1) / stride : 0;
-			int oh_e = (H + pad - kh - 1 >= 0)
-				 ? (H + pad - kh - 1) / stride + 1 : 0;
-			if (oh_e > OH) oh_e = OH;
-			if (oh_s > oh_e) oh_s = oh_e;
-
-			for (int kw = 0; kw < KW; kw++) {
-				int col_row = c * KH * KW
-					    + kh * KW + kw;
-				uint16_t *dst = col
-					      + col_row * col_cols;
-
-				/* Valid ow range */
-				int ow_s = (pad > kw)
-					 ? (pad - kw + stride - 1)
-					   / stride : 0;
-				int ow_e = (W + pad - kw - 1 >= 0)
-					 ? (W + pad - kw - 1)
-					   / stride + 1 : 0;
-				if (ow_e > OW) ow_e = OW;
-				if (ow_s > ow_e) ow_s = ow_e;
-
-				/* Top padding rows */
-				if (oh_s > 0)
-					memset(dst, 0,
-					       (size_t)oh_s * OW
-					       * sizeof(uint16_t));
-
-				for (int oh = oh_s; oh < oh_e; oh++) {
-					int ih = oh * stride + kh - pad;
-					uint16_t *row = dst + oh * OW;
-
-					if (ow_s > 0)
-						memset(row, 0,
-						       ow_s
-						       * sizeof(uint16_t));
-
-					int nv = ow_e - ow_s;
-					if (nv > 0) {
-						int iw0 = ow_s * stride
-							 + kw - pad;
-						if (stride == 1) {
-							memcpy(row + ow_s,
-							       in_c + ih * W
-							       + iw0,
-							       nv * sizeof(
-							       uint16_t));
-						} else {
-							for (int ow = ow_s;
-							     ow < ow_e;
-							     ow++) {
-								int iw = ow * stride
-									 + kw - pad;
-								row[ow] = in_c[
-									ih * W
-									+ iw];
-							}
-						}
+	for (int oh = 0; oh < OH; oh++) {
+		for (int ow = 0; ow < OW; ow++) {
+			uint16_t *dst = col +
+				(size_t)(oh * OW + ow) * K;
+			for (int kh = 0; kh < KH; kh++) {
+				int ih = oh * stride + kh - pad;
+				for (int kw = 0; kw < KW; kw++) {
+					int iw = ow * stride + kw - pad;
+					uint16_t *d = dst +
+						((size_t)kh * KW + kw) *
+						C_grp;
+					if ((unsigned)ih < (unsigned)H &&
+					    (unsigned)iw < (unsigned)W) {
+						memcpy(d,
+						       in + ((size_t)ih * W +
+							     iw) * C +
+						       c_off,
+						       grp_bytes);
+					} else {
+						memset(d, 0, grp_bytes);
 					}
-
-					if (ow_e < OW)
-						memset(row + ow_e, 0,
-						       (OW - ow_e)
-						       * sizeof(uint16_t));
 				}
-
-				/* Bottom padding rows */
-				if (oh_e < OH)
-					memset(dst + (size_t)oh_e * OW,
-					       0,
-					       (size_t)(OH - oh_e) * OW
-					       * sizeof(uint16_t));
 			}
 		}
 	}
+}
+
+/*
+ * transpose_u16 - Transpose [rows, cols] → [cols, rows] for uint16_t.
+ *
+ * Used to convert weight [N, K] → weight_T [K, N] so the matmul
+ * inner loop accesses weight_T[k][j:j+8] contiguously for NEON.
+ */
+static void transpose_u16(const uint16_t *src, uint16_t *dst,
+			   int rows, int cols)
+{
+	for (int i = 0; i < rows; i++)
+		for (int j = 0; j < cols; j++)
+			dst[(size_t)j * rows + i] =
+				src[(size_t)i * cols + j];
 }
 
 /* ── NEON fp16 path ─────────────────────────────────────────────────── */
 
 #if SAM3_HAS_NEON_FP16
 
-struct conv2d_matmul_ctx_f16 {
-	const _Float16 *a;  /* weight [OC, C*KH*KW] */
-	const _Float16 *b;  /* col    [C*KH*KW, OH*OW] */
-	_Float16       *c;  /* output [OC, OH*OW] */
-	int             M;
-	int             K;
-	int             N;
+struct conv2d_nhwc_matmul_ctx_f16 {
+	const _Float16 *col;       /* [M, K] im2col output */
+	const _Float16 *weight_t;  /* [K, N] transposed weight */
+	_Float16       *output;    /* [M, ldc] NHWC output */
+	int             M;         /* OH * OW */
+	int             K;         /* cpg_in * KH * KW */
+	int             N;         /* cpg_out */
+	int             ldc;       /* C_out (output row stride) */
 };
 
-static void conv2d_matmul_f16_fn(void *arg, int task_id, int n_tasks)
+/*
+ * NEON fp16 matmul: output = col × weight_T.
+ *
+ * col [M, K], weight_T [K, N], output [M, ldc] with N cols written.
+ * Uses float16x8_t with 8×8×64 tiling. Splits over M rows.
+ */
+static void conv2d_nhwc_matmul_f16_fn(void *arg, int task_id,
+				       int n_tasks)
 {
-	struct conv2d_matmul_ctx_f16 *ctx =
-		(struct conv2d_matmul_ctx_f16 *)arg;
-	int chunk   = ctx->M / n_tasks;
+	struct conv2d_nhwc_matmul_ctx_f16 *ctx =
+		(struct conv2d_nhwc_matmul_ctx_f16 *)arg;
+	int chunk = ctx->M / n_tasks;
 	int m_start = task_id * chunk;
-	int m_end   = (task_id == n_tasks - 1) ? ctx->M : m_start + chunk;
+	int m_end = (task_id == n_tasks - 1)
+		  ? ctx->M : m_start + chunk;
 
 	if (m_start >= m_end)
 		return;
 
-	memset(ctx->c + (size_t)m_start * ctx->N, 0,
-	       (size_t)(m_end - m_start) * ctx->N * sizeof(_Float16));
+	int K = ctx->K;
+	int N = ctx->N;
+	int ldc = ctx->ldc;
+
+	for (int i = m_start; i < m_end; i++)
+		memset(ctx->output + (size_t)i * ldc, 0,
+		       (size_t)N * sizeof(_Float16));
 
 	for (int i0 = m_start; i0 < m_end; i0 += TILE_M) {
-		int imax = (i0 + TILE_M < m_end) ? i0 + TILE_M : m_end;
-		for (int j0 = 0; j0 < ctx->N; j0 += TILE_N) {
-			int jmax = (j0 + TILE_N < ctx->N)
-				 ? j0 + TILE_N : ctx->N;
-			for (int k0 = 0; k0 < ctx->K; k0 += TILE_K) {
-				int kmax = (k0 + TILE_K < ctx->K)
-					 ? k0 + TILE_K : ctx->K;
+		int imax = (i0 + TILE_M < m_end)
+			 ? i0 + TILE_M : m_end;
+		for (int j0 = 0; j0 < N; j0 += TILE_N) {
+			int jmax = (j0 + TILE_N < N)
+				 ? j0 + TILE_N : N;
+			for (int k0 = 0; k0 < K; k0 += TILE_K) {
+				int kmax = (k0 + TILE_K < K)
+					 ? k0 + TILE_K : K;
 				for (int i = i0; i < imax; i++) {
-					for (int k = k0; k < kmax; k++) {
-						float16x8_t va = vdupq_n_f16(
-							ctx->a[i * ctx->K + k]);
+					for (int k = k0; k < kmax;
+					     k++) {
+						float16x8_t va =
+							vdupq_n_f16(
+							ctx->col[
+							(size_t)i * K
+							+ k]);
 						int j = j0;
-						for (; j + 8 <= jmax; j += 8) {
-							float16x8_t vc = vld1q_f16(
-								(const __fp16 *)(ctx->c + i * ctx->N + j));
-							float16x8_t vb = vld1q_f16(
-								(const __fp16 *)(ctx->b + k * ctx->N + j));
-							vst1q_f16((__fp16 *)(ctx->c + i * ctx->N + j),
-								  vfmaq_f16(vc, va, vb));
+						for (; j + 8 <= jmax;
+						     j += 8) {
+							float16x8_t vc =
+								vld1q_f16(
+								(const __fp16 *)
+								(ctx->output +
+								 (size_t)i *
+								 ldc + j));
+							float16x8_t vb =
+								vld1q_f16(
+								(const __fp16 *)
+								(ctx->weight_t +
+								 (size_t)k *
+								 N + j));
+							vst1q_f16(
+								(__fp16 *)
+								(ctx->output +
+								 (size_t)i *
+								 ldc + j),
+								vfmaq_f16(
+								vc, va, vb));
 						}
-						_Float16 aik = ctx->a[i * ctx->K + k];
+						_Float16 aik =
+							ctx->col[
+							(size_t)i * K
+							+ k];
 						for (; j < jmax; j++)
-							ctx->c[i * ctx->N + j] +=
-								aik * ctx->b[k * ctx->N + j];
+							ctx->output[
+							(size_t)i * ldc
+							+ j] += aik *
+							ctx->weight_t[
+							(size_t)k * N
+							+ j];
 					}
 				}
 			}
@@ -208,198 +197,60 @@ static void conv2d_matmul_f16_fn(void *arg, int task_id, int n_tasks)
 
 /* ── Scalar fallback path (f32 accumulation) ───────────────────────── */
 
-struct conv2d_matmul_ctx_f16 {
-	const uint16_t *a;   /* weight [OC, C*KH*KW] */
-	const uint16_t *b;   /* col    [C*KH*KW, OH*OW] */
-	uint16_t       *c;   /* output [OC, OH*OW] */
-	float          *acc; /* f32 accum [n_tasks, OH*OW] */
-	int             M;
-	int             K;
-	int             N;
+struct conv2d_nhwc_matmul_ctx_f16 {
+	const uint16_t *col;       /* [M, K] im2col output */
+	const uint16_t *weight_t;  /* [K, N] transposed weight */
+	uint16_t       *output;    /* [M, ldc] NHWC output */
+	float          *acc;       /* [n_tasks, N] f32 accumulator */
+	int             M;         /* OH * OW */
+	int             K;         /* cpg_in * KH * KW */
+	int             N;         /* cpg_out */
+	int             ldc;       /* C_out (output row stride) */
 };
 
-static void conv2d_matmul_f16_fn(void *arg, int task_id, int n_tasks)
+static void conv2d_nhwc_matmul_f16_fn(void *arg, int task_id,
+				       int n_tasks)
 {
-	struct conv2d_matmul_ctx_f16 *ctx =
-		(struct conv2d_matmul_ctx_f16 *)arg;
-	int chunk   = ctx->M / n_tasks;
+	struct conv2d_nhwc_matmul_ctx_f16 *ctx =
+		(struct conv2d_nhwc_matmul_ctx_f16 *)arg;
+	int chunk = ctx->M / n_tasks;
 	int m_start = task_id * chunk;
-	int m_end   = (task_id == n_tasks - 1) ? ctx->M : m_start + chunk;
+	int m_end = (task_id == n_tasks - 1)
+		  ? ctx->M : m_start + chunk;
 
 	if (m_start >= m_end)
 		return;
 
 	float *acc = ctx->acc + (size_t)task_id * ctx->N;
+	int K = ctx->K;
+	int N = ctx->N;
+	int ldc = ctx->ldc;
 
 	for (int i = m_start; i < m_end; i++) {
-		memset(acc, 0, ctx->N * sizeof(float));
+		memset(acc, 0, (size_t)N * sizeof(float));
 
-		for (int k0 = 0; k0 < ctx->K; k0 += TILE_K) {
-			int kmax = (k0 + TILE_K < ctx->K)
-				 ? k0 + TILE_K : ctx->K;
+		for (int k0 = 0; k0 < K; k0 += TILE_K) {
+			int kmax = (k0 + TILE_K < K)
+				 ? k0 + TILE_K : K;
 			for (int k = k0; k < kmax; k++) {
 				float aik = fp16_to_f32(
-					ctx->a[i * ctx->K + k]);
-				for (int j = 0; j < ctx->N; j++)
+					ctx->col[(size_t)i * K + k]);
+				for (int j = 0; j < N; j++)
 					acc[j] += aik * fp16_to_f32(
-						ctx->b[k * ctx->N + j]);
+						ctx->weight_t[
+						(size_t)k * N + j]);
 			}
 		}
 
-		/* Convert f32 accumulator -> fp16 output once */
-		uint16_t *out_row = ctx->c + (size_t)i * ctx->N;
-		for (int j = 0; j < ctx->N; j++)
+		uint16_t *out_row = ctx->output +
+			(size_t)i * ldc;
+		for (int j = 0; j < N; j++)
 			out_row[j] = f32_to_fp16(acc[j]);
 	}
 }
 
 #endif /* SAM3_HAS_NEON_FP16 */
 
-/*
- * conv2d_f16_nchw_body - Legacy NCHW F16 conv2d body via im2col + matmul.
- *
- * Operates on stack tensors prepared by the NHWC shim: input NCHW
- * [N,C,H,W], weight OIHW [OC,C,KH,KW], output NCHW [N,OC,OH,OW],
- * all SAM3_DTYPE_F16. Allocates an im2col buffer (and, on the scalar
- * fallback, an f32 accumulation buffer) from scratch and restores the
- * offset before returning.
- */
-static enum sam3_error
-conv2d_f16_nchw_body(const struct sam3_tensor *input,
-		     const struct sam3_tensor *weight,
-		     struct sam3_tensor *output,
-		     int stride, int pad, int groups,
-		     struct sam3_arena *scratch,
-		     struct sam3_threadpool *pool)
-{
-	int N_batch = input->dims[0];
-	int C       = input->dims[1];
-	int H       = input->dims[2];
-	int W       = input->dims[3];
-
-	int OC  = weight->dims[0];
-	int KH  = weight->dims[2];
-	int KW  = weight->dims[3];
-
-	int OH    = output->dims[2];
-	int OW    = output->dims[3];
-	int N_out = OH * OW;
-
-	int cpg_in  = C / groups;
-	int cpg_out = OC / groups;
-
-	size_t saved_offset = scratch->offset;
-
-	/* Allocate im2col buffer: [cpg_in*KH*KW, OH*OW] in fp16 */
-	size_t col_size = (size_t)(cpg_in * KH * KW) * N_out *
-			  sizeof(uint16_t);
-	void *col_buf = sam3_arena_alloc(scratch, col_size);
-	if (!col_buf) {
-		sam3_log_error("conv2d_f16: scratch OOM (%zu bytes)", col_size);
-		scratch->offset = saved_offset;
-		return SAM3_ENOMEM;
-	}
-
-	int n_tasks = sam3_threadpool_n_threads(pool);
-	if (n_tasks < 1)
-		n_tasks = 1;
-
-#if SAM3_HAS_NEON_FP16
-	const _Float16 *w_data = (const _Float16 *)weight->data;
-	uint16_t       *col    = (uint16_t *)col_buf;
-
-	for (int n = 0; n < N_batch; n++) {
-		for (int g = 0; g < groups; g++) {
-			const uint16_t *in_n =
-				(const uint16_t *)input->data
-				+ (size_t)n * C * H * W
-				+ (size_t)g * cpg_in * H * W;
-			_Float16 *out_n = (_Float16 *)output->data
-					  + (size_t)n * OC * N_out
-					  + (size_t)g * cpg_out * N_out;
-			const _Float16 *w_g = w_data
-				+ (size_t)g * cpg_out * cpg_in * KH * KW;
-
-			im2col_f16(in_n, col, cpg_in, H, W, KH, KW,
-				   stride, pad, OH, OW);
-
-			struct conv2d_matmul_ctx_f16 mctx = {
-				.a = w_g,
-				.b = (const _Float16 *)col,
-				.c = out_n,
-				.M = cpg_out,
-				.K = cpg_in * KH * KW,
-				.N = N_out,
-			};
-			sam3_threadpool_parallel_for(pool,
-						     conv2d_matmul_f16_fn,
-						     &mctx, n_tasks);
-		}
-	}
-#else
-	/* Allocate f32 accumulation buffer: one row per thread */
-	size_t acc_size = (size_t)n_tasks * N_out * sizeof(float);
-	float *acc_buf = (float *)sam3_arena_alloc(scratch, acc_size);
-	if (!acc_buf) {
-		sam3_log_error("conv2d_f16: scratch OOM for acc "
-			       "(%zu bytes)", acc_size);
-		scratch->offset = saved_offset;
-		return SAM3_ENOMEM;
-	}
-
-	const uint16_t *w_data = (const uint16_t *)weight->data;
-	uint16_t       *col    = (uint16_t *)col_buf;
-
-	for (int n = 0; n < N_batch; n++) {
-		for (int g = 0; g < groups; g++) {
-			const uint16_t *in_n =
-				(const uint16_t *)input->data
-				+ (size_t)n * C * H * W
-				+ (size_t)g * cpg_in * H * W;
-			uint16_t *out_n = (uint16_t *)output->data
-					  + (size_t)n * OC * N_out
-					  + (size_t)g * cpg_out * N_out;
-			const uint16_t *w_g = w_data
-				+ (size_t)g * cpg_out * cpg_in * KH * KW;
-
-			im2col_f16(in_n, col, cpg_in, H, W, KH, KW,
-				   stride, pad, OH, OW);
-
-			struct conv2d_matmul_ctx_f16 mctx = {
-				.a   = w_g,
-				.b   = col,
-				.c   = out_n,
-				.acc = acc_buf,
-				.M   = cpg_out,
-				.K   = cpg_in * KH * KW,
-				.N   = N_out,
-			};
-			sam3_threadpool_parallel_for(pool,
-						     conv2d_matmul_f16_fn,
-						     &mctx, n_tasks);
-		}
-	}
-#endif
-
-	/* Restore scratch offset -- frees im2col + acc buffers */
-	scratch->offset = saved_offset;
-
-	return SAM3_OK;
-}
-
-/*
- * cpu_kernel_conv2d_f16 - FP16 Conv2D NHWC entry.
- *
- * @node:    Node with n_inputs>=2: input [N,H,W,C] and weight
- *           [OC,KH,KW,C] (OHWI), both SAM3_DTYPE_F16.
- *           node->params[0]=stride, params[1]=padding.
- * @scratch: Scratch arena for NHWC->NCHW transpose scaffolds plus
- *           the body's im2col and (scalar path) f32 accumulation.
- * @pool:    Thread pool for parallel matmul over output channels.
- *
- * Transposes NHWC/OHWI inputs into NCHW/OIHW scratch, runs the body,
- * transposes the result back to NHWC. Returns SAM3_OK on success.
- */
 enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 				      struct sam3_arena *scratch,
 				      struct sam3_threadpool *pool)
@@ -431,6 +282,11 @@ enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
+	/*
+	 * Native NHWC conv2d: im2col from NHWC input, transpose the
+	 * small OHWI weight to [K,N], then matmul col × weight_T
+	 * → [OH*OW, OC] which is already NHWC.
+	 */
 	int N_batch = input->dims[0];
 	int H       = input->dims[1];
 	int W       = input->dims[2];
@@ -452,7 +308,8 @@ enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 	}
 
 	if (C_in % groups != 0 || C_out % groups != 0) {
-		sam3_log_error("conv2d_f16: channels not divisible by groups");
+		sam3_log_error("conv2d_f16: channels not divisible "
+			       "by groups");
 		return SAM3_EINVAL;
 	}
 
@@ -463,70 +320,95 @@ enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	size_t elem_sz = sizeof(uint16_t);
+	int cpg_in  = C_in / groups;
+	int cpg_out = C_out / groups;
+
 	size_t saved_offset = scratch->offset;
 
-	size_t in_bytes = (size_t)N_batch * C_in * H * W * elem_sz;
-	size_t wt_bytes = (size_t)C_out * KIC * KH * KW * elem_sz;
-	size_t out_bytes = (size_t)N_batch * C_out * OH * OW * elem_sz;
-
-	uint8_t *in_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
-							   in_bytes);
-	uint8_t *wt_oihw = (uint8_t *)sam3_arena_alloc_raw(scratch,
-							   wt_bytes);
-	uint8_t *out_nchw = (uint8_t *)sam3_arena_alloc_raw(scratch,
-							    out_bytes);
-	if (!in_nchw || !wt_oihw || !out_nchw) {
-		sam3_log_error("conv2d_f16: scratch OOM (need %zu bytes)",
-			       in_bytes + wt_bytes + out_bytes);
+	/* im2col buffer: [OH*OW, cpg_in*KH*KW] in fp16 */
+	size_t K = (size_t)cpg_in * KH * KW;
+	size_t col_size = (size_t)(OH * OW) * K * sizeof(uint16_t);
+	uint16_t *col = (uint16_t *)sam3_arena_alloc(scratch, col_size);
+	if (!col) {
+		sam3_log_error("conv2d_f16: scratch OOM for im2col "
+			       "(%zu bytes)", col_size);
 		scratch->offset = saved_offset;
 		return SAM3_ENOMEM;
 	}
 
-	sam3_cpu_nhwc_to_nchw_bytes((const uint8_t *)input->data, in_nchw,
-				    N_batch, H, W, C_in, elem_sz);
-	sam3_cpu_ohwi_to_oihw_bytes((const uint8_t *)weight->data, wt_oihw,
-				    C_out, KH, KW, KIC, elem_sz);
-
-	struct sam3_tensor input_nchw = *input;
-	input_nchw.dims[0] = N_batch;
-	input_nchw.dims[1] = C_in;
-	input_nchw.dims[2] = H;
-	input_nchw.dims[3] = W;
-	input_nchw.data = in_nchw;
-	input_nchw.nbytes = in_bytes;
-	sam3_tensor_compute_strides(&input_nchw);
-
-	struct sam3_tensor weight_oihw = *weight;
-	weight_oihw.dims[0] = C_out;
-	weight_oihw.dims[1] = KIC;
-	weight_oihw.dims[2] = KH;
-	weight_oihw.dims[3] = KW;
-	weight_oihw.data = wt_oihw;
-	weight_oihw.nbytes = wt_bytes;
-	sam3_tensor_compute_strides(&weight_oihw);
-
-	struct sam3_tensor output_nchw = *output;
-	output_nchw.dims[0] = N_batch;
-	output_nchw.dims[1] = C_out;
-	output_nchw.dims[2] = OH;
-	output_nchw.dims[3] = OW;
-	output_nchw.data = out_nchw;
-	output_nchw.nbytes = out_bytes;
-	sam3_tensor_compute_strides(&output_nchw);
-
-	enum sam3_error err = conv2d_f16_nchw_body(&input_nchw,
-						   &weight_oihw,
-						   &output_nchw,
-						   stride, pad, groups,
-						   scratch, pool);
-	if (err != SAM3_OK) {
+	/* Weight transpose buffer: [K, cpg_out] in fp16 */
+	size_t wt_size = K * (size_t)cpg_out * sizeof(uint16_t);
+	uint16_t *wt_buf = (uint16_t *)sam3_arena_alloc_raw(scratch,
+							     wt_size);
+	if (!wt_buf) {
+		sam3_log_error("conv2d_f16: scratch OOM for weight_T "
+			       "(%zu bytes)", wt_size);
 		scratch->offset = saved_offset;
-		return err;
+		return SAM3_ENOMEM;
 	}
 
-	sam3_cpu_nchw_to_nhwc_bytes(out_nchw, (uint8_t *)output->data,
-				    N_batch, C_out, OH, OW, elem_sz);
+	int n_tasks = sam3_threadpool_n_threads(pool);
+	if (n_tasks < 1)
+		n_tasks = 1;
+
+#if !SAM3_HAS_NEON_FP16
+	/* f32 accumulator: one row per thread */
+	size_t acc_size = (size_t)n_tasks * cpg_out * sizeof(float);
+	float *acc_buf = (float *)sam3_arena_alloc(scratch, acc_size);
+	if (!acc_buf) {
+		sam3_log_error("conv2d_f16: scratch OOM for acc "
+			       "(%zu bytes)", acc_size);
+		scratch->offset = saved_offset;
+		return SAM3_ENOMEM;
+	}
+#endif
+
+	const uint16_t *w_data = (const uint16_t *)weight->data;
+	int M = OH * OW;
+
+	for (int n = 0; n < N_batch; n++) {
+		const uint16_t *in_n =
+			(const uint16_t *)input->data +
+			(size_t)n * H * W * C_in;
+		uint16_t *out_n = (uint16_t *)output->data +
+			(size_t)n * OH * OW * C_out;
+
+		for (int g = 0; g < groups; g++) {
+			im2col_nhwc_f16(in_n, col,
+					C_in, H, W, KH, KW,
+					stride, pad, OH, OW,
+					g * cpg_in, cpg_in);
+
+			const uint16_t *w_g = w_data +
+				(size_t)g * cpg_out * KH * KW * KIC;
+			transpose_u16(w_g, wt_buf,
+				      cpg_out, (int)K);
+
+#if SAM3_HAS_NEON_FP16
+			struct conv2d_nhwc_matmul_ctx_f16 mctx = {
+				.col = (const _Float16 *)col,
+				.weight_t = (const _Float16 *)wt_buf,
+				.output = (_Float16 *)(out_n +
+					g * cpg_out),
+				.M = M, .K = (int)K,
+				.N = cpg_out, .ldc = C_out,
+			};
+#else
+			struct conv2d_nhwc_matmul_ctx_f16 mctx = {
+				.col = col,
+				.weight_t = wt_buf,
+				.output = out_n + g * cpg_out,
+				.acc = acc_buf,
+				.M = M, .K = (int)K,
+				.N = cpg_out, .ldc = C_out,
+			};
+#endif
+			sam3_threadpool_parallel_for(
+				pool,
+				conv2d_nhwc_matmul_f16_fn,
+				&mctx, n_tasks);
+		}
+	}
 
 	scratch->offset = saved_offset;
 	return SAM3_OK;

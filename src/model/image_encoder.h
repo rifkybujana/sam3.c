@@ -133,6 +133,21 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 			       struct sam3_arena *arena);
 
 /*
+ * sam3_vit_precompute - Eagerly compute RoPE tables and tiled pos_embed.
+ *
+ * @vit: Initialized and loaded ViT.
+ *
+ * Forces the lazy precomputation that normally runs on the first
+ * sam3_vit_build() call. Call this during load so that the precomputed
+ * data is included in the arena offset before weights_end is saved,
+ * allowing repeated set_image calls to roll back without destroying
+ * the precomputed tensors.
+ *
+ * No-op if already precomputed. Returns SAM3_OK on success.
+ */
+enum sam3_error sam3_vit_precompute(struct sam3_vit *vit);
+
+/*
  * sam3_vit_build - Evaluate ViT one transformer block at a time.
  *
  * Evaluates the ViT per-block, resetting the scratch arena between

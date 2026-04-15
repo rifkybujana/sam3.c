@@ -39,8 +39,11 @@ static enum sam3_error cpu_init(struct sam3_backend *be)
 		return err;
 	}
 
-	err = sam3_arena_init(&cpu->scratch,
-			      SAM3_CPU_SCRATCH_DEFAULT_CAPACITY);
+	size_t scratch_cap = cpu->scratch_capacity;
+	if (scratch_cap == 0)
+		scratch_cap = SAM3_CPU_SCRATCH_DEFAULT_CAPACITY;
+
+	err = sam3_arena_init(&cpu->scratch, scratch_cap);
 	if (err != SAM3_OK) {
 		sam3_arena_free(&cpu->arena);
 		sam3_log_error("CPU backend: scratch arena init failed");
@@ -55,7 +58,8 @@ static enum sam3_error cpu_init(struct sam3_backend *be)
 		return SAM3_ENOMEM;
 	}
 
-	sam3_log_info("CPU backend initialized (arena: %zu bytes)", capacity);
+	sam3_log_info("CPU backend initialized (arena: %zu, scratch: %zu)",
+		      capacity, scratch_cap);
 	return SAM3_OK;
 }
 
@@ -154,11 +158,12 @@ static void cpu_arena_reset(struct sam3_backend *be)
 }
 
 static const struct sam3_backend_ops cpu_ops = {
-	.init         = cpu_init,
-	.free         = cpu_free,
-	.alloc_tensor = cpu_alloc_tensor,
-	.graph_eval   = cpu_graph_eval,
-	.arena_reset  = cpu_arena_reset,
+	.init              = cpu_init,
+	.free              = cpu_free,
+	.alloc_tensor      = cpu_alloc_tensor,
+	.graph_eval        = cpu_graph_eval,
+	.arena_reset       = cpu_arena_reset,
+	.cache_invalidate  = NULL,  /* CPU has no tensor cache */
 };
 
 const struct sam3_backend_ops *sam3_cpu_backend_ops(void)

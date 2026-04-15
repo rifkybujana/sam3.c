@@ -108,3 +108,6 @@ tests/fixtures/*
 !tests/fixtures/nhwc_migration/*.bin
 
 TODO*
+
+__pycache__
+.bin
