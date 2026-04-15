@@ -32,21 +32,21 @@ EfficientViT uses BatchNorm (not LayerNorm like Hiera).
 
 MBConv blocks use depthwise conv (`groups=C`). Current conv2d has no groups param.
 
-- [ ] Extend `SAM3_OP_CONV2D` params to carry `groups` count
-- [ ] Update `src/backend/cpu/kernels/cpu_conv2d.c` for grouped conv
-- [ ] Update Metal conv2d kernel for grouped conv
+- [x] Extend `SAM3_OP_CONV2D` params to carry `groups` count
+- [x] Update `src/backend/cpu/kernels/cpu_conv2d.c` for grouped conv
+- [x] Update Metal conv2d kernel for grouped conv
 
 ## EfficientViT Encoder Graph Builder
 
-The entire image encoder is missing (~500-800 LOC).
-
-- [ ] `src/model/image_encoder_efficientvit.h` — struct + API
-- [ ] `src/model/image_encoder_efficientvit.c` — graph construction:
-  - [ ] Input stem (ConvLayer + DSConv residual blocks)
-  - [ ] MBConv blocks (inverted_conv -> depth_conv -> point_conv + skip)
-  - [ ] LiteMLA attention blocks (qkv -> aggreg -> proj in context_module)
-  - [ ] Projection head (1x1 conv -> BN -> 3x3 conv)
-- [ ] Register in CMakeLists.txt
+- [x] `src/model/image_encoder_efficientvit.h` — struct + API
+- [x] `src/model/image_encoder_efficientvit.c` — graph construction:
+  - [x] Input stem (ConvLayer + DSConv residual blocks)
+  - [x] MBConv blocks (inverted_conv -> depth_conv -> point_conv + skip)
+  - [x] LiteMLA attention blocks (qkv -> aggreg -> proj in context_module)
+  - [x] Projection head (1x1 conv -> BN -> GELU -> 3x3 conv)
+- [x] HSwish op (`SAM3_OP_HSWISH`) — CPU kernel, Metal dispatch, graph helper
+- [x] DIV op (`SAM3_OP_DIV`) — CPU kernel, Metal dispatch, graph helper
+- [x] Register in CMakeLists.txt
 
 ## Backbone Type Dispatch
 
