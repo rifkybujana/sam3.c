@@ -15,6 +15,7 @@ option(SAM3_TRACE   "Enable dtype tracing" OFF)
 option(SAM3_DEBUG_DUMP "Enable debug tensor dumps to /tmp" OFF)
 option(SAM3_BLAS    "Use BLAS for CPU matmul (Accelerate/OpenBLAS/MKL)" ON)
 option(SAM3_BENCH   "Build benchmarking harness" OFF)
+option(SAM3_SHARED  "Build shared library" OFF)
 
 # Auto-detect Metal on macOS
 if(APPLE AND NOT DEFINED SAM3_METAL)
@@ -115,8 +116,19 @@ if(SAM3_METAL)
 	add_definitions(-DSAM3_HAS_METAL)
 endif()
 
-# Static library
-add_library(sam3 STATIC ${SAM3_SOURCES})
+if(SAM3_SHARED)
+	add_library(sam3 SHARED ${SAM3_SOURCES})
+	set_target_properties(sam3 PROPERTIES
+		POSITION_INDEPENDENT_CODE ON
+	)
+	if(APPLE)
+		set_target_properties(sam3 PROPERTIES
+			LINK_FLAGS "-exported_symbols_list ${CMAKE_SOURCE_DIR}/python/exports.txt"
+		)
+	endif()
+else()
+	add_library(sam3 STATIC ${SAM3_SOURCES})
+endif()
 
 # Apply sanitizers only to our own code (not fetched dependencies like MLX)
 if(SAM3_SANITIZE_FLAGS)
