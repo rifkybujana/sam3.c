@@ -52,9 +52,9 @@ MBConv blocks use depthwise conv (`groups=C`). Current conv2d has no groups para
 
 Model builder is hardcoded to Hiera. Need runtime backbone routing.
 
-- [ ] `src/model/vl_combiner.c`: check `backbone_type` in init/load/build
-- [ ] `struct sam3_vl_backbone`: support both encoder types (union or separate fields)
-- [ ] Propagate `backbone_type` through `sam3_processor_load` -> `sam3_image_model_load` -> `sam3_vl_backbone_load`
+- [x] `src/model/vl_combiner.c`: check `backbone_type` in init/load/build
+- [x] `struct sam3_vl_backbone`: support both encoder types (union or separate fields)
+- [x] Propagate `backbone_type` through `sam3_processor_init` -> `sam3_image_model_init` -> `sam3_vl_backbone_init`
 
 ## FPN Neck Dimension Fix
 

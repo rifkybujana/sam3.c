@@ -1,14 +1,15 @@
 /*
  * src/model/vl_combiner.h - Vision-language backbone combiner
  *
- * Wraps the ViT image encoder, feature pyramid neck, CLIP text encoder,
- * BPE tokenizer, and 2D position encoding into a single composite module.
- * This is a structural wrapper that organizes sub-modules and provides
- * unified init/load/build entry points for the SAM3 inference pipeline.
+ * Wraps the image encoder (Hiera ViT or EfficientViT), feature pyramid
+ * neck, CLIP text encoder, BPE tokenizer, and 2D position encoding into
+ * a single composite module. This is a structural wrapper that organizes
+ * sub-modules and provides unified init/load/build entry points for the
+ * SAM3 inference pipeline. Backbone dispatch is based on backbone_type.
  *
  * Key types:  sam3_vl_backbone
- * Depends on: image_encoder.h, necks.h, text_encoder.h, tokenizer.h,
- *             position_encoding.h
+ * Depends on: image_encoder.h, image_encoder_efficientvit.h, necks.h,
+ *             text_encoder.h, tokenizer.h, position_encoding.h
  * Used by:    sam3.c (top-level image model)
  *
  * Copyright (c) 2026
@@ -19,13 +20,18 @@
 #define SAM3_MODEL_VL_COMBINER_H
 
 #include "image_encoder.h"
+#include "image_encoder_efficientvit.h"
 #include "necks.h"
 #include "text_encoder.h"
 #include "tokenizer.h"
 #include "position_encoding.h"
 
 struct sam3_vl_backbone {
-	struct sam3_vit vit;
+	int backbone_type;	/* enum sam3_backbone_type */
+	union {
+		struct sam3_vit vit;
+		struct sam3_efficientvit evit;
+	} enc;
 	struct sam3_neck neck;
 	struct sam3_text_encoder text_enc;
 	struct sam3_tokenizer tokenizer;
@@ -36,15 +42,17 @@ struct sam3_vl_backbone {
 /*
  * sam3_vl_backbone_init - Initialize the VL backbone.
  *
- * @vl:    VL backbone struct (caller-allocated, zeroed)
- * @arena: Arena for precomputation (RoPE, position encoding)
+ * @vl:            VL backbone struct (caller-allocated, zeroed)
+ * @backbone_type: SAM3_BACKBONE_HIERA or SAM3_BACKBONE_EFFICIENTVIT
+ * @arena:         Arena for precomputation (RoPE, position encoding)
  *
- * Sets up ViT, neck, tokenizer, and position encoding with
- * SAM3 default configuration values.
+ * Dispatches to the appropriate image encoder init based on backbone_type.
+ * Sets up encoder, neck, tokenizer, and position encoding.
  *
  * Returns SAM3_OK on success, or an error code on failure.
  */
 enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
+				      int backbone_type,
 				      struct sam3_arena *arena);
 
 /*

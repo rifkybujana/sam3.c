@@ -156,7 +156,7 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	}
 
 	/* Initialize processor and load model weights */
-	err = sam3_processor_init(&ctx->proc);
+	err = sam3_processor_init(&ctx->proc, ctx->config.backbone_type);
 	if (err != SAM3_OK) {
 #ifdef SAM3_HAS_PROFILE
 		SAM3_PROF_END(ctx->profiler, "model_load");

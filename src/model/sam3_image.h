@@ -60,8 +60,9 @@ struct sam3_image_model {
  * sam3_image_model_init - Initialize the image model with default SAM3
  * configuration.
  *
- * @model: Image model struct (caller-allocated)
- * @arena: Arena for precomputation (RoPE, position encoding)
+ * @model:         Image model struct (caller-allocated)
+ * @backbone_type: SAM3_BACKBONE_HIERA or SAM3_BACKBONE_EFFICIENTVIT
+ * @arena:         Arena for precomputation (RoPE, position encoding)
  *
  * Initializes all sub-modules (backbone, encoder fusion, decoder,
  * geometry encoder, segmentation head, scorer) with SAM3 defaults.
@@ -69,6 +70,7 @@ struct sam3_image_model {
  * Returns SAM3_OK on success, or propagates the first sub-module error.
  */
 enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
+				      int backbone_type,
 				      struct sam3_arena *arena);
 
 /*

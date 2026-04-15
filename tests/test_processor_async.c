@@ -48,7 +48,7 @@ static void test_set_text_returns_immediately(void)
 	}
 
 	struct sam3_processor proc;
-	enum sam3_error err = sam3_processor_init(&proc);
+	enum sam3_error err = sam3_processor_init(&proc, SAM3_BACKBONE_HIERA);
 	ASSERT_EQ(err, SAM3_OK);
 
 	struct sam3_weight_file wf;
@@ -88,7 +88,7 @@ static void test_set_text_then_segment(void)
 	}
 
 	struct sam3_processor proc;
-	enum sam3_error err = sam3_processor_init(&proc);
+	enum sam3_error err = sam3_processor_init(&proc, SAM3_BACKBONE_HIERA);
 	ASSERT_EQ(err, SAM3_OK);
 
 	struct sam3_weight_file wf;
@@ -180,7 +180,7 @@ static void test_set_text_parallel_with_set_image(void)
 	int    n_masks_legacy = 0, mh = 0, mw = 0;
 	{
 		struct sam3_processor proc;
-		ASSERT_EQ(sam3_processor_init(&proc), SAM3_OK);
+		ASSERT_EQ(sam3_processor_init(&proc, SAM3_BACKBONE_HIERA), SAM3_OK);
 
 		struct sam3_weight_file wf;
 		ASSERT_EQ(sam3_weight_open(&wf, MODEL_PATH), SAM3_OK);
@@ -220,7 +220,7 @@ static void test_set_text_parallel_with_set_image(void)
 	int    n_masks_async = 0;
 	{
 		struct sam3_processor proc;
-		ASSERT_EQ(sam3_processor_init(&proc), SAM3_OK);
+		ASSERT_EQ(sam3_processor_init(&proc, SAM3_BACKBONE_HIERA), SAM3_OK);
 
 		struct sam3_weight_file wf;
 		ASSERT_EQ(sam3_weight_open(&wf, MODEL_PATH), SAM3_OK);

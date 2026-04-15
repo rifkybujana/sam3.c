@@ -55,7 +55,8 @@ void sam3_normalize_rgb_chw(const uint8_t *src, float *dst,
 	}
 }
 
-enum sam3_error sam3_processor_init(struct sam3_processor *proc)
+enum sam3_error sam3_processor_init(struct sam3_processor *proc,
+				    int backbone_type)
 {
 	enum sam3_error err;
 
@@ -146,8 +147,9 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc)
 				      "async text encoding disabled");
 	}
 
-	/* Initialize all sub-modules with default SAM3 config */
-	err = sam3_image_model_init(&proc->model, &proc->model_arena);
+	/* Initialize all sub-modules with appropriate backbone config */
+	err = sam3_image_model_init(&proc->model, backbone_type,
+				     &proc->model_arena);
 	if (err != SAM3_OK)
 		goto cleanup_text_backend;
 
@@ -410,7 +412,15 @@ static struct sam3_tensor *project_prompts(
 	int n_points, n_boxes;
 	int pi = 0, bi = 0;
 	int i;
-	float img_size = (float)model->backbone.vit.img_size;
+	float img_size;
+	switch (model->backbone.backbone_type) {
+	case SAM3_BACKBONE_EFFICIENTVIT:
+		img_size = (float)model->backbone.enc.evit.img_size;
+		break;
+	default: /* SAM3_BACKBONE_HIERA */
+		img_size = (float)model->backbone.enc.vit.img_size;
+		break;
+	}
 
 	count_prompts_by_type(prompts, n_prompts, &n_points, &n_boxes);
 

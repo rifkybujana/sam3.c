@@ -73,7 +73,8 @@ struct sam3_processor {
 /*
  * sam3_processor_init - Initialize processor with CPU backend and arenas.
  *
- * @proc: Processor struct (caller-allocated)
+ * @proc:          Processor struct (caller-allocated)
+ * @backbone_type: SAM3_BACKBONE_HIERA or SAM3_BACKBONE_EFFICIENTVIT
  *
  * Creates a CPU backend, allocates model and scratch arenas, and
  * initializes the image model. Must be followed by sam3_processor_load()
@@ -81,7 +82,8 @@ struct sam3_processor {
  *
  * Returns SAM3_OK on success, or an error code on failure.
  */
-enum sam3_error sam3_processor_init(struct sam3_processor *proc);
+enum sam3_error sam3_processor_init(struct sam3_processor *proc,
+				    int backbone_type);
 
 /*
  * sam3_processor_load - Load model weights from an open weight file.

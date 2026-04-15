@@ -173,14 +173,15 @@ static inline void dump_tensor(const char *path,
 #endif
 
 enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
+				      int backbone_type,
 				      struct sam3_arena *arena)
 {
 	enum sam3_error err;
 
 	memset(model, 0, sizeof(*model));
 
-	/* Vision-language backbone (ViT + neck + text encoder + tokenizer) */
-	err = sam3_vl_backbone_init(&model->backbone, arena);
+	/* Vision-language backbone (encoder + neck + text encoder + tokenizer) */
+	err = sam3_vl_backbone_init(&model->backbone, backbone_type, arena);
 	if (err != SAM3_OK)
 		return err;
 

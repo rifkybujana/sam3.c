@@ -1,9 +1,10 @@
 /*
  * src/model/vl_combiner.c - Vision-language backbone combiner
  *
- * Implements the composite VL backbone that wires together the ViT
- * image encoder, feature pyramid neck, CLIP text encoder, BPE
- * tokenizer, and 2D position encoding. This module does not add new
+ * Implements the composite VL backbone that wires together the image
+ * encoder (Hiera ViT or EfficientViT), feature pyramid neck, CLIP text
+ * encoder, BPE tokenizer, and 2D position encoding. Dispatches to the
+ * correct encoder based on backbone_type. This module does not add new
  * computation -- it organizes the sub-modules and provides unified
  * init/load/build entry points for the SAM3 inference pipeline.
  *
@@ -22,29 +23,57 @@
 #include "util/log.h"
 
 enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
+				      int backbone_type,
 				      struct sam3_arena *arena)
 {
 	enum sam3_error err;
+	int grid_size;
+	int backbone_dim = 1024;
 
 	vl->scalp = 1;
+	vl->backbone_type = backbone_type;
 
-	/* Init ViT with SAM3 defaults */
-	err = sam3_vit_init(&vl->vit,
-			     1008,	/* img_size */
-			     14,	/* patch_size */
-			     1024,	/* embed_dim */
-			     32,	/* depth */
-			     16,	/* n_heads */
-			     24,	/* window_size */
-			     4736,	/* mlp_dim = 1024 * 4.625 */
-			     arena);
-	if (err != SAM3_OK)
-		return err;
+	switch (backbone_type) {
+	case SAM3_BACKBONE_HIERA:
+		err = sam3_vit_init(&vl->enc.vit,
+				     1008,	/* img_size */
+				     14,	/* patch_size */
+				     1024,	/* embed_dim */
+				     32,	/* depth */
+				     16,	/* n_heads */
+				     24,	/* window_size */
+				     4736,	/* mlp_dim = 1024 * 4.625 */
+				     arena);
+		if (err != SAM3_OK)
+			return err;
+		grid_size = vl->enc.vit.grid_size;
+		break;
+
+	case SAM3_BACKBONE_EFFICIENTVIT: {
+		int width_list[] = {24, 48, 96, 192, 384};
+		int depth_list[] = {1, 3, 4, 4, 6};
+		err = sam3_efficientvit_init(&vl->enc.evit,
+					      width_list, depth_list,
+					      32,	/* attn_dim */
+					      4,	/* expand_ratio */
+					      512,	/* img_size */
+					      1024);	/* embed_dim */
+		if (err != SAM3_OK)
+			return err;
+		grid_size = vl->enc.evit.grid_size;
+		break;
+	}
+
+	default:
+		sam3_log_error("vl_backbone: unknown backbone_type %d",
+			       backbone_type);
+		return SAM3_EINVAL;
+	}
 
 	/* Init neck: 4 scales at {4x, 2x, 1x, 0.5x} */
 	float scales[] = {4.0f, 2.0f, 1.0f, 0.5f};
-	err = sam3_neck_init(&vl->neck, 256, 1024,
-			      vl->vit.grid_size, 4, scales);
+	err = sam3_neck_init(&vl->neck, 256, backbone_dim,
+			      grid_size, 4, scales);
 	if (err != SAM3_OK)
 		return err;
 
@@ -62,13 +91,13 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	vl->text_enc.vocab_size = 49408;
 
 	/*
-	 * Lazy 2D sinusoidal position encoding for ViT grid.
+	 * Lazy 2D sinusoidal position encoding for encoder grid.
 	 * Python: num_pos_feats = input // 2 = 256 // 2 = 128.
-	 * Output is [H, W, 128*2] = [72, 72, 256] matching d_model.
+	 * Output is [H, W, 128*2] = [grid, grid, 256] matching d_model.
 	 * Actual computation deferred to first sam3_pos_encoding_get().
 	 */
-	vl->pos_enc.height = vl->vit.grid_size;
-	vl->pos_enc.width = vl->vit.grid_size;
+	vl->pos_enc.height = grid_size;
+	vl->pos_enc.width = grid_size;
 	vl->pos_enc.num_pos_feats = 128;
 	vl->pos_enc.temperature = 10000.0f;
 	vl->pos_enc.arena = arena;
@@ -82,7 +111,17 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 {
 	enum sam3_error err;
 
-	err = sam3_vit_load(&vl->vit, wf, arena);
+	switch (vl->backbone_type) {
+	case SAM3_BACKBONE_HIERA:
+		err = sam3_vit_load(&vl->enc.vit, wf, arena);
+		break;
+	case SAM3_BACKBONE_EFFICIENTVIT:
+		err = sam3_efficientvit_load(&vl->enc.evit, wf, arena);
+		break;
+	default:
+		err = SAM3_EINVAL;
+		break;
+	}
 	if (err != SAM3_OK)
 		return err;
 
@@ -114,19 +153,30 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 	struct sam3_profiler *profiler)
 {
 	/*
-	 * Run ViT per-block: evaluates internally, returns
+	 * Run image encoder per-block: evaluates internally, returns
 	 * materialized output in persist arena.
 	 */
-	struct sam3_tensor *vit_out;
+	struct sam3_tensor *enc_out;
 
-	vit_out = sam3_vit_build(&vl->vit, be, image, scratch, persist,
-				  profiler);
-	if (!vit_out) {
-		sam3_log_error("vl_backbone: vit_build returned NULL");
+	switch (vl->backbone_type) {
+	case SAM3_BACKBONE_HIERA:
+		enc_out = sam3_vit_build(&vl->enc.vit, be, image,
+					  scratch, persist, profiler);
+		break;
+	case SAM3_BACKBONE_EFFICIENTVIT:
+		enc_out = sam3_efficientvit_build(&vl->enc.evit, be, image,
+						   scratch, persist, profiler);
+		break;
+	default:
+		enc_out = NULL;
+		break;
+	}
+	if (!enc_out) {
+		sam3_log_error("vl_backbone: encoder build returned NULL");
 		return NULL;
 	}
 
-	sam3_log_debug("vl_backbone: vit done, scratch %zu/%zu, persist %zu/%zu",
+	sam3_log_debug("vl_backbone: encoder done, scratch %zu/%zu, persist %zu/%zu",
 		       scratch->offset, scratch->size,
 		       persist->offset, persist->size);
 
@@ -139,7 +189,7 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 
 	enum sam3_error err;
 
-	err = sam3_neck_build(&vl->neck, g, vit_out, out_features, scratch);
+	err = sam3_neck_build(&vl->neck, g, enc_out, out_features, scratch);
 	if (err != SAM3_OK) {
 		sam3_log_error("vl_backbone: neck_build failed, scratch %zu/%zu",
 			       scratch->offset, scratch->size);
@@ -149,7 +199,7 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 	sam3_log_debug("vl_backbone: neck built, scratch %zu/%zu, %d nodes",
 		       scratch->offset, scratch->size, g->n_nodes);
 
-	return vit_out;
+	return enc_out;
 }
 
 struct sam3_tensor *sam3_vl_backbone_build_text(
