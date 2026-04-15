@@ -422,9 +422,25 @@ void sam3_bench_print_results(const struct sam3_bench_result *results,
 
 	for (int i = 0; i < n_results; i++) {
 		const struct sam3_bench_result *r = &results[i];
+		char gflops_str[16], mbs_str[16];
+
+		if (r->gflops > 0.0)
+			snprintf(gflops_str, sizeof(gflops_str),
+				 "%8.2f", r->gflops);
+		else
+			snprintf(gflops_str, sizeof(gflops_str),
+				 "%8s", "-");
+
+		if (r->throughput_mbs > 0.0)
+			snprintf(mbs_str, sizeof(mbs_str),
+				 "%10.1f", r->throughput_mbs);
+		else
+			snprintf(mbs_str, sizeof(mbs_str),
+				 "%10s", "-");
+
 		fprintf(stderr,
-			"%-40s %10.3f %10.3f %10.3f %8.2f %10.1f\n",
+			"%-40s %10.3f %10.3f %10.3f %s %s\n",
 			r->name, r->mean_ms, r->min_ms, r->max_ms,
-			r->gflops, r->throughput_mbs);
+			gflops_str, mbs_str);
 	}
 }

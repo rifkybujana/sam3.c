@@ -156,6 +156,8 @@ static int bench_matmul(const struct sam3_bench_config *cfg,
 				continue;
 
 			sam3_arena_reset(arena);
+			if (be->ops->arena_reset)
+				be->ops->arena_reset(be);
 
 			/* Allocate tensor headers from arena. */
 			struct sam3_tensor *a = sam3_arena_alloc(arena,
@@ -259,6 +261,8 @@ static int bench_elementwise(const struct sam3_bench_config *cfg,
 					continue;
 
 				sam3_arena_reset(arena);
+				if (be->ops->arena_reset)
+					be->ops->arena_reset(be);
 
 				int n = sizes[si];
 				int dims[1] = { n };
@@ -373,6 +377,8 @@ static int bench_softmax(const struct sam3_bench_config *cfg,
 				continue;
 
 			sam3_arena_reset(arena);
+			if (be->ops->arena_reset)
+				be->ops->arena_reset(be);
 
 			int dims[2] = { 1, sizes[si] };
 
@@ -449,6 +455,8 @@ static int bench_layernorm(const struct sam3_bench_config *cfg,
 				continue;
 
 			sam3_arena_reset(arena);
+			if (be->ops->arena_reset)
+				be->ops->arena_reset(be);
 
 			int dims_x[2] = { 1, sizes[si] };
 			int dims_p[1] = { sizes[si] };
@@ -537,6 +545,8 @@ static int bench_transpose(const struct sam3_bench_config *cfg,
 				continue;
 
 			sam3_arena_reset(arena);
+			if (be->ops->arena_reset)
+				be->ops->arena_reset(be);
 
 			int dims[2] = { n, n };
 
