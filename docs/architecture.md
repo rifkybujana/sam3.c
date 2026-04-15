@@ -128,7 +128,7 @@ EfficientViT: `16 x 16 = 256`). Shapes below use Hiera as the example.
             │                      (+ pooled [256])
             v
   ┌────────────────────────────────────────────────┐
-  │  Vision backbone (dispatch by backbone_type)    │
+  │  Vision backbone (dispatch by backbone_type)   │
   │                                                │
   │  Hiera:        sam3_vit        (grid 72x72)    │
   │  TinyViT-21M:  sam3_tinyvit    (grid 32x32)    │
@@ -200,11 +200,11 @@ EfficientViT: `16 x 16 = 256`). Shapes below use Hiera as the example.
                            │
                            v
   ┌──────────────────────────────────────────────────────┐
-  │  sam3_result                                          │
-  │    masks       [n_masks, H_orig, W_orig] f32          │
-  │    iou_scores  [n_masks] f32                          │
-  │    boxes       [n_masks, 4] f32 (xyxy, orig coords)   │
-  │    best_mask   int                                    │
+  │  sam3_result                                         │
+  │    masks       [n_masks, H_orig, W_orig] f32         │
+  │    iou_scores  [n_masks] f32                         │
+  │    boxes       [n_masks, 4] f32 (xyxy, orig coords)  │
+  │    best_mask   int                                   │
   └──────────────────────────────────────────────────────┘
 ```
 
