@@ -28,10 +28,21 @@ Inspired by [ggml](https://github.com/ggerganov/ggml) and [llama.cpp](https://gi
 - **Multithreaded CPU backend** — optimized SIMD kernels with thread pool for x86 and ARM.
 - **FP16 and BF16 support** — run inference in half precision for lower memory and faster compute.
 - **Custom `.sam3` weight format** — mmap-friendly binary format with O(1) tensor lookup via hash table.
-- **Full SAM3 pipeline** — image encoder (Hiera), prompt encoder (points, boxes, masks), mask decoder, text encoder, and tokenizer.
+- **Full SAM3 pipeline** — image encoder (Hiera, EfficientViT, TinyViT), prompt encoder (points, boxes, masks), mask decoder, text encoder, and tokenizer.
+- **Multiple backbones** — Hiera (full accuracy), EfficientViT-B1 (lightweight, 512px), and TinyViT-21M (128x128 masks at 1008px input).
 - **Unified CLI** — single `sam3_cli` binary with `segment`, `convert`, and `info` subcommands. Supports stdin/stdout piping, JSON output, and multi-mask color overlays.
 - **48 unit tests** — comprehensive test suite covering numerical operators, memory management, and end-to-end inference.
 - **Built-in profiling** — latency tracing subsystem to identify bottlenecks.
+
+## Supported Models
+
+| Backbone | Input Size | Mask Resolution | Parameters | Use Case |
+|---|---|---|---|---|
+| **Hiera** | 1008x1008 | 288x288 | ~600M | Full accuracy |
+| **TinyViT-21M** | 1008x1008 | 128x128 | ~21M | Balanced quality/speed |
+| **EfficientViT-B1** | 512x512 | 64x64 | ~9M | Fastest, lightweight |
+
+All backbones share the same prompt encoder, mask decoder, and text encoder. The backbone is selected automatically based on the checkpoint.
 
 ## Quick Start
 
@@ -50,7 +61,12 @@ make -j$(nproc)
 Download a SAM3 checkpoint in SafeTensors format, then convert to the optimized `.sam3` format:
 
 ```bash
+# Hiera (default backbone)
 ./sam3_cli convert -i models/sam3.safetensors -o models/sam3.sam3
+
+# TinyViT or EfficientViT (specify backbone)
+./sam3_cli convert -i models/tinyvit.safetensors -o models/tinyvit.sam3 --backbone tinyvit
+./sam3_cli convert -i models/evit.safetensors -o models/evit.sam3 --backbone efficientvit
 ```
 
 ### Run Inference
@@ -89,7 +105,7 @@ sam3.c
 │   │   ├── cpu/         Multithreaded CPU kernels (SIMD-optimized)
 │   │   └── metal/       Apple Metal GPU backend
 │   ├── model/           SAM3 layers
-│   │   ├── image_encoder   Vision transformer
+│   │   ├── image_encoder   Vision transformer (Hiera, EfficientViT, TinyViT)
 │   │   ├── prompt_encoder  Point, box, and mask prompts
 │   │   ├── mask_decoder    Lightweight mask prediction head
 │   │   ├── text_encoder    Text prompt encoding

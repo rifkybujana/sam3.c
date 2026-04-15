@@ -25,9 +25,11 @@ For the on-disk weight layout, see [`docs/weight-format.md`](weight-format.md).
           |   +--------------------------------------------+  |
           |   |       sam3_vl_backbone (vision+text)       |  |
           |   |                                            |  |
-          |   |  sam3_vit (ViT, 32 blocks, 1024 dim)       |  |
-          |   |       |                                    |  |
-          |   |       v   [5184, 1024]                     |  |
+          |   |  sam3_vit   (Hiera, 32 blocks, 1024 dim)   |  |
+          |   |  sam3_efficientvit (EfficientViT-B1)       |  |
+          |   |  sam3_tinyvit (TinyViT-21M, 4 layers)      |  |
+          |   |       |  (backbone dispatch by type)       |  |
+          |   |       v   [grid^2, 1024]                   |  |
           |   |  sam3_neck (FPN, 4 scales -> d_model=256)  |  |
           |   |                                            |  |
           |   |  sam3_tokenizer -> sam3_text_encoder       |  |
@@ -91,8 +93,9 @@ implementation detail living under `src/`.
 ### End-to-end data flow with tensor shapes
 
 The diagram below traces a single image + text inference through every
-stage, annotated with tensor shapes. `H, W` denote the ViT grid
-dimensions (`72 x 72 = 5184` patches for a `1008 x 1008` input).
+stage, annotated with tensor shapes. `H, W` denote the backbone grid
+dimensions (Hiera: `72 x 72 = 5184`, TinyViT: `32 x 32 = 1024`,
+EfficientViT: `16 x 16 = 256`). Shapes below use Hiera as the example.
 
 ```
   ┌──────────────────────────────────────────────────────────────────┐
@@ -124,26 +127,28 @@ dimensions (`72 x 72 = 5184` patches for a `1008 x 1008` input).
             │                      [seq_len=32, 256] text_features
             │                      (+ pooled [256])
             v
-  ┌────────────────────────────────────┐
-  │  sam3_vit  (32 blocks, 1024 dim)   │
-  │  patch_embed: conv2d 14x14 stride14│
-  │  global attn @ blocks 7,15,23,31   │
-  │  windowed attn @ all others (ws=24)│
-  │  RoPE positional encoding          │
-  │                                    │
-  │  per-block eval (55 GB -> 2.5 GB)  │
-  └────────────────────────────────────┘
+  ┌────────────────────────────────────────────────┐
+  │  Vision backbone (dispatch by backbone_type)    │
+  │                                                │
+  │  Hiera:        sam3_vit        (grid 72x72)    │
+  │  TinyViT-21M:  sam3_tinyvit    (grid 32x32)    │
+  │  EfficientViT: sam3_efficientvit (grid 16x16)  │
+  │                                                │
+  │  per-block eval to bound memory                │
+  └────────────────────────────────────────────────┘
             │
-            v   [5184, 1024] backbone features
+            v   [grid^2, 1024] backbone features
   ┌────────────────────────────────────┐
-  │  sam3_neck  (FPN, 3 scales)        │
+  │  sam3_neck  (FPN, 4 scales)        │
   │                                    │
+  │  Hiera example (grid=72):          │
   │  s0 (4x):  [1, 288, 288, 256]      │
   │  s1 (2x):  [1, 144, 144, 256]      │
   │  s2 (1x):  [1,  72,  72, 256]      │
+  │  s3 (0.5x):[1,  36,  36, 256]      │
   └────────────────────────────────────┘
             │
-            v   image_features  [1, 72, 72, 256] NHWC
+            v   image_features  [1, grid, grid, 256] NHWC
             │   multi-scale features cached on model
             │
             │             ┌────────── prompts ────────┐
@@ -236,7 +241,9 @@ src/backend/          # compute backends behind a single vtable
 src/model/            # SAM3 network definition
   sam3_image.[ch]     # composite top-level model
   vl_combiner.[ch]    # wraps ViT + neck + text encoder + tokenizer
-  image_encoder.[ch]  # ViT backbone (32 blocks, windowed attn)
+  image_encoder.[ch]            # Hiera ViT (32 blocks, windowed attn)
+  image_encoder_efficientvit.[ch] # EfficientViT-B1 (MBConv + LiteMLA)
+  image_encoder_tinyvit.[ch]   # TinyViT-21M (MBConv + window attn)
   necks.[ch]          # multi-scale FPN
   text_encoder.[ch]   # CLIP text encoder (24 blocks)
   tokenizer.[ch]      # CLIP BPE (byte-level fallback)
@@ -610,11 +617,35 @@ It exposes a two-phase API:
   and (if set) cached_text_features.
 ```
 
-### 4.2 Vision backbone — ViT (`image_encoder.h`)
+### 4.2 Vision backbone (multi-backbone dispatch)
 
-SAM3 uses a 32-block Vision Transformer with local/global attention
-and RoPE. The struct (`sam3_vit`) hardcodes no dimensions; values come
-from `sam3_vit_init()`. The default config used by the image model is:
+The vision backbone is selected at init time via `backbone_type` in the
+`sam3_vl_backbone` struct. Three backbones are supported:
+
+| Backbone | Type enum | Grid | Input | Mask res | Key file |
+|---|---|---|---|---|---|
+| Hiera | `SAM3_BACKBONE_HIERA` | 72x72 | 1008 | 288x288 | `image_encoder.[ch]` |
+| TinyViT-21M | `SAM3_BACKBONE_TINYVIT` | 32x32 | 1008 | 128x128 | `image_encoder_tinyvit.[ch]` |
+| EfficientViT-B1 | `SAM3_BACKBONE_EFFICIENTVIT` | 16x16 | 512 | 64x64 | `image_encoder_efficientvit.[ch]` |
+
+All backbones output `[grid^2, 1024]` and share the same neck, text
+encoder, prompt encoder, mask decoder, and segmentation head. Dispatch
+happens in `vl_combiner.c` via a `switch` on `backbone_type` in three
+places: `_init`, `_load`, and `_build_vision`.
+
+```c
+union {
+    struct sam3_vit        vit;    /* Hiera */
+    struct sam3_efficientvit evit; /* EfficientViT-B1 */
+    struct sam3_tinyvit    tvit;   /* TinyViT-21M */
+} enc;
+```
+
+#### 4.2.1 Hiera ViT (`image_encoder.h`)
+
+SAM3's default backbone is a 32-block Vision Transformer with
+local/global attention and RoPE. The struct (`sam3_vit`) hardcodes
+no dimensions; values come from `sam3_vit_init()`. The config is:
 
 | Field              | Value | Note                                  |
 |--------------------|-------|---------------------------------------|
@@ -810,17 +841,138 @@ cut kernel-launch overhead (commit `15d2c74`).
     shared by all windows)                        full tables)
 ```
 
+#### 4.2.2 TinyViT-21M (`image_encoder_tinyvit.h`)
+
+A lightweight 4-layer encoder using MBConv blocks (layer 0) and
+windowed attention with learned position bias (layers 1-3). ~21M
+parameters, produces 128x128 masks at 1008px input.
+
+| Field | Value | Note |
+|---|---|---|
+| `img_size` | 1008 | same as Hiera |
+| `embed_dims` | [96, 192, 384, 576] | per-layer channels |
+| `depths` | [2, 2, 6, 2] | blocks per layer |
+| `num_heads` | [3, 6, 12, 18] | per-layer heads |
+| `window_sizes` | [7, 7, 14, 7] | per-layer window size |
+| `grid_size` | 32 | output spatial dim |
+| `embed_dim` | 1024 | after projection head |
+| `mlp_ratio` | 4 | MLP expansion factor |
+
+**Architecture**:
+
+```
+  image [3, 1008, 1008]
+        │
+   patch_embed: 2x Conv2d_BN(3x3, stride 2)
+        │
+        v  [1, 252, 252, 96]
+        │
+   Layer 0 (ConvLayer):
+     2x MBConv(expand=4, DW 3x3) + PatchMerging(stride 2)
+        │
+        v  [1, 126, 126, 192]
+        │
+   Layer 1 (BasicLayer):
+     2x TinyViTBlock(ws=7) + PatchMerging(stride 2)
+        │
+        v  [1, 63, 63, 384]
+        │
+   Layer 2 (BasicLayer):
+     6x TinyViTBlock(ws=14, padded to 70) + PatchMerging(stride 2)
+        │
+        v  [1, 32, 32, 576]
+        │
+   Layer 3 (BasicLayer):
+     2x TinyViTBlock(ws=7, padded to 35), no downsample
+        │
+        v  [1, 32, 32, 576]
+        │
+   Projection: Conv1x1(576->1024) + BN + GELU + Conv3x3
+        │
+        v  [1024, 1024]
+```
+
+**TinyViTBlock** (pre-norm residual + local conv):
+
+```
+  x [H*W, C]
+     │
+     ├───────────────────┐
+     v                   │
+  window_partition       │
+     │                   │
+  ┌─────────────────┐    │
+  │ LN (pre-norm)   │    │
+  │ QKV (interleaved│    │
+  │   per-head)     │    │
+  │ Q@K^T + bias    │    │
+  │ softmax → @V    │    │
+  │ proj            │    │
+  └──┬──────────────┘    │
+     │                   │
+  window_unpartition     │
+     │                   │
+     +◄──────────────────┘ residual
+     │
+  local_conv (3x3 DW + BN)
+     │
+     ├───────────────────┐
+     v                   │
+  ┌─────────────────┐    │
+  │ LN → fc1 → GELU │    │
+  │   → fc2         │    │
+  └──┬──────────────┘    │
+     │                   │
+     +◄──────────────────┘ residual
+     │
+     v  y [H*W, C]
+```
+
+**Per-block evaluation.** Unlike Hiera which batches 4 blocks per
+`graph_eval`, TinyViT evaluates each block individually due to the
+higher scratch memory usage of windowed attention with padding. Each
+block's graph is built, evaluated, and the result copied to a persist
+buffer before scratch is reset.
+
+**Window padding.** Non-divisible spatial sizes (e.g. 63%14 for
+layer 2) are handled by concatenating zero tensors along H/W axes
+before partition, then slicing back to original size after unpartition.
+
+**Attention bias.** At load time, the compact `[n_heads, n_offsets]`
+attention bias is expanded to full `[n_heads, ws^2, ws^2]` using
+absolute position differences, avoiding gather ops at inference.
+
+#### 4.2.3 EfficientViT-B1 (`image_encoder_efficientvit.h`)
+
+A mobile-optimized encoder using MBConv + LiteMLA (lightweight
+multi-scale linear attention). ~9M parameters, fastest backbone with
+64x64 masks at 512px input.
+
+| Field | Value |
+|---|---|
+| `img_size` | 512 |
+| `width_list` | [24, 48, 96, 192, 384] |
+| `depth_list` | [1, 2, 3, 4, 6] |
+| `attn_dim` | 32 |
+| `grid_size` | 16 |
+| `embed_dim` | 1024 |
+
+The architecture follows a stem + 4-stage design with MBConv blocks in
+early stages and MBConv + LiteMLA in later stages. Like TinyViT, it
+uses per-stage evaluation to bound scratch memory.
+
 ### 4.3 Feature pyramid neck (`necks.h`)
 
-`sam3_neck` turns the 1D ViT output `[5184, 1024]` into a set of NHWC
-feature maps at different scales, all projected to `d_model = 256`.
+`sam3_neck` turns the backbone output `[grid^2, backbone_dim]` into a
+set of NHWC feature maps at different scales, all projected to
+`d_model = 256`.
 
 ```c
 struct sam3_neck {
     int d_model;       /* 256 */
-    int backbone_dim;  /* 1024 from ViT */
+    int backbone_dim;  /* derived from encoder (Hiera: 1024, TinyViT: 576, ...) */
     int n_scales;      /* up to 4 */
-    int grid_size;     /* 72 */
+    int grid_size;     /* Hiera: 72, TinyViT: 32, EfficientViT: 16 */
     struct {
         float scale_factor;    /* e.g. 4.0, 2.0, 1.0, 0.5 */
         int   n_convs;
@@ -843,7 +995,8 @@ permute is needed after commit `96641d3`.
 **FPN construction**:
 
 ```
-            vit_out [5184, 1024]  ──► reshape [1, 72, 72, 1024]
+            backbone_out [grid^2, 1024]  ──► reshape [1, grid, grid, backbone_dim]
+            (Hiera example: [5184, 1024] -> [1, 72, 72, 1024])
                                            │
                  ┌─────────────────┬───────┼──────┬─────────────┐
                  │                 │       │      │             │
@@ -879,8 +1032,14 @@ permute is needed after commit `96641d3`.
 ```
 
 The main image_features tensor fed to the encoder fusion is the 1×
-scale `[1, 72, 72, 256]`; the 2× and 4× scales flow as FPN skip
+scale `[1, grid, grid, 256]`; the 2× and 4× scales flow as FPN skip
 connections into both the `seg_head` and the `mask_decoder`.
+
+**sam2_fpn_layers.** EfficientSAM3 checkpoints (EfficientViT and
+TinyViT) include a second FPN neck (`sam2_fpn_layers`) used by the
+tracker. It is initialized and loaded with the same config as the
+primary neck but with a different weight prefix. The `has_sam2_neck`
+flag on `sam3_vl_backbone` tracks whether it was loaded.
 
 ### 4.4 Text tower — tokenizer + CLIP encoder
 
