@@ -11,7 +11,7 @@ pub enum PointLabel {
 
 impl PointLabel {
     #[inline]
-    #[allow(dead_code)] // Used by Ctx::segment lowering in Task 3.11.
+    #[allow(dead_code)] // TODO(task-3.11): remove when Ctx::segment lowering calls it.
     pub(crate) fn to_raw(self) -> i32 {
         match self {
             PointLabel::Foreground => 1,
