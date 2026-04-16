@@ -66,14 +66,18 @@ impl Ctx {
     /// [`segment`](Self::segment).
     pub fn load_model<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let c = path_to_cstring(path.as_ref())?;
-        // SAFETY: raw valid; c lives for the call.
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. c is a NUL-terminated path string not
+        // retained beyond this call.
         unsafe { crate::error::check(sys::sam3_load_model(self.raw.as_ptr(), c.as_ptr())) }
     }
 
     /// Load a BPE vocabulary file (required for text prompts).
     pub fn load_bpe<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let c = path_to_cstring(path.as_ref())?;
-        // SAFETY: raw valid; c lives for the call.
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. c is a NUL-terminated path string not
+        // retained beyond this call.
         unsafe { crate::error::check(sys::sam3_load_bpe(self.raw.as_ptr(), c.as_ptr())) }
     }
 }
@@ -117,10 +121,7 @@ mod tests {
         let err = ctx
             .load_model("/nonexistent/path/to/model.sam3")
             .unwrap_err();
-        // Accept several error variants — libsam3 maps file-not-found to SAM3_EIO.
-        assert!(
-            matches!(err, Error::Io | Error::Invalid | Error::Model),
-            "unexpected error: {err:?}"
-        );
+        // libsam3 maps file-not-found to SAM3_EIO (src/core/weight.c:314).
+        assert!(matches!(err, Error::Io), "unexpected error: {err:?}");
     }
 }
