@@ -123,7 +123,7 @@ if(SAM3_SHARED)
 	)
 	if(APPLE)
 		set_target_properties(sam3 PROPERTIES
-			LINK_FLAGS "-exported_symbols_list ${CMAKE_SOURCE_DIR}/python/exports.txt"
+			LINK_FLAGS "-exported_symbols_list ${CMAKE_SOURCE_DIR}/bindings/python/exports.txt"
 		)
 	endif()
 else()
