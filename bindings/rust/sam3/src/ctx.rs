@@ -1,11 +1,31 @@
 //! SAM3 inference context.
 
+use std::ffi::CString;
 use std::marker::PhantomData;
+use std::path::Path;
 use std::ptr::NonNull;
 
 use sam3_sys as sys;
 
 use crate::error::{Error, Result};
+
+/// Convert a filesystem path to a `CString` suitable for libsam3.
+///
+/// Returns `Error::Invalid` on paths containing interior NULs or non-UTF-8
+/// bytes on non-Unix platforms (libsam3 is Unix-focused; Windows paths are
+/// best-effort via the UTF-8 representation).
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::Invalid)
+    }
+    #[cfg(not(unix))]
+    {
+        let s = path.to_str().ok_or(Error::Invalid)?;
+        CString::new(s).map_err(|_| Error::Invalid)
+    }
+}
 
 /// An owned SAM3 inference context.
 ///
@@ -38,6 +58,23 @@ impl Ctx {
         // SAFETY: raw is valid; sam3_get_image_size is const and safe.
         let sz = unsafe { sys::sam3_get_image_size(self.raw.as_ptr()) };
         sz.max(0) as u32
+    }
+
+    /// Load a `.sam3` weight file.
+    ///
+    /// Must be called before [`set_image`](Self::set_image) or
+    /// [`segment`](Self::segment).
+    pub fn load_model<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let c = path_to_cstring(path.as_ref())?;
+        // SAFETY: raw valid; c lives for the call.
+        unsafe { crate::error::check(sys::sam3_load_model(self.raw.as_ptr(), c.as_ptr())) }
+    }
+
+    /// Load a BPE vocabulary file (required for text prompts).
+    pub fn load_bpe<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let c = path_to_cstring(path.as_ref())?;
+        // SAFETY: raw valid; c lives for the call.
+        unsafe { crate::error::check(sys::sam3_load_bpe(self.raw.as_ptr(), c.as_ptr())) }
     }
 }
 
@@ -72,5 +109,18 @@ mod tests {
         // Before loading a model, the returned size is either 0 or the
         // compiled-in default; both are valid. Just verify the call succeeds.
         let _ = ctx.image_size();
+    }
+
+    #[test]
+    fn load_model_missing_file_returns_error() {
+        let mut ctx = Ctx::new().unwrap();
+        let err = ctx
+            .load_model("/nonexistent/path/to/model.sam3")
+            .unwrap_err();
+        // Accept several error variants — libsam3 maps file-not-found to SAM3_EIO.
+        assert!(
+            matches!(err, Error::Io | Error::Invalid | Error::Model),
+            "unexpected error: {err:?}"
+        );
     }
 }
