@@ -32,6 +32,13 @@ impl Ctx {
             })
             .ok_or(Error::NoMemory)
     }
+
+    /// Return the model's expected input image size, or 0 if no model is loaded.
+    pub fn image_size(&self) -> u32 {
+        // SAFETY: raw is valid; sam3_get_image_size is const and safe.
+        let sz = unsafe { sys::sam3_get_image_size(self.raw.as_ptr()) };
+        sz.max(0) as u32
+    }
 }
 
 impl Drop for Ctx {
@@ -57,5 +64,13 @@ mod tests {
         for _ in 0..4 {
             let _ctx = Ctx::new().unwrap();
         }
+    }
+
+    #[test]
+    fn image_size_before_load_is_zero_or_positive() {
+        let ctx = Ctx::new().unwrap();
+        // Before loading a model, the returned size is either 0 or the
+        // compiled-in default; both are valid. Just verify the call succeeds.
+        let _ = ctx.image_size();
     }
 }
