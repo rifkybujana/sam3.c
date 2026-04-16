@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["sam3-sys"]
+members = ["sam3-sys", "sam3"]
 
 [workspace.package]
 version      = "0.1.0"
