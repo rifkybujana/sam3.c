@@ -13,3 +13,7 @@ pub use log::{set_log_level, version, LogLevel};
 mod prompt;
 
 pub use prompt::{Box, MaskPrompt, Point, PointLabel, Prompt};
+
+mod image;
+
+pub use image::ImageData;
