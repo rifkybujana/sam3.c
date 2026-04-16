@@ -5,7 +5,7 @@ members = ["sam3-sys"]
 [workspace.package]
 version      = "0.1.0"
 edition      = "2021"
-rust-version = "1.75"
+rust-version = "1.77"
 license      = "MIT"
 repository   = "https://github.com/rifkybujana/sam3.c"
 authors      = ["Rifky Bujana Bisri"]
