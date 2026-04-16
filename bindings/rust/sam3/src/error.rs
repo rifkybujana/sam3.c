@@ -32,7 +32,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Convert a raw `sam3_error` code into a `Result`.
-#[allow(dead_code)] // TODO(task-3.7): remove when Ctx::new becomes a non-test caller.
+#[allow(dead_code)] // TODO(task-3.9): remove when load_model/load_bpe call check().
 pub(crate) fn check(code: sys_err) -> Result<()> {
     match code {
         sys_err::SAM3_OK => Ok(()),
