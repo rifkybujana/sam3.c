@@ -45,6 +45,9 @@ pub struct Box {
 }
 
 /// A dense `H*W` mask prompt borrowed from the caller.
+///
+/// `data.len()` must equal `width * height`; mismatches return
+/// [`Error::Invalid`](crate::Error::Invalid) from [`Ctx::segment`](crate::Ctx::segment).
 #[derive(Debug, Clone, Copy)]
 pub struct MaskPrompt<'a> {
     /// Row-major `H*W` f32 values.
