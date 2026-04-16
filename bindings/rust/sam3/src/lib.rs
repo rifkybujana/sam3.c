@@ -17,3 +17,7 @@ pub use prompt::{Box, MaskPrompt, Point, PointLabel, Prompt};
 mod image;
 
 pub use image::ImageData;
+
+mod result;
+
+pub use result::SegmentResult;
