@@ -3,7 +3,8 @@
 /// A borrowed RGB image buffer with explicit dimensions.
 ///
 /// Row-major interleaved RGB (`R, G, B, R, G, B, ...`). `pixels.len()`
-/// must be exactly `width * height * 3`.
+/// must be at least `width * height * 3`; oversized buffers are accepted
+/// (the trailing bytes are ignored).
 #[derive(Debug, Clone, Copy)]
 pub struct ImageData<'a> {
     /// Raw pixel bytes.
@@ -15,8 +16,8 @@ pub struct ImageData<'a> {
 }
 
 impl<'a> ImageData<'a> {
-    /// Return the expected buffer length for `width * height * 3 bytes`.
-    #[allow(dead_code)] // TODO(task-3.10): remove when set_image calls it.
+    /// Return the expected buffer length for `width * height * 3` bytes,
+    /// or `None` if the product overflows `usize`.
     pub(crate) fn required_len(&self) -> Option<usize> {
         (self.width as usize)
             .checked_mul(self.height as usize)?

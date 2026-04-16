@@ -82,11 +82,20 @@ impl Ctx {
     }
 
     /// Set the input image from a raw RGB byte buffer (`W * H * 3` bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] if `pixels.len() < width * height * 3` or
+    /// if `width * height * 3` overflows `usize`. Oversized buffers are
+    /// accepted.
     pub fn set_image_rgb(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
-        let need = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|x| x.checked_mul(3))
-            .ok_or(Error::Invalid)?;
+        let need = crate::ImageData {
+            pixels,
+            width,
+            height,
+        }
+        .required_len()
+        .ok_or(Error::Invalid)?;
         if pixels.len() < need {
             return Err(Error::Invalid);
         }
@@ -104,11 +113,21 @@ impl Ctx {
     }
 
     /// Set the input image from an [`ImageData`](crate::ImageData).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`set_image_rgb`](Self::set_image_rgb).
     pub fn set_image(&mut self, img: &crate::ImageData<'_>) -> Result<()> {
         self.set_image_rgb(img.pixels, img.width, img.height)
     }
 
     /// Set the input image by loading a PNG/JPEG/BMP file from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] if the path contains interior NULs (or is
+    /// non-UTF-8 on non-Unix), [`Error::Io`] if the file cannot be read, or
+    /// other variants as libsam3 reports for decoding failures.
     pub fn set_image_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let c = path_to_cstring(path.as_ref())?;
         // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
@@ -118,6 +137,9 @@ impl Ctx {
     }
 
     /// Set the coordinate space for subsequent point / box prompts.
+    ///
+    /// libsam3 stores dimensions as `int`; values above `i32::MAX` are
+    /// silently truncated when cast.
     pub fn set_prompt_space(&mut self, width: u32, height: u32) {
         // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
         // guarantees no concurrent use. sam3_set_prompt_space has no error
@@ -128,6 +150,10 @@ impl Ctx {
     /// Pre-tokenize and asynchronously encode a text prompt.
     ///
     /// Requires a BPE vocab loaded via [`load_bpe`](Self::load_bpe).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] if `text` contains an interior NUL byte.
     pub fn set_text(&mut self, text: &str) -> Result<()> {
         let c = CString::new(text).map_err(|_| Error::Invalid)?;
         // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
