@@ -80,6 +80,61 @@ impl Ctx {
         // retained beyond this call.
         unsafe { crate::error::check(sys::sam3_load_bpe(self.raw.as_ptr(), c.as_ptr())) }
     }
+
+    /// Set the input image from a raw RGB byte buffer (`W * H * 3` bytes).
+    pub fn set_image_rgb(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
+        let need = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|x| x.checked_mul(3))
+            .ok_or(Error::Invalid)?;
+        if pixels.len() < need {
+            return Err(Error::Invalid);
+        }
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. pixels has at least width*height*3
+        // bytes (verified above) and is not retained past the call.
+        unsafe {
+            crate::error::check(sys::sam3_set_image(
+                self.raw.as_ptr(),
+                pixels.as_ptr(),
+                width as i32,
+                height as i32,
+            ))
+        }
+    }
+
+    /// Set the input image from an [`ImageData`](crate::ImageData).
+    pub fn set_image(&mut self, img: &crate::ImageData<'_>) -> Result<()> {
+        self.set_image_rgb(img.pixels, img.width, img.height)
+    }
+
+    /// Set the input image by loading a PNG/JPEG/BMP file from disk.
+    pub fn set_image_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let c = path_to_cstring(path.as_ref())?;
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. c is a NUL-terminated path string not
+        // retained beyond this call.
+        unsafe { crate::error::check(sys::sam3_set_image_file(self.raw.as_ptr(), c.as_ptr())) }
+    }
+
+    /// Set the coordinate space for subsequent point / box prompts.
+    pub fn set_prompt_space(&mut self, width: u32, height: u32) {
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. sam3_set_prompt_space has no error
+        // path.
+        unsafe { sys::sam3_set_prompt_space(self.raw.as_ptr(), width as i32, height as i32) }
+    }
+
+    /// Pre-tokenize and asynchronously encode a text prompt.
+    ///
+    /// Requires a BPE vocab loaded via [`load_bpe`](Self::load_bpe).
+    pub fn set_text(&mut self, text: &str) -> Result<()> {
+        let c = CString::new(text).map_err(|_| Error::Invalid)?;
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. c is a NUL-terminated string not
+        // retained beyond this call.
+        unsafe { crate::error::check(sys::sam3_set_text(self.raw.as_ptr(), c.as_ptr())) }
+    }
 }
 
 impl Drop for Ctx {
@@ -123,5 +178,32 @@ mod tests {
             .unwrap_err();
         // libsam3 maps file-not-found to SAM3_EIO (src/core/weight.c:314).
         assert!(matches!(err, Error::Io), "unexpected error: {err:?}");
+    }
+
+    #[test]
+    fn set_image_rgb_rejects_short_buffer() {
+        let mut ctx = Ctx::new().unwrap();
+        let err = ctx.set_image_rgb(&[0; 10], 10, 10).unwrap_err();
+        assert!(matches!(err, Error::Invalid));
+    }
+
+    #[test]
+    fn set_image_rgb_rejects_dimension_overflow() {
+        let mut ctx = Ctx::new().unwrap();
+        let err = ctx.set_image_rgb(&[0; 10], u32::MAX, u32::MAX).unwrap_err();
+        assert!(matches!(err, Error::Invalid));
+    }
+
+    #[test]
+    fn set_text_rejects_interior_nul() {
+        let mut ctx = Ctx::new().unwrap();
+        let err = ctx.set_text("hello\0world").unwrap_err();
+        assert!(matches!(err, Error::Invalid));
+    }
+
+    #[test]
+    fn set_prompt_space_is_infallible() {
+        let mut ctx = Ctx::new().unwrap();
+        ctx.set_prompt_space(1024, 1024);
     }
 }
