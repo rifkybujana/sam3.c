@@ -11,7 +11,7 @@ from setuptools import setup
 from setuptools.command.build_ext import build_ext
 
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PKG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sam3")
 
 
