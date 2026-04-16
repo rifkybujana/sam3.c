@@ -31,11 +31,12 @@ fn main() {
 
     bindgen::Builder::default()
         .header("wrapper.h")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .clang_arg(format!("-I{}", include_dir.display()))
         .allowlist_function("sam3_.*")
         .allowlist_type("sam3_.*")
         .allowlist_var("SAM3_.*")
-        .rustified_enum("sam3_error")
+        .newtype_enum("sam3_error")
         .rustified_enum("sam3_log_level")
         .rustified_enum("sam3_dtype")
         .rustified_enum("sam3_prompt_type")
@@ -45,26 +46,47 @@ fn main() {
         .layout_tests(true)
         .generate()
         .expect("bindgen failed to generate sam3 bindings")
-        .write_to_file(&out_path)
+        .write_to_file(out_path)
         .expect("failed to write bindings.rs");
 }
 
 /// Resolve `(lib_dir, include_dir)` via env vars or auto-detection.
 fn resolve_paths() -> (PathBuf, PathBuf) {
+    let lib_env = env::var("SAM3_LIB_DIR").ok();
+    let inc_env = env::var("SAM3_INCLUDE_DIR").ok();
+    if lib_env.is_some() ^ inc_env.is_some() {
+        println!(
+            "cargo:warning=sam3-sys: SAM3_LIB_DIR and SAM3_INCLUDE_DIR must both be set; \
+             ignoring the single-variable override and falling through to auto-detect."
+        );
+    }
+
     // 1. Explicit override.
-    if let (Ok(lib), Ok(inc)) = (env::var("SAM3_LIB_DIR"), env::var("SAM3_INCLUDE_DIR")) {
+    if let (Some(lib), Some(inc)) = (lib_env, inc_env) {
         return (PathBuf::from(lib), PathBuf::from(inc));
     }
 
-    // 2. SAM3_BUILD_DIR with inferred include dir.
+    // 2. SAM3_BUILD_DIR with inferred include dir (explicit request — do not silently fall through).
     if let Ok(build_dir) = env::var("SAM3_BUILD_DIR") {
         let build = PathBuf::from(&build_dir);
-        let include = build.parent()
+        let include = build
+            .parent()
             .map(|p| p.join("include"))
             .unwrap_or_else(|| PathBuf::from("include"));
-        if has_lib(&build) && include.join("sam3").join("sam3.h").is_file() {
-            return (build, include);
+        if !has_lib(&build) {
+            panic!(
+                "sam3-sys: SAM3_BUILD_DIR={} has no libsam3.{{dylib,so}}",
+                build.display()
+            );
         }
+        if !include.join("sam3").join("sam3.h").is_file() {
+            panic!(
+                "sam3-sys: SAM3_BUILD_DIR={} but inferred include dir {} has no sam3/sam3.h",
+                build.display(),
+                include.display()
+            );
+        }
+        return (build, include);
     }
 
     // 3. Auto-detect a sibling build/ by walking up from CARGO_MANIFEST_DIR.
@@ -90,7 +112,5 @@ fn resolve_paths() -> (PathBuf, PathBuf) {
 }
 
 fn has_lib(dir: &Path) -> bool {
-    dir.join("libsam3.dylib").is_file()
-        || dir.join("libsam3.so").is_file()
-        || dir.join("libsam3.dll").is_file()
+    dir.join("libsam3.dylib").is_file() || dir.join("libsam3.so").is_file()
 }
