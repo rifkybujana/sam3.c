@@ -32,7 +32,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Convert a raw `sam3_error` code into a `Result`.
-#[allow(dead_code)] // Wired up by later Phase-3 tasks (Ctx::new, load_model, ...).
+#[allow(dead_code)] // TODO(task-3.7): remove when Ctx::new becomes a non-test caller.
 pub(crate) fn check(code: sys_err) -> Result<()> {
     match code {
         sys_err::SAM3_OK => Ok(()),
@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn unknown_code_maps_to_unknown_variant() {
         // A value outside the documented SAM3_E* set must map to Error::Unknown.
-        let bogus = sam3_sys::sam3_error(-999);
+        let bogus = sys_err(-999);
         assert!(matches!(check(bogus), Err(Error::Unknown(-999))));
     }
 
