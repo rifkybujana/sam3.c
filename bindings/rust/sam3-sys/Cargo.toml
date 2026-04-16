@@ -1,0 +1,17 @@
+[package]
+name         = "sam3-sys"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "Raw FFI bindings to libsam3"
+links        = "sam3"
+build        = "build.rs"
+
+[lib]
+doctest = false
+
+[build-dependencies]
+bindgen = "0.70"
