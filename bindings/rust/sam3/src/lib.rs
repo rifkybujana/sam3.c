@@ -5,3 +5,7 @@
 mod error;
 
 pub use error::{Error, Result};
+
+mod log;
+
+pub use log::{set_log_level, version, LogLevel};
