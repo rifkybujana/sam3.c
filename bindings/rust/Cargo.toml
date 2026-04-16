@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["sam3-sys", "sam3"]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.75"
+license      = "MIT"
+repository   = "https://github.com/facebookresearch/sam3"
+authors      = ["Rifky Bujana Bisri"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
