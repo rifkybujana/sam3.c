@@ -7,7 +7,7 @@ version      = "0.1.0"
 edition      = "2021"
 rust-version = "1.75"
 license      = "MIT"
-repository   = "https://github.com/facebookresearch/sam3"
+repository   = "https://github.com/rifkybujana/sam3.c"
 authors      = ["Rifky Bujana Bisri"]
 
 [workspace.lints.rust]
