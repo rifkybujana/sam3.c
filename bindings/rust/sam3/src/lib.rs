@@ -9,3 +9,7 @@ pub use error::{Error, Result};
 mod log;
 
 pub use log::{set_log_level, version, LogLevel};
+
+mod prompt;
+
+pub use prompt::{Box, MaskPrompt, Point, PointLabel, Prompt};
