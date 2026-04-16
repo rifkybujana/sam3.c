@@ -15,8 +15,8 @@
 #include <sys/wait.h>
 #include "test_helpers.h"
 
-/* Path to sam3_main binary (CTest runs from build directory) */
-#define SAM3_MAIN "./sam3_main"
+/* Path to sam3 CLI binary (CTest runs from build directory) */
+#define SAM3_MAIN "./sam3_cli"
 
 static void test_help_returns_zero(void)
 {

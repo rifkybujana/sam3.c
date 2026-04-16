@@ -87,11 +87,12 @@ static void test_text_encoder_load(void)
 	ASSERT(te.ln_final_b != NULL);
 	ASSERT_EQ(te.ln_final_b->dims[0], TEST_WIDTH);
 
-	/* Check text projection */
+	/* Check text projection: stored as [d_model, width] to match
+	 * the CLIP checkpoint layout (transposed at use). */
 	ASSERT(te.text_projection != NULL);
 	ASSERT_EQ(te.text_projection->n_dims, 2);
-	ASSERT_EQ(te.text_projection->dims[0], TEST_WIDTH);
-	ASSERT_EQ(te.text_projection->dims[1], TEST_D_MODEL);
+	ASSERT_EQ(te.text_projection->dims[0], TEST_D_MODEL);
+	ASSERT_EQ(te.text_projection->dims[1], TEST_WIDTH);
 
 	/* Check per-layer weights */
 	for (int i = 0; i < TEST_N_LAYERS; i++) {
