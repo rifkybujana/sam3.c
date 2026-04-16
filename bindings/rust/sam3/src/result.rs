@@ -1,4 +1,6 @@
 //! Segmentation result returned by [`Ctx::segment`](crate::Ctx::segment).
+//!
+//! Mask buffers contain raw f32 logits; threshold at 0.0 for a binary mask.
 
 /// A segmentation result: one or more mask logits plus scores.
 ///
@@ -38,7 +40,8 @@ impl SegmentResult {
         self.iou_valid
     }
 
-    /// Per-mask IoU scores; `len() == n_masks`.
+    /// Per-mask IoU scores; `len() == n_masks` regardless of [`iou_valid`](Self::iou_valid).
+    /// When `!iou_valid()` the scores are placeholder zeros.
     pub fn iou_scores(&self) -> &[f32] {
         &self.iou_scores
     }
