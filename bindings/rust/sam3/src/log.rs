@@ -39,15 +39,15 @@ pub fn set_log_level(level: LogLevel) {
 /// The pointer has `'static` lifetime (it lives in the loaded library's
 /// read-only data segment).
 pub fn version() -> &'static str {
-    // SAFETY: sam3_version returns a pointer to a static, NUL-terminated
-    // ASCII string. Never returns NULL.
-    unsafe {
-        let c = sys::sam3_version();
-        debug_assert!(!c.is_null());
-        std::ffi::CStr::from_ptr(c)
-            .to_str()
-            .expect("sam3_version must be valid UTF-8")
-    }
+    // SAFETY: sam3_version has no preconditions and returns a non-null
+    // pointer to a NUL-terminated ASCII string in the library's .rodata
+    // segment.
+    let c = unsafe { sys::sam3_version() };
+    debug_assert!(!c.is_null());
+    // SAFETY: `c` is non-null (checked above) and points to a
+    // NUL-terminated C string with 'static lifetime (see above).
+    let cstr = unsafe { std::ffi::CStr::from_ptr(c) };
+    cstr.to_str().expect("sam3_version must be valid UTF-8")
 }
 
 #[cfg(test)]
@@ -56,7 +56,11 @@ mod tests {
 
     #[test]
     fn version_is_non_empty() {
-        assert!(!version().is_empty());
+        let v = version();
+        assert!(!v.is_empty());
+        // Catches wrong-symbol binding or memory corruption surfacing as
+        // multi-byte garbage.
+        assert!(v.is_ascii(), "version string not ASCII: {v:?}");
     }
 
     #[test]
