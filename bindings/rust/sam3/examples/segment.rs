@@ -64,8 +64,17 @@ fn main() -> ExitCode {
 
     let mut ctx = Ctx::new().expect("sam3_init");
     ctx.load_model(&model_path).expect("load_model");
+    // `load_model` auto-discovers a co-located BPE vocab. Only call
+    // `load_bpe` explicitly when the vocab lives elsewhere, and tolerate
+    // `Invalid` — it's what libsam3 returns when a vocab is already loaded.
     if let Some(ref b) = bpe {
-        ctx.load_bpe(b).expect("load_bpe");
+        match ctx.load_bpe(b) {
+            Ok(()) | Err(sam3::Error::Invalid) => {}
+            Err(e) => {
+                eprintln!("load_bpe: {e}");
+                return ExitCode::from(1);
+            }
+        }
     }
     ctx.set_image_file(&image_path).expect("set_image_file");
 
@@ -82,10 +91,6 @@ fn main() -> ExitCode {
         }));
     }
     if let Some(ref t) = text {
-        if bpe.is_none() {
-            eprintln!("--text requires --bpe");
-            return ExitCode::from(2);
-        }
         ctx.set_text(t).expect("set_text");
         prompts.push(Prompt::Text(t));
     }
