@@ -14,10 +14,7 @@ fn main() {
 
     let (lib_dir, include_dir) = resolve_paths();
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        lib_dir.display()
-    );
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=sam3");
 
     // Bake an rpath so binaries find a co-located libsam3 after install.
