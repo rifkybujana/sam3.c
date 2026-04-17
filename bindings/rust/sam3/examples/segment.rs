@@ -105,5 +105,17 @@ fn main() -> ExitCode {
         result.iou_valid(),
     );
 
+    // Text prompts return the full 200-query candidate bank. Apply NMS
+    // with the same defaults as `sam3_cli segment` (prob 0.5, IoU 0.5)
+    // to get a compact set of non-overlapping masks.
+    if text.is_some() && result.iou_valid() && result.n_masks() > 0 {
+        let filtered = result.nms(0.5, 0.5, 0.0).expect("nms");
+        println!(
+            "after NMS (prob=0.5, iou=0.5): n_masks={} scores={:?}",
+            filtered.n_masks(),
+            filtered.iou_scores(),
+        );
+    }
+
     ExitCode::SUCCESS
 }

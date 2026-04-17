@@ -84,6 +84,96 @@ impl SegmentResult {
         self.best_mask.and_then(|i| self.mask(i))
     }
 
+    /// Apply greedy mask non-maximum suppression, mirroring
+    /// `sam3_cli segment`'s post-processing.
+    ///
+    /// Prefilters by per-mask score (`prob_thresh`), then greedily keeps
+    /// the highest-scoring mask whose binarised (logit > 0) IoU with all
+    /// previously-kept masks is ≤ `iou_thresh`. `min_quality` rejects
+    /// masks below a stability threshold after NMS (pass `0.0` to disable).
+    ///
+    /// CLI defaults are `prob_thresh = 0.5`, `iou_thresh = 0.5`,
+    /// `min_quality = 0.0`.
+    ///
+    /// Returns a new `SegmentResult` with only the kept masks, ordered by
+    /// descending score. [`best_mask`](Self::best_mask) is cleared because
+    /// NMS re-indexes the output; boxes are compacted when present.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] if [`iou_valid`](Self::iou_valid) is `false`
+    ///   (NMS needs real scores), if `n_masks > 512` (libsam3 limit), or if
+    ///   the underlying `sam3_mask_nms` rejects its inputs.
+    pub fn nms(&self, prob_thresh: f32, iou_thresh: f32, min_quality: f32) -> Result<Self> {
+        if !self.iou_valid {
+            return Err(Error::Invalid);
+        }
+        if self.n_masks == 0 {
+            return Ok(SegmentResult {
+                masks: Vec::new(),
+                iou_scores: Vec::new(),
+                boxes: self.boxes.as_ref().map(|_| Vec::new()),
+                n_masks: 0,
+                mask_height: self.mask_height,
+                mask_width: self.mask_width,
+                iou_valid: true,
+                best_mask: None,
+            });
+        }
+        if self.n_masks > 512 {
+            return Err(Error::Invalid);
+        }
+
+        let mut kept = vec![0_i32; self.n_masks];
+        // SAFETY: masks has n_masks*h*w f32s and iou_scores has n_masks
+        // f32s (invariants held by `from_raw`). `kept` has n_masks slots,
+        // which is the maximum NMS can return.
+        let n_kept = unsafe {
+            sys::sam3_mask_nms(
+                self.masks.as_ptr(),
+                self.iou_scores.as_ptr(),
+                self.n_masks as i32,
+                self.mask_height as i32,
+                self.mask_width as i32,
+                prob_thresh,
+                iou_thresh,
+                min_quality,
+                kept.as_mut_ptr(),
+            )
+        };
+        if n_kept < 0 {
+            return Err(Error::Invalid);
+        }
+        let n_kept = n_kept as usize;
+        kept.truncate(n_kept);
+
+        let stride = self.mask_height * self.mask_width;
+        let mut masks = Vec::with_capacity(n_kept * stride);
+        let mut iou_scores = Vec::with_capacity(n_kept);
+        let mut boxes_out: Option<Vec<[f32; 4]>> =
+            self.boxes.as_ref().map(|_| Vec::with_capacity(n_kept));
+        for &i in &kept {
+            let i = i as usize;
+            let start = i * stride;
+            masks.extend_from_slice(&self.masks[start..start + stride]);
+            iou_scores.push(self.iou_scores[i]);
+            if let (Some(out), Some(src)) = (boxes_out.as_mut(), self.boxes.as_ref()) {
+                out.push(src[i]);
+            }
+        }
+
+        Ok(SegmentResult {
+            masks,
+            iou_scores,
+            boxes: boxes_out,
+            n_masks: n_kept,
+            mask_height: self.mask_height,
+            mask_width: self.mask_width,
+            iou_valid: true,
+            best_mask: None,
+        })
+    }
+
     /// Copy a C-owned `sam3_result` into an owned `SegmentResult`.
     ///
     /// The caller must free the source `sam3_result` via `sam3_result_free`
@@ -207,5 +297,56 @@ mod tests {
         assert_eq!(r.n_masks(), 0);
         assert!(r.masks().is_empty());
         assert!(r.mask(0).is_none());
+    }
+
+    #[test]
+    fn nms_on_empty_result_is_empty_result() {
+        let r = synthetic(0, 0, 0, None);
+        let out = r.nms(0.5, 0.5, 0.0).unwrap();
+        assert_eq!(out.n_masks(), 0);
+        assert!(out.masks().is_empty());
+        assert!(out.best_mask().is_none());
+    }
+
+    #[test]
+    fn nms_rejects_invalid_iou_scores() {
+        let mut r = synthetic(2, 2, 2, None);
+        r.iou_valid = false;
+        assert!(matches!(r.nms(0.5, 0.5, 0.0), Err(Error::Invalid)));
+    }
+
+    #[test]
+    fn nms_drops_low_score_masks() {
+        // Two masks: one with score 0.9 (kept), one with 0.1 (dropped by
+        // prob_thresh=0.5). Masks don't overlap so IoU wouldn't eliminate
+        // either — only the score prefilter drops the weak one.
+        let mut r = synthetic(2, 4, 4, None);
+        r.iou_scores = vec![0.9, 0.1];
+        for v in r.masks[0..16].iter_mut() {
+            *v = 5.0;
+        }
+        for v in r.masks[16..32].iter_mut() {
+            *v = 5.0;
+        }
+        let out = r.nms(0.5, 0.5, 0.0).unwrap();
+        assert_eq!(out.n_masks(), 1);
+        assert!((out.iou_scores()[0] - 0.9).abs() < 1e-6);
+        assert!(out.best_mask().is_none());
+        assert_eq!(out.mask_height(), 4);
+        assert_eq!(out.mask_width(), 4);
+    }
+
+    #[test]
+    fn nms_suppresses_overlapping_masks() {
+        // Two identical masks; higher-score one wins, the other is
+        // suppressed by IoU >= iou_thresh.
+        let mut r = synthetic(2, 4, 4, None);
+        r.iou_scores = vec![0.9, 0.8];
+        for v in r.masks.iter_mut() {
+            *v = 5.0;
+        }
+        let out = r.nms(0.5, 0.5, 0.0).unwrap();
+        assert_eq!(out.n_masks(), 1);
+        assert!((out.iou_scores()[0] - 0.9).abs() < 1e-6);
     }
 }

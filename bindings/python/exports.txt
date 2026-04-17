@@ -17,3 +17,4 @@ _sam3_profile_disable
 _sam3_profile_report
 _sam3_profile_reset
 _sam3_dump_tensors
+_sam3_mask_nms
