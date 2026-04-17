@@ -212,6 +212,8 @@ impl Ctx {
         // SAFETY: zero-initialized sam3_result is valid for sam3_segment to
         // fill in; all pointer fields will be set by the callee.
         let mut raw = unsafe { std::mem::zeroed::<sys::sam3_result>() };
+        // Named binding (not bare `_`) so the guard lives to scope end and
+        // drops *after* the subsequent `from_raw` read completes.
         let _guard = Guard(&mut raw as *mut _);
         let err_code = unsafe {
             sys::sam3_segment(

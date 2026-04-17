@@ -97,6 +97,10 @@ impl<'a> Prompt<'a> {
             // SAFETY: zeroing a POD-with-union is valid; we overwrite the
             // active variant immediately below.
             let mut raw: sys::sam3_prompt = unsafe { std::mem::zeroed() };
+            // Invariant maintained by each arm: set `raw.type_` to the tag
+            // and write exactly one matching union variant. Union-field
+            // *writes* are safe in Rust (only reads require `unsafe`), so
+            // no `unsafe` block is needed here despite the union access.
             match p {
                 Prompt::Point(pt) => {
                     raw.type_ = sys::sam3_prompt_type::SAM3_PROMPT_POINT;

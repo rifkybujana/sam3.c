@@ -97,16 +97,24 @@ impl SegmentResult {
             .and_then(|x| x.checked_mul(w))
             .ok_or(Error::Invalid)?;
 
-        let masks = if total == 0 || raw.masks.is_null() {
+        // libsam3 contract (include/sam3/sam3_types.h): `masks` points to
+        // n*H*W f32s. A null masks pointer with n_masks > 0 is a contract
+        // violation we surface as Error::Invalid rather than a silently
+        // inconsistent result.
+        let masks = if total == 0 {
             Vec::new()
+        } else if raw.masks.is_null() {
+            return Err(Error::Invalid);
         } else {
             // SAFETY: libsam3 guarantees raw.masks points to `total` f32s
             // while `raw` lives.
             unsafe { std::slice::from_raw_parts(raw.masks, total) }.to_vec()
         };
 
-        let iou_scores = if n == 0 || raw.iou_scores.is_null() {
+        let iou_scores = if n == 0 {
             Vec::new()
+        } else if raw.iou_scores.is_null() {
+            return Err(Error::Invalid);
         } else {
             // SAFETY: libsam3 guarantees raw.iou_scores points to `n` f32s
             // while `raw` lives.

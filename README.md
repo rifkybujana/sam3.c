@@ -105,7 +105,10 @@ sam3.c ships bindings for multiple languages under `bindings/`:
   `sam3` (safe API). See `bindings/rust/README.md`.
 
 Both bindings link dynamically against `libsam3.{dylib,so}` built with
-`cmake -S . -B build -DSAM3_SHARED=ON && cmake --build build`.
+`cmake -S . -B build -DSAM3_SHARED=ON && cmake --build build`. At runtime
+set `DYLD_LIBRARY_PATH` (macOS) or `LD_LIBRARY_PATH` (Linux) to the build
+directory, or install `libsam3` system-wide so the dynamic loader can
+find it.
 
 ## Architecture
 
