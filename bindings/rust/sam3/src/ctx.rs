@@ -161,6 +161,43 @@ impl Ctx {
         // retained beyond this call.
         unsafe { crate::error::check(sys::sam3_set_text(self.raw.as_ptr(), c.as_ptr())) }
     }
+
+    /// Run segmentation with the given prompts against the current image.
+    ///
+    /// `prompts` may mix points, boxes, masks, and (if a BPE vocab is
+    /// loaded) text. Borrows inside `Prompt` must outlive this call.
+    pub fn segment(&mut self, prompts: &[crate::Prompt<'_>]) -> Result<crate::SegmentResult> {
+        let scratch = crate::prompt::Prompt::lower_all(prompts)?;
+
+        // RAII guard: always call sam3_result_free, even on early return or
+        // panic. Holds a raw pointer rather than `&mut` so the result can be
+        // simultaneously read via `&raw` below.
+        struct Guard(*mut sys::sam3_result);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                // SAFETY: the guarded struct was (attempted to be) filled by
+                // sam3_segment; sam3_result_free tolerates partially-filled
+                // results (it null-checks internal pointers).
+                unsafe { sys::sam3_result_free(self.0) }
+            }
+        }
+
+        // SAFETY: zero-initialized sam3_result is valid for sam3_segment to
+        // fill in; all pointer fields will be set by the callee.
+        let mut raw = unsafe { std::mem::zeroed::<sys::sam3_result>() };
+        let _guard = Guard(&mut raw as *mut _);
+        let err_code = unsafe {
+            sys::sam3_segment(
+                self.raw.as_ptr(),
+                scratch.lowered.as_ptr(),
+                scratch.lowered.len() as i32,
+                &mut raw,
+            )
+        };
+
+        crate::error::check(err_code)?;
+        crate::SegmentResult::from_raw(&raw)
+    }
 }
 
 impl Drop for Ctx {

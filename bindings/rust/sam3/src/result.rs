@@ -2,6 +2,10 @@
 //!
 //! Mask buffers contain raw f32 logits; threshold at 0.0 for a binary mask.
 
+use sam3_sys as sys;
+
+use crate::error::{Error, Result};
+
 /// A segmentation result: one or more mask logits plus scores.
 ///
 /// All buffers are owned `Vec<f32>` — copied out of the SAM3 arenas before
@@ -78,6 +82,63 @@ impl SegmentResult {
     /// Return the stability-selected mask, if any.
     pub fn best(&self) -> Option<&[f32]> {
         self.best_mask.and_then(|i| self.mask(i))
+    }
+
+    /// Copy a C-owned `sam3_result` into an owned `SegmentResult`.
+    ///
+    /// The caller must free the source `sam3_result` via `sam3_result_free`
+    /// regardless of the outcome of this function.
+    pub(crate) fn from_raw(raw: &sys::sam3_result) -> Result<Self> {
+        let n = raw.n_masks.max(0) as usize;
+        let h = raw.mask_height.max(0) as usize;
+        let w = raw.mask_width.max(0) as usize;
+        let total = n
+            .checked_mul(h)
+            .and_then(|x| x.checked_mul(w))
+            .ok_or(Error::Invalid)?;
+
+        let masks = if total == 0 || raw.masks.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: libsam3 guarantees raw.masks points to `total` f32s
+            // while `raw` lives.
+            unsafe { std::slice::from_raw_parts(raw.masks, total) }.to_vec()
+        };
+
+        let iou_scores = if n == 0 || raw.iou_scores.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: libsam3 guarantees raw.iou_scores points to `n` f32s
+            // while `raw` lives.
+            unsafe { std::slice::from_raw_parts(raw.iou_scores, n) }.to_vec()
+        };
+
+        let boxes = if raw.boxes_valid != 0 && !raw.boxes.is_null() && n > 0 {
+            // SAFETY: boxes_valid != 0 ⇒ raw.boxes holds n*4 f32s.
+            let flat = unsafe { std::slice::from_raw_parts(raw.boxes, n * 4) };
+            Some(
+                flat.chunks_exact(4)
+                    .map(|c| [c[0], c[1], c[2], c[3]])
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        Ok(SegmentResult {
+            masks,
+            iou_scores,
+            boxes,
+            n_masks: n,
+            mask_height: h,
+            mask_width: w,
+            iou_valid: raw.iou_valid != 0,
+            best_mask: if raw.best_mask >= 0 {
+                Some(raw.best_mask as usize)
+            } else {
+                None
+            },
+        })
     }
 }
 
