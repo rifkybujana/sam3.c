@@ -96,6 +96,17 @@ Download a SAM3 checkpoint in SafeTensors format, then convert to the optimized 
 ctest --output-on-failure
 ```
 
+## Language bindings
+
+sam3.c ships bindings for multiple languages under `bindings/`:
+
+- **Python** — `bindings/python/`. Install with `pip install -e bindings/python`.
+- **Rust** — `bindings/rust/`. Cargo workspace with `sam3-sys` (FFI) and
+  `sam3` (safe API). See `bindings/rust/README.md`.
+
+Both bindings link dynamically against `libsam3.{dylib,so}` built with
+`cmake -S . -B build -DSAM3_SHARED=ON && cmake --build build`.
+
 ## Architecture
 
 ```
