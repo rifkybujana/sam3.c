@@ -35,10 +35,37 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 /// `Ctx` is neither [`Send`] nor [`Sync`]: the context holds internal mutable
 /// state and a worker thread, and libsam3 does not document cross-thread
 /// safety. For concurrency, use separate contexts per thread.
+//
+// The `_not_send_sync: PhantomData<*mut ()>` field is load-bearing: it makes
+// `Ctx` !Send + !Sync via auto-trait negative reasoning. Removing or changing
+// that field requires rethinking thread-safety end-to-end. The compile-time
+// `assert_not_send_not_sync` check below catches regressions.
 pub struct Ctx {
     raw: NonNull<sys::sam3_ctx>,
     _not_send_sync: PhantomData<*mut ()>,
 }
+
+// Compile-time assertion that `Ctx` is neither `Send` nor `Sync`. This uses
+// the ambiguous-impl trick: two blanket impls of `AmbiguousIfSend<_>` apply to
+// `T: Send`, which would make the method call below ambiguous. Only one impl
+// applies when `T: !Send`, so `Ctx` resolving unambiguously here is the proof.
+// A future change that accidentally makes `Ctx: Send` breaks compilation.
+#[allow(dead_code)]
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    <Ctx as AmbiguousIfSend<_>>::some_item();
+
+    trait AmbiguousIfSync<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    <Ctx as AmbiguousIfSync<_>>::some_item();
+};
 
 impl Ctx {
     /// Create a new SAM3 context.
