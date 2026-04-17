@@ -102,13 +102,31 @@ sam3.c ships bindings for multiple languages under `bindings/`:
 
 - **Python** — `bindings/python/`. Install with `pip install -e bindings/python`.
 - **Rust** — `bindings/rust/`. Cargo workspace with `sam3-sys` (FFI) and
-  `sam3` (safe API). See `bindings/rust/README.md`.
+  `sam3` (safe API: owned `Ctx`, typed prompt enum, RAII result cleanup,
+  `SegmentResult::nms` matching the CLI's post-processing). See
+  `bindings/rust/README.md`.
 
 Both bindings link dynamically against `libsam3.{dylib,so}` built with
 `cmake -S . -B build -DSAM3_SHARED=ON && cmake --build build`. At runtime
 set `DYLD_LIBRARY_PATH` (macOS) or `LD_LIBRARY_PATH` (Linux) to the build
 directory, or install `libsam3` system-wide so the dynamic loader can
 find it.
+
+Minimal Rust usage:
+
+```rust
+use sam3::{Ctx, Prompt};
+
+let mut ctx = Ctx::new()?;
+ctx.load_model("models/efficient.sam3")?;      // auto-loads co-located BPE
+ctx.set_image_file("photo.jpg")?;
+ctx.set_text("person")?;
+
+let raw = ctx.segment(&[Prompt::Text("person")])?;
+let hits = raw.nms(0.5, 0.5, 0.0)?;            // 200 candidates → ~N detections
+println!("found {} objects, top score {:.3}",
+         hits.n_masks(), hits.iou_scores()[0]);
+```
 
 ## Architecture
 
