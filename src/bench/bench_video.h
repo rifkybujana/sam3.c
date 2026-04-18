@@ -26,6 +26,42 @@
 #define SAM3_BENCH_VIDEO_SQUARE_START 100
 #define SAM3_BENCH_VIDEO_SQUARE_STEP   8
 
+/* Max frames in any case; sets the canvas size for the generator. */
+#define SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES 128
+
+/*
+ * sam3_bench_bounce_pos - Triangle-wave position for the moving square.
+ *
+ * @i: Frame index (>= 0).
+ *
+ * Returns a position in [0, SAM3_BENCH_VIDEO_IMG_SIZE -
+ * SAM3_BENCH_VIDEO_SQUARE_SIZE]. The sequence reflects off each edge
+ * every (SAM3_BENCH_VIDEO_IMG_SIZE - SAM3_BENCH_VIDEO_SQUARE_SIZE) /
+ * SAM3_BENCH_VIDEO_SQUARE_STEP frames, so the square never writes OOB
+ * regardless of how many frames are rendered.
+ */
+int sam3_bench_bounce_pos(int i);
+
+/*
+ * bench_video_case - One parameterised video benchmark case.
+ *
+ * @n_frames:   Total frames the clip directory contains (<=
+ *              SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES).
+ * @n_objects:  Number of simultaneously-tracked objects seeded on
+ *              @seed_frame.
+ * @seed_frame: Frame index where add_points is called (0 for FORWARD,
+ *              middle frame for BOTH).
+ * @direction:  SAM3_PROPAGATE_FORWARD or SAM3_PROPAGATE_BOTH.
+ * @label:      Suffix appended to the benchmark case name.
+ */
+struct bench_video_case {
+	int         n_frames;
+	int         n_objects;
+	int         seed_frame;
+	int         direction;
+	const char *label;
+};
+
 /*
  * sam3_bench_generate_clip - Synthesise a moving-square clip on disk.
  *

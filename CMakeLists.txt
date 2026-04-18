@@ -218,6 +218,11 @@ if(SAM3_TESTS)
 		list(REMOVE_ITEM TEST_SOURCES
 			${CMAKE_SOURCE_DIR}/tests/test_video_parity_kids.c)
 	endif()
+	if(NOT SAM3_BENCH)
+		list(REMOVE_ITEM TEST_SOURCES
+			${CMAKE_SOURCE_DIR}/tests/test_bench.c
+			${CMAKE_SOURCE_DIR}/tests/test_bench_video.c)
+	endif()
 	foreach(test_src ${TEST_SOURCES})
 		get_filename_component(test_name ${test_src} NAME_WE)
 		add_executable(${test_name} ${test_src})
@@ -316,6 +321,11 @@ if(SAM3_TESTS)
 	# test_bench needs the bench harness library
 	if(SAM3_BENCH AND TARGET test_bench)
 		target_link_libraries(test_bench sam3_bench)
+	endif()
+
+	# test_bench_video needs the bench harness library
+	if(SAM3_BENCH AND TARGET test_bench_video)
+		target_link_libraries(test_bench_video sam3_bench)
 	endif()
 endif()
 

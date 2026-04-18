@@ -62,6 +62,18 @@
 
 /* ── Deterministic noise generator ─────────────────────────────────── */
 
+int sam3_bench_bounce_pos(int i)
+{
+	int max_pos = SAM3_BENCH_VIDEO_IMG_SIZE -
+		      SAM3_BENCH_VIDEO_SQUARE_SIZE;
+	int period  = 2 * max_pos;
+	int raw     = i * SAM3_BENCH_VIDEO_SQUARE_STEP;
+	int t       = raw % period;
+	if (t < 0)
+		t += period;
+	return (t <= max_pos) ? t : (period - t);
+}
+
 /*
  * Simple 32-bit LCG so the noise pattern is reproducible across
  * platforms. Only determinism and coverage of the [100, 156) range
