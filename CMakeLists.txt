@@ -274,6 +274,12 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
+	# test_tracker_v2_load opens models/sam3.1.sam3
+	if(TARGET test_tracker_v2_load)
+		target_compile_definitions(test_tracker_v2_load PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
 	# test_cli_common needs tools/ include path and cli_common.c
 	if(TARGET test_cli_common)
 		target_sources(test_cli_common PRIVATE tools/cli_common.c)
