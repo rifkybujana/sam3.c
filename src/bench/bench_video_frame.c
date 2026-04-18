@@ -283,9 +283,16 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 	 * tests/test_video_e2e.c.
 	 */
 	scale = (float)model_img_size / (float)SAM3_BENCH_VIDEO_IMG_SIZE;
-	vc.seed_pt.x = ((float)SAM3_BENCH_VIDEO_SQUARE_START +
-			(float)SAM3_BENCH_VIDEO_SQUARE_SIZE * 0.5f) * scale;
-	vc.seed_pt.y = vc.seed_pt.x;
+	/*
+	 * Square at frame 0 lives at (bounce_pos(0), bounce_pos(0)).
+	 * Seed point is its centre in PNG pixel space, scaled to model space.
+	 */
+	{
+		float cx = (float)sam3_bench_bounce_pos(0) +
+			   (float)SAM3_BENCH_VIDEO_SQUARE_SIZE * 0.5f;
+		vc.seed_pt.x = cx * scale;
+		vc.seed_pt.y = cx * scale;
+	}
 	vc.seed_pt.label = 1;
 	vc.session = session;
 	vc.obj_id = 0;

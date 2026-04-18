@@ -104,9 +104,12 @@ int sam3_bench_run_video_end_to_end(const struct sam3_bench_config *cfg,
 	scale = (float)model_img_size / (float)SAM3_BENCH_VIDEO_IMG_SIZE;
 	vc.ctx = ctx;
 	vc.clip_dir = tmpdir;
-	vc.seed_pt.x = ((float)SAM3_BENCH_VIDEO_SQUARE_START +
-			(float)SAM3_BENCH_VIDEO_SQUARE_SIZE * 0.5f) * scale;
-	vc.seed_pt.y = vc.seed_pt.x;
+	{
+		float cx = (float)sam3_bench_bounce_pos(0) +
+			   (float)SAM3_BENCH_VIDEO_SQUARE_SIZE * 0.5f;
+		vc.seed_pt.x = cx * scale;
+		vc.seed_pt.y = cx * scale;
+	}
 	vc.seed_pt.label = 1;
 	vc.obj_id = 0;
 	vc.frame_idx = 0;
