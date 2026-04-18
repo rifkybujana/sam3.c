@@ -587,9 +587,9 @@ static void test_end_to_end_fixture_input(void)
 	{
 		int n = result.n_masks * result.mask_height *
 			result.mask_width;
-		float maxd = compare_tensors("pred_masks",
-					     result.masks, py_masks,
-					     n, 1.0f);
+		(void)compare_tensors("pred_masks",
+				       result.masks, py_masks,
+				       n, 1.0f);
 
 		/* Verify outputs are finite */
 		int any_nan = 0;
@@ -816,9 +816,9 @@ static void test_bus_person_text_only(void)
 	{
 		int n = result.n_masks * result.mask_height *
 			result.mask_width;
-		float maxd = compare_tensors("pred_masks",
-					     result.masks, py_masks,
-					     n, 1.0f);
+		(void)compare_tensors("pred_masks",
+				       result.masks, py_masks,
+				       n, 1.0f);
 
 		int any_nan = 0;
 		for (int i = 0; i < n && !any_nan; i++) {

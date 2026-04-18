@@ -387,6 +387,20 @@ enum sam3_error sam3_video_start_ex(sam3_ctx *ctx,
 		return SAM3_EINVAL;
 	}
 
+	/*
+	 * SAM 3.1 uses a different tracker architecture (multiplex-aware
+	 * memory attention + maskmem backbone) than the SAM 3 tracker
+	 * this video path was built for. Loading sam3.1.sam3 weights into
+	 * the SAM 3 tracker would produce garbage masks. Reject cleanly
+	 * until sub-project 2 lands the 3.1 tracker.
+	 */
+	if (ctx->config.variant == SAM3_VARIANT_SAM3_1) {
+		sam3_log_error("video_start: SAM 3.1 video tracking is not "
+			       "yet supported (use a SAM 3 model, or wait "
+			       "for the multiplex tracker)");
+		return SAM3_EVIDEO;
+	}
+
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "video_start");
 
 	session = calloc(1, sizeof(*session));
