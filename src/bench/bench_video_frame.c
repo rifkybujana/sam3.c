@@ -200,6 +200,49 @@ void sam3_bench_rmtree(const char *dir)
 		sam3_log_warn("bench rmtree: cannot rmdir '%s'", dir);
 }
 
+/* ── Multi-object seeding helper ──────────────────────────────────── */
+
+/*
+ * seed_n_objects - Place @n distinct obj_id points inside the frame-@seed
+ * square of a bench synthetic clip.
+ *
+ * @s:     Active video session.
+ * @n:     Number of objects to seed (>= 1).
+ * @seed:  Frame index passed through to sam3_video_add_points.
+ * @scale: PNG-pixel → model-pixel scale factor for this session.
+ *
+ * Points are spread evenly inside the 32×32 white square at
+ * (bounce_pos(seed), bounce_pos(seed)) so each distinct obj_id
+ * gets a slightly different point. Returns SAM3_OK or the first
+ * error from sam3_video_add_points.
+ */
+static enum sam3_error seed_n_objects(sam3_video_session *s, int n,
+				      int seed, float scale)
+{
+	float square_x0 = (float)sam3_bench_bounce_pos(seed);
+	float square_y0 = square_x0;
+	float step      = (float)SAM3_BENCH_VIDEO_SQUARE_SIZE / (float)(n + 1);
+
+	for (int k = 0; k < n; k++) {
+		struct sam3_point pt;
+		struct sam3_video_frame_result r;
+		float px = square_x0 + step * (float)(k + 1);
+		float py = square_y0 + step * (float)(k + 1);
+
+		pt.x     = px * scale;
+		pt.y     = py * scale;
+		pt.label = 1;
+
+		memset(&r, 0, sizeof(r));
+		enum sam3_error err = sam3_video_add_points(
+			s, seed, /* obj_id */ k, &pt, 1, &r);
+		sam3_video_frame_result_free(&r);
+		if (err != SAM3_OK)
+			return err;
+	}
+	return SAM3_OK;
+}
+
 /* ── Per-frame benchmark ──────────────────────────────────────────── */
 
 struct video_frame_ctx {
