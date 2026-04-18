@@ -62,10 +62,6 @@ if(SAM3_DEBUG_DUMP)
 	add_definitions(-DSAM3_DEBUG_DUMP)
 endif()
 
-if(SAM3_METAL_F32_MATMUL)
-	add_definitions(-DSAM3_METAL_F32_MATMUL)
-endif()
-
 if(SAM3_BLAS)
 	if(APPLE)
 		find_library(ACCELERATE_LIB Accelerate)

@@ -177,6 +177,86 @@ static void test_metal_matmul(void)
 	sam3_backend_free(cpu);
 }
 
+/* ── Test: matmul F16-vs-F32 cosine parity ──────────────────────────
+ *
+ * Documents the precision contract the default (F16-storage) Metal path
+ * preserves against the CPU F32 reference. Uses a large K dimension to
+ * stress the dot-product accumulator — MLX's steel GEMM uses F32
+ * internally (AccumHelper<T>::accum_type = float), so F16 operands
+ * should still produce near-reference output.
+ */
+static float cosine_similarity_f32(const float *a, const float *b, int n)
+{
+	double dot = 0.0, na = 0.0, nb = 0.0;
+	for (int i = 0; i < n; i++) {
+		dot += (double)a[i] * (double)b[i];
+		na  += (double)a[i] * (double)a[i];
+		nb  += (double)b[i] * (double)b[i];
+	}
+	double denom = sqrt(na) * sqrt(nb);
+	return (denom == 0.0) ? 0.0f : (float)(dot / denom);
+}
+
+static void test_metal_matmul_large_k_parity(void)
+{
+	struct sam3_backend *metal = sam3_backend_init(SAM3_BACKEND_METAL);
+	struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+	ASSERT(metal && cpu);
+	if (!metal || !cpu) {
+		sam3_backend_free(metal);
+		sam3_backend_free(cpu);
+		return;
+	}
+
+	const int M = 16, K = 1024, N = 64;
+	int dims_a[] = {M, K};
+	int dims_b[] = {K, N};
+	int dims_c[] = {M, N};
+
+	float *data_a = (float *)malloc((size_t)M * K * sizeof(float));
+	float *data_b = (float *)malloc((size_t)K * N * sizeof(float));
+	ASSERT(data_a && data_b);
+
+	/* Deterministic "random-looking" inputs in [-0.1, 0.1] so
+	 * partial sums fit comfortably in F16 range. */
+	unsigned seed = 0x5A3u;
+	for (int i = 0; i < M * K; i++) {
+		seed = seed * 1103515245u + 12345u;
+		data_a[i] = (int)(seed & 0xFFFF) / 327680.0f - 0.1f;
+	}
+	for (int i = 0; i < K * N; i++) {
+		seed = seed * 1103515245u + 12345u;
+		data_b[i] = (int)(seed & 0xFFFF) / 327680.0f - 0.1f;
+	}
+
+	struct sam3_tensor ma = make_tensor(SAM3_DTYPE_F32, 2, dims_a);
+	struct sam3_tensor mb = make_tensor(SAM3_DTYPE_F32, 2, dims_b);
+	struct sam3_tensor mc = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
+	struct sam3_tensor *m_inputs[] = {&ma, &mb};
+	const void *m_data[] = {data_a, data_b};
+	ASSERT_EQ(eval_single_op(metal, SAM3_OP_MATMUL, m_inputs, 2,
+				 m_data, &mc, NULL), SAM3_OK);
+
+	struct sam3_tensor ca = make_tensor(SAM3_DTYPE_F32, 2, dims_a);
+	struct sam3_tensor cb = make_tensor(SAM3_DTYPE_F32, 2, dims_b);
+	struct sam3_tensor cc = make_tensor(SAM3_DTYPE_F32, 2, dims_c);
+	struct sam3_tensor *c_inputs[] = {&ca, &cb};
+	const void *c_data[] = {data_a, data_b};
+	ASSERT_EQ(eval_single_op(cpu, SAM3_OP_MATMUL, c_inputs, 2,
+				 c_data, &cc, NULL), SAM3_OK);
+
+	float cos = cosine_similarity_f32((float *)mc.data,
+					  (float *)cc.data, M * N);
+	/* F32 accumulation inside MLX's GEMM keeps cosine > 0.9999
+	 * even on K=1024. If this drops, the accumulator regressed. */
+	ASSERT(cos > 0.9999f);
+
+	free(data_a);
+	free(data_b);
+	sam3_backend_free(metal);
+	sam3_backend_free(cpu);
+}
+
 /* ── Test: add ───────────────────────────────────────────────────── */
 
 static void test_metal_add(void)
@@ -1265,6 +1345,7 @@ int main(void)
 
 #ifdef SAM3_HAS_CPU
 	test_metal_matmul();
+	test_metal_matmul_large_k_parity();
 	test_metal_add();
 	test_metal_softmax();
 	test_metal_reshape();
