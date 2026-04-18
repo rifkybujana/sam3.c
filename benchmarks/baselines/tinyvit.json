@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "env": {
+    "chip": "placeholder",
+    "os": "placeholder",
+    "cpu_cores": 0,
+    "gpu_cores": 0,
+    "backend": "metal",
+    "commit": "placeholder",
+    "timestamp": "1970-01-01T00:00:00Z",
+    "model_variant": "tinyvit_l"
+  },
+  "config": {
+    "warmup_iters": 5,
+    "timed_iters": 50,
+    "statistical": false,
+    "threshold_pct": 5.0
+  },
+  "results": []
+}
