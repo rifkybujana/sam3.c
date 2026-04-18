@@ -1424,6 +1424,24 @@ static int handle_tracker_misc(struct rename_entry *out, int inner_idx,
 	return add_entry(out, inner_idx, buf);
 }
 
+/*
+ * SAM 3.1 multiplex tracker — strip `tracker.model.` and emit keys
+ * under the `tracker_v2.` namespace so C modules can load them without
+ * colliding with SAM 3's `tracker_model.` names (the architectures
+ * differ; same names would mean two incompatible layouts).
+ *
+ * The upstream multiplex checkpoint already stores weights with
+ * pre-split q_proj / k_proj / v_proj / out_proj names — no QKV
+ * splitting work needed here. The handler just rewrites the prefix.
+ */
+static int handle_tracker_v2(struct rename_entry *out, int inner_idx,
+			     const char *rest)
+{
+	char buf[SAM3_WEIGHT_NAME_MAX];
+	snprintf(buf, sizeof(buf), "tracker_v2.%s", rest);
+	return add_entry(out, inner_idx, buf);
+}
+
 /* ── Prefix table (longest-match-wins) ─────────────────────────────── */
 
 struct prefix_rule {
@@ -1465,6 +1483,9 @@ static const struct prefix_rule prefix_table[] = {
 		handle_memory_attention},
 	{"tracker.maskmem_backbone.",
 		handle_memory_encoder},
+	/* SAM 3.1 multiplex — all under tracker.model.* */
+	{"tracker.model.",
+		handle_tracker_v2},
 	{"tracker.",
 		handle_tracker_misc},
 };
