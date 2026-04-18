@@ -56,7 +56,8 @@ void sam3_normalize_rgb_chw(const uint8_t *src, float *dst,
 }
 
 enum sam3_error sam3_processor_init(struct sam3_processor *proc,
-				    int backbone_type)
+				    int backbone_type,
+				    int n_fpn_scales)
 {
 	enum sam3_error err;
 
@@ -178,7 +179,7 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 
 	/* Initialize all sub-modules with appropriate backbone config */
 	err = sam3_image_model_init(&proc->model, backbone_type,
-				     &proc->model_arena);
+				    n_fpn_scales, &proc->model_arena);
 	if (err != SAM3_OK)
 		goto cleanup_text_backend;
 

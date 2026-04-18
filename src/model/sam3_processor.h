@@ -78,6 +78,7 @@ struct sam3_processor {
  *
  * @proc:          Processor struct (caller-allocated)
  * @backbone_type: SAM3_BACKBONE_HIERA or SAM3_BACKBONE_EFFICIENTVIT
+ * @n_fpn_scales:  Number of FPN scales (3 for SAM 3.1, 4 for SAM 3)
  *
  * Creates a CPU backend, allocates model and scratch arenas, and
  * initializes the image model. Must be followed by sam3_processor_load()
@@ -86,7 +87,8 @@ struct sam3_processor {
  * Returns SAM3_OK on success, or an error code on failure.
  */
 enum sam3_error sam3_processor_init(struct sam3_processor *proc,
-				    int backbone_type);
+				    int backbone_type,
+				    int n_fpn_scales);
 
 /*
  * sam3_processor_load - Load model weights from an open weight file.

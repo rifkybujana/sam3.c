@@ -72,6 +72,7 @@ struct sam3_image_model {
  *
  * @model:         Image model struct (caller-allocated)
  * @backbone_type: SAM3_BACKBONE_HIERA or SAM3_BACKBONE_EFFICIENTVIT
+ * @n_fpn_scales:  Number of FPN scales (3 for SAM 3.1, 4 for SAM 3)
  * @arena:         Arena for precomputation (RoPE, position encoding)
  *
  * Initializes all sub-modules (backbone, encoder fusion, decoder,
@@ -81,6 +82,7 @@ struct sam3_image_model {
  */
 enum sam3_error sam3_image_model_init(struct sam3_image_model *model,
 				      int backbone_type,
+				      int n_fpn_scales,
 				      struct sam3_arena *arena);
 
 /*
