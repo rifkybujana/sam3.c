@@ -280,13 +280,19 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	if (!vit->patch_embed_w)
 		return SAM3_ENOMEM;
 
-	/* Patch embedding bias [embed_dim] — may not exist (bias_patch_embed=False) */
+	/* Patch embedding bias [embed_dim] — optional; absent when the
+	 * upstream ViT was built with bias_patch_embed=False (silent
+	 * zero-fill rather than a noisy warning). */
 	int pe_b_dims[] = {e};
-	vit->patch_embed_b = gh_load_mmap(wf,
+	vit->patch_embed_b = gh_load_mmap_optional(wf,
 		VIT_P "embeddings.patch_embeddings.projection.bias",
 		arena, SAM3_DTYPE_F32, 1, pe_b_dims);
-	if (!vit->patch_embed_b)
-		return SAM3_ENOMEM;
+	if (!vit->patch_embed_b) {
+		vit->patch_embed_b = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						     1, pe_b_dims);
+		if (!vit->patch_embed_b)
+			return SAM3_ENOMEM;
+	}
 
 	/*
 	 * Absolute positional embedding.

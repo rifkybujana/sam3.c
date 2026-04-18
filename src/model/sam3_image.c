@@ -260,10 +260,23 @@ enum sam3_error sam3_image_model_load(struct sam3_image_model *model,
 	if (err != SAM3_OK)
 		return err;
 
-	/* Load SAM mask decoder weights */
-	err = sam3_mask_decoder_load(&model->mask_dec, wf, arena);
-	if (err != SAM3_OK)
-		return err;
+	/* Load SAM mask decoder weights.
+	 *
+	 * The tracker's SAM mask decoder is shared with the image model for
+	 * interactive point/box prompts. SAM 3.1 checkpoints use a different
+	 * naming scheme (tracker_model.model.mask_decoder.*, not
+	 * tracker_model.mask_decoder.*) and a different architecture
+	 * (multiplex-aware) that sub-project 2 will consume.
+	 *
+	 * For now, skip the load entirely when variant is SAM 3.1 so the
+	 * log stays clean. Point/box prompts on SAM 3.1 image inputs
+	 * require sub-project 2 and will be rejected at segment time. */
+	int variant = wf ? (int)wf->header->reserved[1] : 0;
+	if (variant != SAM3_VARIANT_SAM3_1) {
+		err = sam3_mask_decoder_load(&model->mask_dec, wf, arena);
+		if (err != SAM3_OK)
+			return err;
+	}
 
 	/* Load dot-product scorer weights */
 	err = sam3_dot_scorer_load(&model->scorer, wf, arena);

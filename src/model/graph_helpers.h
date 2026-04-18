@@ -93,6 +93,19 @@ struct sam3_tensor *gh_load_mmap(const struct sam3_weight_file *wf,
 				  enum sam3_dtype dtype,
 				  int n_dims, const int *dims);
 
+/*
+ * gh_load_mmap_optional - Like gh_load_mmap, but returns NULL silently
+ * if the tensor is absent from the weight file (no warning log).
+ *
+ * Use for tensors whose absence is a legitimate config choice (e.g.
+ * patch_embed bias when the upstream ViT was built with
+ * bias_patch_embed=False).
+ */
+struct sam3_tensor *gh_load_mmap_optional(
+		const struct sam3_weight_file *wf, const char *name,
+		struct sam3_arena *arena, enum sam3_dtype dtype,
+		int n_dims, const int *dims);
+
 /* --- Unary activation ops (output shape = input shape) --- */
 
 struct sam3_tensor *gh_gelu(struct sam3_graph *g, struct sam3_arena *a,

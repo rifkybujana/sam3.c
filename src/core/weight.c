@@ -251,11 +251,12 @@ static int build_hash_table(struct sam3_weight_file *wf)
 	uint32_t n = wf->header->n_tensors;
 
 	/*
-	 * Size table at 2x the tensor count to keep load factor ≤ 50%.
-	 * At 50% occupancy, average probe length with linear probing is
-	 * ~1.5 — well below the O(n) degradation at >75%.
+	 * Size table at 4x the tensor count to keep load factor ≤ 25%.
+	 * At 25% occupancy, average probe length with linear probing is
+	 * ~1.2 and max probe is typically ≤ 6 even with FNV collisions.
+	 * 2x was borderline: SAM 3.1's 1945 tensors hit max probe 11 at 2x.
 	 */
-	uint32_t min_cap = n * 2;
+	uint32_t min_cap = n * 4;
 
 	if (min_cap < 8)
 		min_cap = 8;

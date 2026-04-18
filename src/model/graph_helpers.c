@@ -144,6 +144,26 @@ struct sam3_tensor *gh_load_mmap(const struct sam3_weight_file *wf,
 	return gh_alloc_tensor(arena, dtype, n_dims, dims);
 }
 
+struct sam3_tensor *gh_load_mmap_optional(
+		const struct sam3_weight_file *wf, const char *name,
+		struct sam3_arena *arena, enum sam3_dtype dtype,
+		int n_dims, const int *dims)
+{
+	(void)dtype; (void)n_dims; (void)dims;
+	if (!wf)
+		return NULL;
+	const struct sam3_weight_tensor_desc *desc = sam3_weight_find(wf, name);
+	if (!desc)
+		return NULL;
+	struct sam3_tensor *t = (struct sam3_tensor *)sam3_arena_alloc(
+			arena, sizeof(struct sam3_tensor));
+	if (!t)
+		return NULL;
+	memset(t, 0, sizeof(*t));
+	sam3_weight_to_tensor(wf, desc, t);
+	return t;
+}
+
 /* ── Unary activation ops ────────────────────────────────────────── */
 
 static struct sam3_tensor *gh_unary(struct sam3_graph *g,
