@@ -14,6 +14,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -125,16 +126,31 @@ int sam3_bench_run_pipeline(const struct sam3_bench_config *cfg,
 	}
 
 	/*
-	 * Set image once for segment benchmarks. All subsequent segment
-	 * calls reuse the encoded image features.
+	 * Skip the set_image setup when no segment case will run, so a
+	 * filter like "video_*" does not pay the image-encoder cost (or
+	 * trigger unrelated encoder errors on a model that fails to
+	 * encode).
 	 */
-	if (sam3_set_image(ctx, pixels, img_size, img_size) != SAM3_OK) {
-		sam3_log_error("pipeline bench: sam3_set_image failed");
-		goto error;
-	}
+	bool any_segment = sam3_bench_filter_match("full_pipeline_point",
+						   cfg->filter) ||
+			   sam3_bench_filter_match("full_pipeline_box",
+						   cfg->filter) ||
+			   sam3_bench_filter_match("full_pipeline_text",
+						   cfg->filter);
 
-	/* Set prompt space to match image dimensions. */
-	sam3_set_prompt_space(ctx, img_size, img_size);
+	if (any_segment) {
+		/*
+		 * Set image once for segment benchmarks. All subsequent segment
+		 * calls reuse the encoded image features.
+		 */
+		if (sam3_set_image(ctx, pixels, img_size, img_size) != SAM3_OK) {
+			sam3_log_error("pipeline bench: sam3_set_image failed");
+			goto error;
+		}
+
+		/* Set prompt space to match image dimensions. */
+		sam3_set_prompt_space(ctx, img_size, img_size);
+	}
 
 	/* ── full_pipeline_point ──────────────────────────────────────── */
 	if (count < max_results &&
