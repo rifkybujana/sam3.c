@@ -8,17 +8,22 @@
  * and MLPs.
  *
  * Key types:  (none -- uses sam3_tensor, sam3_graph, sam3_arena)
- * Depends on: graph_helpers.h, core/graph.h, core/alloc.h, core/tensor.h, core/weight.h
- * Used by:    model/ files (vitdet.c, text_encoder.c, decoder.c, etc.)
+ * Depends on: graph_helpers.h, memory_bank.h, core/graph.h, core/alloc.h,
+ *             core/tensor.h, core/weight.h
+ * Used by:    model/ files (vitdet.c, text_encoder.c, decoder.c,
+ *             tracker.c, etc.)
  *
  * Copyright (c) 2026
  * SPDX-License-Identifier: MIT
  */
 
+#include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "util/log.h"
 
 #include "graph_helpers.h"
+#include "memory_bank.h"
 
 /* ── Tensor allocation ───────────────────────────────────────────── */
 
@@ -1138,6 +1143,7 @@ struct sam3_tensor *gh_cross_attention_sep(
 	struct sam3_graph *g, struct sam3_arena *arena,
 	struct sam3_tensor *q_src,
 	struct sam3_tensor *kv_src,
+	struct sam3_tensor *k_src,
 	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
 	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
 	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
@@ -1147,9 +1153,10 @@ struct sam3_tensor *gh_cross_attention_sep(
 	int d_model = q_src->dims[1];
 	int head_dim = d_model / n_heads;
 
-	/* Project Q from q_src, K and V separately from kv_src */
+	/* K projects from k_src when provided, otherwise from kv_src */
 	struct sam3_tensor *q = gh_linear(g, arena, q_src, q_w, q_b);
-	struct sam3_tensor *k = gh_linear(g, arena, kv_src, k_w, k_b);
+	struct sam3_tensor *k = gh_linear(g, arena,
+		k_src ? k_src : kv_src, k_w, k_b);
 	struct sam3_tensor *v = gh_linear(g, arena, kv_src, v_w, v_b);
 	if (!q || !k || !v)
 		return NULL;
@@ -1417,6 +1424,423 @@ struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
 	node->params[0] = kernel_size;
 	node->params[1] = stride;
+
+	return out;
+}
+
+/* ── Tracker memory helpers ──────────────────────────────────────── */
+
+struct sam3_tensor *gh_concat_mem(struct sam3_graph *g,
+				  struct sam3_arena *a,
+				  const struct sam3_memory_bank_view *view)
+{
+	if (!view || !view->bank)
+		return NULL;
+
+	const struct sam3_memory_bank *bank = view->bank;
+	int total = view->n_cond + bank->n_non_cond;
+	if (total <= 0)
+		return NULL;
+
+	/* Allocate a temporary pointer array from the arena. */
+	struct sam3_tensor **tensors = (struct sam3_tensor **)
+		sam3_arena_alloc(a,
+				 (size_t)total * sizeof(struct sam3_tensor *));
+	if (!tensors) {
+		sam3_log_error("gh_concat_mem: arena alloc failed");
+		return NULL;
+	}
+
+	int n = 0;
+
+	for (int k = 0; k < view->n_cond; k++) {
+		int idx = view->cond_idx[k];
+		struct sam3_tensor *sp = bank->cond[idx].spatial_features;
+		if (sp)
+			tensors[n++] = sp;
+	}
+	for (int i = 0; i < bank->n_non_cond; i++) {
+		struct sam3_tensor *sp = bank->non_cond[i].spatial_features;
+		if (sp)
+			tensors[n++] = sp;
+	}
+
+	if (n == 0)
+		return NULL;
+
+	if (n == 1)
+		return tensors[0];
+
+	return gh_concat(g, a, tensors, n, 0);
+}
+
+struct sam3_tensor *gh_tpos_enc_mem(struct sam3_graph *g,
+				    struct sam3_arena *a,
+				    const struct sam3_memory_bank_view *view,
+				    struct sam3_tensor *tpos_table,
+				    int current_frame_idx)
+{
+	(void)g;
+
+	if (!view || !view->bank || !tpos_table)
+		return NULL;
+
+	const struct sam3_memory_bank *bank = view->bank;
+
+	/* tpos_table is expected to be [num_maskmem, 1, 1, mem_dim]. */
+	if (tpos_table->n_dims != 4) {
+		sam3_log_error("gh_tpos_enc_mem: bad tpos_table dims %d",
+			       tpos_table->n_dims);
+		return NULL;
+	}
+	int num_maskmem = tpos_table->dims[0];
+	int mem_dim     = tpos_table->dims[3];
+
+	/* Count usable entries and compute total spatial tokens. */
+	int total_spatial = 0;
+	int n_entries     = view->n_cond + bank->n_non_cond;
+	for (int k = 0; k < view->n_cond; k++) {
+		int idx = view->cond_idx[k];
+		struct sam3_tensor *sp = bank->cond[idx].spatial_features;
+		if (sp)
+			total_spatial += sp->dims[0];
+	}
+	for (int i = 0; i < bank->n_non_cond; i++) {
+		struct sam3_tensor *sp = bank->non_cond[i].spatial_features;
+		if (sp)
+			total_spatial += sp->dims[0];
+	}
+	if (total_spatial == 0 || n_entries == 0)
+		return NULL;
+
+	int out_dims[] = {total_spatial, mem_dim};
+	struct sam3_tensor *out = gh_alloc_tensor(a, SAM3_DTYPE_F32,
+						  2, out_dims);
+	if (!out) {
+		sam3_log_error("gh_tpos_enc_mem: alloc failed");
+		return NULL;
+	}
+
+	float       *dst = (float *)out->data;
+	const float *tbl = (const float *)tpos_table->data;
+	int          row = 0;
+
+	(void)current_frame_idx;
+
+	/*
+	 * Slot selection matches Python sam3_tracker_base.py:614-676.
+	 *
+	 *   t = t_pos if not is_selected_cond_frame else 0
+	 *   maskmem_enc = maskmem_enc + maskmem_tpos_enc[num_maskmem - t - 1]
+	 *
+	 * Cond frames (t = 0) always bind to the last slot,
+	 *   slot = num_maskmem - 1.
+	 *
+	 * Non-cond frames occupy t_pos = 1..num_maskmem-1 in the sliding
+	 * memory window (t_pos = num_maskmem-1 is the most recent, t_pos = 1
+	 * is the oldest), so
+	 *   slot = num_maskmem - 1 - t_pos.
+	 * The bank stores non_cond[0] = oldest and non_cond[n-1] = newest,
+	 * so the k-th most-recent entry (k = 1..n_non_cond, counting from
+	 * the newest) sits at index i = n_non_cond - k and gets slot k - 1.
+	 * For n_non_cond < num_maskmem - 1 Python simply drops the missing
+	 * slots; our bank keeps whatever entries it has and binds each to
+	 * its own k-based slot.
+	 */
+	for (int k = 0; k < view->n_cond; k++) {
+		int idx = view->cond_idx[k];
+		struct sam3_tensor *sp = bank->cond[idx].spatial_features;
+		if (!sp)
+			continue;
+
+		int hw   = sp->dims[0];
+		int slot = num_maskmem - 1;
+		const float *tbl_slot = tbl + (size_t)slot * mem_dim;
+
+		for (int j = 0; j < hw; j++) {
+			memcpy(dst + (size_t)row * mem_dim, tbl_slot,
+			       (size_t)mem_dim * sizeof(float));
+			row++;
+		}
+	}
+
+	for (int i = 0; i < bank->n_non_cond; i++) {
+		struct sam3_tensor *sp = bank->non_cond[i].spatial_features;
+		if (!sp)
+			continue;
+
+		int hw   = sp->dims[0];
+		int slot = bank->n_non_cond - 1 - i;
+		if (slot < 0)
+			slot = 0;
+		if (slot > num_maskmem - 2)
+			slot = num_maskmem - 2;
+
+		const float *tbl_slot = tbl + (size_t)slot * mem_dim;
+
+		for (int j = 0; j < hw; j++) {
+			memcpy(dst + (size_t)row * mem_dim, tbl_slot,
+			       (size_t)mem_dim * sizeof(float));
+			row++;
+		}
+	}
+
+	return out;
+}
+
+struct sam3_tensor *gh_concat_obj_ptrs(struct sam3_graph *g,
+				       struct sam3_arena *a,
+				       const struct sam3_memory_bank_view *view,
+				       int max_obj_ptrs)
+{
+	if (!view || !view->bank)
+		return NULL;
+
+	const struct sam3_memory_bank *bank = view->bank;
+	int total_entries = view->n_cond + bank->n_non_cond;
+	if (total_entries <= 0)
+		return NULL;
+
+	/*
+	 * Upstream splits each [n_obj, hidden_dim=256] obj_pointer row
+	 * into hidden_dim/mem_dim = 4 chunks of mem_dim=64 each and
+	 * stacks them along axis 0 as additional memory tokens.
+	 */
+	const int mem_dim    = 64;
+	const int hidden_dim = 256;
+	const int split      = hidden_dim / mem_dim; /* 4 */
+
+	struct sam3_tensor **tensors = (struct sam3_tensor **)
+		sam3_arena_alloc(a, (size_t)total_entries *
+				 sizeof(struct sam3_tensor *));
+	if (!tensors) {
+		sam3_log_error("gh_concat_obj_ptrs: arena alloc failed");
+		return NULL;
+	}
+
+	int n_tensors    = 0;
+	int total_n_obj  = 0;
+
+	/*
+	 * Select up to max_obj_ptrs most recent entries. Within each pass
+	 * we walk newest-first so the cap drops oldest entries when
+	 * saturated. Pass 0 visits selected cond entries via view->cond_idx
+	 * (already sorted oldest-first); pass 1 visits bank->non_cond[]
+	 * directly (oldest at index 0, newest at n_non_cond-1). Collected
+	 * chunks are appended newest-first here; after the passes we
+	 * reverse tensors[] so the concat output stays oldest-first.
+	 */
+	for (int pass = 0; pass < 2; pass++) {
+		int count = (pass == 0) ? view->n_cond : bank->n_non_cond;
+
+		for (int k = count - 1; k >= 0; k--) {
+			int idx = (pass == 0) ? view->cond_idx[k] : k;
+			const struct sam3_memory_entry *arr =
+				(pass == 0) ? bank->cond : bank->non_cond;
+			struct sam3_tensor *op = arr[idx].obj_pointer;
+			if (!op)
+				continue;
+
+			int n_obj = op->dims[0];
+
+			/* Cap so that total pre-reshape rows <= max. */
+			if (max_obj_ptrs > 0 &&
+			    total_n_obj + n_obj > max_obj_ptrs) {
+				n_obj = max_obj_ptrs - total_n_obj;
+				if (n_obj <= 0)
+					break;
+			}
+
+			int reshaped_dims[] = {n_obj * split, mem_dim};
+			struct sam3_tensor *chunk = gh_reshape(
+				g, a, op, 2, reshaped_dims);
+			if (!chunk) {
+				sam3_log_error("gh_concat_obj_ptrs: reshape "
+					       "failed");
+				return NULL;
+			}
+
+			tensors[n_tensors++] = chunk;
+			total_n_obj += n_obj;
+
+			if (max_obj_ptrs > 0 && total_n_obj >= max_obj_ptrs)
+				break;
+		}
+		if (max_obj_ptrs > 0 && total_n_obj >= max_obj_ptrs)
+			break;
+	}
+
+	if (n_tensors == 0)
+		return NULL;
+
+	if (n_tensors == 1)
+		return tensors[0];
+
+	/* Reverse so concat rows come out oldest-first. */
+	for (int lo = 0, hi = n_tensors - 1; lo < hi; lo++, hi--) {
+		struct sam3_tensor *tmp = tensors[lo];
+		tensors[lo] = tensors[hi];
+		tensors[hi] = tmp;
+	}
+
+	return gh_concat(g, a, tensors, n_tensors, 0);
+}
+
+/*
+ * gh_obj_ptrs_tpos_sine - see header for contract.
+ *
+ * Iterates the memory bank with the same selection rule as
+ * gh_concat_obj_ptrs and writes one [hidden_dim] sine PE per
+ * contributing chunk (4 chunks per 256-D pointer) into a single
+ * arena tensor. The temporal distance is abs(current - entry) /
+ * (max_obj_ptrs - 1), matching Python's _get_tpos_enc.
+ */
+struct sam3_tensor *gh_obj_ptrs_tpos_sine(
+	struct sam3_graph *g,
+	struct sam3_arena *a,
+	const struct sam3_memory_bank_view *view,
+	int max_obj_ptrs,
+	int current_frame_idx,
+	int hidden_dim)
+{
+	(void)g;
+
+	if (!view || !view->bank || !a ||
+	    hidden_dim < 2 || (hidden_dim & 1) != 0)
+		return NULL;
+
+	const struct sam3_memory_bank *bank = view->bank;
+
+	const int mem_dim = 64;
+	const int split   = hidden_dim / mem_dim;
+	const int pe_dim  = hidden_dim / 2; /* half sine, half cosine */
+	const float temperature = 10000.0f;
+	const float t_diff_max =
+		(max_obj_ptrs > 1) ? (float)(max_obj_ptrs - 1) : 1.0f;
+
+	/*
+	 * Collect contributing frame indices in the same order as
+	 * gh_concat_obj_ptrs: cond pass then non_cond pass, within each
+	 * pass entries visited newest-first (reverse iteration), then
+	 * the full list is reversed at the end.
+	 */
+	int total_candidates = view->n_cond + bank->n_non_cond;
+	if (total_candidates <= 0)
+		return NULL;
+	int *frame_idxs = (int *)sam3_arena_alloc(
+		a, (size_t)total_candidates * sizeof(int));
+	if (!frame_idxs)
+		return NULL;
+
+	int n_entries = 0;
+	int total_n_obj = 0;
+
+	for (int pass = 0; pass < 2; pass++) {
+		int count = (pass == 0) ? view->n_cond : bank->n_non_cond;
+
+		for (int k = count - 1; k >= 0; k--) {
+			int idx = (pass == 0) ? view->cond_idx[k] : k;
+			const struct sam3_memory_entry *arr =
+				(pass == 0) ? bank->cond : bank->non_cond;
+			struct sam3_tensor *op = arr[idx].obj_pointer;
+			if (!op)
+				continue;
+
+			int n_obj = op->dims[0];
+			if (max_obj_ptrs > 0 &&
+			    total_n_obj + n_obj > max_obj_ptrs) {
+				n_obj = max_obj_ptrs - total_n_obj;
+				if (n_obj <= 0)
+					break;
+			}
+
+			frame_idxs[n_entries++] = arr[idx].frame_idx;
+			total_n_obj += n_obj;
+
+			if (max_obj_ptrs > 0 && total_n_obj >= max_obj_ptrs)
+				break;
+		}
+		if (max_obj_ptrs > 0 && total_n_obj >= max_obj_ptrs)
+			break;
+	}
+
+	if (n_entries == 0)
+		return NULL;
+
+	/* Reverse to match gh_concat_obj_ptrs output ordering. */
+	for (int lo = 0, hi = n_entries - 1; lo < hi; lo++, hi--) {
+		int tmp = frame_idxs[lo];
+		frame_idxs[lo] = frame_idxs[hi];
+		frame_idxs[hi] = tmp;
+	}
+
+	int total_rows = n_entries * split;
+	int out_dims[] = {total_rows, hidden_dim};
+	struct sam3_tensor *out = gh_alloc_tensor(
+		a, SAM3_DTYPE_F32, 2, out_dims);
+	if (!out)
+		return NULL;
+
+	float *dst = (float *)out->data;
+
+	for (int k = 0; k < n_entries; k++) {
+		int dist = current_frame_idx - frame_idxs[k];
+		if (dist < 0)
+			dist = -dist;
+		float norm_pos = (float)dist / t_diff_max;
+
+		/*
+		 * get_1d_sine_pe: first half sin, second half cos.
+		 *   dim_t[j] = temperature ** (2*(j//2) / pe_dim)
+		 *   pe[j]           = sin(norm_pos / dim_t[j])
+		 *   pe[pe_dim + j]  = cos(norm_pos / dim_t[j])
+		 */
+		for (int r = 0; r < split; r++) {
+			float *row = dst + ((size_t)k * split + r) * hidden_dim;
+			for (int j = 0; j < pe_dim; j++) {
+				float exponent =
+					(float)(2 * (j / 2)) / (float)pe_dim;
+				float dim_t = powf(temperature, exponent);
+				float v = norm_pos / dim_t;
+				row[j]          = sinf(v);
+				row[pe_dim + j] = cosf(v);
+			}
+		}
+	}
+
+	return out;
+}
+
+struct sam3_tensor *gh_concat_rows(struct sam3_graph *g,
+				   struct sam3_arena *a,
+				   struct sam3_tensor *x,
+				   struct sam3_tensor *y)
+{
+	if (!x)
+		return y;
+	if (!y)
+		return x;
+
+	struct sam3_tensor *pair[] = {x, y};
+	return gh_concat(g, a, pair, 2, 0);
+}
+
+struct sam3_tensor *gh_zeros_like(struct sam3_graph *g,
+				  struct sam3_arena *a,
+				  struct sam3_tensor *src)
+{
+	(void)g;
+
+	if (!src)
+		return NULL;
+
+	struct sam3_tensor *out = gh_alloc_tensor(a, src->dtype,
+						  src->n_dims, src->dims);
+	if (!out)
+		return NULL;
+
+	if (out->data && out->nbytes)
+		memset(out->data, 0, out->nbytes);
 
 	return out;
 }

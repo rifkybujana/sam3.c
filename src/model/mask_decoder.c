@@ -495,6 +495,43 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	if (!dec->iou_proj_out_b)
 		return SAM3_ENOMEM;
 
+	/* ── pred_obj_score_head: 3-layer MLP [256->256->256->1] ─── */
+	{
+		int fc0_w_dims[] = {d, d};
+		int fc0_b_dims[] = {d};
+		int fc1_w_dims[] = {d, d};
+		int fc1_b_dims[] = {d};
+		int fc2_w_dims[] = {1, d};
+		int fc2_b_dims[] = {1};
+
+		dec->obj_score_fc0_w = gh_load_mmap(wf,
+			P "pred_obj_score_head.layers.0.weight",
+			arena, SAM3_DTYPE_F32, 2, fc0_w_dims);
+		if (!dec->obj_score_fc0_w) return SAM3_ENOMEM;
+		dec->obj_score_fc0_b = gh_load_mmap(wf,
+			P "pred_obj_score_head.layers.0.bias",
+			arena, SAM3_DTYPE_F32, 1, fc0_b_dims);
+		if (!dec->obj_score_fc0_b) return SAM3_ENOMEM;
+
+		dec->obj_score_fc1_w = gh_load_mmap(wf,
+			P "pred_obj_score_head.layers.1.weight",
+			arena, SAM3_DTYPE_F32, 2, fc1_w_dims);
+		if (!dec->obj_score_fc1_w) return SAM3_ENOMEM;
+		dec->obj_score_fc1_b = gh_load_mmap(wf,
+			P "pred_obj_score_head.layers.1.bias",
+			arena, SAM3_DTYPE_F32, 1, fc1_b_dims);
+		if (!dec->obj_score_fc1_b) return SAM3_ENOMEM;
+
+		dec->obj_score_fc2_w = gh_load_mmap(wf,
+			P "pred_obj_score_head.layers.2.weight",
+			arena, SAM3_DTYPE_F32, 2, fc2_w_dims);
+		if (!dec->obj_score_fc2_w) return SAM3_ENOMEM;
+		dec->obj_score_fc2_b = gh_load_mmap(wf,
+			P "pred_obj_score_head.layers.2.bias",
+			arena, SAM3_DTYPE_F32, 1, fc2_b_dims);
+		if (!dec->obj_score_fc2_b) return SAM3_ENOMEM;
+	}
+
 	/* ── Multi-scale skip connection convolutions ──────────── */
 	{
 		/* Conv2d weights ship in OHWI after Task 12's permute:
@@ -756,7 +793,10 @@ enum sam3_error sam3_mask_decoder_build(
 	struct sam3_tensor *feat_s1,
 	struct sam3_arena *arena,
 	struct sam3_tensor **out_masks,
-	struct sam3_tensor **out_iou)
+	struct sam3_tensor **out_iou,
+	struct sam3_tensor **out_obj_token,
+	struct sam3_tensor **out_obj_score_logits,
+	struct sam3_tensor **out_mask_tokens)
 {
 	int d = dec->d_model;
 	int nm = dec->n_masks;
@@ -803,10 +843,23 @@ enum sam3_error sam3_mask_decoder_build(
 	if (!image_pe)
 		return SAM3_ENOMEM;
 
-	/* Add no_mask_embed [1, 256] to every pixel of image features */
-	img_feat = broadcast_add_1d(arena, img_feat, dec->no_mask_embed);
+	/* Add no_mask_embed [1, 256] to every pixel of image features.
+	 * Use gh_add (graph op) so the addition runs on the backend.
+	 * The earlier CPU broadcast_add_1d read uninitialized data when
+	 * img_feat lived only on the GPU prior to graph_eval. */
+	img_feat = gh_add(g, arena, img_feat, dec->no_mask_embed);
 	if (!img_feat)
 		return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_xformer_in_img;
+		extern struct sam3_tensor *sam3_dbg_xformer_in_tokens;
+		sam3_dbg_xformer_in_img = img_feat;
+		sam3_dbg_xformer_in_tokens = tokens;
+		img_feat->dbg_force_readback = 1;
+		tokens->dbg_force_readback = 1;
+	}
+#endif
 
 	struct sam3_tensor *queries = tokens;	/* evolving tokens */
 	struct sam3_tensor *keys = img_feat;	/* evolving image feat */
@@ -906,6 +959,13 @@ enum sam3_error sam3_mask_decoder_build(
 					dec->layers[i].ln2_b);
 		if (!queries)
 			return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+		if (i == 0) {
+			extern struct sam3_tensor *sam3_dbg_xformer_layer0_q;
+			sam3_dbg_xformer_layer0_q = queries;
+			queries->dbg_force_readback = 1;
+		}
+#endif
 
 		/*
 		 * (c) MLP on tokens with residual.
@@ -1016,6 +1076,50 @@ enum sam3_error sam3_mask_decoder_build(
 		return SAM3_ENOMEM;
 
 	/*
+	 * Extract the transformer-processed obj_score_token at index
+	 * 1 + nm. Shape [1, d_model]. Feeds pred_obj_score_head to
+	 * produce the occlusion logit, and optionally exposed via
+	 * out_obj_token for debugging.
+	 */
+	struct sam3_tensor *obj_token_out;
+	obj_token_out = gh_slice(g, arena, queries, 0,
+				  1 + nm, 1 + nm + 1);
+	if (!obj_token_out)
+		return SAM3_ENOMEM;
+
+	if (out_obj_token)
+		*out_obj_token = obj_token_out;
+
+	/* Expose mask_tokens so the caller can pick the best-IoU one. */
+	if (out_mask_tokens)
+		*out_mask_tokens = mask_tokens_out;
+
+	/*
+	 * pred_obj_score_head: 3-layer MLP on obj_score_token.
+	 * Python: obj_score_logits = MLP(obj_score_token, 256,256,1,3).
+	 */
+	if (out_obj_score_logits) {
+		struct sam3_tensor *h;
+		h = gh_linear(g, arena, obj_token_out,
+			      dec->obj_score_fc0_w,
+			      dec->obj_score_fc0_b);
+		if (!h) return SAM3_ENOMEM;
+		h = gh_relu(g, arena, h);
+		if (!h) return SAM3_ENOMEM;
+		h = gh_linear(g, arena, h,
+			      dec->obj_score_fc1_w,
+			      dec->obj_score_fc1_b);
+		if (!h) return SAM3_ENOMEM;
+		h = gh_relu(g, arena, h);
+		if (!h) return SAM3_ENOMEM;
+		h = gh_linear(g, arena, h,
+			      dec->obj_score_fc2_w,
+			      dec->obj_score_fc2_b);
+		if (!h) return SAM3_ENOMEM;
+		*out_obj_score_logits = h; /* [1, 1] logit */
+	}
+
+	/*
 	 * Step 5: Pixel decoder — upsample image features.
 	 * Reshape [n_pix, d_model] -> [1, H, W, d_model] (NHWC),
 	 * then 2x transposed conv + layer norm + GELU pipeline.
@@ -1031,6 +1135,13 @@ enum sam3_error sam3_mask_decoder_build(
 		if (!px)
 			return SAM3_ENOMEM;
 	}
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_pix_ct1_input;
+		sam3_dbg_pix_ct1_input = px;
+		px->dbg_force_readback = 1;
+	}
+#endif
 
 	/* Conv transpose 1: [1, H, W, 256] -> [1, 2H, 2W, 64] */
 	px = gh_conv_transpose2d(g, arena, px,
@@ -1038,6 +1149,13 @@ enum sam3_error sam3_mask_decoder_build(
 				       2, 0);
 	if (!px)
 		return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_pix_ct1;
+		sam3_dbg_pix_ct1 = px;
+		px->dbg_force_readback = 1;
+	}
+#endif
 
 	/*
 	 * Multi-scale skip: add conv_s1(feat_s1) at 2x resolution.
@@ -1051,10 +1169,24 @@ enum sam3_error sam3_mask_decoder_build(
 					1, 0, 1);
 		if (!skip1)
 			return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+		{
+			extern struct sam3_tensor *sam3_dbg_pix_skip1;
+			sam3_dbg_pix_skip1 = skip1;
+			skip1->dbg_force_readback = 1;
+		}
+#endif
 		px = gh_add(g, arena, px, skip1);
 		if (!px)
 			return SAM3_ENOMEM;
 	}
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_pix_after_skip1;
+		sam3_dbg_pix_after_skip1 = px;
+		px->dbg_force_readback = 1;
+	}
+#endif
 
 	/* Layer norm on 64-dim channels.
 	 * In NHWC [1, 2H, 2W, 64], channels are the innermost axis,
@@ -1114,6 +1246,13 @@ enum sam3_error sam3_mask_decoder_build(
 	px = gh_gelu(g, arena, px);
 	if (!px)
 		return SAM3_ENOMEM;
+
+#ifdef SAM3_DEBUG_DUMP
+	/* Remember px so the caller can dump it after graph_eval. */
+	extern struct sam3_tensor *sam3_dbg_pixel_out;
+	sam3_dbg_pixel_out = px;
+	px->dbg_force_readback = 1;
+#endif
 
 	/*
 	 * Flatten pixel features for dot product.
@@ -1217,4 +1356,65 @@ enum sam3_error sam3_mask_decoder_build(
 	}
 
 	return SAM3_OK;
+}
+
+int sam3_mask_decoder_select_with_stability(const float *logits,
+					     const float *iou_scores,
+					     int n_masks, int H, int W,
+					     float delta,
+					     float stability_thresh)
+{
+	if (!logits || !iou_scores || n_masks <= 0)
+		return 0;
+
+	/* Plain argmax fallback when inputs disable stability gating. */
+	if (n_masks < 3 || delta <= 0.0f || stability_thresh <= 0.0f) {
+		int best = 0;
+		float best_score = iou_scores[0];
+		for (int i = 1; i < n_masks; i++) {
+			if (iou_scores[i] > best_score) {
+				best_score = iou_scores[i];
+				best = i;
+			}
+		}
+		return best;
+	}
+
+	int hw = H * W;
+	int best_stable = -1;
+	float best_stable_iou = -1.0f;
+
+	for (int m = 0; m < n_masks; m++) {
+		const float *p = logits + (size_t)m * hw;
+		int area_hi = 0, area_lo = 0;
+		for (int i = 0; i < hw; i++) {
+			if (p[i] >  delta) area_hi++;
+			if (p[i] > -delta) area_lo++;
+		}
+		float lo = (float)area_lo;
+		float hi = (float)area_hi;
+		float mn = lo < hi ? lo : hi;
+		float mx = lo > hi ? lo : hi;
+		float stab = (mx > 0.0f) ? (mn / mx) : 1.0f;
+
+		if (stab >= stability_thresh &&
+		    iou_scores[m] > best_stable_iou) {
+			best_stable_iou = iou_scores[m];
+			best_stable = m;
+		}
+	}
+
+	if (best_stable >= 0)
+		return best_stable;
+
+	/* No mask qualifies: fall back to argmax IoU. */
+	int best = 0;
+	float best_score = iou_scores[0];
+	for (int i = 1; i < n_masks; i++) {
+		if (iou_scores[i] > best_score) {
+			best_score = iou_scores[i];
+			best = i;
+		}
+	}
+	return best;
 }

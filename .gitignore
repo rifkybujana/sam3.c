@@ -106,6 +106,8 @@ output/
 tests/fixtures/*
 !tests/fixtures/nhwc_migration/
 !tests/fixtures/nhwc_migration/*.bin
+!tests/fixtures/video_kids/
+!tests/fixtures/video_kids/README.md
 
 TODO*
 

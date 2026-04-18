@@ -519,7 +519,8 @@ static void test_mask_decoder_nhwc_fixture(void)
 	err = sam3_mask_decoder_build(&dec, &graph, keys,
 				       MD_GRID_H, MD_GRID_W,
 				       NULL, feat_s0, feat_s1,
-				       &g_cpu.arena, &masks, &iou);
+				       &g_cpu.arena, &masks, &iou, NULL,
+				       NULL, NULL);
 	ASSERT_EQ(err, SAM3_OK);
 	ASSERT(masks != NULL);
 	if (!masks)
@@ -548,11 +549,87 @@ static void test_mask_decoder_nhwc_fixture(void)
 	free(ref);
 }
 
+/*
+ * test_mask_decoder_emits_obj_token - Exercise the optional
+ * out_obj_token output. Uses the same synthetic setup as the fixture
+ * test but passes a non-NULL obj_token pointer and verifies the token
+ * has the expected shape [1, d_model] (2-D, since the token stack
+ * flowing through the two-way transformer is [n_tokens, d_model]).
+ *
+ * Runs without fixture files — the numeric output is not compared,
+ * only the tensor shape, so this test is always executable.
+ */
+static void test_mask_decoder_emits_obj_token(void)
+{
+	uint32_t rng = MD_FIXTURE_SEED;
+	struct sam3_mask_decoder dec;
+	enum sam3_error err;
+
+	err = sam3_mask_decoder_init(&dec);
+	ASSERT_EQ(err, SAM3_OK);
+
+	err = sam3_mask_decoder_load(&dec, NULL, &g_cpu.arena);
+	ASSERT_EQ(err, SAM3_OK);
+
+	fill_weights(&dec, &rng);
+
+	int keys_dims[] = {MD_N_PIX, MD_D_MODEL};
+	int s1_dims[] = {1, MD_FEAT_S1_H, MD_FEAT_S1_W, MD_D_MODEL};
+	int s0_dims[] = {1, MD_FEAT_S0_H, MD_FEAT_S0_W, MD_D_MODEL};
+
+	struct sam3_tensor *keys = gh_alloc_tensor(&g_cpu.arena,
+		SAM3_DTYPE_F32, 2, keys_dims);
+	struct sam3_tensor *feat_s1 = gh_alloc_tensor(&g_cpu.arena,
+		SAM3_DTYPE_F32, 4, s1_dims);
+	struct sam3_tensor *feat_s0 = gh_alloc_tensor(&g_cpu.arena,
+		SAM3_DTYPE_F32, 4, s0_dims);
+	ASSERT(keys != NULL);
+	ASSERT(feat_s1 != NULL);
+	ASSERT(feat_s0 != NULL);
+	if (!keys || !feat_s1 || !feat_s0)
+		return;
+
+	fill_prng((float *)keys->data,
+		  MD_N_PIX * MD_D_MODEL, 0.3f, &rng);
+	fill_feat_nhwc(feat_s0, 1, MD_D_MODEL,
+		       MD_FEAT_S0_H, MD_FEAT_S0_W, &rng);
+	fill_feat_nhwc(feat_s1, 1, MD_D_MODEL,
+		       MD_FEAT_S1_H, MD_FEAT_S1_W, &rng);
+
+	struct sam3_graph graph;
+	sam3_graph_init(&graph);
+
+	struct sam3_tensor *masks = NULL;
+	struct sam3_tensor *iou = NULL;
+	struct sam3_tensor *obj_token = NULL;
+	err = sam3_mask_decoder_build(&dec, &graph, keys,
+				       MD_GRID_H, MD_GRID_W,
+				       NULL, feat_s0, feat_s1,
+				       &g_cpu.arena, &masks, &iou,
+				       &obj_token, NULL, NULL);
+	ASSERT_EQ(err, SAM3_OK);
+	ASSERT(masks != NULL);
+	ASSERT(obj_token != NULL);
+	if (!obj_token)
+		return;
+
+	/* Token stack through the transformer is [n_tokens, d_model];
+	 * slicing axis 0 preserves rank, so obj_token is 2-D with
+	 * dims [1, d_model]. */
+	ASSERT_EQ(obj_token->n_dims, 2);
+	ASSERT_EQ(obj_token->dims[0], 1);
+	ASSERT_EQ(obj_token->dims[1], MD_D_MODEL);
+
+	err = g_cpu.base.ops->graph_eval(&g_cpu.base, &graph);
+	ASSERT_EQ(err, SAM3_OK);
+}
+
 int main(void)
 {
 	setup();
 
 	test_mask_decoder_nhwc_fixture();
+	test_mask_decoder_emits_obj_token();
 
 	teardown();
 

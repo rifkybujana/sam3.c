@@ -122,6 +122,27 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 	struct sam3_profiler *profiler);
 
 /*
+ * sam3_vl_backbone_build_vision_dual - As build_vision, but also produces
+ * sam2-side features. When sam2_neck is initialized (has_sam2_neck=1),
+ * sam2_features[] is populated with 4 multi-scale tensors from the
+ * sam2 neck. The video tracker uses sam2_features as input to the SAM
+ * mask decoder (Python's pix_feat_with_mem path).
+ *
+ * If sam2_features is NULL or has_sam2_neck=0, behaves identically to
+ * sam3_vl_backbone_build_vision.
+ */
+struct sam3_tensor *sam3_vl_backbone_build_vision_dual(
+	struct sam3_vl_backbone *vl,
+	struct sam3_graph *g,
+	struct sam3_backend *be,
+	struct sam3_tensor *image,
+	struct sam3_tensor *out_features[],
+	struct sam3_tensor *sam2_features[],
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_profiler *profiler);
+
+/*
  * sam3_vl_backbone_build_text - Build text pipeline graph.
  *
  * @vl:         Initialized and loaded backbone

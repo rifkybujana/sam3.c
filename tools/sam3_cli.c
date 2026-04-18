@@ -6,7 +6,7 @@
  * segment if argv[1] starts with '-' (backward compatibility).
  *
  * Key types:  (none)
- * Depends on: cli_common.h, cli_segment.h, cli_convert.h, cli_info.h
+ * Depends on: cli_common.h, cli_segment.h, cli_convert.h, cli_info.h, cli_track.h
  * Used by:    end users
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -21,6 +21,7 @@
 #include "cli_segment.h"
 #include "cli_convert.h"
 #include "cli_info.h"
+#include "cli_track.h"
 #ifdef SAM3_HAS_BENCH
 #include "cli_bench.h"
 #endif
@@ -31,6 +32,7 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "Usage: %s <command> [options]\n\n", prog);
 	fprintf(stderr, "Commands:\n");
 	fprintf(stderr, "  segment    Run segmentation inference\n");
+	fprintf(stderr, "  track      Track objects across video frames\n");
 	fprintf(stderr, "  convert    Convert model weights to .sam3\n");
 	fprintf(stderr, "  info       Print model file metadata\n");
 #ifdef SAM3_HAS_BENCH
@@ -65,6 +67,8 @@ int main(int argc, char **argv)
 	/* Subcommand dispatch */
 	if (strcmp(cmd, "segment") == 0)
 		return cli_segment(argc - 1, argv + 1);
+	if (strcmp(cmd, "track") == 0)
+		return cli_track(argc - 1, argv + 1);
 	if (strcmp(cmd, "convert") == 0)
 		return cli_convert(argc - 1, argv + 1);
 	if (strcmp(cmd, "info") == 0)

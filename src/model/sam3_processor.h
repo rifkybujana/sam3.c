@@ -9,7 +9,7 @@
  *
  * Key types:  sam3_processor
  * Depends on: sam3_image.h, backend/backend.h, sam3/sam3_types.h
- * Used by:    sam3.c (top-level context), tools/
+ * Used by:    sam3.c (top-level context), model/sam3_video.c, tools/
  *
  * Copyright (c) 2026
  * SPDX-License-Identifier: MIT
@@ -197,5 +197,34 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       const struct sam3_prompt *prompts,
 				       int n_prompts,
 				       struct sam3_result *result);
+
+/*
+ * sam3_project_prompts - CPU-side prompt coordinate projection.
+ *
+ * @model:        Loaded image model (for geometry encoder weights)
+ * @feat_s1_nhwc: Cached 1x backbone feature [1, H, W, d_model] used
+ *                for the pool-projection path. May be NULL; the
+ *                pool-projection term is skipped in that case.
+ * @prompts:      Array of point/box prompts
+ * @n_prompts:    Number of prompts
+ * @prompt_w:     Width used to normalize x coordinates
+ * @prompt_h:     Height used to normalize y coordinates
+ * @arena:        Arena for the output tensor and internal LN scratch
+ *
+ * Projects point/box coordinates to d_model embeddings purely on CPU
+ * (no graph or backend involvement) and returns a freshly allocated
+ * [N_total, d_model] tensor owned by @arena. Returns NULL if no point
+ * or box prompts are present, or on allocation failure.
+ *
+ * Shared between sam3_processor_segment (single-image path) and the
+ * video tracker's add_points / add_box paths.
+ */
+struct sam3_tensor *sam3_project_prompts(
+	struct sam3_image_model *model,
+	const struct sam3_tensor *feat_s1_nhwc,
+	const struct sam3_prompt *prompts,
+	int n_prompts,
+	int prompt_w, int prompt_h,
+	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_SAM3_PROCESSOR_H */

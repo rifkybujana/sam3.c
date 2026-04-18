@@ -96,6 +96,15 @@ struct sam3_mask_decoder {
 	struct sam3_tensor *iou_hidden_w, *iou_hidden_b;
 	struct sam3_tensor *iou_proj_out_w, *iou_proj_out_b;
 
+	/*
+	 * Object-score prediction MLP: 3-layer MLP on obj_score_token.
+	 * Python: pred_obj_score_head = MLP(256, 256, 1, 3).
+	 * Layers: [256->256]-relu-[256->256]-relu-[256->1].
+	 */
+	struct sam3_tensor *obj_score_fc0_w, *obj_score_fc0_b; /* [256,256]/[256] */
+	struct sam3_tensor *obj_score_fc1_w, *obj_score_fc1_b; /* [256,256]/[256] */
+	struct sam3_tensor *obj_score_fc2_w, *obj_score_fc2_b; /* [1,256]/[1] */
+
 	/* Multi-scale skip connections: conv_s0 (32) and conv_s1 (64)
 	 * (OHWI after Task 10) */
 	struct sam3_tensor *conv_s0_w, *conv_s0_b;	/* [32,1,1,256]/[32] */
@@ -153,9 +162,18 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
  *             or NULL
  * @feat_s1:   [1, 2H, 2W, d_model] 1x-scale backbone feature (NHWC),
  *             or NULL
- * @arena:     Arena for intermediates
- * @out_masks: Receives [4, H, W] mask logits
- * @out_iou:   Receives [4] IoU predictions, or NULL
+ * @arena:         Arena for intermediates
+ * @out_masks:     Receives [4, H, W] mask logits
+ * @out_iou:       Receives [4] IoU predictions, or NULL
+ * @out_obj_token: Optional. If non-NULL, receives the object-score
+ *                 token of shape [1, d_model] (2-D view sliced from
+ *                 the transformer token stack). Pass NULL to skip.
+ * @out_obj_score_logits: Optional [1, 1] scalar logit from
+ *                 pred_obj_score_head(obj_score_token). Positive means
+ *                 object visible. Pass NULL to skip.
+ * @out_mask_tokens: Optional [4, d_model] transformer-processed mask
+ *                 tokens, used by the tracker to select the best-IoU
+ *                 token for obj_ptr_proj. Pass NULL to skip.
  *
  * Returns SAM3_OK on success, SAM3_ENOMEM on allocation failure.
  */
@@ -169,6 +187,32 @@ enum sam3_error sam3_mask_decoder_build(
 	struct sam3_tensor *feat_s1,
 	struct sam3_arena *arena,
 	struct sam3_tensor **out_masks,
-	struct sam3_tensor **out_iou);
+	struct sam3_tensor **out_iou,
+	struct sam3_tensor **out_obj_token,
+	struct sam3_tensor **out_obj_score_logits,
+	struct sam3_tensor **out_mask_tokens);
+
+/*
+ * sam3_mask_decoder_select_with_stability - Pick best mask using stability.
+ *
+ * @logits:           [n_masks * H * W] row-major f32 mask logits.
+ * @iou_scores:       [n_masks] predicted IoU scores.
+ * @n_masks:          Candidate count. Stability gating only kicks in for
+ *                    n_masks >= 3; otherwise returns argmax(iou).
+ * @H, @W:            Mask spatial dims.
+ * @delta:            Perturbation offset (e.g. 0.05). 0 → falls back to
+ *                    argmax(iou).
+ * @stability_thresh: Stability floor (e.g. 0.98). 0 → falls back.
+ *
+ * Returns the chosen mask index in [0, n_masks). Among masks with
+ * stability >= stability_thresh, prefers the highest IoU; if none
+ * qualify, plain argmax(iou). Exposed for testing; the video path
+ * calls it with session opts filled in.
+ */
+int sam3_mask_decoder_select_with_stability(const float *logits,
+					     const float *iou_scores,
+					     int n_masks, int H, int W,
+					     float delta,
+					     float stability_thresh);
 
 #endif /* SAM3_MODEL_MASK_DECODER_H */

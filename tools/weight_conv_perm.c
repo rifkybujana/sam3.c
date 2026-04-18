@@ -70,8 +70,11 @@ static int is_conv2d_weight(const char *name)
 		return 1;
 
 	/* FPN neck Conv2d layers: .neck.fpn_layers.{i}.proj1/proj2.weight
-	 * (scale_layers.* are ConvTranspose2d — handled separately). */
-	if (strstr(name, ".neck.fpn_layers.") &&
+	 * (scale_layers.* are ConvTranspose2d — handled separately).
+	 * Also match the second neck (.neck.sam2_fpn_layers.) used by the
+	 * video tracker's SAM mask decoder path. */
+	if ((strstr(name, ".neck.fpn_layers.") ||
+	     strstr(name, ".neck.sam2_fpn_layers.")) &&
 	    (str_ends_with(name, ".proj1.weight") ||
 	     str_ends_with(name, ".proj2.weight")))
 		return 1;
@@ -93,6 +96,28 @@ static int is_conv2d_weight(const char *name)
 	 * tracker_model.mask_decoder.conv_s0/conv_s1.weight */
 	if (str_ends_with(name, ".mask_decoder.conv_s0.weight") ||
 	    str_ends_with(name, ".mask_decoder.conv_s1.weight"))
+		return 1;
+
+	/* Memory encoder (maskmem_backbone): 4D conv weights used by the
+	 * memory encoder's mask_downsampler encoder chain, fuser CXBlocks
+	 * (depthwise), final out_proj and pix_feat_proj. Names use the raw
+	 * PyTorch suffix ".weight" and originate from
+	 *   tracker.maskmem_backbone.mask_downsampler.encoder.{0,3,6,9,12}.weight
+	 *   tracker.maskmem_backbone.fuser.layers.{0,1}.dwconv.weight
+	 *   tracker.maskmem_backbone.out_proj.weight
+	 *   tracker.maskmem_backbone.pix_feat_proj.weight
+	 *
+	 * After the weight_rename pass the prefix is `tracker_model.` so
+	 * we match on the maskmem_backbone substring. */
+	if (strstr(name, ".maskmem_backbone.") &&
+	    (str_ends_with(name, ".encoder.0.weight") ||
+	     str_ends_with(name, ".encoder.3.weight") ||
+	     str_ends_with(name, ".encoder.6.weight") ||
+	     str_ends_with(name, ".encoder.9.weight") ||
+	     str_ends_with(name, ".encoder.12.weight") ||
+	     str_ends_with(name, ".dwconv.weight") ||
+	     str_ends_with(name, ".out_proj.weight") ||
+	     str_ends_with(name, ".pix_feat_proj.weight")))
 		return 1;
 
 	/*
@@ -133,8 +158,10 @@ static int is_conv_transpose_weight(const char *name)
 {
 	/* FPN neck scale_layers ConvTranspose2d:
 	 * detector_model.vision_encoder.neck.fpn_layers.{i}
-	 *     .scale_layers.{j}.weight */
-	if (strstr(name, ".neck.fpn_layers.") &&
+	 *     .scale_layers.{j}.weight
+	 * Also match the sam2 second neck (.neck.sam2_fpn_layers.). */
+	if ((strstr(name, ".neck.fpn_layers.") ||
+	     strstr(name, ".neck.sam2_fpn_layers.")) &&
 	    strstr(name, ".scale_layers.") &&
 	    str_ends_with(name, ".weight"))
 		return 1;

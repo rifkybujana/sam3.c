@@ -4,14 +4,15 @@ import sam3._ffi  # noqa: F401
 
 from sam3.errors import (  # noqa: F401
     Sam3Error, InvalidArgumentError, OutOfMemoryError,
-    Sam3IOError, BackendError, ModelError, DtypeError,
+    Sam3IOError, BackendError, ModelError, DtypeError, VideoError,
 )
 from sam3.model import Model, Result  # noqa: F401
+from sam3.video import VideoSession  # noqa: F401
 
 __all__ = [
-    "Model", "Result", "Sam3Error",
+    "Model", "Result", "VideoSession", "Sam3Error",
     "InvalidArgumentError", "OutOfMemoryError", "Sam3IOError",
-    "BackendError", "ModelError", "DtypeError",
+    "BackendError", "ModelError", "DtypeError", "VideoError",
     "version", "set_log_level",
 ]
 

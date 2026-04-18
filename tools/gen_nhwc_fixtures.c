@@ -625,7 +625,8 @@ static enum sam3_error dump_mask_dec_fixture(const char *out_dir,
 	err = sam3_mask_decoder_build(&dec, &graph, keys,
 				      MD_GRID_H, MD_GRID_W,
 				      NULL, feat_s0, feat_s1,
-				      &cpu->arena, &masks, &iou);
+				      &cpu->arena, &masks, &iou, NULL,
+				      NULL, NULL);
 	if (err != SAM3_OK || !masks) {
 		sam3_log_error("mask_decoder_build failed (%d)", err);
 		return err ? err : SAM3_ENOMEM;

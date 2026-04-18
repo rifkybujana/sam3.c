@@ -638,12 +638,17 @@ static void test_prompt_encoder(void)
 }
 
 /* ── Memory attention tests ────────────────────────────────────────── */
+/*
+ * C memory_attn.c loads weights with PyTorch attribute names directly
+ * (out_proj, cross_attn_image, norm1, linear1, etc.) so the rename
+ * handler just swaps the prefix: tracker.transformer.encoder.* ->
+ * tracker_model.transformer.encoder.* with no attribute renaming.
+ */
 
 static void test_memory_attention_self_attn(void)
 {
 	struct mock_reader_state ms = {0};
 	int dims2[] = {256, 256};
-	/* PT uses out_proj -> C uses o_proj */
 	mock_add(&ms,
 		 "tracker.transformer.encoder.layers.1."
 		 "self_attn.out_proj.weight",
@@ -659,10 +664,10 @@ static void test_memory_attention_self_attn(void)
 	ASSERT_EQ(rr.ops->n_tensors(&rr), 2);
 
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.1."
-		"self_attn.o_proj.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.1."
+		"self_attn.out_proj.weight") >= 0);
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.1."
+		"tracker_model.transformer.encoder.layers.1."
 		"self_attn.q_proj.weight") >= 0);
 	rr.ops->close(&rr);
 }
@@ -671,12 +676,11 @@ static void test_memory_attention_cross_attn(void)
 {
 	struct mock_reader_state ms = {0};
 	int dims2[] = {256, 256};
-	/* cross_attn_image -> cross_attn (module rename) */
+	/* cross_attn_image passes through unchanged */
 	mock_add(&ms,
 		 "tracker.transformer.encoder.layers.0."
 		 "cross_attn_image.q_proj.weight",
 		 2, dims2);
-	/* cross_attn_image.out_proj -> cross_attn.o_proj */
 	mock_add(&ms,
 		 "tracker.transformer.encoder.layers.0."
 		 "cross_attn_image.out_proj.weight",
@@ -688,11 +692,11 @@ static void test_memory_attention_cross_attn(void)
 	ASSERT_EQ(rr.ops->n_tensors(&rr), 2);
 
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.0."
-		"cross_attn.q_proj.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.0."
+		"cross_attn_image.q_proj.weight") >= 0);
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.0."
-		"cross_attn.o_proj.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.0."
+		"cross_attn_image.out_proj.weight") >= 0);
 	rr.ops->close(&rr);
 }
 
@@ -700,7 +704,7 @@ static void test_memory_attention_norms(void)
 {
 	struct mock_reader_state ms = {0};
 	int dims1[] = {256};
-	/* PT uses norm{1..3} -> C uses layer_norm{1..3} */
+	/* norm{1..3} pass through unchanged */
 	mock_add(&ms,
 		 "tracker.transformer.encoder.layers.0.norm1.weight",
 		 1, dims1);
@@ -717,14 +721,14 @@ static void test_memory_attention_norms(void)
 	ASSERT_EQ(rr.ops->n_tensors(&rr), 3);
 
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.0."
-		"layer_norm1.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.0."
+		"norm1.weight") >= 0);
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.0."
-		"layer_norm2.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.0."
+		"norm2.weight") >= 0);
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.0."
-		"layer_norm3.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.0."
+		"norm3.weight") >= 0);
 	rr.ops->close(&rr);
 }
 
@@ -732,6 +736,7 @@ static void test_memory_attention_mlp(void)
 {
 	struct mock_reader_state ms = {0};
 	int dims2[] = {2048, 256};
+	/* linear1/linear2 pass through unchanged */
 	mock_add(&ms,
 		 "tracker.transformer.encoder.layers.0.linear1.weight",
 		 2, dims2);
@@ -746,11 +751,11 @@ static void test_memory_attention_mlp(void)
 	ASSERT_EQ(rr.ops->n_tensors(&rr), 2);
 
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.0."
-		"mlp.fc1.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.0."
+		"linear1.weight") >= 0);
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layers.0."
-		"mlp.fc2.weight") >= 0);
+		"tracker_model.transformer.encoder.layers.0."
+		"linear2.weight") >= 0);
 	rr.ops->close(&rr);
 }
 
@@ -758,7 +763,7 @@ static void test_memory_attention_top_norm(void)
 {
 	struct mock_reader_state ms = {0};
 	int dims1[] = {256};
-	/* Top-level norm (not inside layers.{i}) passes through */
+	/* Top-level layer_norm passes through unchanged */
 	mock_add(&ms,
 		 "tracker.transformer.encoder.layer_norm.weight",
 		 1, dims1);
@@ -769,7 +774,8 @@ static void test_memory_attention_top_norm(void)
 	ASSERT_EQ(rr.ops->n_tensors(&rr), 1);
 
 	ASSERT(find_output(&rr,
-		"detector_model.detr_encoder.layer_norm.weight") >= 0);
+		"tracker_model.transformer.encoder."
+		"layer_norm.weight") >= 0);
 	rr.ops->close(&rr);
 }
 

@@ -1386,125 +1386,41 @@ static int handle_prompt_encoder(struct rename_entry *out, int inner_idx,
 
 /*
  * Memory attention: tracker.transformer.encoder.*
- * -> detector_model.detr_encoder.*
+ * -> tracker_model.transformer.encoder.*
  *
- * PT has separate q/k/v_proj (not fused), so no QKV splits needed.
- * Renames: cross_attn_image->cross_attn, out_proj->o_proj,
- * norm{1..3}->layer_norm{1..3}, linear{1,2}->mlp.fc{1,2}.
+ * The C memory_attn module loads weights using the PyTorch attribute
+ * names directly (out_proj, cross_attn_image, norm1, linear1, etc.),
+ * so no attribute renaming is needed — just a prefix change.
  */
 static int handle_memory_attention(struct rename_entry *out, int inner_idx,
 				   const char *rest)
 {
 	char buf[SAM3_WEIGHT_NAME_MAX];
-	const char *prefix = "detector_model.detr_encoder.";
-	const char *r;
-
-	/* layers.{i}.* */
-	r = strip_prefix(rest, "layers.");
-	if (!r)
-		goto passthrough;
-
-	int idx, consumed;
-	if (sscanf(r, "%d.%n", &idx, &consumed) < 1)
-		goto passthrough;
-	const char *attr = r + consumed;
-
-	char lp[SAM3_WEIGHT_NAME_MAX];
-	snprintf(lp, sizeof(lp), "%slayers.%d.", prefix, idx);
-
-	/* self_attn.out_proj.X -> self_attn.o_proj.X */
-	r = strip_prefix(attr, "self_attn.out_proj.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%sself_attn.o_proj.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* cross_attn_image.out_proj.X -> cross_attn.o_proj.X */
-	r = strip_prefix(attr, "cross_attn_image.out_proj.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%scross_attn.o_proj.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* cross_attn_image.X -> cross_attn.X (general module rename,
-	 * must come after the out_proj special case above) */
-	r = strip_prefix(attr, "cross_attn_image.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%scross_attn.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* norm1.X -> layer_norm1.X */
-	r = strip_prefix(attr, "norm1.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%slayer_norm1.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* norm2.X -> layer_norm2.X */
-	r = strip_prefix(attr, "norm2.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%slayer_norm2.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* norm3.X -> layer_norm3.X */
-	r = strip_prefix(attr, "norm3.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%slayer_norm3.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* linear1.X -> mlp.fc1.X */
-	r = strip_prefix(attr, "linear1.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%smlp.fc1.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* linear2.X -> mlp.fc2.X */
-	r = strip_prefix(attr, "linear2.");
-	if (r) {
-		snprintf(buf, sizeof(buf),
-			 "%smlp.fc2.%s", lp, r);
-		return add_entry(out, inner_idx, buf);
-	}
-
-	/* Everything else (self_attn q/k/v_proj, etc.): pass through */
-	snprintf(buf, sizeof(buf), "%s%s", lp, attr);
-	return add_entry(out, inner_idx, buf);
-
-passthrough:
-	snprintf(buf, sizeof(buf), "%s%s", prefix, rest);
+	snprintf(buf, sizeof(buf),
+		 "tracker_model.transformer.encoder.%s", rest);
 	return add_entry(out, inner_idx, buf);
 }
 
-/* Memory encoder: tracker.maskmem_backbone.* (pass-through) */
+/* Memory encoder: tracker.maskmem_backbone.* -> tracker_model.maskmem_backbone.* */
 static int handle_memory_encoder(struct rename_entry *out, int inner_idx,
 				 const char *rest)
 {
 	char buf[SAM3_WEIGHT_NAME_MAX];
-	snprintf(buf, sizeof(buf), "memory_encoder.%s", rest);
+	snprintf(buf, sizeof(buf),
+		 "tracker_model.maskmem_backbone.%s", rest);
 	return add_entry(out, inner_idx, buf);
 }
 
 /*
  * Tracker misc: fallback for tracker.* keys not matched by more
  * specific prefixes (mask_downsample, no_mem_embed, etc.).
- * Pass through with original name; C model doesn't use these.
+ * Maps to tracker_model.* which tracker.c loads with WP "tracker_model.".
  */
 static int handle_tracker_misc(struct rename_entry *out, int inner_idx,
 			       const char *rest)
 {
 	char buf[SAM3_WEIGHT_NAME_MAX];
-	snprintf(buf, sizeof(buf), "tracker.%s", rest);
+	snprintf(buf, sizeof(buf), "tracker_model.%s", rest);
 	return add_entry(out, inner_idx, buf);
 }
 

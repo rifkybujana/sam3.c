@@ -7,7 +7,7 @@
  * and the full image model pipeline.
  *
  * Key types:  sam3_ctx
- * Depends on: sam3/sam3.h, model/sam3_processor.h
+ * Depends on: sam3/sam3.h, model/sam3_internal.h
  * Used by:    tools/sam3_main.c, user applications
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -26,22 +26,7 @@
 #include "core/alloc.h"
 #include "util/image.h"
 #include "util/log.h"
-#include "model/sam3_processor.h"
-#ifdef SAM3_HAS_PROFILE
-#include "util/profile.h"
-#endif
-
-/* Internal context definition. */
-struct sam3_ctx {
-	struct sam3_model_config config;
-	struct sam3_weight_file weights;
-	int loaded;
-	struct sam3_processor proc;
-	int proc_ready;
-#ifdef SAM3_HAS_PROFILE
-	struct sam3_profiler *profiler;
-#endif
-};
+#include "model/sam3_internal.h"
 
 const char *sam3_version(void)
 {
@@ -353,6 +338,16 @@ void sam3_profile_report(sam3_ctx *ctx)
 		sam3_profiler_report(ctx->profiler);
 #else
 	(void)ctx;
+#endif
+}
+
+struct sam3_profiler *sam3_profile_get(sam3_ctx *ctx)
+{
+#ifdef SAM3_HAS_PROFILE
+	return ctx ? ctx->profiler : NULL;
+#else
+	(void)ctx;
+	return NULL;
 #endif
 }
 

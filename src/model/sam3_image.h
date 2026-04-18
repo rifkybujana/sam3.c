@@ -53,6 +53,16 @@ struct sam3_image_model {
 	struct sam3_tensor *cached_feat_s0_nhwc; /* [1, 2H, 2W, d] 2x */
 	struct sam3_tensor *cached_feat_s1_nhwc; /* [1, H,  W,  d] 1x */
 	struct sam3_tensor *cached_feat_4x_nhwc; /* [1, 4H, 4W, d] 4x */
+	/*
+	 * Sam2-side neck outputs. Populated when backbone.has_sam2_neck=1.
+	 * Used by the video tracker as the input image embeddings to the
+	 * SAM mask decoder (Python's pix_feat_with_mem). The sam3-side
+	 * features above remain the source for the SAM3 detector path.
+	 */
+	struct sam3_tensor *cached_sam2_05x_nhwc; /* [1, H/2, W/2, d] 0.5x */
+	struct sam3_tensor *cached_sam2_1x_nhwc;  /* [1, H,   W,   d] 1x  */
+	struct sam3_tensor *cached_sam2_2x_nhwc;  /* [1, 2H, 2W,  d] 2x */
+	struct sam3_tensor *cached_sam2_4x_nhwc;  /* [1, 4H, 4W,  d] 4x */
 	int image_encoded;
 };
 

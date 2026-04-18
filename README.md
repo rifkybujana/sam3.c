@@ -29,6 +29,7 @@ Inspired by [ggml](https://github.com/ggerganov/ggml) and [llama.cpp](https://gi
 - **FP16 and BF16 support** — run inference in half precision for lower memory and faster compute.
 - **Custom `.sam3` weight format** — mmap-friendly binary format with O(1) tensor lookup via hash table.
 - **Full SAM3 pipeline** — image encoder (Hiera, EfficientViT, TinyViT), prompt encoder (points, boxes, masks), mask decoder, text encoder, and tokenizer.
+- **Video object tracking** — memory-based frame-by-frame propagation with point, box, and mask prompts. Supports MPEG video files and frame directories.
 - **Multiple backbones** — Hiera (full accuracy), EfficientViT-B1 (lightweight, 512px), and TinyViT-21M (128x128 masks at 1008px input).
 - **Unified CLI** — single `sam3_cli` binary with `segment`, `convert`, and `info` subcommands. Supports stdin/stdout piping, JSON output, and multi-mask color overlays.
 - **48 unit tests** — comprehensive test suite covering numerical operators, memory management, and end-to-end inference.
@@ -83,6 +84,17 @@ Download a SAM3 checkpoint in SafeTensors format, then convert to the optimized 
 # Box prompt
 ./sam3_cli segment -m models/sam3.sam3 -i photo.jpg -b 100,100,400,400 --all
 ```
+
+### Video tracking
+
+Track an object across frames of a video:
+
+```bash
+./sam3_cli track --model models/sam3.sam3 --video clip.mp4 \
+    --point 504,504,1 --frame 0 --output out/
+```
+
+Output: `out/frame_NNNNN.png` binary mask per frame.
 
 ### Inspect a Model
 

@@ -114,10 +114,15 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 	 * headroom for the FPN pixel decoder as well.
 	 */
 	int is_cpu = (proc->backend->type == SAM3_BACKEND_CPU);
-	size_t model_cap = is_cpu ? 1536UL * 1024 * 1024
-				  : 2048UL * 1024 * 1024;
-	size_t scratch_cap = is_cpu ? 2560UL * 1024 * 1024
-				    : 3072UL * 1024 * 1024;
+	/* Model arena holds weights + per-frame cached features. The video
+	 * tracker now caches BOTH sam3 and sam2 neck outputs (4 scales each:
+	 * 4x = 81 MiB, 2x = 20 MiB, 1x = 5 MiB, 0.5x = 1.3 MiB ≈ 107 MiB
+	 * per neck), so the second neck adds ~107 MiB on top of single-image
+	 * usage. Bump caps accordingly. */
+	size_t model_cap = is_cpu ? 1792UL * 1024 * 1024
+				  : 2304UL * 1024 * 1024;
+	size_t scratch_cap = is_cpu ? 3072UL * 1024 * 1024
+				    : 3584UL * 1024 * 1024;
 
 	err = sam3_arena_init(&proc->model_arena, model_cap);
 	if (err != SAM3_OK)
@@ -455,19 +460,32 @@ static void cpu_bilinear_sample_nhwc(float *out, const float *data,
 }
 
 /*
- * project_prompts - Project point/box coordinates to d_model embeddings.
+ * sam3_project_prompts - Project point/box coordinates to d_model
+ * embeddings.
  *
  * Computes three encoding paths and sums them (matching Python):
  *   1. Direct projection: Linear(2, d) on normalized coords
  *   2. Positional encoding: sinusoidal pos enc + Linear(d, d)
- *   3. Pool projection: bilinear sample from LayerNormed img feats + Linear(d, d)
+ *   3. Pool projection: bilinear sample from LayerNormed img feats +
+ *      Linear(d, d)
  * Then adds label embedding: type_embed + points_embed.
  *
  * Points use [N, 2] -> [N, d_model], boxes use [N, 4] -> [N, d_model].
  * Results are concatenated into a single [total, d_model] tensor.
+ *
+ * @model:         Loaded image model (for geom_enc weights)
+ * @feat_s1_nhwc:  Cached 1x backbone feature [1, H, W, d_model] NHWC,
+ *                 used for the pool-projection path. May be NULL; in
+ *                 that case pool projection is skipped.
+ * @prompts:       Array of point/box prompts
+ * @n_prompts:     Number of prompts
+ * @prompt_w:      Width for coord normalization
+ * @prompt_h:      Height for coord normalization
+ * @arena:         Arena for the output tensor and LN scratch
  */
-static struct sam3_tensor *project_prompts(
+struct sam3_tensor *sam3_project_prompts(
 	struct sam3_image_model *model,
+	const struct sam3_tensor *feat_s1_nhwc,
 	const struct sam3_prompt *prompts,
 	int n_prompts,
 	int prompt_w, int prompt_h,
@@ -476,7 +494,6 @@ static struct sam3_tensor *project_prompts(
 	struct sam3_geometry_encoder *enc = &model->geom_enc;
 	int d = enc->d_model;
 	int n_points, n_boxes;
-	int pi = 0, bi = 0;
 	int i;
 	float norm_w = (float)prompt_w;
 	float norm_h = (float)prompt_h;
@@ -504,10 +521,8 @@ static struct sam3_tensor *project_prompts(
 	const float *img_normed = NULL;
 	float *img_norm_buf = NULL;
 	int feat_H = 0, feat_W = 0;
-	if (n_points > 0 && enc->pool_proj_w &&
-	    model->cached_feat_s1_nhwc) {
-		const struct sam3_tensor *feat =
-			model->cached_feat_s1_nhwc;
+	if (n_points > 0 && enc->pool_proj_w && feat_s1_nhwc) {
+		const struct sam3_tensor *feat = feat_s1_nhwc;
 		/* NHWC: dims = [1, H, W, C] */
 		feat_H = feat->dims[1];
 		feat_W = feat->dims[2];
@@ -1016,9 +1031,10 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 			 * No graph/Metal needed for tiny prompt tensors.
 			 */
 			SAM3_PROF_BEGIN(proc->profiler, "prompt_project");
-			prompt_tokens = project_prompts(
-				&proc->model, prompts,
-				n_prompts,
+			prompt_tokens = sam3_project_prompts(
+				&proc->model,
+				proc->model.cached_feat_s1_nhwc,
+				prompts, n_prompts,
 				proc->prompt_w, proc->prompt_h,
 				&proc->model_arena);
 			SAM3_PROF_END(proc->profiler, "prompt_project");

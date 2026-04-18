@@ -1,19 +1,23 @@
 /*
  * src/core/tensor.c - Tensor operations
  *
- * Implements element counting, dtype sizing, and stride computation
- * for the sam3_tensor type. These are low-level utilities used by
- * the arena allocator and compute graph.
+ * Implements element counting, dtype sizing, stride computation, and
+ * deep-copy helpers for the sam3_tensor type. These are low-level
+ * utilities used by the arena allocator, compute graph, and modules
+ * that must retain tensor snapshots beyond a single graph evaluation.
  *
  * Key types:  sam3_tensor
- * Depends on: tensor.h
+ * Depends on: tensor.h, alloc.h
  * Used by:    alloc.c, graph.c, model/ files
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
+#include <string.h>
+
 #include "tensor.h"
+#include "alloc.h"
 
 int sam3_tensor_nelems(const struct sam3_tensor *t)
 {
@@ -56,4 +60,39 @@ const char *sam3_dtype_str(enum sam3_dtype dtype)
 	case SAM3_DTYPE_Q8_0: return "Q8_0";
 	}
 	return "UNKNOWN";
+}
+
+struct sam3_tensor *sam3_tensor_clone_persist(struct sam3_arena *arena,
+					      const struct sam3_tensor *src)
+{
+	struct sam3_tensor *dst;
+
+	if (!arena || !src)
+		return NULL;
+
+	dst = (struct sam3_tensor *)
+		sam3_arena_alloc(arena, sizeof(struct sam3_tensor));
+	if (!dst)
+		return NULL;
+
+	dst->dtype    = src->dtype;
+	dst->n_dims   = src->n_dims;
+	for (int i = 0; i < SAM3_MAX_DIMS; i++) {
+		dst->dims[i]    = src->dims[i];
+		dst->strides[i] = src->strides[i];
+	}
+	dst->nbytes    = src->nbytes;
+	dst->ephemeral = 0;
+
+	if (src->nbytes == 0 || !src->data) {
+		dst->data = NULL;
+		return dst;
+	}
+
+	dst->data = sam3_arena_alloc_raw(arena, src->nbytes);
+	if (!dst->data)
+		return NULL;
+
+	memcpy(dst->data, src->data, src->nbytes);
+	return dst;
 }

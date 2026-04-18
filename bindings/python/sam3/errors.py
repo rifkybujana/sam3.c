@@ -42,6 +42,11 @@ class DtypeError(Sam3Error):
     pass
 
 
+class VideoError(Sam3Error):
+    """SAM3_EVIDEO: Video tracking error."""
+    pass
+
+
 _ERROR_MAP = {
     -1: InvalidArgumentError,
     -2: OutOfMemoryError,
@@ -49,6 +54,7 @@ _ERROR_MAP = {
     -4: BackendError,
     -5: ModelError,
     -6: DtypeError,
+    -7: VideoError,
 }
 
 

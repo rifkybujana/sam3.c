@@ -442,7 +442,7 @@ struct sam3_tensor *sam3_encoder_fusion_build_layer(
 	struct sam3_tensor *ca_out;
 	ca_out = gh_cross_attention_sep(
 		g, arena,
-		x_norm, text_features,
+		x_norm, text_features, NULL,
 		enc->layers[i].ca_q_w,
 		enc->layers[i].ca_q_b,
 		enc->layers[i].ca_k_w,

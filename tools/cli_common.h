@@ -8,7 +8,7 @@
  *
  * Key types:  sam3_exit
  * Depends on: sam3/sam3_types.h, <stdio.h>, <unistd.h>
- * Used by:    tools/sam3_main.c, tools/sam3_convert.c
+ * Used by:    tools/sam3_convert.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT

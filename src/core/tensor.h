@@ -19,6 +19,8 @@
 
 #include "sam3/sam3_types.h"
 
+struct sam3_arena;
+
 struct sam3_tensor {
 	enum sam3_dtype dtype;
 	int             n_dims;
@@ -34,6 +36,16 @@ struct sam3_tensor {
 	 * data contents have changed.
 	 */
 	int             ephemeral;
+	/*
+	 * Debug: force the Metal backend to read back this intermediate
+	 * tensor's data to host memory during phase 3 of graph_eval.
+	 * Normally intermediate tensors (those consumed by later nodes)
+	 * stay GPU-resident and their ->data pointer is never populated.
+	 * Set to 1 to override and get host data for inspection/dump.
+	 * Ignored when SAM3_DEBUG_DUMP is not defined or no backend
+	 * readback is scheduled.
+	 */
+	int             dbg_force_readback;
 };
 
 /* Return the total number of elements in the tensor. */
@@ -47,5 +59,20 @@ void sam3_tensor_compute_strides(struct sam3_tensor *t);
 
 /* Return a short string name for the dtype ("F32", "F16", etc). */
 const char *sam3_dtype_str(enum sam3_dtype dtype);
+
+/*
+ * sam3_tensor_clone_persist - Deep-copy a tensor into a persistent arena.
+ *
+ * @arena: Destination arena (must outlive all uses of the returned tensor)
+ * @src:   Source tensor
+ *
+ * Allocates a new tensor header and data buffer from @arena, copies
+ * @src->nbytes of data from @src->data, and preserves dtype, dims,
+ * strides, and n_dims. The returned tensor has ephemeral=0.
+ *
+ * Returns NULL on allocation failure or if @src is NULL.
+ */
+struct sam3_tensor *sam3_tensor_clone_persist(struct sam3_arena *arena,
+					      const struct sam3_tensor *src);
 
 #endif /* SAM3_CORE_TENSOR_H */

@@ -8,7 +8,8 @@
  * Key types:  (none)
  * Depends on: cli_bench.h, cli_common.h, bench/bench.h,
  *             bench/bench_json.h, bench/bench_compare.h,
- *             bench/bench_kernels.h, bench/bench_pipeline.h
+ *             bench/bench_kernels.h, bench/bench_pipeline.h,
+ *             bench/bench_video.h
  * Used by:    tools/sam3_cli.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -23,6 +24,7 @@
 #include "bench/bench_compare.h"
 #include "bench/bench_kernels.h"
 #include "bench/bench_pipeline.h"
+#include "bench/bench_video.h"
 #include "backend/backend.h"
 
 #include <stdio.h>
@@ -186,6 +188,20 @@ int cli_bench(int argc, char **argv)
 						results + n_results,
 						SAM3_BENCH_MAX_RESULTS -
 						n_results);
+		if (n > 0)
+			n_results += n;
+
+		n = sam3_bench_run_video_frame(&cfg, ctx,
+					       results + n_results,
+					       SAM3_BENCH_MAX_RESULTS -
+					       n_results);
+		if (n > 0)
+			n_results += n;
+
+		n = sam3_bench_run_video_end_to_end(&cfg, ctx,
+						    results + n_results,
+						    SAM3_BENCH_MAX_RESULTS -
+						    n_results);
 		if (n > 0)
 			n_results += n;
 

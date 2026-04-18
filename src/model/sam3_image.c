@@ -277,6 +277,124 @@ void sam3_image_model_free(struct sam3_image_model *model)
 		sam3_vl_backbone_free(&model->backbone);
 }
 
+/*
+ * eval_neck_to_persist - Evaluate one FPN neck stage-by-stage and copy
+ * its 4 NHWC outputs into the persist arena.
+ *
+ * Identical pipeline to the inline neck evaluation in
+ * sam3_image_model_encode: wrap ViT NHWC, per-stage maxpool/conv loop,
+ * snapshot scratch outputs, then deep-copy to persist. Used to evaluate
+ * both the sam3 neck (detector path) and the optional sam2 neck (video
+ * tracker path) from the same ViT output.
+ */
+static enum sam3_error eval_neck_to_persist(
+	struct sam3_neck *neck,
+	struct sam3_tensor *vit_out,
+	struct sam3_backend *be,
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_tensor *out_pfn[4])
+{
+	enum sam3_error err;
+	int C = neck->backbone_dim;
+	int gs = neck->grid_size;
+	int HW = gs * gs;
+	int nhwc_dims[] = {1, gs, gs, C};
+	size_t nhwc_bytes = (size_t)C * HW * sizeof(float);
+	struct sam3_tensor *stage_out_nhwc[4] = {0};
+
+	for (int si = 0; si < neck->n_scales; si++) {
+		void *stage_nhwc = sam3_arena_alloc(scratch, nhwc_bytes);
+		if (!stage_nhwc)
+			return SAM3_ENOMEM;
+		memcpy(stage_nhwc, vit_out->data, nhwc_bytes);
+
+		struct sam3_tensor *nhwc_in;
+		nhwc_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+					  4, nhwc_dims, stage_nhwc);
+		if (!nhwc_in)
+			return SAM3_ENOMEM;
+
+		struct sam3_tensor *x = nhwc_in;
+
+		if (neck->stages[si].has_maxpool) {
+			struct sam3_graph g_stage;
+			sam3_graph_init(&g_stage);
+			x = gh_maxpool2d(&g_stage, scratch, x, 2, 2);
+			if (!x)
+				return SAM3_ENOMEM;
+			err = be->ops->graph_eval(be, &g_stage);
+			if (err != SAM3_OK)
+				return err;
+			x = gh_tensor_wrap(scratch, x->dtype,
+				x->n_dims, x->dims, x->data);
+			if (!x)
+				return SAM3_ENOMEM;
+		}
+
+		for (int j = 0; j < neck->stages[si].n_convs; j++) {
+			struct sam3_graph g_stage;
+			sam3_graph_init(&g_stage);
+			int k = neck->stages[si].kernel_size[j];
+			int pad = (k == 3) ? 1 : 0;
+
+			if (neck->stages[si].is_transpose[j]) {
+				x = gh_conv_transpose2d(&g_stage, scratch, x,
+					neck->stages[si].conv_w[j],
+					neck->stages[si].conv_b[j],
+					2, 0);
+			} else {
+				x = gh_conv2d(&g_stage, scratch, x,
+					neck->stages[si].conv_w[j],
+					neck->stages[si].conv_b[j],
+					1, pad, 1);
+			}
+			if (!x)
+				return SAM3_ENOMEM;
+
+			if (neck->stages[si].gelu_after[j]) {
+				x = gh_gelu(&g_stage, scratch, x);
+				if (!x)
+					return SAM3_ENOMEM;
+			}
+
+			err = be->ops->graph_eval(be, &g_stage);
+			if (err != SAM3_OK)
+				return err;
+
+			x = gh_tensor_wrap(scratch, x->dtype,
+				x->n_dims, x->dims, x->data);
+			if (!x)
+				return SAM3_ENOMEM;
+		}
+
+		int sH = x->dims[1];
+		int sW = x->dims[2];
+		int sC = x->dims[3];
+		int nhwc_dims_out[] = {1, sH, sW, sC};
+
+		stage_out_nhwc[si] = gh_alloc_tensor(
+			scratch, x->dtype, 4, nhwc_dims_out);
+		if (!stage_out_nhwc[si])
+			return SAM3_ENOMEM;
+		memcpy(stage_out_nhwc[si]->data, x->data,
+		       stage_out_nhwc[si]->nbytes);
+	}
+
+	for (int si = 0; si < 4; si++) {
+		out_pfn[si] = gh_alloc_tensor(persist,
+			stage_out_nhwc[si]->dtype,
+			stage_out_nhwc[si]->n_dims,
+			stage_out_nhwc[si]->dims);
+		if (!out_pfn[si])
+			return SAM3_ENOMEM;
+		memcpy(out_pfn[si]->data, stage_out_nhwc[si]->data,
+		       stage_out_nhwc[si]->nbytes);
+	}
+
+	return SAM3_OK;
+}
+
 enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 					struct sam3_backend *be,
 					struct sam3_tensor *image,
@@ -589,6 +707,33 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 		dump_tensor("/tmp/dbg_neck_2x.bin", pfn[1]);
 		dump_tensor("/tmp/dbg_neck_1x.bin", pfn[2]);
 		dump_tensor("/tmp/dbg_neck_05x.bin", pfn[3]);
+
+		/*
+		 * Run the second (sam2) neck if loaded. The video tracker's
+		 * SAM mask decoder consumes sam2 features as its image
+		 * embeddings (Python pix_feat_with_mem). The sam3 features
+		 * above continue to feed the SAM3 detector path.
+		 */
+		if (model->backbone.has_sam2_neck) {
+			sam3_arena_reset(scratch);
+			struct sam3_tensor *spfn[4];
+			err = eval_neck_to_persist(
+				&model->backbone.sam2_neck, vit_out, be,
+				scratch, persist, spfn);
+			if (err != SAM3_OK) {
+				sam3_log_error("encode: sam2_neck eval "
+					       "failed (%d)", err);
+				return err;
+			}
+			model->cached_sam2_4x_nhwc  = spfn[0];
+			model->cached_sam2_2x_nhwc  = spfn[1];
+			model->cached_sam2_1x_nhwc  = spfn[2];
+			model->cached_sam2_05x_nhwc = spfn[3];
+			dump_tensor("/tmp/dbg_sam2_4x.bin", spfn[0]);
+			dump_tensor("/tmp/dbg_sam2_2x.bin", spfn[1]);
+			dump_tensor("/tmp/dbg_sam2_1x.bin", spfn[2]);
+			dump_tensor("/tmp/dbg_sam2_05x.bin", spfn[3]);
+		}
 
 		sam3_log_debug("encode: cached features (NHWC): "
 			       "main [%d,%d,%d,%d] "

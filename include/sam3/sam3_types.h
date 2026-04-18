@@ -30,6 +30,7 @@ enum sam3_error {
 	SAM3_EBACKEND = -4,  /* Backend initialization failed */
 	SAM3_EMODEL   = -5,  /* Model format error */
 	SAM3_EDTYPE   = -6,  /* Unsupported or mismatched dtype */
+	SAM3_EVIDEO   = -7,  /* Video tracking error */
 };
 
 /* Log severity levels. */
@@ -121,7 +122,21 @@ struct sam3_model_config {
 	int backbone_type;    /* enum sam3_backbone_type */
 };
 
+/* Propagation direction for video tracking. */
+enum sam3_propagate_dir {
+	SAM3_PROPAGATE_BOTH     = 0,
+	SAM3_PROPAGATE_FORWARD  = 1,
+	SAM3_PROPAGATE_BACKWARD = 2,
+};
+
+#define SAM3_MAX_OBJECTS         16   /* per-session object cap; matches Python multiplex bucket */
+#define SAM3_MAX_MEMORY_FRAMES   16
+#define SAM3_MAX_POINTS_PER_OBJ  16
+
 /* Opaque context handle. */
 typedef struct sam3_ctx sam3_ctx;
+
+/* Opaque video session handle. */
+typedef struct sam3_video_session sam3_video_session;
 
 #endif /* SAM3_TYPES_H */

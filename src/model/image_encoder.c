@@ -595,6 +595,20 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 
 	/* Copy result to persistent buffer */
 	memcpy(x_buf, x->data, x_bytes);
+#ifdef SAM3_DEBUG_DUMP
+	{
+		FILE *fp = fopen("/tmp/dbg_vit_patch.bin", "wb");
+		if (fp) {
+			int n_elt = 1;
+			for (int i = 0; i < x->n_dims; i++)
+				n_elt *= x->dims[i];
+			fwrite(x->data, sizeof(float), (size_t)n_elt, fp);
+			fclose(fp);
+			sam3_log_info("dump: wrote /tmp/dbg_vit_patch.bin "
+				      "(%d floats)", n_elt);
+		}
+	}
+#endif
 
 	sam3_log_info("vit: patch embedding + pos_embed + ln_pre evaluated "
 		      "(%d patches)", np);
@@ -622,6 +636,12 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 		size_t block_bytes = (size_t)np * vit->mlp_dim * 4 * 3;
 		int batch = (skip_data || block_bytes < 256UL * 1024 * 1024)
 			  ? 4 : 2;
+#ifdef SAM3_DEBUG_DUMP
+		/* Force batch=1 + host-side readback so we can dump after
+		 * every ViT block. Slow but diagnostic. */
+		batch = 1;
+		skip_data = 0;
+#endif
 
 		/*
 		 * GPU-resident forwarding tensor. Allocated in
@@ -830,6 +850,33 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 
 			if (!skip_data)
 				memcpy(x_buf, x->data, x_bytes);
+#ifdef SAM3_DEBUG_DUMP
+			/* Dump selected blocks for Python parity diff.
+			 * `end-1` is the block index we just finished. */
+			{
+				int done = end - 1;
+				if (done == 0 || done == 3 || done == 7 ||
+				    done == 11 || done == 13 || done == 14 ||
+				    done == 15 || done == 16 || done == 17 ||
+				    done == 19 || done == 23 || done == 27 ||
+				    done == 31) {
+					char p[128];
+					snprintf(p, sizeof(p),
+						 "/tmp/dbg_vit_block%02d.bin",
+						 done);
+					FILE *fp = fopen(p, "wb");
+					if (fp) {
+						int n = np * e;
+						fwrite(x_buf, sizeof(float),
+						       (size_t)n, fp);
+						fclose(fp);
+						sam3_log_info("dump: wrote %s "
+							      "(%d floats)",
+							      p, n);
+					}
+				}
+			}
+#endif
 		}
 	}
 	SAM3_PROF_END(profiler, "vit_blocks");

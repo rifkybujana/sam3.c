@@ -16,6 +16,7 @@ ffi.cdef("""
         SAM3_EBACKEND = -4,
         SAM3_EMODEL   = -5,
         SAM3_EDTYPE   = -6,
+        SAM3_EVIDEO   = -7,
     };
 
     /* Prompt types */
@@ -117,4 +118,41 @@ ffi.cdef("""
 
     /* Debug */
     enum sam3_error sam3_dump_tensors(sam3_ctx *ctx, const char *out_dir);
+
+    /* Video tracking */
+    enum sam3_propagate_dir {
+        SAM3_PROPAGATE_BOTH     = 0,
+        SAM3_PROPAGATE_FORWARD  = 1,
+        SAM3_PROPAGATE_BACKWARD = 2,
+    };
+
+    typedef struct sam3_video_session sam3_video_session;
+
+    typedef int (*sam3_video_frame_cb)(int frame_idx,
+                                       const struct sam3_result *result,
+                                       int n_objects,
+                                       const int *obj_ids,
+                                       void *user_data);
+
+    enum sam3_error sam3_video_start(sam3_ctx *ctx,
+                                     const char *resource_path,
+                                     sam3_video_session **out_session);
+    enum sam3_error sam3_video_add_points(sam3_video_session *session,
+                                          int frame_idx, int obj_id,
+                                          const struct sam3_point *points,
+                                          int n_points,
+                                          struct sam3_result *result);
+    enum sam3_error sam3_video_add_box(sam3_video_session *session,
+                                       int frame_idx, int obj_id,
+                                       const struct sam3_box *box,
+                                       struct sam3_result *result);
+    enum sam3_error sam3_video_propagate(sam3_video_session *session,
+                                         int direction,
+                                         sam3_video_frame_cb callback,
+                                         void *user_data);
+    enum sam3_error sam3_video_remove_object(sam3_video_session *session,
+                                             int obj_id);
+    enum sam3_error sam3_video_reset(sam3_video_session *session);
+    void sam3_video_end(sam3_video_session *session);
+    int sam3_video_frame_count(const sam3_video_session *session);
 """)

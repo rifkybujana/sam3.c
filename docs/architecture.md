@@ -1892,14 +1892,115 @@ cd build && ctest --output-on-failure
 
 ---
 
-## 10. What is *not* implemented
+## 10. Video Tracker
+
+The video tracker implements the `Sam3TrackerPredictor` from the
+reference Python implementation and is exposed through the
+`sam3_video_*` API in `include/sam3/sam3.h`. It reuses the image
+encoder and mask decoder already described above, and adds a memory
+attention module, memory encoder, and memory bank for per-frame
+propagation.
+
+### 10.1 Data flow
+
+```
+Frame N pixels
+    |
+    v
++-------------------+     Reused: sam3_image_model backbone
+| Image Encoder     |     (ViT + Neck, features cached per frame
+| (ViT + Neck)      |     in the session's persist arena)
++--------+----------+
+         | backbone features [72x72, 256]
+         v
++-------------------+     NEW: 4-layer RoPE cross-attention
+| Memory Attention  |     between current features and the
+| (4-layer xformer) |     memory bank of past frames
++--------+----------+
+         | memory-conditioned features
+         v
++-------------------+     Reused: SAM prompt encoder + mask
+| SAM Prompt Enc    |     decoder (extended with an object
+| + Mask Decoder    |     token output for pointer tracking)
++--------+----------+
+         | mask logits + obj pointer tokens
+         v
++-------------------+     NEW: fuse predicted mask with pixel
+| Memory Encoder    |     features into compact memory tokens
+| (ConvNeXt fuser)  |
++--------+----------+
+         | memory tokens + obj pointers
+         v
++-------------------+     NEW: FIFO ring buffer + SAM3-Long
+| Memory Bank       |     selection (see 10.2). Conditioning
+| (ring buffer)     |     frames are stored separately.
++---------+---------+
+```
+
+The image backbone is run once per frame (matching
+`forward_backbone_per_frame_for_eval=True` upstream). All objects
+share the same backbone features; masks are stacked per-object
+through the memory encoder.
+
+### 10.2 Memory bank policy
+
+* **Capacity.** Each object keeps `num_maskmem - 1 = 6` non-conditioning
+  frame memories in a FIFO ring buffer. Conditioning frames are stored
+  separately (up to `SAM3_MAX_MEMORY_FRAMES = 16` entries) and never
+  evicted; at attention time the `max_cond_frames_in_attn = 4` closest
+  cond frames are selected, matching Python's `max_cond_frames_in_attn`.
+  Conditioning frames are the frames where the user supplied a prompt
+  via `sam3_video_add_points` / `sam3_video_add_box`; the session
+  tracks them with a bitmap.
+* **SAM3-Long selection.** Frames where *every* tracked object has
+  a predicted score below `mf_threshold = 0.01` are skipped and
+  not admitted to the ring buffer.
+* **Temporal stride.** When the stride `r > 1`, the bank keeps
+  every `r`-th frame plus the most recent frame, which preserves
+  long-range context without growing memory.
+* **Object pointers.** Up to 16 object pointer tokens feed into the
+  memory attention alongside the spatial memory tokens.
+
+### 10.3 Limits
+
+* `SAM3_MAX_OBJECTS = 64` simultaneous tracked objects per session.
+* `SAM3_MAX_POINTS_PER_OBJ` points per object per prompt call.
+* At most 16 object pointers are consumed by memory attention.
+* In practice the session is capped at roughly 200 frames: each
+  frame caches 72x72x256 F32 backbone features (~5 MiB), so the
+  persist arena sits at ~1 GiB at that length.
+* The tracker is single-threaded per session — concurrent sessions
+  are supported, but a single session does not parallelise across
+  frames. This is a documented non-goal.
+* Video I/O: MPEG1/2 is decoded via the bundled `pl_mpeg` backend,
+  and a directory of JPEG/PNG frames is accepted as an alternative
+  source (frames are decoded via `stb_image`).
+
+### 10.4 Public API
+
+All tracker entry points live in `include/sam3/sam3.h`:
+
+* `sam3_video_start` / `sam3_video_end` / `sam3_video_reset`
+* `sam3_video_add_points` / `sam3_video_add_box`
+* `sam3_video_propagate` with a per-frame callback
+* `sam3_video_remove_object` / `sam3_video_frame_count`
+
+Propagation direction is selected with the constants
+`SAM3_PROPAGATE_BOTH`, `SAM3_PROPAGATE_FORWARD`, and
+`SAM3_PROPAGATE_BACKWARD` (see `include/sam3/sam3_types.h`).
+
+### 10.5 Python binding
+
+`python/sam3/video.py` provides `VideoSession`, a context-manager
+wrapper over the C API that mirrors the lifecycle calls above.
+
+---
+
+## 11. What is *not* implemented
 
 To keep the documentation honest, these items from the upstream SAM3
 are **absent** from the C engine today:
 
-* **Video / memory tracking** — `memory_attn.[ch]` exists as a stub,
-  but the video head and per-frame memory updates are not wired up.
-  Only image inference runs end-to-end.
 * **Causal masking in the text encoder** — `sam3_text_encoder_build`
   notes this explicitly; short prompts still give usable outputs.
 * **Training-only modules** — e.g. the matching loss and Hungarian

@@ -7,7 +7,8 @@
  *
  * Key types:  (none -- uses sam3_tensor, sam3_graph, sam3_arena)
  * Depends on: core/graph.h, core/alloc.h, core/tensor.h, core/weight.h
- * Used by:    model/ files (vitdet.c, text_encoder.c, decoder.c, etc.)
+ * Used by:    model/ files (vitdet.c, text_encoder.c, decoder.c,
+ *             tracker.c, etc.)
  *
  * Copyright (c) 2026
  * SPDX-License-Identifier: MIT
@@ -20,6 +21,16 @@
 #include "core/alloc.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+
+/*
+ * Opaque forward declarations to avoid pulling model-layer memory_bank.h
+ * into this otherwise core-facing header. The full definitions are in
+ * model/memory_bank.h and are only needed by the tracker-specific helpers
+ * below (gh_concat_mem, gh_tpos_enc_mem, gh_concat_obj_ptrs,
+ * gh_obj_ptrs_tpos_sine).
+ */
+struct sam3_memory_bank;
+struct sam3_memory_bank_view;
 
 /*
  * gh_alloc_tensor - Allocate a tensor with given shape from the arena.
@@ -444,11 +455,16 @@ struct sam3_tensor *gh_cross_attention(
  *
  * Like gh_cross_attention but takes separate K and V weight/bias tensors
  * instead of a packed [2*d_model, d_model] KV tensor.
+ *
+ * @k_src: Optional separate source for K projection. When non-NULL, K is
+ *         projected from k_src while V is projected from kv_src. When NULL,
+ *         both K and V are projected from kv_src (standard behavior).
  */
 struct sam3_tensor *gh_cross_attention_sep(
 	struct sam3_graph *g, struct sam3_arena *arena,
 	struct sam3_tensor *q_src,
 	struct sam3_tensor *kv_src,
+	struct sam3_tensor *k_src,
 	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
 	struct sam3_tensor *k_w, struct sam3_tensor *k_b,
 	struct sam3_tensor *v_w, struct sam3_tensor *v_b,
@@ -551,5 +567,141 @@ struct sam3_tensor *gh_conv_transpose2d(struct sam3_graph *g,
 struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 				 struct sam3_tensor *input,
 				 int kernel_size, int stride);
+
+/* --- Tracker memory helpers --- */
+
+/*
+ * gh_concat_mem - Concatenate spatial features from a bank view along
+ *                 axis 0.
+ *
+ * @g:    Graph to build into
+ * @a:    Arena for intermediate tensors and the output concat node
+ * @view: Memory bank view (conditioning selection + full non_cond ring)
+ *
+ * Walks the selected conditioning frames first (in view->cond_idx order),
+ * then non-conditioning frames in storage order, skipping any entry
+ * with a NULL spatial_features. Produces a single [total_spatial,
+ * mem_dim] tensor. Returns NULL if the view has no usable spatial
+ * features or if concat fails.
+ */
+struct sam3_tensor *gh_concat_mem(struct sam3_graph *g,
+				  struct sam3_arena *a,
+				  const struct sam3_memory_bank_view *view);
+
+/*
+ * gh_tpos_enc_mem - Build temporal position encoding for memory tokens.
+ *
+ * @g:                 Graph (unused -- the result is a concrete tensor)
+ * @a:                 Arena for the output tensor data
+ * @bank:              Memory bank whose entries define the layout
+ * @tpos_table:        maskmem_tpos_enc [num_maskmem, 1, 1, mem_dim]
+ * @current_frame_idx: Frame index being tracked (unused by the slot
+ *                     formula; kept for API symmetry with the obj-ptr
+ *                     temporal encoder and for future per-frame logic)
+ *
+ * Allocates a [total_spatial, mem_dim] F32 tensor and fills it by
+ * broadcasting the selected temporal slot from tpos_table across all
+ * HW spatial positions of each memory entry (cond first, then
+ * non_cond, skipping entries with NULL spatial_features).
+ *
+ * Slot selection matches Python sam3_tracker_base.py:614-676:
+ *   - Cond frames map to slot = num_maskmem - 1 (the anchor slot).
+ *   - Non-cond frames occupy window positions t_pos = 1..num_maskmem-1
+ *     (newest = num_maskmem-1, oldest = 1) and map to
+ *     slot = num_maskmem - 1 - t_pos. The bank stores non_cond[0] as
+ *     the oldest entry and non_cond[n-1] as the newest, so entry i
+ *     binds to slot = n_non_cond - 1 - i (clamped to [0, num_maskmem-2]).
+ *
+ * Returns NULL if the bank is empty of spatial features or if
+ * allocation fails.
+ */
+struct sam3_tensor *gh_tpos_enc_mem(struct sam3_graph *g,
+				    struct sam3_arena *a,
+				    const struct sam3_memory_bank_view *view,
+				    struct sam3_tensor *tpos_table,
+				    int current_frame_idx);
+
+/*
+ * gh_concat_obj_ptrs - Concatenate object pointers reshaped to mem_dim.
+ *
+ * @g:            Graph to build into
+ * @a:            Arena for intermediate tensors
+ * @bank:         Memory bank with per-entry obj_pointer
+ * @max_obj_ptrs: Upper bound on the total number of obj_pointer rows
+ *                (pre-reshape) included in the result
+ *
+ * Each entry's obj_pointer tensor is expected to have shape
+ * [1, hidden_dim=256]. It is reshaped to
+ * [1 * (hidden_dim/mem_dim), mem_dim=64] (i.e. split every 256-D
+ * pointer into 4 chunks of 64) and stacked along axis 0. Entries
+ * with NULL obj_pointer are skipped. Returns NULL when no entry
+ * contributes any obj_pointer.
+ */
+struct sam3_tensor *gh_concat_obj_ptrs(struct sam3_graph *g,
+				       struct sam3_arena *a,
+				       const struct sam3_memory_bank_view *view,
+				       int max_obj_ptrs);
+
+/*
+ * gh_obj_ptrs_tpos_sine - Build 1D sine temporal position encoding
+ *                        for object pointer memory tokens.
+ *
+ * @g:                 Graph (unused — result is a concrete arena tensor)
+ * @a:                 Arena for the output tensor
+ * @bank:              Memory bank, iterated in the same order as
+ *                     gh_concat_obj_ptrs (cond pass then non_cond pass,
+ *                     within each pass entries visited newest-first,
+ *                     then the final ordering is reversed to match the
+ *                     row ordering of gh_concat_obj_ptrs).
+ * @max_obj_ptrs:      Upper bound on pre-split rows, used as
+ *                     max_abs_pos for the normalized temporal distance
+ *                     (matches Python's max_obj_ptrs_in_encoder=16).
+ * @current_frame_idx: Frame being tracked.
+ * @hidden_dim:        Sine PE dimension (typically 256, matches
+ *                     obj_ptr_tpos_proj input dim).
+ *
+ * Each contributing entry contributes (hidden_dim / 64) = 4 rows of
+ * the same PE (one per split chunk). The sine PE follows
+ * `get_1d_sine_pe` from sam3_tracker_utils.py: pairs of
+ * sin/cos frequencies at temperature=10000.
+ *
+ * Caller then applies gh_linear(obj_ptr_tpos_proj_w, _b) to get
+ * [total_rows, mem_dim=64] ready to concat with the spatial
+ * memory position encoding.
+ *
+ * Returns NULL if the bank has no contributing entries.
+ */
+struct sam3_tensor *gh_obj_ptrs_tpos_sine(
+	struct sam3_graph *g,
+	struct sam3_arena *a,
+	const struct sam3_memory_bank_view *view,
+	int max_obj_ptrs,
+	int current_frame_idx,
+	int hidden_dim);
+
+/*
+ * gh_concat_rows - Concatenate two tensors along axis 0.
+ *
+ * Thin wrapper around gh_concat with n=2 and axis=0. If either input
+ * is NULL, returns the other input unchanged (no graph node emitted).
+ */
+struct sam3_tensor *gh_concat_rows(struct sam3_graph *g,
+				   struct sam3_arena *a,
+				   struct sam3_tensor *x,
+				   struct sam3_tensor *y);
+
+/*
+ * gh_zeros_like - Allocate a zero-initialized tensor matching src.
+ *
+ * @g:   Graph (unused; kept for API symmetry)
+ * @a:   Arena to allocate the output from
+ * @src: Template tensor; the result has the same dtype, n_dims, and
+ *       dims.
+ *
+ * Returns NULL if src is NULL or the arena is full.
+ */
+struct sam3_tensor *gh_zeros_like(struct sam3_graph *g,
+				  struct sam3_arena *a,
+				  struct sam3_tensor *src);
 
 #endif /* SAM3_MODEL_GRAPH_HELPERS_H */

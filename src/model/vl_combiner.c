@@ -100,18 +100,17 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 		return err;
 
 	/*
-	 * EfficientSAM3 checkpoints carry a second FPN (sam2_fpn_layers)
-	 * used by the tracker. Init with same config; loading will
-	 * pick up the sam2_fpn_layers.* tensors if present.
+	 * SAM3 checkpoints carry a second FPN (sam2_fpn_layers, originally
+	 * named sam2_convs in the .pt) used by the video tracker's mask
+	 * decoder. The HIERA, EfficientViT, and TinyViT backbones all have
+	 * this dual-neck structure. The video tracker requires sam2
+	 * features as the input image embeddings to the SAM mask decoder.
 	 */
-	if (backbone_type == SAM3_BACKBONE_EFFICIENTVIT ||
-	    backbone_type == SAM3_BACKBONE_TINYVIT) {
-		err = sam3_neck_init(&vl->sam2_neck, 256, backbone_dim,
-				      grid_size, 4, scales);
-		if (err != SAM3_OK)
-			return err;
-		vl->has_sam2_neck = 1;
-	}
+	err = sam3_neck_init(&vl->sam2_neck, 256, backbone_dim,
+			      grid_size, 4, scales);
+	if (err != SAM3_OK)
+		return err;
+	vl->has_sam2_neck = 1;
 
 	/* Init tokenizer (byte-level fallback vocab) */
 	err = sam3_tokenizer_init(&vl->tokenizer);
@@ -235,12 +234,39 @@ void sam3_vl_backbone_free(struct sam3_vl_backbone *vl)
 		sam3_tokenizer_free(&vl->tokenizer);
 }
 
+struct sam3_tensor *sam3_vl_backbone_build_vision_dual(
+	struct sam3_vl_backbone *vl,
+	struct sam3_graph *g,
+	struct sam3_backend *be,
+	struct sam3_tensor *image,
+	struct sam3_tensor *out_features[],
+	struct sam3_tensor *sam2_features[],
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_profiler *profiler);
+
 struct sam3_tensor *sam3_vl_backbone_build_vision(
 	struct sam3_vl_backbone *vl,
 	struct sam3_graph *g,
 	struct sam3_backend *be,
 	struct sam3_tensor *image,
 	struct sam3_tensor *out_features[],
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_profiler *profiler)
+{
+	return sam3_vl_backbone_build_vision_dual(
+		vl, g, be, image, out_features, NULL,
+		scratch, persist, profiler);
+}
+
+struct sam3_tensor *sam3_vl_backbone_build_vision_dual(
+	struct sam3_vl_backbone *vl,
+	struct sam3_graph *g,
+	struct sam3_backend *be,
+	struct sam3_tensor *image,
+	struct sam3_tensor *out_features[],
+	struct sam3_tensor *sam2_features[],
 	struct sam3_arena *scratch,
 	struct sam3_arena *persist,
 	struct sam3_profiler *profiler)
@@ -295,6 +321,17 @@ struct sam3_tensor *sam3_vl_backbone_build_vision(
 
 	sam3_log_debug("vl_backbone: neck built, scratch %zu/%zu, %d nodes",
 		       scratch->offset, scratch->size, g->n_nodes);
+
+	if (sam2_features && vl->has_sam2_neck) {
+		err = sam3_neck_build(&vl->sam2_neck, g, enc_out,
+				      sam2_features, scratch);
+		if (err != SAM3_OK) {
+			sam3_log_error("vl_backbone: sam2_neck_build failed");
+			return NULL;
+		}
+		sam3_log_debug("vl_backbone: sam2_neck built, scratch %zu/%zu, %d nodes",
+			       scratch->offset, scratch->size, g->n_nodes);
+	}
 
 	return enc_out;
 }

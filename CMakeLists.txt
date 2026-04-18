@@ -16,6 +16,20 @@ option(SAM3_DEBUG_DUMP "Enable debug tensor dumps to /tmp" OFF)
 option(SAM3_BLAS    "Use BLAS for CPU matmul (Accelerate/OpenBLAS/MKL)" ON)
 option(SAM3_BENCH   "Build benchmarking harness" OFF)
 option(SAM3_SHARED  "Build shared library" OFF)
+option(SAM3_FIXTURE_TESTS
+	"Register tests that require Python-generated fixtures" OFF)
+option(SAM3_E2E_TESTS
+	"Build end-to-end video integration tests" OFF)
+option(SAM3_BUILD_PARITY_TESTS
+	"Build end-to-end Python-parity tests (requires fixtures)" OFF)
+set(SAM3_TEST_MODEL "" CACHE STRING
+	"Path to a .sam3 model file used by E2E tests")
+
+if(SAM3_E2E_TESTS AND NOT SAM3_TEST_MODEL)
+	message(FATAL_ERROR
+		"SAM3_E2E_TESTS=ON requires "
+		"-DSAM3_TEST_MODEL=/abs/path/to/model.sam3")
+endif()
 
 # Auto-detect Metal on macOS
 if(APPLE AND NOT DEFINED SAM3_METAL)
@@ -46,6 +60,10 @@ endif()
 
 if(SAM3_DEBUG_DUMP)
 	add_definitions(-DSAM3_DEBUG_DUMP)
+endif()
+
+if(SAM3_METAL_F32_MATMUL)
+	add_definitions(-DSAM3_METAL_F32_MATMUL)
 endif()
 
 if(SAM3_BLAS)
@@ -169,6 +187,7 @@ add_executable(sam3_cli
 	tools/sam3_cli.c
 	tools/cli_common.c
 	tools/cli_segment.c
+	tools/cli_track.c
 	tools/cli_convert.c
 	tools/cli_info.c
 	tools/weight_rename.c
@@ -187,6 +206,18 @@ target_link_libraries(gen_nhwc_fixtures sam3)
 if(SAM3_TESTS)
 	enable_testing()
 	file(GLOB TEST_SOURCES "tests/test_*.c")
+	if(NOT SAM3_FIXTURE_TESTS)
+		list(REMOVE_ITEM TEST_SOURCES
+			${CMAKE_SOURCE_DIR}/tests/test_tracker_fixtures.c)
+	endif()
+	if(NOT SAM3_E2E_TESTS)
+		list(REMOVE_ITEM TEST_SOURCES
+			${CMAKE_SOURCE_DIR}/tests/test_video_e2e.c)
+	endif()
+	if(NOT SAM3_BUILD_PARITY_TESTS)
+		list(REMOVE_ITEM TEST_SOURCES
+			${CMAKE_SOURCE_DIR}/tests/test_video_parity_kids.c)
+	endif()
 	foreach(test_src ${TEST_SOURCES})
 		get_filename_component(test_name ${test_src} NAME_WE)
 		add_executable(${test_name} ${test_src})
@@ -241,6 +272,45 @@ if(SAM3_TESTS)
 		target_sources(test_cli_common PRIVATE tools/cli_common.c)
 		target_include_directories(test_cli_common PRIVATE
 			${CMAKE_SOURCE_DIR}/tools)
+	endif()
+
+	# test_cli_track needs tools/ include path and cli_track.c
+	if(TARGET test_cli_track)
+		target_sources(test_cli_track PRIVATE
+			tools/cli_track.c)
+		target_include_directories(test_cli_track PRIVATE
+			${CMAKE_SOURCE_DIR}/tools)
+	endif()
+
+	# test_video_io needs source dir for test data
+	if(TARGET test_video_io)
+		target_compile_definitions(test_video_io PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
+	# test_video_api needs source dir for model path and fixture data
+	if(TARGET test_video_api)
+		target_compile_definitions(test_video_api PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
+	# test_tracker_fixtures needs source dir for fixture paths
+	if(TARGET test_tracker_fixtures)
+		target_compile_definitions(test_tracker_fixtures PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
+	# test_video_e2e needs the model path at build time
+	if(TARGET test_video_e2e)
+		target_compile_definitions(test_video_e2e PRIVATE
+			SAM3_TEST_MODEL="${SAM3_TEST_MODEL}")
+	endif()
+
+	# test_video_parity_kids needs source dir and model path at build time
+	if(TARGET test_video_parity_kids)
+		target_compile_definitions(test_video_parity_kids PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+			SAM3_TEST_MODEL="${SAM3_TEST_MODEL}")
 	endif()
 
 	# test_bench needs the bench harness library
