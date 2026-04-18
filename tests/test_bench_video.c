@@ -14,11 +14,13 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "test_helpers.h"
 #include "bench/bench.h"
 #include "bench/bench_video.h"
-
-#include <string.h>
 
 /* --- test_bounce_stays_in_bounds --- */
 
@@ -41,10 +43,6 @@ static void test_bounce_starts_at_zero(void)
 }
 
 /* --- test_generate_clip_128_frames --- */
-
-#include <stdio.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 static void test_generate_clip_128_frames(void)
 {
