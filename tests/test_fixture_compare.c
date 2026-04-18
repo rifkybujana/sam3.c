@@ -850,6 +850,123 @@ cleanup:
 	free(py_logits);
 }
 
+/* ── Test: SAM 3.1 bus/person text-only (full API) ────────────────────── */
+
+#define SAM3_1_BUS_FIXTURE_DIR \
+	SAM3_SOURCE_DIR "/tests/fixtures/sam3_1_bus_person"
+#define SAM3_1_MODEL_PATH SAM3_SOURCE_DIR "/models/sam3.1.sam3"
+
+static int sam3_1_fixtures_available(void)
+{
+	return access(SAM3_1_BUS_FIXTURE_DIR "/metadata.json", F_OK) == 0
+	    && access(SAM3_1_MODEL_PATH, F_OK) == 0;
+}
+
+static void test_bus_person_sam3_1(void)
+{
+	float *py_masks = NULL;
+	float *py_logits = NULL;
+	int msk_ndims, msk_dims[SAM3_MAX_DIMS], msk_nelems;
+	int log_nelems;
+	struct sam3_result result;
+	struct sam3_prompt prompt;
+	enum sam3_error err;
+	sam3_ctx *ctx = NULL;
+
+	printf("\ntest_bus_person_sam3_1: ");
+	if (!sam3_1_fixtures_available()) {
+		printf("SKIP (fixture or model missing)\n");
+		return;
+	}
+	printf("\n");
+
+	memset(&result, 0, sizeof(result));
+
+	/* Load fixture masks from 10_final */
+	py_masks = load_fixture_tensor(
+		SAM3_1_BUS_FIXTURE_DIR "/10_final/tensors.safetensors",
+		"pred_masks", &msk_ndims, msk_dims, &msk_nelems);
+	ASSERT(py_masks != NULL);
+	if (!py_masks)
+		return;
+
+	/* Load fixture pred_logits [1, 200, 1] */
+	py_logits = load_fixture_tensor(
+		SAM3_1_BUS_FIXTURE_DIR "/10_final/tensors.safetensors",
+		"pred_logits", NULL, NULL, &log_nelems);
+
+	ASSERT_EQ(msk_ndims, 4);
+	ASSERT_EQ(msk_dims[0], 1);
+
+	/* Initialize context and load SAM 3.1 model via full API */
+	ctx = sam3_init();
+	ASSERT(ctx != NULL);
+	if (!ctx)
+		goto cleanup;
+
+	err = sam3_load_model(ctx, SAM3_1_MODEL_PATH);
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK)
+		goto cleanup;
+
+	/* Set image from file (bus.jpg is pre-normalized in fixture) */
+	err = sam3_set_image_file(ctx, SAM3_SOURCE_DIR "/assets/bus.jpg");
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK)
+		goto cleanup;
+
+	/* Run segment with text prompt "bus" */
+	prompt.type = SAM3_PROMPT_TEXT;
+	prompt.text = "bus";
+
+	err = sam3_segment(ctx, &prompt, 1, &result);
+	ASSERT_EQ(err, SAM3_OK);
+	if (err != SAM3_OK)
+		goto cleanup;
+
+	/* ── Compare final masks ───────────────────────────────── */
+	printf("\n  Final output comparison:\n");
+
+	ASSERT_EQ(result.n_masks, msk_dims[1]);
+	ASSERT_EQ(result.mask_height, msk_dims[2]);
+	ASSERT_EQ(result.mask_width, msk_dims[3]);
+
+	{
+		int n = result.n_masks * result.mask_height *
+			result.mask_width;
+		float maxd = compare_tensors("pred_masks",
+					     result.masks, py_masks,
+					     n, 1.0f);
+
+		int any_nan = 0;
+		for (int i = 0; i < n && !any_nan; i++) {
+			if (result.masks[i] != result.masks[i])
+				any_nan = 1;
+		}
+		ASSERT(!any_nan);
+
+		/* Functional validation: IoU on detected masks only */
+		if (py_logits) {
+			int n_det = 0;
+			float iou = compute_detected_mask_iou(
+				result.masks, py_masks, py_logits,
+				result.n_masks,
+				result.mask_height, result.mask_width,
+				&n_det);
+			printf("  detected masks: %d, avg IoU: %.4f\n",
+			       n_det, (double)iou);
+			ASSERT(n_det > 0);
+			ASSERT(iou >= 0.99f);
+		}
+	}
+
+cleanup:
+	sam3_result_free(&result);
+	sam3_free(ctx);
+	free(py_masks);
+	free(py_logits);
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -874,6 +991,8 @@ int main(void)
 		else
 			printf("\nSKIP: bus/person fixtures not found at %s\n",
 			       BUS_FIXTURE_DIR);
+
+		test_bus_person_sam3_1();
 	} else {
 		printf("SKIP: model not found at %s\n", MODEL_PATH);
 		printf("  (skipping end-to-end tests)\n");
