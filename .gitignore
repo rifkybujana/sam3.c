@@ -118,3 +118,4 @@ __pycache__
 # Private tooling (never pushed)
 # ==========================================
 .sam3-social/
+trackanything/

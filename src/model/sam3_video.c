@@ -535,6 +535,32 @@ enum sam3_error sam3_video_start(sam3_ctx *ctx,
 }
 
 /*
+ * propagate_frame_ctx - Per-frame shared state for multi-object
+ *                       propagation. Built once in propagate_one and
+ *                       passed to each per-object call so the backbone
+ *                       feature flatten runs only once per frame instead
+ *                       of once per object. NULL means "no sharing, do
+ *                       the per-object work locally" (legacy path used
+ *                       by add_points / add_box).
+ *
+ * @cf:           Frame cache features (result of sam3_frame_cache_get).
+ * @img_2d:       [HW, d] flatten of cf.feat_s1 for the tracker graph.
+ * @grid_h/grid_w: Spatial dims of cf.feat_s1 (e.g. 72x72 on Hiera).
+ * @scratch_mark: Scratch arena offset immediately after @img_2d. Each
+ *                per-object call resets the scratch to this mark instead
+ *                of 0, so the shared img_2d survives across objects
+ *                while per-object intermediates (prompt tokens, graph
+ *                scratch) are recycled between iterations.
+ */
+struct propagate_frame_ctx {
+	struct sam3_frame_features cf;
+	struct sam3_tensor *img_2d;
+	int grid_h;
+	int grid_w;
+	size_t scratch_mark;
+};
+
+/*
  * video_add_prompts_pipeline - Shared prompt -> tracker -> memory pipeline.
  *
  * @session:        Video session (already validated non-NULL by caller)
@@ -551,6 +577,12 @@ enum sam3_error sam3_video_start(sam3_ctx *ctx,
  * @result:         Caller-owned result. Zeroed before work starts and on
  *                  failure; filled with heap-allocated masks + IoU on
  *                  success.
+ * @shared:         Optional per-frame shared state from propagate_one.
+ *                  When non-NULL, frame_cache_get and the img_2d flatten
+ *                  are skipped — the pipeline reuses @shared->cf and
+ *                  @shared->img_2d and resets the scratch arena to
+ *                  @shared->scratch_mark between objects. NULL = run the
+ *                  legacy per-call path (used by add_points / add_box).
  *
  * Runs the same five-step pipeline used by add_points / add_box:
  *   1. Project prompts to [N, d_model] tokens (sam3_project_prompts).
@@ -577,6 +609,7 @@ video_add_prompts_pipeline(struct sam3_video_session *session,
 			   int n_prompts,
 			   const struct sam3_video_prompt *stored_prompt,
 			   int obj_id,
+			   const struct propagate_frame_ctx *shared,
 			   struct sam3_video_frame_result *result)
 {
 	struct sam3_ctx *ctx;
@@ -611,14 +644,19 @@ video_add_prompts_pipeline(struct sam3_video_session *session,
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "video_add_prompts");
 
 	trk = &session->tracker;
-	memset(&cf, 0, sizeof(cf));
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "frame_cache_get");
-	err = sam3_frame_cache_get(&session->frame_cache, frame_idx, &cf);
-	SAM3_PROF_END(ctx->proc.profiler, "frame_cache_get");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_add_prompts: frame %d cache get failed"
-			       " (%d)", frame_idx, err);
-		goto cleanup;
+	if (shared) {
+		cf = shared->cf;
+	} else {
+		memset(&cf, 0, sizeof(cf));
+		SAM3_PROF_BEGIN(ctx->proc.profiler, "frame_cache_get");
+		err = sam3_frame_cache_get(&session->frame_cache,
+					   frame_idx, &cf);
+		SAM3_PROF_END(ctx->proc.profiler, "frame_cache_get");
+		if (err != SAM3_OK) {
+			sam3_log_error("video_add_prompts: frame %d cache get "
+				       "failed (%d)", frame_idx, err);
+			goto cleanup;
+		}
 	}
 	if (!cf.image_features || !cf.feat_s0 || !cf.feat_s1) {
 		sam3_log_error("video_add_prompts: frame %d features missing",
@@ -634,9 +672,18 @@ video_add_prompts_pipeline(struct sam3_video_session *session,
 	 * decoder) needs several hundred MiB of intermediates at the
 	 * 5184-patch grid size. The session scratch is reserved for
 	 * small per-call bookkeeping.
+	 *
+	 * Shared-frame path: propagate_one already allocated @shared->img_2d
+	 * in this arena and captured the post-flatten offset. Resetting to
+	 * that mark (instead of 0) preserves the shared flatten across the
+	 * per-object loop while still recycling per-object prompt / graph
+	 * scratch between iterations.
 	 */
 	gfx_scratch = &ctx->proc.scratch_arena;
-	sam3_arena_reset(gfx_scratch);
+	if (shared)
+		gfx_scratch->offset = shared->scratch_mark;
+	else
+		sam3_arena_reset(gfx_scratch);
 
 	/*
 	 * Python clear_non_cond_mem_around_input: when a new conditioning
@@ -689,8 +736,14 @@ video_add_prompts_pipeline(struct sam3_video_session *session,
 	 * frame-0 outputs non-zero but at the wrong 36x36 scale — masks
 	 * came out with structural bias but not clean silhouettes. The
 	 * weights are trained for 72x72; stick with that here.)
+	 *
+	 * Shared-frame path: reuse the flatten propagate_one already did.
 	 */
-	{
+	if (shared) {
+		img_2d = shared->img_2d;
+		grid_h = shared->grid_h;
+		grid_w = shared->grid_w;
+	} else {
 		struct sam3_tensor *img = cf.feat_s1;
 		int HW, d;
 		int dims2[2];
@@ -1182,7 +1235,8 @@ enum sam3_error sam3_video_add_points(sam3_video_session *session,
 
 	return video_add_prompts_pipeline(session, frame_idx, obj_idx,
 					  prompts, n_points,
-					  &stored, obj_id, result);
+					  &stored, obj_id, /*shared=*/NULL,
+					  result);
 }
 
 /*
@@ -1242,7 +1296,8 @@ enum sam3_error sam3_video_add_box(sam3_video_session *session,
 
 	return video_add_prompts_pipeline(session, frame_idx, obj_idx,
 					  &prompt, 1,
-					  &stored, obj_id, result);
+					  &stored, obj_id, /*shared=*/NULL,
+					  result);
 }
 
 /*
@@ -1263,6 +1318,7 @@ enum sam3_error sam3_video_add_box(sam3_video_session *session,
 static enum sam3_error
 video_replay_stored_prompt(struct sam3_video_session *session,
 			   const struct sam3_video_prompt *sp,
+			   const struct propagate_frame_ctx *shared,
 			   struct sam3_video_frame_result *result)
 {
 	struct sam3_prompt prompts[SAM3_MAX_POINTS_PER_OBJ];
@@ -1333,7 +1389,7 @@ video_replay_stored_prompt(struct sam3_video_session *session,
 	return video_add_prompts_pipeline(session, sp->frame_idx,
 					  sp->obj_internal_idx,
 					  prompts, n_prompts,
-					  sp, obj_id, result);
+					  sp, obj_id, shared, result);
 }
 
 /*
@@ -1357,6 +1413,7 @@ video_replay_stored_prompt(struct sam3_video_session *session,
 static enum sam3_error
 video_propagate_pure_tracking_obj(struct sam3_video_session *session,
 				  int obj_idx, int f,
+				  const struct propagate_frame_ctx *shared,
 				  struct sam3_video_object_mask *obj_mask)
 {
 	struct sam3_ctx *ctx;
@@ -1389,14 +1446,18 @@ video_propagate_pure_tracking_obj(struct sam3_video_session *session,
 	}
 
 	trk = &session->tracker;
-	memset(&cf, 0, sizeof(cf));
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "frame_cache_get");
-	err = sam3_frame_cache_get(&session->frame_cache, f, &cf);
-	SAM3_PROF_END(ctx->proc.profiler, "frame_cache_get");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_propagate_obj: frame %d cache get failed"
-			       " (%d)", f, err);
-		goto cleanup;
+	if (shared) {
+		cf = shared->cf;
+	} else {
+		memset(&cf, 0, sizeof(cf));
+		SAM3_PROF_BEGIN(ctx->proc.profiler, "frame_cache_get");
+		err = sam3_frame_cache_get(&session->frame_cache, f, &cf);
+		SAM3_PROF_END(ctx->proc.profiler, "frame_cache_get");
+		if (err != SAM3_OK) {
+			sam3_log_error("video_propagate_obj: frame %d cache get "
+				       "failed (%d)", f, err);
+			goto cleanup;
+		}
 	}
 	if (!cf.image_features || !cf.feat_s0 || !cf.feat_s1) {
 		sam3_log_error("video_propagate_obj: frame %d features missing",
@@ -1405,14 +1466,25 @@ video_propagate_pure_tracking_obj(struct sam3_video_session *session,
 		goto cleanup;
 	}
 
-	/* Same 3 GiB scratch as the conditioning path — per-frame reset. */
+	/* Same 3 GiB scratch as the conditioning path. When @shared is set,
+	 * propagate_one already flattened feat_s1 into this arena and marked
+	 * the tail — reset to that mark so the shared img_2d survives. */
 	gfx_scratch = &ctx->proc.scratch_arena;
-	sam3_arena_reset(gfx_scratch);
+	if (shared)
+		gfx_scratch->offset = shared->scratch_mark;
+	else
+		sam3_arena_reset(gfx_scratch);
 
 	/* Flatten NHWC backbone features → [HW, d] for tracker main.
 	 * Python reference operates at main=72x72 (image_size/stride).
-	 * Cache layout: feat_s1 = neck_1x = 72x72 1x feature. */
-	{
+	 * Cache layout: feat_s1 = neck_1x = 72x72 1x feature.
+	 *
+	 * Shared-frame path: reuse the flatten propagate_one already did. */
+	if (shared) {
+		img_2d = shared->img_2d;
+		grid_h = shared->grid_h;
+		grid_w = shared->grid_w;
+	} else {
 		struct sam3_tensor *img = cf.feat_s1;
 		int HW, d;
 		int dims2[2];
@@ -1721,6 +1793,7 @@ cleanup:
 static enum sam3_error
 video_replay_obj_prompt(struct sam3_video_session *session,
 			int obj_idx, int f,
+			const struct propagate_frame_ctx *shared,
 			struct sam3_video_object_mask *obj_mask)
 {
 	/*
@@ -1741,7 +1814,7 @@ video_replay_obj_prompt(struct sam3_video_session *session,
 		struct sam3_video_frame_result tmp;
 		memset(&tmp, 0, sizeof(tmp));
 
-		err = video_replay_stored_prompt(session, sp, &tmp);
+		err = video_replay_stored_prompt(session, sp, shared, &tmp);
 		if (err != SAM3_OK) {
 			sam3_video_frame_result_free(&tmp);
 			return err;
@@ -1809,6 +1882,50 @@ propagate_one(struct sam3_video_session *session, int f,
 		return SAM3_ENOMEM;
 	}
 
+	/*
+	 * Build per-frame shared state: flatten feat_s1 once and capture
+	 * the arena offset. Each per-object call resets scratch to this
+	 * mark instead of 0, so the flatten is paid once per frame rather
+	 * than once per object. On multi-object clips (8 objs) this drops
+	 * 7 redundant ~1.3 MB memcpys plus the matching arena churn.
+	 *
+	 * Fall back to per-object flatten (shared = NULL) if context is
+	 * not ready, cache lookup fails, or feat_s1 has an unexpected
+	 * shape — keeps correctness paths identical to the legacy code.
+	 */
+	struct sam3_ctx *ctx = session->ctx;
+	struct propagate_frame_ctx fctx;
+	const struct propagate_frame_ctx *shared = NULL;
+	if (ctx && ctx->proc_ready && ctx->proc.backend) {
+		memset(&fctx, 0, sizeof(fctx));
+		SAM3_PROF_BEGIN(prof, "frame_cache_get");
+		enum sam3_error cf_err = sam3_frame_cache_get(
+			&session->frame_cache, f, &fctx.cf);
+		SAM3_PROF_END(prof, "frame_cache_get");
+		if (cf_err == SAM3_OK &&
+		    fctx.cf.image_features &&
+		    fctx.cf.feat_s0 &&
+		    fctx.cf.feat_s1 &&
+		    fctx.cf.feat_s1->n_dims == 4) {
+			struct sam3_arena *scratch = &ctx->proc.scratch_arena;
+			sam3_arena_reset(scratch);
+
+			struct sam3_tensor *img = fctx.cf.feat_s1;
+			fctx.grid_h = img->dims[1];
+			fctx.grid_w = img->dims[2];
+			int dims2[2] = {fctx.grid_h * fctx.grid_w,
+					img->dims[3]};
+			fctx.img_2d = gh_alloc_tensor(scratch, img->dtype,
+						      2, dims2);
+			if (fctx.img_2d) {
+				memcpy(fctx.img_2d->data, img->data,
+				       img->nbytes);
+				fctx.scratch_mark = scratch->offset;
+				shared = &fctx;
+			}
+		}
+	}
+
 	for (int i = 0; i < session->n_objects; i++) {
 		out->objects[i].obj_id = session->objects[i].obj_id;
 
@@ -1816,12 +1933,13 @@ propagate_one(struct sam3_video_session *session, int f,
 		if (sam3_session_obj_is_prompted(session, i, f)) {
 			SAM3_PROF_BEGIN(prof, "video_replay_prompt");
 			err = video_replay_obj_prompt(session, i, f,
+						      shared,
 						      &out->objects[i]);
 			SAM3_PROF_END(prof, "video_replay_prompt");
 		} else {
 			SAM3_PROF_BEGIN(prof, "video_pure_tracking");
 			err = video_propagate_pure_tracking_obj(
-				session, i, f, &out->objects[i]);
+				session, i, f, shared, &out->objects[i]);
 			SAM3_PROF_END(prof, "video_pure_tracking");
 		}
 		if (err != SAM3_OK) {
