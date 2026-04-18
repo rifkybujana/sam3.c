@@ -43,7 +43,7 @@
 int sam3_bench_bounce_pos(int i);
 
 /*
- * bench_video_case - One parameterised video benchmark case.
+ * sam3_bench_video_case - One parameterised video benchmark case.
  *
  * @n_frames:   Total frames the clip directory contains (<=
  *              SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES).
@@ -54,12 +54,12 @@ int sam3_bench_bounce_pos(int i);
  * @direction:  SAM3_PROPAGATE_FORWARD or SAM3_PROPAGATE_BOTH.
  * @label:      Suffix appended to the benchmark case name.
  */
-struct bench_video_case {
-	int         n_frames;
-	int         n_objects;
-	int         seed_frame;
-	int         direction;
-	const char *label;
+struct sam3_bench_video_case {
+	int                     n_frames;
+	int                     n_objects;
+	int                     seed_frame;
+	enum sam3_propagate_dir direction;
+	const char             *label;
 };
 
 /*
