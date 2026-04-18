@@ -61,7 +61,14 @@ void cli_json_model_info(FILE *fp,
 		header->n_encoder_layers);
 	fprintf(fp, "  \"decoder_layers\": %d,\n",
 		header->n_decoder_layers);
-	fprintf(fp, "  \"file_size\": %zu\n", file_size);
+	fprintf(fp, "  \"file_size\": %zu,\n", file_size);
+	const char *variant_str = (header->reserved[1] == SAM3_VARIANT_SAM3_1)
+				   ? "sam3.1" : "sam3";
+	uint32_t scales = header->reserved[2]
+			   ? header->reserved[2]
+			   : (header->reserved[1] == SAM3_VARIANT_SAM3_1 ? 3 : 4);
+	fprintf(fp, "  \"variant\": \"%s\",\n", variant_str);
+	fprintf(fp, "  \"n_fpn_scales\": %u\n", scales);
 	fprintf(fp, "}\n");
 }
 

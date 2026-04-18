@@ -82,6 +82,13 @@ int cli_info(int argc, char **argv)
 		printf("  encoder_layers:  %d\n", h->n_encoder_layers);
 		printf("  decoder_layers:  %d\n", h->n_decoder_layers);
 		printf("  n_tensors:       %u\n", h->n_tensors);
+		const char *variant_str = (h->reserved[1] == SAM3_VARIANT_SAM3_1)
+					   ? "sam3.1" : "sam3";
+		uint32_t scales = h->reserved[2]
+				   ? h->reserved[2]
+				   : (h->reserved[1] == SAM3_VARIANT_SAM3_1 ? 3 : 4);
+		printf("  variant:         %s\n", variant_str);
+		printf("  n_fpn_scales:    %u\n", scales);
 
 		double gb = (double)wf.mapped_size /
 			    (1024.0 * 1024.0 * 1024.0);
