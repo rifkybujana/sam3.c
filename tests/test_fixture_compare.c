@@ -450,7 +450,7 @@ static void test_end_to_end_fixture_input(void)
 	if (err != SAM3_OK)
 		goto cleanup;
 
-	err = sam3_processor_init(&proc, SAM3_BACKBONE_HIERA);
+	err = sam3_processor_init(&proc, SAM3_BACKBONE_HIERA, 4);
 	ASSERT_EQ(err, SAM3_OK);
 	if (err != SAM3_OK) {
 		sam3_weight_close(&wf);
@@ -682,7 +682,7 @@ static void test_bus_person_text_only(void)
 	if (err != SAM3_OK)
 		goto cleanup;
 
-	err = sam3_processor_init(&proc, SAM3_BACKBONE_HIERA);
+	err = sam3_processor_init(&proc, SAM3_BACKBONE_HIERA, 4);
 	ASSERT_EQ(err, SAM3_OK);
 	if (err != SAM3_OK) {
 		sam3_weight_close(&wf);
