@@ -155,6 +155,77 @@ Once the image is encoded, subsequent prompts on the same image only pay the
 segment cost — so multi-prompt workflows (e.g. annotating 10 objects) amortize
 the encode time and approach the segment-only FPS.
 
+## Video: Per-Frame Tracking Cost
+
+Measures one tracker step (memory attention + mask decoder + minor
+IO) inside a `reset → seed → propagate` loop on a synthetic moving-
+square clip. `mean_ms` in the result table is for the full loop;
+per-frame cost below is `mean_ms / (n_frames - 1)` to amortise the
+reset/seed overhead. The memory bank saturates after ~6–8 tracked
+frames, so the 32f and 64f columns measure steady-state cost.
+
+### Clip-length scaling (1 object, FORWARD)
+
+| Model | 8f (ms/frame) | 32f (ms/frame) | 64f (ms/frame) |
+|-------|--------------:|---------------:|---------------:|
+| EfficientViT (efficient.sam3) | _tbd_ | _tbd_ | _tbd_ |
+| TinyViT-L (tinyvit_l.sam3)    | _tbd_ | _tbd_ | _tbd_ |
+| Hiera-Large (sam3.sam3)       | _tbd_ | _tbd_ | _tbd_ |
+
+Per-frame cost should stay roughly flat between 32f and 64f once the
+memory bank saturates — a linear climb would indicate the bank is
+growing unbounded.
+
+### Multi-object scaling (32 frames, FORWARD)
+
+| Model | 1 obj | 2 obj | 4 obj | 8 obj |
+|-------|------:|------:|------:|------:|
+| EfficientViT | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| TinyViT-L    | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| Hiera-Large  | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+
+Image encoder cost is fixed per frame; mask decoder and memory
+attention run once per tracked object. Linear scaling in N objects
+with a shared encoder term is the expected pattern.
+
+### Propagation direction (32 frames, 1 object)
+
+| Model | FORWARD | BOTH (fwd+bwd) |
+|-------|--------:|---------------:|
+| EfficientViT | _tbd_ | _tbd_ |
+| TinyViT-L    | _tbd_ | _tbd_ |
+| Hiera-Large  | _tbd_ | _tbd_ |
+
+The BOTH case seeds at the middle frame so each pass does equal work.
+Expected ratio is ~1.5–2× forward — encoded features are reused
+across both passes, so the reverse direction mostly pays for its own
+memory attention and mask decode.
+
+## Video: End-to-End Clip Latency
+
+Full user-facing latency for `sam3_video_start → add_points →
+propagate → sam3_video_end` on the synthetic clip. Includes session
+init, feature caching, propagation, and teardown.
+
+### End-to-end latency (1 object, FORWARD)
+
+| Model | 8f (ms) | 32f (ms) | 64f (ms) | Effective FPS (64f) |
+|-------|--------:|---------:|---------:|--------------------:|
+| EfficientViT | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| TinyViT-L    | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| Hiera-Large  | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+
+### Multi-object end-to-end (32 frames, FORWARD)
+
+| Model | 1 obj | 4 obj |
+|-------|------:|------:|
+| EfficientViT | _tbd_ | _tbd_ |
+| TinyViT-L    | _tbd_ | _tbd_ |
+| Hiera-Large  | _tbd_ | _tbd_ |
+
+Effective FPS is the clip length divided by the total wall-clock
+time — the interactive-annotation ceiling for that model.
+
 ## Peak Throughput Summary
 
 | Precision | Peak GFLOPS | Theoretical Peak | Utilization |
@@ -208,4 +279,8 @@ make -j$(nproc)
     --output results.json
 ./sam3_cli bench all --model ../models/efficient.sam3 --backend metal \
     --compare results.json --threshold 5.0
+
+# Only the video cases, with results written to JSON
+./sam3_cli bench all --model ../models/efficient.sam3 --backend metal \
+    --filter "video_*" --output video.json
 ```
