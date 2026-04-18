@@ -3,10 +3,10 @@
  *
  * Drives a table of cases that each run a full video_start → seed →
  * propagate → end cycle on a synthetic moving-square clip. Cases vary
- * clip length and object count. One clip is synthesised per run and
- * sized to the largest n_frames in the case table; each case reuses
- * the directory. Times the total user-facing latency including
- * session init, feature caching, and teardown.
+ * clip length and object count. One clip directory is synthesised per
+ * unique n_frames in the case table; each case picks the directory
+ * matching its configured clip length. Times the total user-facing
+ * latency including session init, feature caching, and teardown.
  *
  * Key types:  sam3_bench_config, sam3_bench_result, sam3_ctx,
  *             sam3_bench_video_case
@@ -95,12 +95,15 @@ int sam3_bench_run_video_end_to_end(const struct sam3_bench_config *cfg,
 				    struct sam3_bench_result *results,
 				    int max_results)
 {
-	char tmpdir[] = "/tmp/sam3_bench_ve_XXXXXX";
 	int model_img_size;
 	float scale;
 	int count = 0;
 	size_t n_cases = sizeof(e2e_cases) / sizeof(e2e_cases[0]);
-	int max_frames = 0;
+
+	int unique_nf[8];
+	int n_unique = 0;
+	char tmpdirs[8][32];
+	int n_open = 0;
 
 	if (!cfg || !ctx || !results || max_results <= 0) {
 		sam3_log_error("bench_run_video_end_to_end: "
@@ -109,42 +112,63 @@ int sam3_bench_run_video_end_to_end(const struct sam3_bench_config *cfg,
 	}
 
 	for (size_t i = 0; i < n_cases; i++) {
-		if (e2e_cases[i].n_frames > max_frames)
-			max_frames = e2e_cases[i].n_frames;
+		int nf = e2e_cases[i].n_frames;
+		int seen = 0;
+		for (int j = 0; j < n_unique; j++) {
+			if (unique_nf[j] == nf) {
+				seen = 1;
+				break;
+			}
+		}
+		if (!seen && n_unique < (int)(sizeof(unique_nf) /
+					      sizeof(unique_nf[0]))) {
+			unique_nf[n_unique++] = nf;
+		}
 	}
-	if (max_frames > SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES) {
-		sam3_log_error("bench_run_video_end_to_end: n_frames %d "
-			       "exceeds CLIP_MAX_FRAMES %d",
-			       max_frames, SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES);
-		return -1;
+
+	for (int u = 0; u < n_unique; u++) {
+		if (unique_nf[u] > SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES) {
+			sam3_log_error("bench_run_video_end_to_end: "
+				       "n_frames %d exceeds CLIP_MAX_FRAMES %d",
+				       unique_nf[u],
+				       SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES);
+			goto cleanup;
+		}
 	}
 
 	model_img_size = sam3_get_image_size(ctx);
 	if (model_img_size <= 0) {
 		sam3_log_error("bench_run_video_end_to_end: no model "
 			       "loaded (image size = %d)", model_img_size);
-		return -1;
-	}
-
-	if (!mkdtemp(tmpdir)) {
-		sam3_log_error("bench_run_video_end_to_end: mkdtemp "
-			       "failed for clip dir");
-		return -1;
-	}
-
-	if (sam3_bench_generate_clip(tmpdir, max_frames) != 0) {
-		sam3_log_error("bench_run_video_end_to_end: failed to "
-			       "synthesize clip in '%s'", tmpdir);
-		sam3_bench_rmtree(tmpdir);
-		return -1;
+		goto cleanup;
 	}
 
 	scale = (float)model_img_size / (float)SAM3_BENCH_VIDEO_IMG_SIZE;
+
+	for (int u = 0; u < n_unique; u++) {
+		snprintf(tmpdirs[u], sizeof(tmpdirs[u]),
+			 "/tmp/sam3_bench_ve_XXXXXX");
+		if (!mkdtemp(tmpdirs[u])) {
+			sam3_log_error("bench_run_video_end_to_end: "
+				       "mkdtemp failed for clip dir %d", u);
+			goto cleanup;
+		}
+		n_open = u + 1;
+
+		if (sam3_bench_generate_clip(tmpdirs[u], unique_nf[u]) != 0) {
+			sam3_log_error("bench_run_video_end_to_end: "
+				       "generate_clip failed for %d frames",
+				       unique_nf[u]);
+			goto cleanup;
+		}
+	}
 
 	for (size_t i = 0; i < n_cases && count < max_results; i++) {
 		char name[128];
 		struct video_e2e_ctx vc;
 		int rc;
+		int nf = e2e_cases[i].n_frames;
+		int slot = -1;
 
 		snprintf(name, sizeof(name), "video_e2e_%s",
 			 e2e_cases[i].label);
@@ -152,8 +176,21 @@ int sam3_bench_run_video_end_to_end(const struct sam3_bench_config *cfg,
 		if (!sam3_bench_filter_match(name, cfg->filter))
 			continue;
 
+		for (int u = 0; u < n_unique; u++) {
+			if (unique_nf[u] == nf) {
+				slot = u;
+				break;
+			}
+		}
+		if (slot < 0) {
+			sam3_log_error("bench_run_video_end_to_end: no clip "
+				       "for %d frames (case %zu)", nf, i);
+			count = -1;
+			goto cleanup;
+		}
+
 		vc.ctx      = ctx;
-		vc.clip_dir = tmpdir;
+		vc.clip_dir = tmpdirs[slot];
 		vc.c        = &e2e_cases[i];
 		vc.scale    = scale;
 
@@ -169,9 +206,10 @@ int sam3_bench_run_video_end_to_end(const struct sam3_bench_config *cfg,
 	}
 
 	sam3_log_info("video benchmarks: end-to-end driver completed "
-		      "(%d cases)", count);
+		      "(%d cases, %d clip sizes)", count, n_unique);
 
 cleanup:
-	sam3_bench_rmtree(tmpdir);
+	for (int u = 0; u < n_open; u++)
+		sam3_bench_rmtree(tmpdirs[u]);
 	return count;
 }
