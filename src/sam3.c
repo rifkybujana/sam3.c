@@ -129,6 +129,27 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->config.n_encoder_layers = h->n_encoder_layers;
 	ctx->config.n_decoder_layers = h->n_decoder_layers;
 	ctx->config.backbone_type    = (int)h->reserved[0];
+	ctx->config.variant          = (int)h->reserved[1];
+	ctx->config.n_fpn_scales     = (int)h->reserved[2];
+
+	/* Legacy (pre-SAM3.1) .sam3 files have reserved[1..2] == 0.
+	 * Treat that as SAM 3 with 4 FPN scales. */
+	if (ctx->config.variant == 0 && ctx->config.n_fpn_scales == 0) {
+		ctx->config.n_fpn_scales = 4;
+	}
+	if (ctx->config.variant != SAM3_VARIANT_SAM3 &&
+	    ctx->config.variant != SAM3_VARIANT_SAM3_1) {
+		sam3_log_error("unknown model variant %d in %s",
+			       ctx->config.variant, path);
+		sam3_weight_close(&ctx->weights);
+		return SAM3_EMODEL;
+	}
+	if (ctx->config.n_fpn_scales < 1 || ctx->config.n_fpn_scales > 4) {
+		sam3_log_error("invalid n_fpn_scales %d in %s (expect 3 or 4)",
+			       ctx->config.n_fpn_scales, path);
+		sam3_weight_close(&ctx->weights);
+		return SAM3_EMODEL;
+	}
 
 	ctx->loaded = 1;
 
