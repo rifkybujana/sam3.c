@@ -28,6 +28,7 @@
 #include "sam3/sam3.h"
 #include "sam3/internal/processor_normalize.h"
 #include "core/weight.h"
+#include "model/sam3_internal.h"
 #include "model/sam3_processor.h"
 #include "model/graph_helpers.h"
 
@@ -930,6 +931,33 @@ static void test_bus_person_sam3_1(void)
 	/* Sanity-check the result regardless of fixture depth. */
 	ASSERT(result.n_masks >= 0);
 	ASSERT(result.mask_height > 0 && result.mask_width > 0);
+
+	/* ── Compare neck outputs against Python reference ──────── */
+	printf("  Neck comparison (3 scales, tri-neck):\n");
+	if (ctx->proc.model.cached_feat_4x_nhwc) {
+		compare_nhwc_fixture(
+			"sam3.1 neck scale_4x",
+			ctx->proc.model.cached_feat_4x_nhwc,
+			SAM3_1_BUS_FIXTURE_DIR "/02_neck/tensors.safetensors",
+			"scale_4x");
+	}
+	if (ctx->proc.model.cached_feat_s0_nhwc) {
+		compare_nhwc_fixture(
+			"sam3.1 neck scale_2x",
+			ctx->proc.model.cached_feat_s0_nhwc,
+			SAM3_1_BUS_FIXTURE_DIR "/02_neck/tensors.safetensors",
+			"scale_2x");
+	}
+	if (ctx->proc.model.cached_feat_s1_nhwc) {
+		compare_nhwc_fixture(
+			"sam3.1 neck scale_1x",
+			ctx->proc.model.cached_feat_s1_nhwc,
+			SAM3_1_BUS_FIXTURE_DIR "/02_neck/tensors.safetensors",
+			"scale_1x");
+	}
+	/* The tri-neck has no 4th (0.5x) scale — cached_image_features
+	 * stays NULL for SAM 3.1. */
+	ASSERT(ctx->proc.model.cached_image_features == NULL);
 
 	/* ── Compare final masks (only if fixture has them) ───── */
 	if (py_masks) {
