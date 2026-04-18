@@ -48,6 +48,9 @@ struct sam3_vl_backbone {
  *
  * @vl:            VL backbone struct (caller-allocated, zeroed)
  * @backbone_type: SAM3_BACKBONE_HIERA or SAM3_BACKBONE_EFFICIENTVIT
+ * @n_fpn_scales:  Number of FPN scales for the main neck (3 for SAM 3.1,
+ *                 4 for SAM 3). The tracker-side sam2_neck always uses
+ *                 4 scales regardless.
  * @arena:         Arena for precomputation (RoPE, position encoding)
  *
  * Dispatches to the appropriate image encoder init based on backbone_type.
@@ -57,6 +60,7 @@ struct sam3_vl_backbone {
  */
 enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 				      int backbone_type,
+				      int n_fpn_scales,
 				      struct sam3_arena *arena);
 
 /*

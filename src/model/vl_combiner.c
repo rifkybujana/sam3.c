@@ -24,6 +24,7 @@
 
 enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 				      int backbone_type,
+				      int n_fpn_scales,
 				      struct sam3_arena *arena)
 {
 	enum sam3_error err;
@@ -92,10 +93,15 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 		return SAM3_EINVAL;
 	}
 
-	/* Init neck: 4 scales at {4x, 2x, 1x, 0.5x} */
+	/* Init main neck: n_fpn_scales at {4x, 2x, 1x, [0.5x]} */
 	float scales[] = {4.0f, 2.0f, 1.0f, 0.5f};
+	if (n_fpn_scales < 1 || n_fpn_scales > 4) {
+		sam3_log_error("vl_backbone: invalid n_fpn_scales %d",
+			       n_fpn_scales);
+		return SAM3_EINVAL;
+	}
 	err = sam3_neck_init(&vl->neck, 256, backbone_dim,
-			      grid_size, 4, scales);
+			      grid_size, n_fpn_scales, scales);
 	if (err != SAM3_OK)
 		return err;
 
