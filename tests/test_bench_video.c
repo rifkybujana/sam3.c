@@ -66,10 +66,34 @@ static void test_generate_clip_128_frames(void)
 	sam3_bench_rmtree(dir);
 }
 
+/* --- test_filter_glob_matches_case_names --- */
+
+static void test_filter_glob_matches_case_names(void)
+{
+	/* 4obj filter matches only the 4obj cases. */
+	ASSERT(sam3_bench_filter_match(
+		"video_per_frame_32f_4obj_fwd", "*_4obj_*"));
+	ASSERT(sam3_bench_filter_match(
+		"video_e2e_32f_4obj_fwd", "*_4obj_*"));
+	ASSERT(!sam3_bench_filter_match(
+		"video_per_frame_32f_1obj_fwd", "*_4obj_*"));
+
+	/* video_* matches every new case. */
+	ASSERT(sam3_bench_filter_match(
+		"video_per_frame_8f_1obj_fwd", "video_*"));
+	ASSERT(sam3_bench_filter_match(
+		"video_e2e_64f_1obj_fwd", "video_*"));
+
+	/* Unrelated kernel cases do not match. */
+	ASSERT(!sam3_bench_filter_match(
+		"matmul_f32_1024x1024", "video_*"));
+}
+
 int main(void)
 {
 	test_bounce_stays_in_bounds();
 	test_bounce_starts_at_zero();
 	test_generate_clip_128_frames();
+	test_filter_glob_matches_case_names();
 	TEST_REPORT();
 }

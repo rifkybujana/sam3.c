@@ -243,31 +243,40 @@ static enum sam3_error seed_n_objects(sam3_video_session *s, int n,
 	return SAM3_OK;
 }
 
-/* ── Per-frame benchmark ──────────────────────────────────────────── */
+/* ── Per-frame case-table driver ──────────────────────────────────── */
+
+/*
+ * Case table — each row is one benchmark emitted by this function.
+ * Order matters only for readability; bench result ordering mirrors it.
+ */
+static const struct sam3_bench_video_case per_frame_cases[] = {
+	{ 8,  1, 0,  SAM3_PROPAGATE_FORWARD, "8f_1obj_fwd"   },
+	{ 32, 1, 0,  SAM3_PROPAGATE_FORWARD, "32f_1obj_fwd"  },
+	{ 64, 1, 0,  SAM3_PROPAGATE_FORWARD, "64f_1obj_fwd"  },
+	{ 32, 2, 0,  SAM3_PROPAGATE_FORWARD, "32f_2obj_fwd"  },
+	{ 32, 4, 0,  SAM3_PROPAGATE_FORWARD, "32f_4obj_fwd"  },
+	{ 32, 8, 0,  SAM3_PROPAGATE_FORWARD, "32f_8obj_fwd"  },
+	{ 32, 1, 16, SAM3_PROPAGATE_BOTH,    "32f_1obj_both" },
+};
 
 struct video_frame_ctx {
-	sam3_video_session *session;
-	struct sam3_point   seed_pt;
-	int                 obj_id;    /* 0 */
-	int                 frame_idx; /* 0 */
+	sam3_video_session                  *session;
+	const struct sam3_bench_video_case  *c;
+	float                                scale;
 };
 
 static void video_frame_fn(void *arg)
 {
 	struct video_frame_ctx *vc = arg;
-	struct sam3_video_frame_result r;
-	memset(&r, 0, sizeof(r));
 
 	if (sam3_video_reset(vc->session) != SAM3_OK)
 		return;
-	if (sam3_video_add_points(vc->session, vc->frame_idx, vc->obj_id,
-				  &vc->seed_pt, 1, &r) != SAM3_OK) {
-		sam3_video_frame_result_free(&r);
+
+	if (seed_n_objects(vc->session, vc->c->n_objects,
+			   vc->c->seed_frame, vc->scale) != SAM3_OK)
 		return;
-	}
-	sam3_video_frame_result_free(&r);
-	sam3_video_propagate(vc->session, SAM3_PROPAGATE_FORWARD,
-			     NULL, NULL);
+
+	sam3_video_propagate(vc->session, vc->c->direction, NULL, NULL);
 }
 
 int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
@@ -277,20 +286,29 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 {
 	char tmpdir[] = "/tmp/sam3_bench_vf_XXXXXX";
 	sam3_video_session *session = NULL;
-	struct video_frame_ctx vc;
 	int model_img_size;
 	float scale;
 	int count = 0;
-	int rc;
+	size_t n_cases = sizeof(per_frame_cases) /
+			 sizeof(per_frame_cases[0]);
+	/* Max frames across all cases — only the largest clip is synthesised. */
+	int max_frames = 0;
 
 	if (!cfg || !ctx || !results || max_results <= 0) {
 		sam3_log_error("bench_run_video_frame: invalid arguments");
 		return -1;
 	}
 
-	/* Filter gate — bail cheaply if excluded. */
-	if (!sam3_bench_filter_match("video_per_frame", cfg->filter))
-		return 0;
+	for (size_t i = 0; i < n_cases; i++) {
+		if (per_frame_cases[i].n_frames > max_frames)
+			max_frames = per_frame_cases[i].n_frames;
+	}
+	if (max_frames > SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES) {
+		sam3_log_error("bench_run_video_frame: n_frames %d exceeds "
+			       "CLIP_MAX_FRAMES %d",
+			       max_frames, SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES);
+		return -1;
+	}
 
 	model_img_size = sam3_get_image_size(ctx);
 	if (model_img_size <= 0) {
@@ -305,7 +323,7 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 		return -1;
 	}
 
-	if (sam3_bench_generate_clip(tmpdir, 2) != 0) {
+	if (sam3_bench_generate_clip(tmpdir, max_frames) != 0) {
 		sam3_log_error("bench_run_video_frame: failed to "
 			       "synthesize clip in '%s'", tmpdir);
 		sam3_bench_rmtree(tmpdir);
@@ -319,42 +337,36 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 		return -1;
 	}
 
-	/*
-	 * Seed point: centre of the square on frame 0, scaled from the
-	 * synthetic PNG space (SAM3_BENCH_VIDEO_IMG_SIZE) into the
-	 * model's input space. Matches the pattern used in
-	 * tests/test_video_e2e.c.
-	 */
 	scale = (float)model_img_size / (float)SAM3_BENCH_VIDEO_IMG_SIZE;
-	/*
-	 * Square at frame 0 lives at (bounce_pos(0), bounce_pos(0)).
-	 * Seed point is its centre in PNG pixel space, scaled to model space.
-	 */
-	{
-		float cx = (float)sam3_bench_bounce_pos(0) +
-			   (float)SAM3_BENCH_VIDEO_SQUARE_SIZE * 0.5f;
-		vc.seed_pt.x = cx * scale;
-		vc.seed_pt.y = cx * scale;
-	}
-	vc.seed_pt.label = 1;
-	vc.session = session;
-	vc.obj_id = 0;
-	vc.frame_idx = 0;
 
-	if (count < max_results) {
-		rc = sam3_bench_run(cfg, "video_per_frame", "pipeline",
+	for (size_t i = 0; i < n_cases && count < max_results; i++) {
+		char name[128];
+		struct video_frame_ctx vc;
+		int rc;
+
+		snprintf(name, sizeof(name), "video_per_frame_%s",
+			 per_frame_cases[i].label);
+
+		if (!sam3_bench_filter_match(name, cfg->filter))
+			continue;
+
+		vc.session = session;
+		vc.c       = &per_frame_cases[i];
+		vc.scale   = scale;
+
+		rc = sam3_bench_run(cfg, name, "pipeline",
 				    video_frame_fn, &vc,
 				    0, 0, &results[count]);
 		if (rc != 0) {
-			sam3_log_error("video bench: video_per_frame "
-				       "failed");
+			sam3_log_error("video bench: %s failed", name);
 			count = -1;
 			goto cleanup;
 		}
 		count++;
 	}
 
-	sam3_log_info("video benchmarks: video_per_frame completed");
+	sam3_log_info("video benchmarks: per-frame driver completed "
+		      "(%d cases)", count);
 
 cleanup:
 	sam3_video_end(session);
