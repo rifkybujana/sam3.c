@@ -370,6 +370,29 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 			return -1;
 		}
 
+		/*
+		 * Pre-warm the frame cache with a single propagation so the
+		 * bench-harness warmup + timed iterations all hit the warm
+		 * path. Without this, cold frame encoding (~2–3 s/frame on
+		 * Hiera) dominates per-iteration time and the reported
+		 * mean is essentially a cold-cache first-call measurement.
+		 */
+		{
+			struct sam3_video_frame_result r;
+			memset(&r, 0, sizeof(r));
+
+			(void)sam3_video_reset(session);
+			if (seed_n_objects(session, 1, 0, scale) == SAM3_OK) {
+				sam3_video_propagate(session,
+						     SAM3_PROPAGATE_FORWARD,
+						     NULL, NULL);
+			}
+			(void)sam3_video_reset(session);
+			(void)r;  /* unused; add_points inside seed frees. */
+			sam3_log_info("bench_run_video_frame: cache pre-warmed "
+				      "for %d-frame session", nf_u);
+		}
+
 		/* Run every case whose n_frames matches this session. */
 		for (size_t i = 0; i < n_cases && count < max_results; i++) {
 			char name[128];
