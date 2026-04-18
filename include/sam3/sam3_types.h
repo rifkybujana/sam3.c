@@ -112,6 +112,14 @@ enum sam3_backbone_type {
 	SAM3_BACKBONE_TINYVIT      = 2,
 };
 
+/* Model variant. SAM3_1 uses the tri-neck (3 FPN scales) and the
+ * multiplex-capable tracker; SAM3 uses the dual-neck and the original
+ * tracker. Stored in the .sam3 header's reserved[1] slot. */
+enum sam3_variant {
+	SAM3_VARIANT_SAM3   = 0,
+	SAM3_VARIANT_SAM3_1 = 1,
+};
+
 /* Model configuration loaded from weights file. */
 struct sam3_model_config {
 	int image_size;       /* Input image size (e.g., 1024) */
@@ -120,6 +128,8 @@ struct sam3_model_config {
 	int n_encoder_layers;
 	int n_decoder_layers;
 	int backbone_type;    /* enum sam3_backbone_type */
+	int n_fpn_scales;     /* 3 (SAM 3.1) or 4 (SAM 3) */
+	int variant;          /* enum sam3_variant */
 };
 
 /* Propagation direction for video tracking. */
