@@ -56,6 +56,8 @@ static void print_usage(const char *prog)
 	printf("  --backbone <type>    Vision backbone: "
 	       "\"hiera\" (default), \"efficientvit\", "
 	       "\"tinyvit\"\n");
+	printf("  --variant <type>     Model variant: "
+	       "\"sam3\" (default), \"sam3.1\"\n");
 	printf("  --quantize <type>    Quantize weights: "
 	       "\"q8_0\" (default: none)\n");
 	printf("  -v                   Verbose output "
@@ -71,6 +73,7 @@ struct convert_args {
 	const char *output_path;
 	const char *format;
 	const char *backbone;   /* "hiera", "efficientvit", or "tinyvit" */
+	const char *variant;    /* "sam3" or "sam3.1" */
 	const char *quantize;   /* NULL or "q8_0" */
 	int         image_size;
 	int         encoder_dim;
@@ -78,6 +81,8 @@ struct convert_args {
 	int         encoder_layers;
 	int         decoder_layers;
 	int         backbone_type;
+	int         variant_type;     /* enum sam3_variant */
+	int         n_fpn_scales;
 	int         verbose;
 	int         quiet;
 };
@@ -94,6 +99,7 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->output_path    = NULL;
 	args->format         = "safetensors";
 	args->backbone       = "hiera";
+	args->variant        = "sam3";
 	args->quantize       = NULL;
 	args->image_size     = -1; /* -1 = use backbone default */
 	args->encoder_dim    = -1; /* -1 = use backbone default */
@@ -101,6 +107,8 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->encoder_layers = -1; /* -1 = use backbone default */
 	args->decoder_layers = 2;
 	args->backbone_type  = SAM3_BACKBONE_HIERA;
+	args->variant_type   = SAM3_VARIANT_SAM3;
+	args->n_fpn_scales   = 4;
 	args->verbose        = 0;
 	args->quiet          = 0;
 
@@ -173,6 +181,13 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 				return 1;
 			}
 			args->backbone = argv[i];
+		} else if (strcmp(argv[i], "--variant") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --variant requires a type\n");
+				return 1;
+			}
+			args->variant = argv[i];
 		} else if (strcmp(argv[i], "--quantize") == 0) {
 			if (++i >= argc) {
 				fprintf(stderr,
@@ -225,6 +240,21 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 			"(use \"hiera\", \"efficientvit\", "
 			"or \"tinyvit\")\n",
 			args->backbone);
+		return 1;
+	}
+
+	/* Resolve variant and apply its defaults */
+	if (strcmp(args->variant, "sam3") == 0) {
+		args->variant_type = SAM3_VARIANT_SAM3;
+		args->n_fpn_scales = 4;
+	} else if (strcmp(args->variant, "sam3.1") == 0) {
+		args->variant_type = SAM3_VARIANT_SAM3_1;
+		args->n_fpn_scales = 3;
+	} else {
+		fprintf(stderr,
+			"error: unsupported variant '%s' "
+			"(use \"sam3\" or \"sam3.1\")\n",
+			args->variant);
 		return 1;
 	}
 
@@ -489,6 +519,8 @@ int cli_convert(int argc, char **argv)
 		cli_progress("  output:         %s\n", args.output_path);
 		cli_progress("  format:         %s\n", args.format);
 		cli_progress("  backbone:       %s\n", args.backbone);
+		cli_progress("  variant:        %s\n", args.variant);
+		cli_progress("  n_fpn_scales:   %d\n", args.n_fpn_scales);
 		cli_progress("  tensors:        %d (after rename/split)\n", n);
 		cli_progress("  image_size:     %d\n", args.image_size);
 		cli_progress("  encoder_dim:    %d\n", args.encoder_dim);
@@ -504,6 +536,8 @@ int cli_convert(int argc, char **argv)
 	config.n_encoder_layers = args.encoder_layers;
 	config.n_decoder_layers = args.decoder_layers;
 	config.backbone_type    = args.backbone_type;
+	config.variant          = args.variant_type;
+	config.n_fpn_scales     = args.n_fpn_scales;
 
 	/* Set up quantizing wrapper if requested */
 	struct weight_reader *write_reader = &conv_perm_reader;
