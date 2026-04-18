@@ -73,6 +73,7 @@ if not torch.cuda.is_available():
     # Module.cuda() likewise returns self without moving.
     torch.nn.Module.cuda = lambda self, *a, **kw: self
 
+
 if "triton" not in sys.modules:
     class _TritonStubType:
         pass
@@ -111,8 +112,37 @@ def build_model_sam3(checkpoint: str, bpe_path: str, device: str):
     )
 
 
+def _install_addmm_act_fp32_patch():
+    """Replace sam3.perflib.fused.addmm_act with an fp32-preserving
+    version that works on CPU. Must be called AFTER importing sam3 (so
+    sam3.perflib.fused exists) but BEFORE vitdet captures it. Since
+    vitdet does `from sam3.perflib.fused import addmm_act` at import
+    time, we also patch vitdet's module-level reference.
+    """
+    import sam3.perflib.fused as _fused
+
+    def _addmm_act_fp32(activation, linear, mat1):
+        if torch.is_grad_enabled():
+            raise ValueError("Expected grad to be disabled.")
+        w = linear.weight.detach()
+        b = linear.bias.detach()
+        y = torch.nn.functional.linear(mat1, w, b)
+        if activation in (torch.nn.functional.relu, torch.nn.ReLU):
+            return torch.nn.functional.relu(y)
+        if activation in (torch.nn.functional.gelu, torch.nn.GELU):
+            return torch.nn.functional.gelu(y)
+        raise ValueError(f"Unexpected activation {activation}")
+
+    _fused.addmm_act = _addmm_act_fp32
+    # vitdet imports the symbol directly; patch its copy too.
+    import sam3.model.vitdet as _vitdet
+    _vitdet.addmm_act = _addmm_act_fp32
+
+
 def build_model_sam3_1(checkpoint: str, bpe_path: str, device: str):
     """Assemble SAM 3.1 image model - reuses the multiplex tri-neck."""
+    if not torch.cuda.is_available():
+        _install_addmm_act_fp32_patch()
     from sam3.model_builder import (
         _create_geometry_encoder,
         _create_multiplex_tri_backbone,
@@ -122,11 +152,11 @@ def build_model_sam3_1(checkpoint: str, bpe_path: str, device: str):
         _create_text_encoder,
     )
     from sam3.model.sam3_image import Sam3Image
-    from sam3.model.vl_combiner import SAM3VLBackbone
+    from sam3.model.vl_combiner import SAM3VLBackboneTri
 
     tri_neck = _create_multiplex_tri_backbone()
     text_encoder = _create_text_encoder(bpe_path)
-    backbone = SAM3VLBackbone(scalp=1, visual=tri_neck, text=text_encoder)
+    backbone = SAM3VLBackboneTri(scalp=0, visual=tri_neck, text=text_encoder)
     transformer = _create_sam3_transformer()
     dot_prod_scoring = _create_dot_product_scoring()
     segmentation_head = _create_segmentation_head()
@@ -185,31 +215,45 @@ def run_and_dump(model, image_path: str, text: str, out_dir: str):
               str(Path(out_dir) / "00_input" / "tensors.safetensors"))
 
     with torch.no_grad():
-        neck_outs = []
-
-        def _neck_hook(mod, inp, out):
-            neck_outs.append(out)
-
-        h = model.backbone.vision_backbone.register_forward_hook(_neck_hook)
-        # TODO: the SAM3 image model expects a BatchedDatapoint wrapper
-        # around img_t + captions rather than a bare (img_t, text=...).
-        # Building that wrapper is upstream-API work deferred until the
-        # numerical-parity fixture is actually needed by CI.
-        # For now: demonstrate that the assembly + weight-load works
-        # (1166 tensors load with 0 missing / 0 unexpected), then stop.
+        # Direct vision-only path: SAM3VLBackbone.forward_image produces
+        # the FPN feature dict used by the detector. No text, no
+        # BatchedDatapoint wrapping needed.
         try:
-            out = model.backbone.forward_image(img_t)
+            vision_out = model.backbone.forward_image(img_t)
         except Exception as exc:
             print(f"forward_image failed ({exc}); wrote input only",
                   file=sys.stderr)
-            out = None
-        h.remove()
+            vision_out = None
+        out = None
 
     (Path(out_dir) / "02_neck").mkdir(exist_ok=True)
-    # neck output format is implementation-specific; inspect neck_outs on
-    # first run and fill in scale_4x / scale_2x / scale_1x saves below.
-    # Keep empty for the first pass so tools/dump_reference.py returns 0
-    # and the user can inspect the output.
+    if isinstance(vision_out, dict):
+        # SAM3VLBackboneTri.forward_image returns:
+        #   vision_features   - tensor, last FPN scale [1, 256, 72, 72]
+        #   vision_pos_enc    - list of N pos-enc tensors
+        #   backbone_fpn      - list of N NestedTensor per-scale features
+        # Plus 'interactive' and 'sam2_backbone_out' sub-dicts with the
+        # same shape (tracker-specific; skip them for the image parity
+        # fixture — the C side only consumes the detector FPN).
+        neck_dict = {}
+        scale_names = ["scale_4x", "scale_2x", "scale_1x"]
+        fpn = vision_out.get("backbone_fpn")
+        if isinstance(fpn, (list, tuple)):
+            for i, nt in enumerate(fpn):
+                t = getattr(nt, "tensors", nt)
+                if isinstance(t, torch.Tensor) and i < len(scale_names):
+                    neck_dict[scale_names[i]] = t.cpu().contiguous().float()
+        pos_enc = vision_out.get("vision_pos_enc")
+        if isinstance(pos_enc, (list, tuple)):
+            for i, t in enumerate(pos_enc):
+                if isinstance(t, torch.Tensor) and i < len(scale_names):
+                    neck_dict[f"pos_{scale_names[i]}"] = (
+                        t.cpu().contiguous().float())
+        if neck_dict:
+            save_file(neck_dict,
+                      str(Path(out_dir) / "02_neck" / "tensors.safetensors"))
+            print(f"Wrote {len(neck_dict)} neck tensors: "
+                  f"{sorted(neck_dict)}", file=sys.stderr)
 
     (Path(out_dir) / "10_final").mkdir(exist_ok=True)
     final_dict = {}
@@ -217,12 +261,27 @@ def run_and_dump(model, image_path: str, text: str, out_dir: str):
         for k in ("pred_masks", "pred_logits"):
             if k in out:
                 final_dict[k] = out[k].cpu().contiguous()
-    # Dict must be non-empty for save_file; stub with a zero scalar if
-    # the forward call returned nothing usable.
     if not final_dict:
+        # Running the full Sam3Image.forward requires a BatchedDatapoint
+        # wrapper around image + prompts that's upstream-internal; for
+        # now we dump only the neck output and let the integration test
+        # treat the final stage as optional.
         final_dict["placeholder"] = torch.zeros(1)
     save_file(final_dict,
               str(Path(out_dir) / "10_final" / "tensors.safetensors"))
+
+    # Marker file the C integration test uses to gate on fixture
+    # availability.
+    import json
+    meta = {
+        "variant": "sam3.1",
+        "image": Path(image_path).name,
+        "text": text,
+        "image_size": 1008,
+        "n_fpn_scales": 3,
+        "has_final_masks": "pred_masks" in final_dict,
+    }
+    (Path(out_dir) / "metadata.json").write_text(json.dumps(meta, indent=2))
 
 
 def main() -> int:
