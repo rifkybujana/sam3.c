@@ -77,6 +77,32 @@ Download a SAM3 checkpoint in SafeTensors format, then convert to the optimized 
 ./sam3_cli convert -i models/evit.safetensors -o models/evit.sam3 --backbone efficientvit
 ```
 
+### SAM 3.1
+
+SAM 3.1 ships as a PyTorch `.pt` checkpoint only
+(`sam3.1_multiplex.pt`, ~3.3 GB). Convert in two steps:
+
+```bash
+# 1. Normalize into .safetensors (unwraps {"model": ...}, remaps
+#    sam3_model.* -> detector.* and sam2_predictor.* -> tracker.*)
+python tools/pt_to_safetensors.py \
+    models/sam3.1_multiplex.pt \
+    models/sam3.1_multiplex.safetensors
+
+# 2. Convert to .sam3 with the SAM 3.1 variant flag
+./sam3_cli convert \
+    -i models/sam3.1_multiplex.safetensors \
+    -o models/sam3.1.sam3 \
+    --variant sam3.1
+
+# 3. Use it
+./sam3_cli segment -m models/sam3.1.sam3 -i img.jpg -t "cat"
+```
+
+Only the image-detector path is wired in this release. The SAM 3.1
+multiplex tracker and joint multi-object video pass are planned for
+follow-up work — SAM 3 continues to handle all video tracking today.
+
 ### Run Inference
 
 ```bash
