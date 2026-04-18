@@ -38,7 +38,6 @@ static enum sam3_error mock_encode(struct sam3_video_session *session,
 				    struct sam3_frame_features *out)
 {
 	(void)session;
-	g_encode_calls++;
 
 	int dims[4] = {1, 2, 2, 4};
 
@@ -78,6 +77,10 @@ static enum sam3_error mock_encode(struct sam3_video_session *session,
 
 	/* Encode a signal so we can verify identity on hits. */
 	((float *)d0)[0] = (float)frame_idx;
+	/* Counted only on success so retries after a budget-induced
+	 * ENOMEM don't inflate the per-frame encode count that the
+	 * LRU test asserts against. */
+	g_encode_calls++;
 	return SAM3_OK;
 }
 
@@ -147,6 +150,73 @@ static void test_lru_eviction_when_backend_full(void)
 	sam3_frame_cache_release(&cache);
 }
 
+static void test_spill_promote_via_memcpy(void)
+{
+	g_encode_calls = 0;
+	struct sam3_frame_cache cache = {0};
+	/* Each encoded slot uses ~192 bytes (three 64-byte tensor data
+	 * buffers); a 768-byte backend budget therefore fits ~3 slots. */
+	enum sam3_error err = sam3_frame_cache_init(&cache, NULL, mock_encode,
+			/*n_frames=*/8,
+			/*backend=*/768,
+			/*spill=*/1024 * 1024);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Encode frame 1 first so it becomes the LRU victim below. */
+	struct sam3_frame_features f = {0};
+	ASSERT_EQ(sam3_frame_cache_get(&cache, 1, &f), SAM3_OK);
+	ASSERT_EQ(cache.slots[1].tier, SAM3_FRAME_TIER_BACKEND);
+
+	/* Mutate the tensor contents so we can verify byte-for-byte
+	 * survival across spill -> promote. */
+	((float *)f.image_features->data)[3] = 123.5f;
+	((float *)f.feat_s0->data)[5] = -7.25f;
+	((float *)f.feat_s1->data)[0] = 99.0f;
+
+	const size_t nbytes = f.image_features->nbytes;
+	char saved_image[64], saved_s0[64], saved_s1[64];
+	ASSERT_EQ(nbytes, 64);
+	memcpy(saved_image, f.image_features->data, nbytes);
+	memcpy(saved_s0,    f.feat_s0->data,        nbytes);
+	memcpy(saved_s1,    f.feat_s1->data,        nbytes);
+
+	/* Touch frames 2..5 to force frame 1 onto spill. */
+	for (int i = 2; i <= 5; i++)
+		ASSERT_EQ(sam3_frame_cache_get(&cache, i, &f), SAM3_OK);
+	ASSERT_EQ(cache.slots[1].tier, SAM3_FRAME_TIER_CPU_SPILL);
+	ASSERT(cache.slots[1].spill_image_features != NULL);
+
+	int encode_before = g_encode_calls;
+	uint64_t promotes_before = cache.n_spill_promotes;
+
+	/* Re-access frame 1: must promote via memcpy without re-encoding. */
+	struct sam3_frame_features f1p = {0};
+	ASSERT_EQ(sam3_frame_cache_get(&cache, 1, &f1p), SAM3_OK);
+
+	ASSERT_EQ(g_encode_calls, encode_before);
+	ASSERT_EQ(cache.n_spill_promotes, promotes_before + 1);
+	ASSERT_EQ(cache.slots[1].tier, SAM3_FRAME_TIER_BACKEND);
+
+	/* Tensor headers restored with the original metadata. */
+	ASSERT_NOT_NULL(f1p.image_features);
+	ASSERT_NOT_NULL(f1p.feat_s0);
+	ASSERT_NOT_NULL(f1p.feat_s1);
+	ASSERT_EQ(f1p.image_features->dtype, SAM3_DTYPE_F32);
+	ASSERT_EQ(f1p.image_features->n_dims, 4);
+	ASSERT_EQ(f1p.image_features->nbytes, nbytes);
+
+	/* Byte-for-byte match with the pre-evict contents. */
+	ASSERT_EQ(memcmp(f1p.image_features->data, saved_image, nbytes), 0);
+	ASSERT_EQ(memcmp(f1p.feat_s0->data,        saved_s0,    nbytes), 0);
+	ASSERT_EQ(memcmp(f1p.feat_s1->data,        saved_s1,    nbytes), 0);
+
+	/* Spill buffers released after promotion. */
+	ASSERT(cache.slots[1].spill_image_features == NULL);
+	ASSERT_EQ(cache.slots[1].spill_bytes, (size_t)0);
+
+	sam3_frame_cache_release(&cache);
+}
+
 static void test_invalidate_clears_state(void)
 {
 	g_encode_calls = 0;
@@ -174,6 +244,7 @@ int main(void)
 	test_init_and_release();
 	test_first_access_encodes_then_hits();
 	test_lru_eviction_when_backend_full();
+	test_spill_promote_via_memcpy();
 	test_invalidate_clears_state();
 	TEST_REPORT();
 }

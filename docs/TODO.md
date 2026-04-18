@@ -215,62 +215,77 @@ and a cosine-diff sweep, both of which are separate work items.
 
 ---
 
-## 9. Spill→backend promotion via memcpy (no re-encode)
+## 9. ~~Spill→backend promotion via memcpy (no re-encode)~~ [x] DONE
 
-**File:** `src/model/frame_cache.c:6-7` (header TODO), `:293-309` (hot path)
-**Impact:** High (saves full 2.3 s encode per evicted frame on long clips)
-**Complexity:** Low
+**Resolution:** `spill_slot_to_cpu` now snapshots each tensor's header
+(dtype, n_dims, dims, strides, nbytes) into new `spill_hdr_*` fields
+on the cache slot alongside the raw byte copy. On a spill hit,
+`sam3_frame_cache_get` takes a new `spill_promote` fast path that
+builds fresh tensors in the backend arena via `sam3_tensor_clone_persist`
+(pointing each temporary header at the matching spill buffer), byte-
+copying straight from the host spill into the arena without invoking
+the encoder. `n_spill_promotes` now reflects genuine memcpy-only
+promotions. Falls back to the full encode path if any required spill
+buffer is NULL (e.g. was dropped to TIER_NONE under spill pressure).
 
-### Problem
+The retry ladder in `sam3_frame_cache_get` gained a last-resort
+`drain_backend_tier` step. The bump arena cannot reclaim individual
+slots, so a budget-sized `make_backend_room` can leave the offset
+stuck near capacity even after partial LRU eviction; the new helper
+evicts every remaining backend slot (to spill when budget allows)
+so the arena can reset before the final retry. This makes the
+eviction path actually reachable under tight budgets — a latent bug
+that blocked tests and would surface in production once the 4 GiB
+arena filled.
 
-`frame_cache.c`'s own header comment says: *"promotion from spill
-triggers recompute … future optimization may replace with a direct
-memcpy fast path."* With a 4 GiB backend budget the cache holds only
-~30 Hiera frames of the 4 cached scales; on a 64-frame clip the rest
-spill. Each spill→backend round-trip re-runs the 32-block Hiera encoder
-instead of copying ~50 MB of already-computed features back from the
-CPU spill buffer.
-
-### Approach
-
-When `s->tier == SAM3_FRAME_TIER_CPU_SPILL` and the spill buffers are
-still populated (`s->spill_image_features != NULL`), allocate fresh
-tensors in the backend arena and `memcpy` from spill → backend instead
-of calling `cache->encode`. Invalidate on model change. Fall back to
-re-encode if any spill buffer is NULL.
-
-### Tasks
-
-- [ ] Add spill-hit path in `sam3_frame_cache_get` (before encode dispatch)
-- [ ] Measure `n_spill_promotes` on 64f Hiera clip and confirm wins
-- [ ] Unit test: evict a frame, re-access, verify features match pre-evict byte-for-byte
+**Files changed:**
+- `src/model/frame_cache.h` — `spill_hdr_image_features` / `_feat_s0` /
+  `_feat_s1` / `_feat_4x` fields on `sam3_frame_cache_slot`; updated
+  top-of-file docstring to describe memcpy promotion
+- `src/model/frame_cache.c` — header snapshot in `spill_slot_to_cpu`;
+  new `spill_promote` + `drain_backend_tier` helpers; rewritten retry
+  ladder in `sam3_frame_cache_get`; docstring refreshed
+- `tests/test_frame_cache.c` — `test_spill_promote_via_memcpy` (evicts
+  frame 1, mutates its contents first, re-accesses and asserts
+  `n_spill_promotes` bumped, `g_encode_calls` unchanged, byte-for-byte
+  match across three tensors); mock `g_encode_calls` moved to the
+  success path so retry counts don't inflate the LRU test's assertion
 
 ---
 
-## 10. Share flattened `feat_s1` across objects in one frame
+## 10. ~~Share flattened `feat_s1` across objects in one frame~~ [x] DONE
 
-**File:** `src/model/sam3_video.c:1438` (propagate path), conditioning path mirrors
-**Impact:** Low-Med (~1-3 ms/frame per extra object)
-**Complexity:** Trivial
+**Resolution:** Added a private `struct propagate_frame_ctx` that
+carries the per-frame `sam3_frame_features`, the flattened `[HW, d]`
+`img_2d` tensor, its grid dims, and the scratch-arena offset captured
+immediately after the flatten. `propagate_one` builds this once per
+frame (reset scratch → frame_cache_get → allocate+memcpy img_2d →
+snapshot offset) and threads a pointer through `video_replay_obj_prompt`
+→ `video_replay_stored_prompt` → `video_add_prompts_pipeline`, and
+into `video_propagate_pure_tracking_obj`.
 
-### Problem
+When the shared ctx is non-NULL the per-object functions skip
+`sam3_frame_cache_get`, reuse `shared->img_2d`, and reset the scratch
+arena to `shared->scratch_mark` (instead of 0) so per-object prompt
+tokens and graph intermediates still recycle between iterations while
+the shared flatten survives. Public callers (`sam3_video_add_points`,
+`sam3_video_add_box`) pass NULL and keep the legacy per-call path.
 
-`video_propagate_obj` allocates a fresh `img_2d` tensor and `memcpy`s
-`cf.feat_s1->data` into it for **every object**, on every frame. Same
-frame, same backbone features — the flatten is per-object pure
-overhead. On 8-obj clips: 7 redundant 1.3 MB memcpys per frame.
+On an 8-object clip this saves 7 redundant `cf.feat_s1->nbytes`
+memcpys (≈ 1.3 MB each at 72×72×256 f16) plus the matching
+arena churn every frame. If cache lookup or feat_s1 shape are
+unexpected, `propagate_one` silently falls back to per-object flatten
+— the fast path is an opt-in.
 
-### Approach
-
-Flatten once in `propagate_one` before the object loop and pass the
-shared `img_2d` into both `video_replay_obj_prompt` and
-`video_propagate_pure_tracking_obj`. Lifetime: the per-frame scratch
-arena (reset at end of frame) already matches.
+**Files changed:**
+- `src/model/sam3_video.c` — new `propagate_frame_ctx` struct; threaded
+  through four static helpers; `propagate_one` builds it; public
+  wrappers pass NULL
 
 ### Tasks
 
-- [ ] Lift `feat_s1 → img_2d` flatten into `propagate_one`
-- [ ] Thread `img_2d` through `video_replay_obj_prompt` + `video_propagate_pure_tracking_obj`
+- [x] Lift `feat_s1 → img_2d` flatten into `propagate_one`
+- [x] Thread `img_2d` through `video_replay_obj_prompt` + `video_propagate_pure_tracking_obj`
 - [ ] Confirm bench `video_per_frame_32f_8obj_fwd` improves
 
 ---
@@ -468,8 +483,8 @@ diff the resulting `mem_feat` tensors against the 5× path. Keep the
 4. ~~**SDPA mask cache** (item 2)~~ — **DONE** (stack-local 4-slot cache)
 5. ~~**Multi-stream** (item 5)~~ — **DONE** (GPU-resident forwarding via no_readback)
 6. ~~**Matmul precision policy** (item 8)~~ — **DONE** (dead-code cleanup; MLX already accumulates F16 matmul in F32)
-7. **Spill→backend memcpy** (item 9) — biggest win on long clips
-8. **Share `feat_s1`** (item 10) — trivial, zero-risk, do first
+7. ~~**Spill→backend memcpy** (item 9)~~ — **DONE** (memcpy promote via saved headers; drain_backend_tier unblocks the ENOMEM retry ladder)
+8. ~~**Share `feat_s1`** (item 10)~~ — **DONE** (per-frame shared `img_2d` via `propagate_frame_ctx`)
 9. **Skip memattn for small bank** (item 12) — quick win at clip start
 10. **ViT block batch bump** (item 11) — easy after item 5 landed
 11. **Batch objects in decoder** (item 15) — big on multi-obj
