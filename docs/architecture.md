@@ -1972,9 +1972,10 @@ through the memory encoder.
 * The tracker is single-threaded per session — concurrent sessions
   are supported, but a single session does not parallelise across
   frames. This is a documented non-goal.
-* Video I/O: MPEG1/2 is decoded via the bundled `pl_mpeg` backend,
-  and a directory of JPEG/PNG frames is accepted as an alternative
-  source (frames are decoded via `stb_image`).
+* Video I/O: Video files are decoded via libav (libavformat/libavcodec/libswscale),
+  supporting any codecs exposed by the linked ffmpeg build. A directory of
+  JPEG/PNG frames is accepted as an alternative source (frames are decoded via
+  `stb_image`).
 
 ### 10.4 Public API
 

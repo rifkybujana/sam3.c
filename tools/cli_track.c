@@ -29,6 +29,8 @@
 #include "util/log.h"
 #include "util/error.h"
 #include "util/profile.h"
+#include "util/video_internal.h"
+#include "util/video_encode.h"
 
 /* Suppress warnings in vendored stb header (declarations only) */
 #ifdef __clang__
@@ -60,6 +62,10 @@
 #elif defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
+
+/* Forward declarations for mode-specific entry points */
+static int cli_track_run_dir(const struct track_args *a);
+static int cli_track_run_video(const struct track_args *a);
 
 /* --- argv parsing helpers --- */
 
@@ -131,18 +137,42 @@ static int parse_box(const char *str, struct sam3_prompt *prompt)
 	return 0;
 }
 
+static int has_suffix_ci(const char *s, const char *suf)
+{
+	size_t sn = strlen(s), xn = strlen(suf);
+	if (sn < xn) return 0;
+	const char *tail = s + sn - xn;
+	for (size_t i = 0; i < xn; i++) {
+		char a = tail[i], b = suf[i];
+		if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+		if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+		if (a != b) return 0;
+	}
+	return 1;
+}
+
+static int detect_output_mode(const char *path)
+{
+	if (has_suffix_ci(path, ".mp4")  || has_suffix_ci(path, ".mov") ||
+	    has_suffix_ci(path, ".mkv")  || has_suffix_ci(path, ".webm"))
+		return TRACK_OUTPUT_VIDEO;
+	return TRACK_OUTPUT_DIR;
+}
+
 static void print_usage(const char *prog)
 {
 	printf("sam3 track - video object tracking v%s\n\n",
 	       sam3_version());
 	printf("Usage: %s --model <path> --video <path> "
-	       "--output <dir> [prompts] [options]\n\n", prog);
+	       "--output <path> [prompts] [options]\n\n", prog);
 	printf("Required:\n");
 	printf("  --model <path>        Model weights file (.sam3)\n");
 	printf("  --video <path>        Video file or frame "
 	       "directory\n");
-	printf("  --output <dir>        Output directory for "
-	       "per-frame PNG masks\n");
+	printf("  --output <path>       Output path: a directory for "
+	       "per-frame PNGs,\n");
+	printf("                        or a .mp4/.mov/.mkv/.webm "
+	       "file for overlay video\n");
 	printf("\nPrompts (at least one required):\n");
 	printf("  --point x,y,label     Point prompt (repeatable, "
 	       "label: 1=fg, 0=bg)\n");
@@ -159,20 +189,28 @@ static void print_usage(const char *prog)
 	printf("  -v, --verbose         Enable debug logging\n");
 	printf("  --profile             Print stage/op timing report at end\n");
 	printf("  -h, --help            Show this help\n");
+	printf("\nVideo-output options (when --output has a "
+	       ".mp4/.mov/.mkv/.webm extension):\n");
+	printf("  --alpha <f>           Overlay alpha in [0,1] (default: 0.5)\n");
+	printf("  --fps <n>             Frame rate (required for frame-dir "
+	       "input; ignored for videos)\n");
 }
 
 int cli_track_parse(int argc, char **argv, struct track_args *out)
 {
 	int cur_obj_id = 0;
 
-	out->model_path = NULL;
-	out->video_path = NULL;
-	out->output_dir = NULL;
-	out->n_prompts  = 0;
-	out->frame_idx  = 0;
-	out->propagate  = TRACK_PROPAGATE_BOTH;
-	out->verbose    = 0;
-	out->profile    = 0;
+	out->model_path  = NULL;
+	out->video_path  = NULL;
+	out->output_dir  = NULL;
+	out->n_prompts   = 0;
+	out->frame_idx   = 0;
+	out->propagate   = TRACK_PROPAGATE_BOTH;
+	out->verbose     = 0;
+	out->profile     = 0;
+	out->alpha       = 0.5f;
+	out->fps         = 0;
+	out->output_mode = TRACK_OUTPUT_DIR; /* finalized after --output parsed */
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-h") == 0 ||
@@ -304,6 +342,35 @@ int cli_track_parse(int argc, char **argv, struct track_args *out)
 					"both (got '%s')", argv[i]);
 				return -1;
 			}
+		} else if (strcmp(argv[i], "--alpha") == 0) {
+			if (++i >= argc) {
+				sam3_log_error("--alpha requires a value");
+				return -1;
+			}
+			char *end;
+			errno = 0;
+			double v = strtod(argv[i], &end);
+			if (argv[i][0] == '\0' || *end != '\0' ||
+			    errno == ERANGE || v < 0.0 || v > 1.0) {
+				sam3_log_error(
+					"--alpha must be in [0,1] (got '%s')",
+					argv[i]);
+				return -1;
+			}
+			out->alpha = (float)v;
+		} else if (strcmp(argv[i], "--fps") == 0) {
+			if (++i >= argc) {
+				sam3_log_error("--fps requires a value");
+				return -1;
+			}
+			int tmp;
+			if (parse_int_arg("--fps", argv[i], &tmp))
+				return -1;
+			if (tmp <= 0) {
+				sam3_log_error("--fps %d must be > 0", tmp);
+				return -1;
+			}
+			out->fps = tmp;
 		} else if (strcmp(argv[i], "-v") == 0 ||
 			   strcmp(argv[i], "--verbose") == 0) {
 			out->verbose = 1;
@@ -324,9 +391,10 @@ int cli_track_parse(int argc, char **argv, struct track_args *out)
 		return -1;
 	}
 	if (!out->output_dir) {
-		sam3_log_error("--output <dir> is required");
+		sam3_log_error("--output <path> is required");
 		return -1;
 	}
+	out->output_mode = detect_output_mode(out->output_dir);
 	if (out->n_prompts == 0) {
 		sam3_log_error(
 			"at least one --point or --box prompt is "
@@ -470,6 +538,13 @@ static const char *dir_name(enum sam3_propagate_dir dir)
 
 static int cli_track_run(const struct track_args *a)
 {
+	if (a->output_mode == TRACK_OUTPUT_VIDEO)
+		return cli_track_run_video(a);
+	return cli_track_run_dir(a);
+}
+
+static int cli_track_run_dir(const struct track_args *a)
+{
 	sam3_ctx              *ctx     = NULL;
 	sam3_video_session    *session = NULL;
 	enum sam3_error        err;
@@ -575,6 +650,286 @@ cleanup:
 		sam3_video_end(session);
 	sam3_free(ctx);
 	free(fc.gray_buf);
+	return ret;
+}
+
+/*
+ * video_frame_ctx - Per-frame mask buffer + profiler carry.
+ *
+ * Populated by video_mask_callback during sam3_video_propagate.
+ * `masks` is laid out as: masks[(frame_idx * n_objects + obj_id) *
+ * mask_h * mask_w + y * mask_w + x], storing 0 or 255.
+ */
+struct video_frame_ctx {
+	int      n_frames;
+	int      n_objects;
+	int      mask_w, mask_h;
+	uint8_t *masks;  /* n_frames * n_objects * mask_h * mask_w */
+	uint8_t *seen;   /* n_frames */
+	struct sam3_profiler *profiler; /* NULL if --profile is off */
+};
+
+static int video_mask_callback(const struct sam3_video_frame_result *r,
+			       void *user_data)
+{
+	struct video_frame_ctx *fc = user_data;
+	if (!r || r->frame_idx < 0 || r->frame_idx >= fc->n_frames)
+		return 0;
+
+	SAM3_PROF_BEGIN(fc->profiler, "mask_buffer");
+
+	fc->seen[r->frame_idx] = 1;
+	for (int i = 0; i < r->n_objects; i++) {
+		int obj_id = r->objects[i].obj_id;
+		if (obj_id < 0 || obj_id >= fc->n_objects)
+			continue;
+		if (!r->objects[i].mask)
+			continue;
+
+		int mw = r->objects[i].mask_w;
+		int mh = r->objects[i].mask_h;
+		if (mw != fc->mask_w || mh != fc->mask_h)
+			continue; /* resolution mismatch — skip */
+
+		size_t off = ((size_t)r->frame_idx * fc->n_objects + obj_id) *
+			     (size_t)fc->mask_h * fc->mask_w;
+		uint8_t *dst = fc->masks + off;
+		const float *src = r->objects[i].mask;
+		int n = mw * mh;
+		for (int k = 0; k < n; k++)
+			dst[k] = src[k] >= 0.0f ? 255 : 0;
+	}
+
+	SAM3_PROF_END(fc->profiler, "mask_buffer");
+	return 0;
+}
+
+static int cli_track_run_video(const struct track_args *a)
+{
+	sam3_ctx              *ctx     = NULL;
+	sam3_video_session    *session = NULL;
+	enum sam3_error        err;
+	int                    ret     = SAM3_EXIT_INTERNAL;
+	struct video_frame_ctx fc      = {0};
+
+	if (a->verbose)
+		sam3_log_set_level(SAM3_LOG_DEBUG);
+
+	ctx = sam3_init();
+	if (!ctx) {
+		sam3_log_error("failed to initialize sam3 context");
+		return SAM3_EXIT_INTERNAL;
+	}
+
+	if (a->profile) {
+		err = sam3_profile_enable(ctx);
+		if (err != SAM3_OK)
+			sam3_log_warn("profiling not available: %s",
+				      sam3_error_str(err));
+		fc.profiler = sam3_profile_get(ctx);
+	}
+
+	sam3_log_info("loading model: %s", a->model_path);
+	err = sam3_load_model(ctx, a->model_path);
+	if (err != SAM3_OK) {
+		sam3_log_error("failed to load model '%s': %s",
+			       a->model_path, sam3_error_str(err));
+		ret = (int)sam3_error_to_exit(err);
+		goto cleanup;
+	}
+
+	sam3_log_info("starting video session: %s", a->video_path);
+	err = sam3_video_start(ctx, a->video_path, &session);
+	if (err != SAM3_OK) {
+		sam3_log_error("video start failed: %s",
+			       sam3_error_str(err));
+		ret = (int)sam3_error_to_exit(err);
+		goto cleanup;
+	}
+
+	fc.n_frames = sam3_video_frame_count(session);
+	/* Masks come back at the model input size. */
+	fc.mask_w = sam3_get_image_size(ctx);
+	fc.mask_h = fc.mask_w;
+
+	/* Determine number of objects in use (max obj_id in prompts + 1). */
+	int max_obj = -1;
+	for (int i = 0; i < a->n_prompts; i++)
+		if (a->prompts[i].obj_id > max_obj)
+			max_obj = a->prompts[i].obj_id;
+	fc.n_objects = max_obj + 1;
+	if (fc.n_objects <= 0) fc.n_objects = 1;
+
+	size_t bytes = (size_t)fc.n_frames * fc.n_objects *
+		       (size_t)fc.mask_h * fc.mask_w;
+	fc.masks = calloc(1, bytes);
+	fc.seen  = calloc(1, (size_t)fc.n_frames);
+	if (!fc.masks || !fc.seen) {
+		sam3_log_error(
+			"out of memory for mask buffer (%zu MB)",
+			bytes / (1024 * 1024));
+		ret = (int)sam3_error_to_exit(SAM3_ENOMEM);
+		goto cleanup;
+	}
+
+	for (int i = 0; i < a->n_prompts; i++) {
+		const struct track_prompt_entry *e = &a->prompts[i];
+		struct sam3_video_frame_result prompt_result = {0};
+
+		if (e->prompt.type == SAM3_PROMPT_POINT) {
+			err = sam3_video_add_points(session, a->frame_idx,
+						    e->obj_id,
+						    &e->prompt.point, 1,
+						    &prompt_result);
+		} else if (e->prompt.type == SAM3_PROMPT_BOX) {
+			err = sam3_video_add_box(session, a->frame_idx,
+						 e->obj_id, &e->prompt.box,
+						 &prompt_result);
+		} else {
+			sam3_log_warn("prompt %d: unsupported type, skipping", i);
+			continue;
+		}
+		if (err == SAM3_OK)
+			video_mask_callback(&prompt_result, &fc);
+		sam3_video_frame_result_free(&prompt_result);
+		if (err != SAM3_OK) {
+			sam3_log_error("prompt %d failed: %s", i,
+				       sam3_error_str(err));
+			ret = (int)sam3_error_to_exit(err);
+			goto cleanup;
+		}
+	}
+
+	int sam3_dir = track_propagate_to_sam3_dir(a->propagate);
+	if (sam3_dir < 0) {
+		sam3_log_info("propagation disabled (--propagate none)");
+	} else {
+		sam3_log_info("propagating masks (%s)",
+			      dir_name((enum sam3_propagate_dir)sam3_dir));
+		err = sam3_video_propagate(session, sam3_dir,
+					   video_mask_callback, &fc);
+		if (err != SAM3_OK) {
+			sam3_log_error("propagation failed: %s",
+				       sam3_error_str(err));
+			ret = (int)sam3_error_to_exit(err);
+			goto cleanup;
+		}
+	}
+
+	/* --- Pass 2: decode source at native resolution, composite, encode --- */
+	{
+		struct sam3_rgb_iter     *it  = NULL;
+		struct sam3_video_encoder *enc = NULL;
+		uint8_t                  *rgb_copy = NULL;
+
+		err = sam3_rgb_iter_open(a->video_path, &it);
+		if (err != SAM3_OK) {
+			ret = (int)sam3_error_to_exit(err);
+			goto pass2_cleanup;
+		}
+
+		/* Peek the first frame to know dimensions and fps fallback. */
+		const uint8_t *rgb = NULL;
+		int w = 0, h = 0, eof = 0;
+		err = sam3_rgb_iter_next(it, &rgb, &w, &h, &eof);
+		if (err != SAM3_OK || eof || !rgb) {
+			sam3_log_error(
+				"video mode: source has no frames to encode");
+			if (err == SAM3_OK) err = SAM3_EIO;
+			ret = (int)sam3_error_to_exit(err);
+			goto pass2_cleanup;
+		}
+
+		int fps_num = 0, fps_den = 1;
+		if (a->fps > 0) {
+			fps_num = a->fps;
+			fps_den = 1;
+		} else {
+			sam3_rgb_iter_fps(it, &fps_num, &fps_den);
+			if (fps_num <= 0) {
+				sam3_log_error(
+					"--fps is required when source has "
+					"no native frame rate (frame "
+					"directory or unrecognized container)");
+				err = SAM3_EINVAL;
+				ret = (int)sam3_error_to_exit(err);
+				goto pass2_cleanup;
+			}
+		}
+
+		err = sam3_video_encoder_open(a->output_dir, w, h,
+					      fps_num, fps_den, &enc);
+		if (err != SAM3_OK) {
+			ret = (int)sam3_error_to_exit(err);
+			goto pass2_cleanup;
+		}
+
+		/* Work buffer for the overlay (mutable copy of the iter's
+		 * frame, which the iterator owns). */
+		rgb_copy = malloc((size_t)w * h * 3);
+		if (!rgb_copy) {
+			sam3_log_error("out of memory for overlay buffer");
+			err = SAM3_ENOMEM;
+			ret = (int)sam3_error_to_exit(err);
+			goto pass2_cleanup;
+		}
+
+		int frame_idx = 0;
+		for (;;) {
+			if (!rgb) break; /* defensive */
+			memcpy(rgb_copy, rgb, (size_t)w * h * 3);
+
+			if (frame_idx < fc.n_frames && fc.seen[frame_idx]) {
+				for (int o = 0; o < fc.n_objects; o++) {
+					size_t off = ((size_t)frame_idx *
+						      fc.n_objects + o) *
+						     (size_t)fc.mask_h * fc.mask_w;
+					sam3_overlay_composite(
+						rgb_copy, w, h,
+						fc.masks + off,
+						fc.mask_w, fc.mask_h,
+						o, a->alpha);
+				}
+			}
+
+			err = sam3_video_encoder_write_rgb(enc, rgb_copy);
+			if (err != SAM3_OK) {
+				sam3_log_error("encode failed at frame %d",
+					       frame_idx);
+				ret = (int)sam3_error_to_exit(err);
+				goto pass2_cleanup;
+			}
+			frame_idx++;
+
+			err = sam3_rgb_iter_next(it, &rgb, &w, &h, &eof);
+			if (err != SAM3_OK) {
+				ret = (int)sam3_error_to_exit(err);
+				goto pass2_cleanup;
+			}
+			if (eof) break;
+		}
+
+		ret = SAM3_EXIT_OK;
+
+pass2_cleanup:
+		/* Close encoder even on partial success to finalize file. */
+		if (enc) {
+			enum sam3_error cerr = sam3_video_encoder_close(enc);
+			if (cerr != SAM3_OK && ret == SAM3_EXIT_OK)
+				ret = (int)sam3_error_to_exit(cerr);
+		}
+		sam3_rgb_iter_close(it);
+		free(rgb_copy);
+	}
+
+cleanup:
+	if (a->profile)
+		sam3_profile_report(ctx);
+	if (session)
+		sam3_video_end(session);
+	sam3_free(ctx);
+	free(fc.masks);
+	free(fc.seen);
 	return ret;
 }
 

@@ -38,6 +38,15 @@ enum track_propagate {
 };
 
 /*
+ * CLI-layer output mode, derived from the extension on --output.
+ * Selected during cli_track_parse so cli_track_run can branch cleanly.
+ */
+enum track_output_mode {
+	TRACK_OUTPUT_DIR   = 0, /* write per-frame PNGs into a directory */
+	TRACK_OUTPUT_VIDEO = 1, /* write a single overlay video file */
+};
+
+/*
  * A single CLI prompt entry. Each prompt carries the object id the
  * caller associated with it via `--obj-id`. Points and boxes share the
  * array so that order of `--point`/`--box` on the command line is
@@ -54,6 +63,9 @@ struct track_prompt_entry {
  * Internal, test surface. Not part of the public sam3 ABI. Always use
  * cli_track() from application code; this struct is exposed only so
  * that tests/test_cli_track.c can unit-test cli_track_parse().
+ *
+ * The output_mode, alpha, and fps fields are video-mode only. alpha
+ * defaults to 0.5; fps defaults to 0 (meaning inherit from source).
  */
 struct track_args {
 	const char               *model_path;
@@ -65,6 +77,9 @@ struct track_args {
 	int                       propagate;  /* enum track_propagate */
 	int                       verbose;
 	int                       profile;    /* 1 if --profile was passed */
+	int                       output_mode; /* enum track_output_mode */
+	float                     alpha;       /* overlay alpha, [0, 1] */
+	int                       fps;         /* output fps (frame-dir input) */
 };
 
 /*

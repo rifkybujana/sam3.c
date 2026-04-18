@@ -45,7 +45,7 @@
 #include "util/time.h"
 
 /* Arena capacities for video sessions */
-#define VIDEO_PERSIST_SIZE  (1UL << 30)  /* 1 GiB */
+#define VIDEO_PERSIST_SIZE  (4UL << 30)  /* 4 GiB */
 #define VIDEO_SCRATCH_SIZE  (1UL << 28)  /* 256 MiB */
 
 /*

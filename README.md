@@ -59,6 +59,11 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
+> **First build note:** the build fetches and statically compiles
+> FFmpeg, openh264, and libvpx into `build/external/`. Expect ~10-15
+> minutes on first configure; subsequent incremental builds are fast.
+> The resulting binary has no runtime dependency on system ffmpeg.
+
 ### Convert Weights
 
 Download a SAM3 checkpoint in SafeTensors format, then convert to the optimized `.sam3` format:

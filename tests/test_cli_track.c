@@ -169,6 +169,113 @@ static void test_track_parse_box_and_obj_id(void)
 	ASSERT_EQ(a.frame_idx, 5);
 }
 
+static void test_track_parse_alpha_valid(void)
+{
+	struct track_args a = {0};
+	char **argv = ARGV("track",
+			   "--model", "m.sam3", "--video", "v.mp4",
+			   "--output", "out/",
+			   "--point", "1,2,1",
+			   "--alpha", "0.75");
+	int argc = ARGC("track",
+			"--model", "m.sam3", "--video", "v.mp4",
+			"--output", "out/",
+			"--point", "1,2,1",
+			"--alpha", "0.75");
+
+	ASSERT_EQ(cli_track_parse(argc, argv, &a), 0);
+	ASSERT(a.alpha > 0.74f && a.alpha < 0.76f);
+}
+
+static void test_track_parse_alpha_out_of_range(void)
+{
+	struct track_args a = {0};
+	char **argv = ARGV("track",
+			   "--model", "m.sam3", "--video", "v.mp4",
+			   "--output", "out/",
+			   "--point", "1,2,1",
+			   "--alpha", "2.0");
+	int argc = ARGC("track",
+			"--model", "m.sam3", "--video", "v.mp4",
+			"--output", "out/",
+			"--point", "1,2,1",
+			"--alpha", "2.0");
+
+	ASSERT_EQ(cli_track_parse(argc, argv, &a), -1);
+}
+
+static void test_track_parse_fps_valid(void)
+{
+	struct track_args a = {0};
+	char **argv = ARGV("track",
+			   "--model", "m.sam3", "--video", "v.mp4",
+			   "--output", "out.mp4",
+			   "--point", "1,2,1",
+			   "--fps", "30");
+	int argc = ARGC("track",
+			"--model", "m.sam3", "--video", "v.mp4",
+			"--output", "out.mp4",
+			"--point", "1,2,1",
+			"--fps", "30");
+
+	ASSERT_EQ(cli_track_parse(argc, argv, &a), 0);
+	ASSERT_EQ(a.fps, 30);
+	ASSERT_EQ(a.output_mode, TRACK_OUTPUT_VIDEO);
+}
+
+static void test_track_output_mode_video_extensions(void)
+{
+	const char *paths[] = {
+		"out.mp4", "OUT.MOV", "x.mkv", "seg.webm"
+	};
+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		struct track_args a = {0};
+		char **argv = ARGV("track",
+				   "--model", "m.sam3", "--video", "v.mp4",
+				   "--output", paths[i],
+				   "--point", "1,2,1");
+		int argc = ARGC("track",
+				"--model", "m.sam3", "--video", "v.mp4",
+				"--output", paths[i],
+				"--point", "1,2,1");
+		ASSERT_EQ(cli_track_parse(argc, argv, &a), 0);
+		ASSERT_EQ(a.output_mode, TRACK_OUTPUT_VIDEO);
+	}
+}
+
+static void test_track_output_mode_dir_default(void)
+{
+	const char *paths[] = { "out/", "results", "./x.png" };
+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		struct track_args a = {0};
+		char **argv = ARGV("track",
+				   "--model", "m.sam3", "--video", "v.mp4",
+				   "--output", paths[i],
+				   "--point", "1,2,1");
+		int argc = ARGC("track",
+				"--model", "m.sam3", "--video", "v.mp4",
+				"--output", paths[i],
+				"--point", "1,2,1");
+		ASSERT_EQ(cli_track_parse(argc, argv, &a), 0);
+		ASSERT_EQ(a.output_mode, TRACK_OUTPUT_DIR);
+	}
+}
+
+static void test_track_default_alpha(void)
+{
+	struct track_args a = {0};
+	char **argv = ARGV("track",
+			   "--model", "m.sam3", "--video", "v.mp4",
+			   "--output", "out/",
+			   "--point", "1,2,1");
+	int argc = ARGC("track",
+			"--model", "m.sam3", "--video", "v.mp4",
+			"--output", "out/",
+			"--point", "1,2,1");
+	ASSERT_EQ(cli_track_parse(argc, argv, &a), 0);
+	ASSERT(a.alpha > 0.49f && a.alpha < 0.51f);
+}
+
 int main(void)
 {
 	test_track_parse_minimal();
@@ -178,6 +285,12 @@ int main(void)
 	test_track_parse_bad_point();
 	test_track_parse_bad_propagate();
 	test_track_parse_box_and_obj_id();
+	test_track_parse_alpha_valid();
+	test_track_parse_alpha_out_of_range();
+	test_track_parse_fps_valid();
+	test_track_output_mode_video_extensions();
+	test_track_output_mode_dir_default();
+	test_track_default_alpha();
 
 	TEST_REPORT();
 }

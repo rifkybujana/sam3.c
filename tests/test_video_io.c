@@ -32,15 +32,20 @@ static void test_detect_frame_dir(void)
 
 static void test_detect_video_file(void)
 {
-	ASSERT_EQ(sam3_video_detect_type("video.mpg"), SAM3_VIDEO_MPEG);
-	ASSERT_EQ(sam3_video_detect_type("video.mpeg"), SAM3_VIDEO_MPEG);
-	ASSERT_EQ(sam3_video_detect_type("VIDEO.MPG"), SAM3_VIDEO_MPEG);
+	/*
+	 * Detection is now stat()-based: any regular file returns FILE;
+	 * libav validates format on open. Use a real file we can stat.
+	 */
+	char path[512];
+	snprintf(path, sizeof(path), "%s/CMakeLists.txt", SAM3_SOURCE_DIR);
+	ASSERT_EQ(sam3_video_detect_type(path), SAM3_VIDEO_FILE);
 }
 
 static void test_detect_unknown(void)
 {
-	ASSERT_EQ(sam3_video_detect_type("photo.jpg"), SAM3_VIDEO_UNKNOWN);
-	ASSERT_EQ(sam3_video_detect_type("data.bin"), SAM3_VIDEO_UNKNOWN);
+	/* Non-existent path */
+	ASSERT_EQ(sam3_video_detect_type("/does/not/exist/xyz.mp4"),
+		  SAM3_VIDEO_UNKNOWN);
 	ASSERT_EQ(sam3_video_detect_type(NULL), SAM3_VIDEO_UNKNOWN);
 }
 

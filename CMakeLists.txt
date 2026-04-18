@@ -162,6 +162,12 @@ target_link_libraries(sam3 Threads::Threads)
 find_package(ZLIB REQUIRED)
 target_link_libraries(sam3 ZLIB::ZLIB)
 
+# Video I/O via statically-built FFmpeg (+ openh264 + libvpx). Binary
+# ships self-contained — no runtime dependency on system ffmpeg. First
+# build takes ~10-15 min to compile ffmpeg from source.
+include(${CMAKE_SOURCE_DIR}/cmake/StaticFfmpeg.cmake)
+target_link_libraries(sam3 ffmpeg_static)
+
 if(SAM3_BLAS)
 	if(APPLE)
 		target_link_libraries(sam3 ${ACCELERATE_LIB})
@@ -280,6 +286,11 @@ if(SAM3_TESTS)
 			tools/cli_track.c)
 		target_include_directories(test_cli_track PRIVATE
 			${CMAKE_SOURCE_DIR}/tools)
+	endif()
+
+	# test_video_encode needs libav headers directly for the roundtrip test
+	if(TARGET test_video_encode)
+		target_link_libraries(test_video_encode ffmpeg_static)
 	endif()
 
 	# test_video_io needs source dir for test data
