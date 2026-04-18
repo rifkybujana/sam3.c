@@ -13,7 +13,7 @@
 # Copyright (c) 2026 Rifky Bujana Bisri
 # SPDX-License-Identifier: MIT
 
-set -euo pipefail
+set -uo pipefail
 
 BUILD="${1:-${BUILD:-build-release}}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +27,8 @@ cmake --build "$BUILD" --target sam3_cli -j
 
 mkdir -p benchmarks/baselines
 
+# Collect failures so one broken model does not abort the whole batch.
+failed=()
 for variant in efficient tinyvit hiera; do
     case "$variant" in
         efficient) model="models/efficient.sam3" ;;
@@ -41,9 +43,17 @@ for variant in efficient tinyvit hiera; do
 
     out="benchmarks/baselines/${variant}.json"
     echo "==> Running bench all for $variant -> $out"
-    "$BUILD/sam3_cli" bench all \
-        --model "$model" --backend metal \
-        --output "$out"
+    if ! "$BUILD/sam3_cli" bench all \
+            --model "$model" --backend metal \
+            --output "$out"; then
+        echo "FAIL: $variant (continuing with next model)"
+        failed+=("$variant")
+    fi
 done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+    echo "==> Done with failures: ${failed[*]}"
+    exit 1
+fi
 
 echo "==> Done"
