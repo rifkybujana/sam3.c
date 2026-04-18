@@ -211,6 +211,14 @@ static void test_filter_match(void)
 	ASSERT(sam3_bench_filter_match("abc", "*xyz") == false);
 	ASSERT(sam3_bench_filter_match("abc", "xyz*") == false);
 
+	/* Wrap glob: "*foo*" — substring contains. */
+	ASSERT(sam3_bench_filter_match("video_per_frame_4obj", "*_4obj*") == true);
+	ASSERT(sam3_bench_filter_match("matmul_f32_1024", "*1024*") == true);
+	ASSERT(sam3_bench_filter_match("matmul_f32_1024", "*4obj*") == false);
+	ASSERT(sam3_bench_filter_match("ab", "*abc*") == false);
+	/* Trivial "**" matches anything. */
+	ASSERT(sam3_bench_filter_match("anything", "**") == true);
+
 	/* Empty filter matches all. */
 	ASSERT(sam3_bench_filter_match("anything", "") == true);
 }

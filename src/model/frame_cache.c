@@ -3,9 +3,10 @@
  *
  * Implements the public API declared in model/frame_cache.h. Backend
  * tier uses a dedicated bump arena; CPU spill keeps evicted bytes on
- * the host. Current design: promotion from spill triggers recompute
- * (tensor metadata re-hydration); future optimization may replace
- * with a direct memcpy fast path.
+ * the host. Promotion from spill to backend is a direct memcpy into a
+ * fresh arena allocation — tensor header metadata captured at spill
+ * time lets the cache rebuild the backend tensors without invoking
+ * the encoder again.
  *
  * Key types:  sam3_frame_cache, sam3_frame_features
  * Depends on: model/frame_cache.h, util/log.h
@@ -25,9 +26,7 @@
 #define DEFAULT_BACKEND_BUDGET ((size_t)4  * 1024 * 1024 * 1024) /* 4 GiB  */
 #define DEFAULT_SPILL_BUDGET   ((size_t)16 * 1024 * 1024 * 1024) /* 16 GiB */
 
-/* -------------------------------------------------------------------------
- * sam3_frame_cache_init
- * ---------------------------------------------------------------------- */
+/* --- sam3_frame_cache_init --- */
 
 enum sam3_error sam3_frame_cache_init(struct sam3_frame_cache *cache,
 				      struct sam3_video_session *owner,
@@ -69,9 +68,7 @@ enum sam3_error sam3_frame_cache_init(struct sam3_frame_cache *cache,
 	return SAM3_OK;
 }
 
-/* -------------------------------------------------------------------------
- * Internal helpers
- * ---------------------------------------------------------------------- */
+/* --- Internal helpers --- */
 
 static size_t slot_backend_bytes(const struct sam3_frame_cache_slot *s)
 {
@@ -97,9 +94,7 @@ static void slot_free_spill(struct sam3_frame_cache_slot *s,
 	s->spill_bytes = 0;
 }
 
-/* -------------------------------------------------------------------------
- * sam3_frame_cache_invalidate
- * ---------------------------------------------------------------------- */
+/* --- sam3_frame_cache_invalidate --- */
 
 void sam3_frame_cache_invalidate(struct sam3_frame_cache *cache)
 {
@@ -122,9 +117,7 @@ void sam3_frame_cache_invalidate(struct sam3_frame_cache *cache)
 	sam3_arena_reset(&cache->backend_arena);
 }
 
-/* -------------------------------------------------------------------------
- * sam3_frame_cache_release
- * ---------------------------------------------------------------------- */
+/* sam3_frame_cache_release --- */
 
 void sam3_frame_cache_release(struct sam3_frame_cache *cache)
 {
@@ -139,9 +132,7 @@ void sam3_frame_cache_release(struct sam3_frame_cache *cache)
 	memset(cache, 0, sizeof(*cache));
 }
 
-/* -------------------------------------------------------------------------
- * Eviction helpers
- * ---------------------------------------------------------------------- */
+/* --- Eviction helpers --- */
 
 /*
  * spill_slot_to_cpu - Copy a backend-tier slot's tensor data to host memory.
@@ -193,6 +184,21 @@ spill_slot_to_cpu(struct sam3_frame_cache_slot *s,
 	memcpy(s1, s->feat_s1->data,        s->feat_s1->nbytes);
 	if (s->feat_4x)
 		memcpy(s4, s->feat_4x->data, s->feat_4x->nbytes);
+
+	/* Snapshot tensor headers so a later promote-via-memcpy can
+	 * rebuild the backend tensors without the encoder. Clearing the
+	 * data pointer keeps these copies from being mistaken for live
+	 * arena-backed tensors. */
+	s->spill_hdr_image_features      = *s->image_features;
+	s->spill_hdr_image_features.data = NULL;
+	s->spill_hdr_feat_s0             = *s->feat_s0;
+	s->spill_hdr_feat_s0.data        = NULL;
+	s->spill_hdr_feat_s1             = *s->feat_s1;
+	s->spill_hdr_feat_s1.data        = NULL;
+	if (s->feat_4x) {
+		s->spill_hdr_feat_4x      = *s->feat_4x;
+		s->spill_hdr_feat_4x.data = NULL;
+	}
 
 	s->spill_image_features = im;
 	s->spill_feat_s0        = s0;
@@ -260,9 +266,87 @@ make_backend_room(struct sam3_frame_cache *cache, size_t need)
 	return SAM3_OK;
 }
 
-/* -------------------------------------------------------------------------
- * sam3_frame_cache_get
- * ---------------------------------------------------------------------- */
+/*
+ * drain_backend_tier - Evict every backend slot and reset the arena.
+ *
+ * The bump arena cannot reclaim individual allocations, so when a
+ * budget-scoped make_backend_room() leaves the arena offset too close
+ * to its capacity for the next encode/promote to fit, the only path
+ * forward is to evict everything in the backend tier. Each evicted
+ * slot moves to spill when budget allows, or to NONE otherwise.
+ * Called from sam3_frame_cache_get as a last-resort retry step.
+ */
+static void drain_backend_tier(struct sam3_frame_cache *cache)
+{
+	for (int i = 0; i < cache->n_frames; i++) {
+		struct sam3_frame_cache_slot *s = &cache->slots[i];
+		if (s->tier != SAM3_FRAME_TIER_BACKEND)
+			continue;
+		size_t freed = slot_backend_bytes(s);
+		(void)spill_slot_to_cpu(s, cache);
+		if (freed <= cache->backend_used)
+			cache->backend_used -= freed;
+		else
+			cache->backend_used = 0;
+	}
+	if (cache->backend_used == 0)
+		sam3_arena_reset(&cache->backend_arena);
+}
+
+/*
+ * spill_promote - Promote a CPU-spill slot back to the backend tier
+ *                 by memcpy'ing bytes into fresh arena allocations,
+ *                 bypassing the image encoder entirely.
+ *
+ * Precondition: s->tier == SAM3_FRAME_TIER_CPU_SPILL with valid
+ * spill_image_features / spill_feat_s0 / spill_feat_s1 pointers
+ * and matching spill_hdr_* metadata captured by spill_slot_to_cpu.
+ *
+ * On success, @out points at tensors allocated from cache->backend_arena
+ * whose contents are byte-identical to the pre-eviction state. Returns
+ * SAM3_ENOMEM if any arena allocation fails (the partial allocations
+ * are left in the arena; the bump offset is not rewound).
+ */
+static enum sam3_error
+spill_promote(struct sam3_frame_cache *cache,
+	      struct sam3_frame_cache_slot *s,
+	      struct sam3_frame_features *out)
+{
+	struct sam3_arena *arena = &cache->backend_arena;
+
+	struct sam3_tensor tmp;
+
+	tmp      = s->spill_hdr_image_features;
+	tmp.data = s->spill_image_features;
+	out->image_features = sam3_tensor_clone_persist(arena, &tmp);
+	if (!out->image_features)
+		return SAM3_ENOMEM;
+
+	tmp      = s->spill_hdr_feat_s0;
+	tmp.data = s->spill_feat_s0;
+	out->feat_s0 = sam3_tensor_clone_persist(arena, &tmp);
+	if (!out->feat_s0)
+		return SAM3_ENOMEM;
+
+	tmp      = s->spill_hdr_feat_s1;
+	tmp.data = s->spill_feat_s1;
+	out->feat_s1 = sam3_tensor_clone_persist(arena, &tmp);
+	if (!out->feat_s1)
+		return SAM3_ENOMEM;
+
+	if (s->spill_feat_4x) {
+		tmp      = s->spill_hdr_feat_4x;
+		tmp.data = s->spill_feat_4x;
+		out->feat_4x = sam3_tensor_clone_persist(arena, &tmp);
+		if (!out->feat_4x)
+			return SAM3_ENOMEM;
+	} else {
+		out->feat_4x = NULL;
+	}
+	return SAM3_OK;
+}
+
+/* --- sam3_frame_cache_get --- */
 
 enum sam3_error sam3_frame_cache_get(struct sam3_frame_cache *cache,
 				     int frame,
@@ -285,27 +369,57 @@ enum sam3_error sam3_frame_cache_get(struct sam3_frame_cache *cache,
 		return SAM3_OK;
 	}
 
-	if (s->tier == SAM3_FRAME_TIER_CPU_SPILL)
+	int use_promote = (s->tier == SAM3_FRAME_TIER_CPU_SPILL &&
+			   s->spill_image_features != NULL &&
+			   s->spill_feat_s0        != NULL &&
+			   s->spill_feat_s1        != NULL);
+	if (use_promote)
 		cache->n_spill_promotes++;
+	else if (s->tier == SAM3_FRAME_TIER_CPU_SPILL)
+		cache->n_misses++;  /* spill buffers dropped — must re-encode */
 	else
 		cache->n_misses++;
 
-	/* Miss or spill: run encode hook.
-	 *
-	 * If the hook returns SAM3_ENOMEM (arena full), evict half the budget
-	 * worth of LRU slots and retry once. The hook must allocate tensor
-	 * memory from the provided arena. */
+	/*
+	 * Miss, or spill-hit promote path. Both allocate into the backend
+	 * arena and share the same SAM3_ENOMEM recovery: evict LRU slots
+	 * via make_backend_room, and if the bump arena is still stuck full
+	 * (partial eviction leaves the offset high since the allocator
+	 * cannot reclaim individual slots), drain the backend tier to
+	 * force a reset before the final retry.
+	 */
 	struct sam3_frame_features fresh = {0};
-	enum sam3_error err = cache->encode(cache->owner, frame,
-					    &cache->backend_arena, &fresh);
+	enum sam3_error err;
+
+	if (use_promote)
+		err = spill_promote(cache, s, &fresh);
+	else
+		err = cache->encode(cache->owner, frame,
+				    &cache->backend_arena, &fresh);
+
 	if (err == SAM3_ENOMEM) {
 		enum sam3_error room_err =
 			make_backend_room(cache, cache->backend_budget / 2);
 		if (room_err != SAM3_OK)
 			return room_err;
 		memset(&fresh, 0, sizeof(fresh));
-		err = cache->encode(cache->owner, frame,
-				    &cache->backend_arena, &fresh);
+		if (use_promote)
+			err = spill_promote(cache, s, &fresh);
+		else
+			err = cache->encode(cache->owner, frame,
+					    &cache->backend_arena, &fresh);
+	}
+	if (err == SAM3_ENOMEM) {
+		/* Budget-based eviction left the bump arena too full for
+		 * this encode to fit. Drain every backend slot so the
+		 * arena can reset, then try one last time. */
+		drain_backend_tier(cache);
+		memset(&fresh, 0, sizeof(fresh));
+		if (use_promote)
+			err = spill_promote(cache, s, &fresh);
+		else
+			err = cache->encode(cache->owner, frame,
+					    &cache->backend_arena, &fresh);
 	}
 	if (err != SAM3_OK)
 		return err;

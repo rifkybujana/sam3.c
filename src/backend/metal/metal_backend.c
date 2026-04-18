@@ -531,37 +531,14 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 
 	switch (node->op) {
 	case SAM3_OP_MATMUL:
-#ifdef SAM3_METAL_F32_MATMUL
-	{
-		/* Upcast F16/BF16 inputs to F32, run matmul in F32, cast
-		 * result back to the inputs' dtype. Eliminates the F16
-		 * accumulation precision loss that compounds over deep
-		 * transformer stacks (32-layer ViT shows >15% cosine
-		 * drift from reference without this). */
-		mlx_dtype d0 = mlx_array_dtype(inputs[0]);
-		mlx_dtype d1 = mlx_array_dtype(inputs[1]);
-		int needs_upcast = (d0 == MLX_FLOAT16 || d0 == MLX_BFLOAT16 ||
-				    d1 == MLX_FLOAT16 || d1 == MLX_BFLOAT16);
-		if (needs_upcast) {
-			mlx_array a32 = mlx_array_new();
-			mlx_array b32 = mlx_array_new();
-			mlx_astype(&a32, inputs[0], MLX_FLOAT32, stream);
-			mlx_astype(&b32, inputs[1], MLX_FLOAT32, stream);
-			mlx_array r32 = mlx_array_new();
-			rc = mlx_matmul(&r32, a32, b32, stream);
-			if (rc == 0) {
-				rc = mlx_astype(&result, r32, d0, stream);
-			}
-			mlx_array_free(a32);
-			mlx_array_free(b32);
-			mlx_array_free(r32);
-		} else {
-			rc = mlx_matmul(&result, inputs[0], inputs[1], stream);
-		}
-	}
-#else
+		/*
+		 * MLX's steel GEMM accumulates in F32 regardless of operand
+		 * dtype (AccumType defaults to float in gemm.h/transforms.h).
+		 * So F16 operands already get F32 accumulation for free —
+		 * no manual astype round-trip needed. For fully-F32 compute,
+		 * set SAM3_METAL_F32=1 which keeps tensors F32 end-to-end.
+		 */
 		rc = mlx_matmul(&result, inputs[0], inputs[1], stream);
-#endif
 		break;
 
 	case SAM3_OP_ADD:

@@ -7,9 +7,10 @@
  *   1. Backend tier — held in a dedicated bump arena, ready for
  *      tracker consumption. Default budget 4 GiB.
  *   2. CPU spill — raw byte copies on the host (malloc'd). Default
- *      budget 16 GiB; 0 disables the tier. Promotion back to backend
- *      is currently done by recompute (memcpy fast path is a future
- *      optimization).
+ *      budget 16 GiB; 0 disables the tier. Promotion back to the
+ *      backend tier is a direct memcpy into a fresh arena allocation;
+ *      the saved header metadata lets the cache skip re-encoding the
+ *      frame entirely when the spill buffers are still populated.
  *   3. Recompute — runs the image encoder on a miss. Automatic
  *      fallback when both tiers cannot hold the frame.
  *
@@ -93,6 +94,18 @@ struct sam3_frame_cache_slot {
 	void                *spill_feat_s1;
 	void                *spill_feat_4x;
 	size_t               spill_bytes;     /* total bytes across all 4 */
+	/*
+	 * Tensor header snapshots captured when the slot transitions to
+	 * tier=CPU_SPILL. Used by the promote-via-memcpy fast path to
+	 * rebuild backend tensors without re-running the image encoder.
+	 * The data pointer in these copies is always NULL; only the
+	 * entries whose matching spill_* byte buffer is non-NULL are
+	 * considered valid (feat_4x is optional for older models).
+	 */
+	struct sam3_tensor   spill_hdr_image_features;
+	struct sam3_tensor   spill_hdr_feat_s0;
+	struct sam3_tensor   spill_hdr_feat_s1;
+	struct sam3_tensor   spill_hdr_feat_4x;
 	uint64_t             last_access_seq; /* LRU bookkeeping */
 };
 

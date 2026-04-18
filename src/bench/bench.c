@@ -211,6 +211,21 @@ bool sam3_bench_filter_match(const char *name, const char *filter)
 	if (flen == 0)
 		return true;
 
+	/*
+	 * Wrap glob: "*foo*" — substring contains. Must be checked before
+	 * the prefix/suffix branches because a wrap pattern ends with '*'
+	 * and would otherwise be mis-dispatched to the prefix branch.
+	 */
+	if (flen >= 2 && filter[0] == '*' && filter[flen - 1] == '*') {
+		char needle[128];
+		size_t nlen = flen - 2;
+		if (nlen >= sizeof(needle))
+			return false;
+		memcpy(needle, filter + 1, nlen);
+		needle[nlen] = '\0';
+		return strstr(name, needle) != NULL;
+	}
+
 	/* Check for prefix glob: "foo*" */
 	if (filter[flen - 1] == '*') {
 		return strncmp(name, filter, flen - 1) == 0;

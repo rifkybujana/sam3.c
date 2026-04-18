@@ -1,14 +1,14 @@
 /*
  * src/bench/bench_video_frame.c - Per-frame video tracker benchmark
  *
- * Times a single sam3_tracker_track_frame invocation as exposed through
- * the public video API: sam3_video_reset → sam3_video_add_points →
- * sam3_video_propagate(FORWARD) over a 2-frame synthetic clip. The
- * clip is synthesised once before the timing loop and the session is
- * reused across iterations so that the benchmark isolates the
- * per-frame tracking cost (memory attention + mask decoder) from
- * video-start overhead. Also defines the shared clip-synthesis helpers
- * used by bench_video_end_to_end.c.
+ * Drives a static case-table sweep of sam3_tracker_track_frame via the
+ * public video API: sam3_video_reset → sam3_video_add_points →
+ * sam3_video_propagate(direction). For each unique n_frames value in
+ * the case table, one clip directory and one video session are
+ * synthesised at setup time and reused across all matching cases, so
+ * the timed function isolates per-frame tracking cost (memory
+ * attention + mask decoder) from video-start overhead. Also defines
+ * the shared clip-synthesis helpers used by bench_video_end_to_end.c.
  *
  * Key types:  sam3_bench_config, sam3_bench_result, sam3_ctx,
  *             sam3_video_session
@@ -62,6 +62,18 @@
 
 /* ── Deterministic noise generator ─────────────────────────────────── */
 
+int sam3_bench_bounce_pos(int i)
+{
+	int max_pos = SAM3_BENCH_VIDEO_IMG_SIZE -
+		      SAM3_BENCH_VIDEO_SQUARE_SIZE;
+	int period  = 2 * max_pos;
+	int raw     = i * SAM3_BENCH_VIDEO_SQUARE_STEP;
+	int t       = raw % period;
+	if (t < 0)
+		t += period;
+	return (t <= max_pos) ? t : (period - t);
+}
+
 /*
  * Simple 32-bit LCG so the noise pattern is reproducible across
  * platforms. Only determinism and coverage of the [100, 156) range
@@ -112,10 +124,8 @@ int sam3_bench_generate_clip(const char *dir, int n)
 		for (size_t k = 0; k < nbytes; k++)
 			buf[k] = (uint8_t)(100u + (bench_lcg_next() % 56u));
 
-		int x0 = SAM3_BENCH_VIDEO_SQUARE_START +
-			 i * SAM3_BENCH_VIDEO_SQUARE_STEP;
-		int y0 = SAM3_BENCH_VIDEO_SQUARE_START +
-			 i * SAM3_BENCH_VIDEO_SQUARE_STEP;
+		int x0 = sam3_bench_bounce_pos(i);
+		int y0 = x0;
 		int x1 = x0 + SAM3_BENCH_VIDEO_SQUARE_SIZE;
 		int y1 = y0 + SAM3_BENCH_VIDEO_SQUARE_SIZE;
 
@@ -190,31 +200,83 @@ void sam3_bench_rmtree(const char *dir)
 		sam3_log_warn("bench rmtree: cannot rmdir '%s'", dir);
 }
 
-/* ── Per-frame benchmark ──────────────────────────────────────────── */
+/* ── Multi-object seeding helper ──────────────────────────────────── */
+
+/*
+ * seed_n_objects - Place @n distinct obj_id points inside the frame-@seed
+ * square of a bench synthetic clip.
+ *
+ * @s:     Active video session.
+ * @n:     Number of objects to seed (>= 1).
+ * @seed:  Frame index passed through to sam3_video_add_points.
+ * @scale: PNG-pixel → model-pixel scale factor for this session.
+ *
+ * Points are spread evenly inside the 32×32 white square at
+ * (bounce_pos(seed), bounce_pos(seed)) so each distinct obj_id
+ * gets a slightly different point. Returns SAM3_OK or the first
+ * error from sam3_video_add_points.
+ */
+static enum sam3_error seed_n_objects(sam3_video_session *s, int n,
+				      int seed, float scale)
+{
+	float square_x0 = (float)sam3_bench_bounce_pos(seed);
+	float square_y0 = square_x0;
+	float step      = (float)SAM3_BENCH_VIDEO_SQUARE_SIZE / (float)(n + 1);
+
+	for (int k = 0; k < n; k++) {
+		struct sam3_point pt;
+		struct sam3_video_frame_result r;
+		float px = square_x0 + step * (float)(k + 1);
+		float py = square_y0 + step * (float)(k + 1);
+
+		pt.x     = px * scale;
+		pt.y     = py * scale;
+		pt.label = 1;
+
+		memset(&r, 0, sizeof(r));
+		enum sam3_error err = sam3_video_add_points(
+			s, seed, /* obj_id */ k, &pt, 1, &r);
+		sam3_video_frame_result_free(&r);
+		if (err != SAM3_OK)
+			return err;
+	}
+	return SAM3_OK;
+}
+
+/* ── Per-frame case-table driver ──────────────────────────────────── */
+
+/*
+ * Case table — each row is one benchmark emitted by this function.
+ * Order matters only for readability; bench result ordering mirrors it.
+ */
+static const struct sam3_bench_video_case per_frame_cases[] = {
+	{ 8,  1, 0,  SAM3_PROPAGATE_FORWARD, "8f_1obj_fwd"   },
+	{ 32, 1, 0,  SAM3_PROPAGATE_FORWARD, "32f_1obj_fwd"  },
+	{ 64, 1, 0,  SAM3_PROPAGATE_FORWARD, "64f_1obj_fwd"  },
+	{ 32, 2, 0,  SAM3_PROPAGATE_FORWARD, "32f_2obj_fwd"  },
+	{ 32, 4, 0,  SAM3_PROPAGATE_FORWARD, "32f_4obj_fwd"  },
+	{ 32, 8, 0,  SAM3_PROPAGATE_FORWARD, "32f_8obj_fwd"  },
+	{ 32, 1, 16, SAM3_PROPAGATE_BOTH,    "32f_1obj_both" },
+};
 
 struct video_frame_ctx {
-	sam3_video_session *session;
-	struct sam3_point   seed_pt;
-	int                 obj_id;    /* 0 */
-	int                 frame_idx; /* 0 */
+	sam3_video_session                  *session;
+	const struct sam3_bench_video_case  *c;
+	float                                scale;
 };
 
 static void video_frame_fn(void *arg)
 {
 	struct video_frame_ctx *vc = arg;
-	struct sam3_video_frame_result r;
-	memset(&r, 0, sizeof(r));
 
 	if (sam3_video_reset(vc->session) != SAM3_OK)
 		return;
-	if (sam3_video_add_points(vc->session, vc->frame_idx, vc->obj_id,
-				  &vc->seed_pt, 1, &r) != SAM3_OK) {
-		sam3_video_frame_result_free(&r);
+
+	if (seed_n_objects(vc->session, vc->c->n_objects,
+			   vc->c->seed_frame, vc->scale) != SAM3_OK)
 		return;
-	}
-	sam3_video_frame_result_free(&r);
-	sam3_video_propagate(vc->session, SAM3_PROPAGATE_FORWARD,
-			     NULL, NULL);
+
+	sam3_video_propagate(vc->session, vc->c->direction, NULL, NULL);
 }
 
 int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
@@ -222,22 +284,54 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 			       struct sam3_bench_result *results,
 			       int max_results)
 {
-	char tmpdir[] = "/tmp/sam3_bench_vf_XXXXXX";
-	sam3_video_session *session = NULL;
-	struct video_frame_ctx vc;
+	/*
+	 * Iterate unique n_frames in the outer loop; for each value,
+	 * open a single session and run all cases that match it, then
+	 * tear the session down before moving to the next n_frames.
+	 * Keeping one session alive at a time bounds peak memory to
+	 * one frame-cache budget rather than N × budget — important
+	 * for large backbones (e.g. Hiera) where three concurrent 64-
+	 * frame feature caches exhaust the tensor arena and produce
+	 * silent "clone frame X failed" errors mid-case.
+	 */
 	int model_img_size;
 	float scale;
 	int count = 0;
-	int rc;
+	size_t n_cases = sizeof(per_frame_cases) /
+			 sizeof(per_frame_cases[0]);
 
 	if (!cfg || !ctx || !results || max_results <= 0) {
 		sam3_log_error("bench_run_video_frame: invalid arguments");
 		return -1;
 	}
 
-	/* Filter gate — bail cheaply if excluded. */
-	if (!sam3_bench_filter_match("video_per_frame", cfg->filter))
-		return 0;
+	/* Collect unique n_frames values (keep small — N <= 4 in practice). */
+	int unique_nf[8];
+	int n_unique = 0;
+	for (size_t i = 0; i < n_cases; i++) {
+		int nf = per_frame_cases[i].n_frames;
+		int seen = 0;
+		for (int j = 0; j < n_unique; j++) {
+			if (unique_nf[j] == nf) {
+				seen = 1;
+				break;
+			}
+		}
+		if (!seen && n_unique < (int)(sizeof(unique_nf) /
+					      sizeof(unique_nf[0]))) {
+			unique_nf[n_unique++] = nf;
+		}
+	}
+
+	for (int u = 0; u < n_unique; u++) {
+		if (unique_nf[u] > SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES) {
+			sam3_log_error("bench_run_video_frame: n_frames %d "
+				       "exceeds CLIP_MAX_FRAMES %d",
+				       unique_nf[u],
+				       SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES);
+			return -1;
+		}
+	}
 
 	model_img_size = sam3_get_image_size(ctx);
 	if (model_img_size <= 0) {
@@ -246,58 +340,96 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 		return -1;
 	}
 
-	if (!mkdtemp(tmpdir)) {
-		sam3_log_error("bench_run_video_frame: mkdtemp failed "
-			       "for clip dir");
-		return -1;
-	}
-
-	if (sam3_bench_generate_clip(tmpdir, 2) != 0) {
-		sam3_log_error("bench_run_video_frame: failed to "
-			       "synthesize clip in '%s'", tmpdir);
-		sam3_bench_rmtree(tmpdir);
-		return -1;
-	}
-
-	if (sam3_video_start(ctx, tmpdir, &session) != SAM3_OK || !session) {
-		sam3_log_error("bench_run_video_frame: sam3_video_start "
-			       "failed");
-		sam3_bench_rmtree(tmpdir);
-		return -1;
-	}
-
-	/*
-	 * Seed point: centre of the square on frame 0, scaled from the
-	 * synthetic PNG space (SAM3_BENCH_VIDEO_IMG_SIZE) into the
-	 * model's input space. Matches the pattern used in
-	 * tests/test_video_e2e.c.
-	 */
 	scale = (float)model_img_size / (float)SAM3_BENCH_VIDEO_IMG_SIZE;
-	vc.seed_pt.x = ((float)SAM3_BENCH_VIDEO_SQUARE_START +
-			(float)SAM3_BENCH_VIDEO_SQUARE_SIZE * 0.5f) * scale;
-	vc.seed_pt.y = vc.seed_pt.x;
-	vc.seed_pt.label = 1;
-	vc.session = session;
-	vc.obj_id = 0;
-	vc.frame_idx = 0;
 
-	if (count < max_results) {
-		rc = sam3_bench_run(cfg, "video_per_frame", "pipeline",
-				    video_frame_fn, &vc,
-				    0, 0, &results[count]);
-		if (rc != 0) {
-			sam3_log_error("video bench: video_per_frame "
-				       "failed");
-			count = -1;
-			goto cleanup;
+	for (int u = 0; u < n_unique; u++) {
+		char tmpdir[32];
+		sam3_video_session *session = NULL;
+		int nf_u = unique_nf[u];
+
+		snprintf(tmpdir, sizeof(tmpdir),
+			 "/tmp/sam3_bench_vf_XXXXXX");
+		if (!mkdtemp(tmpdir)) {
+			sam3_log_error("bench_run_video_frame: mkdtemp "
+				       "failed for %d-frame clip", nf_u);
+			return -1;
 		}
-		count++;
+
+		if (sam3_bench_generate_clip(tmpdir, nf_u) != 0) {
+			sam3_log_error("bench_run_video_frame: generate_clip "
+				       "failed for %d frames", nf_u);
+			sam3_bench_rmtree(tmpdir);
+			return -1;
+		}
+
+		if (sam3_video_start(ctx, tmpdir, &session) != SAM3_OK ||
+		    !session) {
+			sam3_log_error("bench_run_video_frame: video_start "
+				       "failed for %d frames", nf_u);
+			sam3_bench_rmtree(tmpdir);
+			return -1;
+		}
+
+		/*
+		 * Pre-warm the frame cache with a single propagation so the
+		 * bench-harness warmup + timed iterations all hit the warm
+		 * path. Without this, cold frame encoding (~2–3 s/frame on
+		 * Hiera) dominates per-iteration time and the reported
+		 * mean is essentially a cold-cache first-call measurement.
+		 */
+		{
+			struct sam3_video_frame_result r;
+			memset(&r, 0, sizeof(r));
+
+			(void)sam3_video_reset(session);
+			if (seed_n_objects(session, 1, 0, scale) == SAM3_OK) {
+				sam3_video_propagate(session,
+						     SAM3_PROPAGATE_FORWARD,
+						     NULL, NULL);
+			}
+			(void)sam3_video_reset(session);
+			(void)r;  /* unused; add_points inside seed frees. */
+			sam3_log_info("bench_run_video_frame: cache pre-warmed "
+				      "for %d-frame session", nf_u);
+		}
+
+		/* Run every case whose n_frames matches this session. */
+		for (size_t i = 0; i < n_cases && count < max_results; i++) {
+			char name[128];
+			struct video_frame_ctx vc;
+			int rc;
+
+			if (per_frame_cases[i].n_frames != nf_u)
+				continue;
+
+			snprintf(name, sizeof(name), "video_per_frame_%s",
+				 per_frame_cases[i].label);
+
+			if (!sam3_bench_filter_match(name, cfg->filter))
+				continue;
+
+			vc.session = session;
+			vc.c       = &per_frame_cases[i];
+			vc.scale   = scale;
+
+			rc = sam3_bench_run(cfg, name, "pipeline",
+					    video_frame_fn, &vc,
+					    0, 0, &results[count]);
+			if (rc != 0) {
+				sam3_log_error("video bench: %s failed", name);
+				sam3_video_end(session);
+				sam3_bench_rmtree(tmpdir);
+				return -1;
+			}
+			count++;
+		}
+
+		sam3_video_end(session);
+		sam3_bench_rmtree(tmpdir);
 	}
 
-	sam3_log_info("video benchmarks: video_per_frame completed");
+	sam3_log_info("video benchmarks: per-frame driver completed "
+		      "(%d cases, %d clip sizes)", count, n_unique);
 
-cleanup:
-	sam3_video_end(session);
-	sam3_bench_rmtree(tmpdir);
 	return count;
 }
