@@ -124,10 +124,8 @@ int sam3_bench_generate_clip(const char *dir, int n)
 		for (size_t k = 0; k < nbytes; k++)
 			buf[k] = (uint8_t)(100u + (bench_lcg_next() % 56u));
 
-		int x0 = SAM3_BENCH_VIDEO_SQUARE_START +
-			 i * SAM3_BENCH_VIDEO_SQUARE_STEP;
-		int y0 = SAM3_BENCH_VIDEO_SQUARE_START +
-			 i * SAM3_BENCH_VIDEO_SQUARE_STEP;
+		int x0 = sam3_bench_bounce_pos(i);
+		int y0 = x0;
 		int x1 = x0 + SAM3_BENCH_VIDEO_SQUARE_SIZE;
 		int y1 = y0 + SAM3_BENCH_VIDEO_SQUARE_SIZE;
 

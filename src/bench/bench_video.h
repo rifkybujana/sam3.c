@@ -70,8 +70,10 @@ struct sam3_bench_video_case {
  *
  * Writes PNG files frame_0000.png .. frame_{n-1}.png into @dir. Each
  * frame is a SAM3_BENCH_VIDEO_IMG_SIZE^2 RGB image with gray noise
- * background and a white SAM3_BENCH_VIDEO_SQUARE_SIZE^2 square that
- * slides diagonally by SAM3_BENCH_VIDEO_SQUARE_STEP px per frame.
+ * background and a white SAM3_BENCH_VIDEO_SQUARE_SIZE^2 square whose
+ * (x, y) position follows sam3_bench_bounce_pos(i) — a triangle-wave
+ * reflection that keeps the square in-bounds for n up to
+ * SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES.
  *
  * Returns 0 on success, non-zero on any I/O failure.
  */
