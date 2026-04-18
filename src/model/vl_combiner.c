@@ -111,12 +111,20 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	 * decoder. The HIERA, EfficientViT, and TinyViT backbones all have
 	 * this dual-neck structure. The video tracker requires sam2
 	 * features as the input image embeddings to the SAM mask decoder.
+	 *
+	 * SAM 3.1's multiplex tracker drops the dual neck entirely — the
+	 * tri-neck's image features feed both the detector and the tracker.
+	 * We detect that here by n_fpn_scales == 3.
 	 */
-	err = sam3_neck_init(&vl->sam2_neck, 256, backbone_dim,
-			      grid_size, 4, scales);
-	if (err != SAM3_OK)
-		return err;
-	vl->has_sam2_neck = 1;
+	if (n_fpn_scales < 4) {
+		vl->has_sam2_neck = 0;
+	} else {
+		err = sam3_neck_init(&vl->sam2_neck, 256, backbone_dim,
+				      grid_size, 4, scales);
+		if (err != SAM3_OK)
+			return err;
+		vl->has_sam2_neck = 1;
+	}
 
 	/* Init tokenizer (byte-level fallback vocab) */
 	err = sam3_tokenizer_init(&vl->tokenizer);

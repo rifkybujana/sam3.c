@@ -383,7 +383,7 @@ static enum sam3_error eval_neck_to_persist(
 		       stage_out_nhwc[si]->nbytes);
 	}
 
-	for (int si = 0; si < 4; si++) {
+	for (int si = 0; si < neck->n_scales; si++) {
 		out_pfn[si] = gh_alloc_tensor(persist,
 			stage_out_nhwc[si]->dtype,
 			stage_out_nhwc[si]->n_dims,
@@ -393,6 +393,8 @@ static enum sam3_error eval_neck_to_persist(
 		memcpy(out_pfn[si]->data, stage_out_nhwc[si]->data,
 		       stage_out_nhwc[si]->nbytes);
 	}
+	for (int si = neck->n_scales; si < 4; si++)
+		out_pfn[si] = NULL;
 
 	return SAM3_OK;
 }
@@ -689,8 +691,8 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 		 * downstream consumer (geom encoder, fusion, decoder,
 		 * seg_head, mask decoder) now reads NHWC directly.
 		 */
-		struct sam3_tensor *pfn[4];
-		for (int si = 0; si < 4; si++) {
+		struct sam3_tensor *pfn[4] = {0};
+		for (int si = 0; si < model->backbone.neck.n_scales; si++) {
 			pfn[si] = gh_alloc_tensor(persist,
 				stage_out_nhwc[si]->dtype,
 				stage_out_nhwc[si]->n_dims,
@@ -703,12 +705,15 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 		model->cached_feat_4x_nhwc = pfn[0];
 		model->cached_feat_s0_nhwc = pfn[1];
 		model->cached_feat_s1_nhwc = pfn[2];
+		/* pfn[3] is only populated for 4-scale necks (SAM 3). For the
+		 * tri-neck (SAM 3.1) cached_image_features stays NULL. */
 		model->cached_image_features = pfn[3];
 
 		dump_tensor("/tmp/dbg_neck_4x.bin", pfn[0]);
 		dump_tensor("/tmp/dbg_neck_2x.bin", pfn[1]);
 		dump_tensor("/tmp/dbg_neck_1x.bin", pfn[2]);
-		dump_tensor("/tmp/dbg_neck_05x.bin", pfn[3]);
+		if (pfn[3])
+			dump_tensor("/tmp/dbg_neck_05x.bin", pfn[3]);
 
 		/*
 		 * Run the second (sam2) neck if loaded. The video tracker's
@@ -737,18 +742,30 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 			dump_tensor("/tmp/dbg_sam2_05x.bin", spfn[3]);
 		}
 
-		sam3_log_debug("encode: cached features (NHWC): "
-			       "main [%d,%d,%d,%d] "
-			       "s0 [%d,%d,%d,%d] s1 [%d,%d,%d,%d] "
-			       "4x [%d,%d,%d,%d]",
-			       pfn[3]->dims[0], pfn[3]->dims[1],
-			       pfn[3]->dims[2], pfn[3]->dims[3],
-			       pfn[1]->dims[0], pfn[1]->dims[1],
-			       pfn[1]->dims[2], pfn[1]->dims[3],
-			       pfn[2]->dims[0], pfn[2]->dims[1],
-			       pfn[2]->dims[2], pfn[2]->dims[3],
-			       pfn[0]->dims[0], pfn[0]->dims[1],
-			       pfn[0]->dims[2], pfn[0]->dims[3]);
+		if (pfn[3]) {
+			sam3_log_debug("encode: cached features (NHWC): "
+				       "main [%d,%d,%d,%d] "
+				       "s0 [%d,%d,%d,%d] s1 [%d,%d,%d,%d] "
+				       "4x [%d,%d,%d,%d]",
+				       pfn[3]->dims[0], pfn[3]->dims[1],
+				       pfn[3]->dims[2], pfn[3]->dims[3],
+				       pfn[1]->dims[0], pfn[1]->dims[1],
+				       pfn[1]->dims[2], pfn[1]->dims[3],
+				       pfn[2]->dims[0], pfn[2]->dims[1],
+				       pfn[2]->dims[2], pfn[2]->dims[3],
+				       pfn[0]->dims[0], pfn[0]->dims[1],
+				       pfn[0]->dims[2], pfn[0]->dims[3]);
+		} else {
+			sam3_log_debug("encode: cached features (NHWC): "
+				       "s0 [%d,%d,%d,%d] s1 [%d,%d,%d,%d] "
+				       "4x [%d,%d,%d,%d] (no 05x scale)",
+				       pfn[1]->dims[0], pfn[1]->dims[1],
+				       pfn[1]->dims[2], pfn[1]->dims[3],
+				       pfn[2]->dims[0], pfn[2]->dims[1],
+				       pfn[2]->dims[2], pfn[2]->dims[3],
+				       pfn[0]->dims[0], pfn[0]->dims[1],
+				       pfn[0]->dims[2], pfn[0]->dims[3]);
+		}
 	}
 
 	SAM3_PROF_END(profiler, "neck");
