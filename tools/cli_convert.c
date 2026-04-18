@@ -219,7 +219,11 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	if (strcmp(args->backbone, "hiera") == 0) {
 		args->backbone_type = SAM3_BACKBONE_HIERA;
 		if (args->encoder_dim < 0)
-			args->encoder_dim = 1280;
+			args->encoder_dim = 1024;  /* actual ViT trunk
+						    * embed_dim in this repo;
+						    * the old 1280 referred to
+						    * SAM 2 Hiera-L and was
+						    * never used at runtime */
 		if (args->encoder_layers < 0)
 			args->encoder_layers = 32;
 	} else if (strcmp(args->backbone, "efficientvit") == 0) {
