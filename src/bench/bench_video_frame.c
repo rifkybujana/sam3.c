@@ -285,16 +285,25 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 			       int max_results)
 {
 	/*
-	 * For each unique n_frames in per_frame_cases, create one
-	 * tmpdir + clip + video_session. Cases index into these by
-	 * matching n_frames. Session reuse across iterations of the
-	 * same case keeps frame-cache warm.
+	 * Iterate unique n_frames in the outer loop; for each value,
+	 * open a single session and run all cases that match it, then
+	 * tear the session down before moving to the next n_frames.
+	 * Keeping one session alive at a time bounds peak memory to
+	 * one frame-cache budget rather than N × budget — important
+	 * for large backbones (e.g. Hiera) where three concurrent 64-
+	 * frame feature caches exhaust the tensor arena and produce
+	 * silent "clone frame X failed" errors mid-case.
 	 */
 	int model_img_size;
 	float scale;
 	int count = 0;
 	size_t n_cases = sizeof(per_frame_cases) /
 			 sizeof(per_frame_cases[0]);
+
+	if (!cfg || !ctx || !results || max_results <= 0) {
+		sam3_log_error("bench_run_video_frame: invalid arguments");
+		return -1;
+	}
 
 	/* Collect unique n_frames values (keep small — N <= 4 in practice). */
 	int unique_nf[8];
@@ -314,23 +323,13 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 		}
 	}
 
-	/* Per-n_frames clip dir + session. */
-	char tmpdirs[8][32];
-	sam3_video_session *sessions[8];
-	int n_open = 0;  /* how many of the above are populated */
-
-	if (!cfg || !ctx || !results || max_results <= 0) {
-		sam3_log_error("bench_run_video_frame: invalid arguments");
-		return -1;
-	}
-
 	for (int u = 0; u < n_unique; u++) {
 		if (unique_nf[u] > SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES) {
 			sam3_log_error("bench_run_video_frame: n_frames %d "
 				       "exceeds CLIP_MAX_FRAMES %d",
 				       unique_nf[u],
 				       SAM3_BENCH_VIDEO_CLIP_MAX_FRAMES);
-			goto cleanup;
+			return -1;
 		}
 	}
 
@@ -338,85 +337,76 @@ int sam3_bench_run_video_frame(const struct sam3_bench_config *cfg,
 	if (model_img_size <= 0) {
 		sam3_log_error("bench_run_video_frame: no model loaded "
 			       "(image size = %d)", model_img_size);
-		goto cleanup;
+		return -1;
 	}
 
 	scale = (float)model_img_size / (float)SAM3_BENCH_VIDEO_IMG_SIZE;
 
 	for (int u = 0; u < n_unique; u++) {
-		snprintf(tmpdirs[u], sizeof(tmpdirs[u]),
+		char tmpdir[32];
+		sam3_video_session *session = NULL;
+		int nf_u = unique_nf[u];
+
+		snprintf(tmpdir, sizeof(tmpdir),
 			 "/tmp/sam3_bench_vf_XXXXXX");
-		if (!mkdtemp(tmpdirs[u])) {
+		if (!mkdtemp(tmpdir)) {
 			sam3_log_error("bench_run_video_frame: mkdtemp "
-				       "failed for clip dir %d", u);
-			goto cleanup;
+				       "failed for %d-frame clip", nf_u);
+			return -1;
 		}
-		n_open = u + 1;  /* tmpdir created; needs rmtree on cleanup */
 
-		if (sam3_bench_generate_clip(tmpdirs[u], unique_nf[u]) != 0) {
+		if (sam3_bench_generate_clip(tmpdir, nf_u) != 0) {
 			sam3_log_error("bench_run_video_frame: generate_clip "
-				       "failed for %d frames", unique_nf[u]);
-			goto cleanup;
+				       "failed for %d frames", nf_u);
+			sam3_bench_rmtree(tmpdir);
+			return -1;
 		}
 
-		sessions[u] = NULL;
-		if (sam3_video_start(ctx, tmpdirs[u], &sessions[u]) != SAM3_OK ||
-		    !sessions[u]) {
+		if (sam3_video_start(ctx, tmpdir, &session) != SAM3_OK ||
+		    !session) {
 			sam3_log_error("bench_run_video_frame: video_start "
-				       "failed for %d frames", unique_nf[u]);
-			goto cleanup;
+				       "failed for %d frames", nf_u);
+			sam3_bench_rmtree(tmpdir);
+			return -1;
 		}
-	}
 
-	for (size_t i = 0; i < n_cases && count < max_results; i++) {
-		char name[128];
-		struct video_frame_ctx vc;
-		int rc;
-		int nf = per_frame_cases[i].n_frames;
-		int slot = -1;
+		/* Run every case whose n_frames matches this session. */
+		for (size_t i = 0; i < n_cases && count < max_results; i++) {
+			char name[128];
+			struct video_frame_ctx vc;
+			int rc;
 
-		snprintf(name, sizeof(name), "video_per_frame_%s",
-			 per_frame_cases[i].label);
+			if (per_frame_cases[i].n_frames != nf_u)
+				continue;
 
-		if (!sam3_bench_filter_match(name, cfg->filter))
-			continue;
+			snprintf(name, sizeof(name), "video_per_frame_%s",
+				 per_frame_cases[i].label);
 
-		for (int u = 0; u < n_unique; u++) {
-			if (unique_nf[u] == nf) {
-				slot = u;
-				break;
+			if (!sam3_bench_filter_match(name, cfg->filter))
+				continue;
+
+			vc.session = session;
+			vc.c       = &per_frame_cases[i];
+			vc.scale   = scale;
+
+			rc = sam3_bench_run(cfg, name, "pipeline",
+					    video_frame_fn, &vc,
+					    0, 0, &results[count]);
+			if (rc != 0) {
+				sam3_log_error("video bench: %s failed", name);
+				sam3_video_end(session);
+				sam3_bench_rmtree(tmpdir);
+				return -1;
 			}
-		}
-		if (slot < 0) {
-			sam3_log_error("bench_run_video_frame: no session "
-				       "for %d frames (case %zu)", nf, i);
-			count = -1;
-			goto cleanup;
+			count++;
 		}
 
-		vc.session = sessions[slot];
-		vc.c       = &per_frame_cases[i];
-		vc.scale   = scale;
-
-		rc = sam3_bench_run(cfg, name, "pipeline",
-				    video_frame_fn, &vc,
-				    0, 0, &results[count]);
-		if (rc != 0) {
-			sam3_log_error("video bench: %s failed", name);
-			count = -1;
-			goto cleanup;
-		}
-		count++;
+		sam3_video_end(session);
+		sam3_bench_rmtree(tmpdir);
 	}
 
 	sam3_log_info("video benchmarks: per-frame driver completed "
 		      "(%d cases, %d clip sizes)", count, n_unique);
 
-cleanup:
-	for (int u = 0; u < n_open; u++) {
-		if (sessions[u])
-			sam3_video_end(sessions[u]);
-		sam3_bench_rmtree(tmpdirs[u]);
-	}
 	return count;
 }
