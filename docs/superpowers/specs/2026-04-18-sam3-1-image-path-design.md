@@ -78,21 +78,26 @@ Findings that drive this spec:
 
 ## Weight-format changes
 
-Bump `.sam3` header version from 2 to 3. Append two bytes to
-`struct sam3_weight_header` after the existing fields:
+The `.sam3` header is already at `SAM3_WEIGHT_VERSION = 3` and its
+48-byte layout is locked by `_Static_assert`. `reserved[0]` already
+carries `backbone_type`. We reuse the remaining two 32-bit slots:
 
 ```c
-uint8_t variant;       /* enum sam3_variant: 0=SAM3, 1=SAM3_1 */
-uint8_t n_fpn_scales;  /* 4 (SAM3) or 3 (SAM3.1) */
-uint8_t reserved[2];   /* align to 4, zero */
+/* src/core/weight.c, sam3_weight_write */
+hdr.reserved[0] = (uint32_t)config->backbone_type;  /* existing */
+hdr.reserved[1] = (uint32_t)config->variant;        /* new: 0=SAM3, 1=SAM3_1 */
+hdr.reserved[2] = (uint32_t)config->n_fpn_scales;   /* new: 3 or 4 */
 ```
 
-Loader behavior on version mismatch:
+No version bump, no struct layout change, no `_Static_assert` touch.
 
-- `version == 2`: old file; synthesize `variant = SAM3`,
-  `n_fpn_scales = 4`. No user-visible change for existing `.sam3` files.
-- `version == 3`: read fields directly.
-- `version > 3` or unknown `variant`: return `SAM3_EMODEL`.
+Loader behavior (existing `sam3_weight_open`):
+
+- `reserved[1] == 0, reserved[2] == 0`: old file predating SAM 3.1;
+  treat as `variant = SAM3_VARIANT_SAM3`, `n_fpn_scales = 4` for
+  backwards compatibility.
+- `reserved[1] == 1`: SAM 3.1. Require `reserved[2] in {3, 4}`.
+- `reserved[1] > 1`: return `SAM3_EMODEL` (unknown variant).
 
 Public-API additions in `include/sam3/sam3_types.h`:
 
