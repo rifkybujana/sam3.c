@@ -7,10 +7,13 @@ from sam3.errors import (  # noqa: F401
     Sam3IOError, BackendError, ModelError, DtypeError, VideoError,
 )
 from sam3.model import Model, Result  # noqa: F401
-from sam3.video import VideoSession  # noqa: F401
+from sam3.video import (  # noqa: F401
+    VideoSession, FrameResult, ObjectMask, StartOpts,
+)
 
 __all__ = [
-    "Model", "Result", "VideoSession", "Sam3Error",
+    "Model", "Result", "VideoSession", "FrameResult",
+    "ObjectMask", "StartOpts", "Sam3Error",
     "InvalidArgumentError", "OutOfMemoryError", "Sam3IOError",
     "BackendError", "ModelError", "DtypeError", "VideoError",
     "version", "set_log_level",

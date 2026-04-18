@@ -128,24 +128,63 @@ ffi.cdef("""
 
     typedef struct sam3_video_session sam3_video_session;
 
-    typedef int (*sam3_video_frame_cb)(int frame_idx,
-                                       const struct sam3_result *result,
-                                       int n_objects,
-                                       const int *obj_ids,
-                                       void *user_data);
+    struct sam3_video_object_mask {
+        int    obj_id;
+        float *mask;
+        int    mask_h;
+        int    mask_w;
+        float  iou_score;
+        float  obj_score_logit;
+        int    is_occluded;
+    };
+
+    struct sam3_video_frame_result {
+        int frame_idx;
+        int n_objects;
+        struct sam3_video_object_mask *objects;
+    };
+
+    void sam3_video_frame_result_free(struct sam3_video_frame_result *r);
+
+    struct sam3_video_start_opts {
+        size_t frame_cache_backend_budget;
+        size_t frame_cache_spill_budget;
+        int    clear_non_cond_window;
+        int    iter_use_prev_mask_pred;
+        int    multimask_via_stability;
+        float  multimask_stability_delta;
+        float  multimask_stability_thresh;
+    };
+
+    typedef int (*sam3_video_frame_cb)(
+        const struct sam3_video_frame_result *result,
+        void *user_data);
 
     enum sam3_error sam3_video_start(sam3_ctx *ctx,
                                      const char *resource_path,
                                      sam3_video_session **out_session);
-    enum sam3_error sam3_video_add_points(sam3_video_session *session,
-                                          int frame_idx, int obj_id,
-                                          const struct sam3_point *points,
-                                          int n_points,
-                                          struct sam3_result *result);
-    enum sam3_error sam3_video_add_box(sam3_video_session *session,
-                                       int frame_idx, int obj_id,
-                                       const struct sam3_box *box,
-                                       struct sam3_result *result);
+    enum sam3_error sam3_video_start_ex(
+        sam3_ctx *ctx,
+        const char *resource_path,
+        const struct sam3_video_start_opts *opts,
+        sam3_video_session **out_session);
+    enum sam3_error sam3_video_add_points(
+        sam3_video_session *session,
+        int frame_idx, int obj_id,
+        const struct sam3_point *points,
+        int n_points,
+        struct sam3_video_frame_result *result);
+    enum sam3_error sam3_video_add_box(
+        sam3_video_session *session,
+        int frame_idx, int obj_id,
+        const struct sam3_box *box,
+        struct sam3_video_frame_result *result);
+    enum sam3_error sam3_video_add_mask(
+        sam3_video_session *session,
+        int frame_idx, int obj_id,
+        const uint8_t *mask,
+        int mask_h, int mask_w,
+        struct sam3_video_frame_result *result);
     enum sam3_error sam3_video_propagate(sam3_video_session *session,
                                          int direction,
                                          sam3_video_frame_cb callback,

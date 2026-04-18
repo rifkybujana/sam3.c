@@ -25,3 +25,7 @@ pub use result::SegmentResult;
 mod ctx;
 
 pub use ctx::Ctx;
+
+mod video;
+
+pub use video::{Direction, FrameResult, ObjectMask, StartOpts, VideoSession};

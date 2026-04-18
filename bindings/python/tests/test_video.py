@@ -89,8 +89,10 @@ def test_video_session_tracks_moving_square(model_path, moving_square_dir):
                 frame=0, obj_id=0,
                 points=[(gt_cx * scale, gt_cy * scale, 1)])
 
-            assert r0.masks.ndim == 3
-            assert r0.masks.shape[0] >= 1
+            assert len(r0.objects) == 1
+            assert r0.objects[0].obj_id == 0
+            assert r0.objects[0].mask.ndim == 2
+            assert r0.objects[0].mask.size > 0
 
             frames = list(sess.propagate(direction="forward"))
 
@@ -98,17 +100,16 @@ def test_video_session_tracks_moving_square(model_path, moving_square_dir):
 
             mask_h = mask_w = 0
             centroids = [None] * _N_FRAMES
-            for frame_idx, fr in frames:
-                assert 0 <= frame_idx < _N_FRAMES
-                assert fr.masks.ndim == 3
+            for fr in frames:
+                assert 0 <= fr.frame_idx < _N_FRAMES
+                om = fr.by_obj_id(0)
+                assert om is not None, (
+                    f"frame {fr.frame_idx} missing obj 0")
+                assert om.mask.ndim == 2
                 if mask_w == 0:
-                    mask_h = fr.masks.shape[1]
-                    mask_w = fr.masks.shape[2]
-                idx = fr.best_mask if fr.best_mask >= 0 else 0
-                if idx >= fr.masks.shape[0]:
-                    idx = 0
-                c = _mask_centroid(fr.masks[idx])
-                centroids[frame_idx] = c
+                    mask_h = om.mask.shape[0]
+                    mask_w = om.mask.shape[1]
+                centroids[fr.frame_idx] = _mask_centroid(om.mask)
 
             assert mask_w > 0 and mask_h > 0
 

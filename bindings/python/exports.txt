@@ -19,10 +19,13 @@ _sam3_profile_reset
 _sam3_dump_tensors
 _sam3_mask_nms
 _sam3_video_start
+_sam3_video_start_ex
 _sam3_video_add_points
 _sam3_video_add_box
+_sam3_video_add_mask
 _sam3_video_propagate
 _sam3_video_remove_object
 _sam3_video_reset
 _sam3_video_end
 _sam3_video_frame_count
+_sam3_video_frame_result_free

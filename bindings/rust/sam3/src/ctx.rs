@@ -80,6 +80,15 @@ impl Ctx {
             .ok_or(Error::NoMemory)
     }
 
+    /// Raw pointer for intra-crate FFI (e.g. video session construction).
+    ///
+    /// Not part of the public API. Returned pointer is live for the lifetime
+    /// of `&self`; callers must not alias the exclusive access expected by
+    /// other `&mut self` methods.
+    pub(crate) fn raw(&self) -> *mut sys::sam3_ctx {
+        self.raw.as_ptr()
+    }
+
     /// Return the model's expected input image size, or 0 if no model is loaded.
     pub fn image_size(&self) -> u32 {
         // SAFETY: raw is valid; sam3_get_image_size is const and safe.

@@ -23,6 +23,9 @@ pub enum Error {
     /// Unsupported or mismatched tensor dtype.
     #[error("unsupported or mismatched dtype")]
     Dtype,
+    /// Video tracking failed (bad resource, propagation failure).
+    #[error("video tracking failed")]
+    Video,
     /// Unrecognized error code (future-proofing).
     #[error("unknown SAM3 error ({0})")]
     Unknown(i32),
@@ -41,6 +44,7 @@ pub(crate) fn check(code: sys_err) -> Result<()> {
         sys_err::SAM3_EBACKEND => Err(Error::Backend),
         sys_err::SAM3_EMODEL => Err(Error::Model),
         sys_err::SAM3_EDTYPE => Err(Error::Dtype),
+        sys_err::SAM3_EVIDEO => Err(Error::Video),
         other => Err(Error::Unknown(other.0)),
     }
 }
@@ -62,6 +66,7 @@ mod tests {
         assert!(matches!(check(sys_err::SAM3_EBACKEND), Err(Error::Backend)));
         assert!(matches!(check(sys_err::SAM3_EMODEL), Err(Error::Model)));
         assert!(matches!(check(sys_err::SAM3_EDTYPE), Err(Error::Dtype)));
+        assert!(matches!(check(sys_err::SAM3_EVIDEO), Err(Error::Video)));
     }
 
     #[test]
