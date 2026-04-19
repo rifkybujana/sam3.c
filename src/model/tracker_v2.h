@@ -33,6 +33,8 @@
 #include "core/alloc.h"
 #include "core/graph.h"
 
+struct sam3_memory_bank;  /* fwd decl: memory_bank.h */
+
 /*
  * Multiplex bucket size. The SAM 3.1 checkpoint bakes 16 into several
  * tensors (no_obj_embed_spatial, output_{valid,invalid}_embed,
@@ -214,10 +216,12 @@ struct sam3_v2_mask_decoder {
 	struct sam3_tensor *final_out_w, *final_out_b;
 	struct sam3_tensor *norm_final_w, *norm_final_b;
 
-	/* output_upscaling: ConvT2d -> LN2d -> GELU -> ConvT2d */
-	struct sam3_tensor *up0_w, *up0_b;   /* [256, 2, 2, 64] OHWI */
+	/* output_upscaling: ConvT2d -> LN2d -> GELU -> ConvT2d
+	 * Both ConvTranspose weights arrive in OHWI [OC, kH, kW, IC] after
+	 * the conv_perm pass in tools/weight_conv_perm.c. */
+	struct sam3_tensor *up0_w, *up0_b;   /* [64, 2, 2, 256] OHWI ConvT 256->64 */
 	struct sam3_tensor *up1_w, *up1_b;   /* LN2d [64] */
-	struct sam3_tensor *up3_w, *up3_b;   /* [64, 2, 2, 32] OHWI */
+	struct sam3_tensor *up3_w, *up3_b;   /* [32, 2, 2, 64]  OHWI ConvT 64->32 */
 
 	/* output_hypernetworks_mlps: 3 MLPs, each 256->256->32 */
 	struct sam3_tensor *hn_w[3][3];  /* [mlp_idx][layer_idx] */
@@ -459,5 +463,160 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
 		struct sam3_tensor *memory_image_pos,
 		int grid_w,
 		int num_k_exclude_rope);
+
+/*
+ * sam3_v2_mask_decoder_forward - Build the SAM 3.1 multiplex mask decoder
+ * graph for a single frame.
+ *
+ * Mirrors MultiplexMaskDecoder.predict_masks in
+ * reference/sam3/sam3/model/multiplex_mask_decoder.py, with the SAM 3.1
+ * config baked in: multiplex_count=16, num_multimask_outputs=3,
+ * num_mask_output_per_object=3 (multimask_outputs_only=True),
+ * pred_obj_scores=True, pred_obj_scores_mlp=True,
+ * decode_mask_attribute_with_shared_tokens=False,
+ * decode_mask_with_shared_tokens=False, use_high_res_features=True.
+ *
+ * @g:                       Graph being built.
+ * @arena:                   Arena for intermediate tensors.
+ * @md:                      Loaded mask-decoder sub-module (125 tensors).
+ * @image_embeddings:        [1, H, W, 256] NHWC — neck output at the 1x
+ *                           scale (H=W=72 in the production 1008/14
+ *                           config).
+ * @image_pe:                [H*W, 256] — dense positional encoding
+ *                           (caller responsible; typically produced by
+ *                           the image_pe_layer Gaussian basis, TODO
+ *                           phase 2.6).
+ * @feat_s1:                 [1, 2H, 2W, 256] NHWC — raw neck 2x feature
+ *                           map. Projected to 64 channels by conv_s1
+ *                           inside this function.
+ * @feat_s0:                 [1, 4H, 4W, 256] NHWC — raw neck 4x feature
+ *                           map. Projected to 32 channels by conv_s0
+ *                           inside this function.
+ * @extra_per_object:        [16, 256] extra per-object embeddings added
+ *                           to the mask tokens, or NULL. Matches the
+ *                           extra_per_object_embeddings argument in the
+ *                           Python reference (the multiplex controller
+ *                           supplies a [1, 16, 256] in production).
+ *
+ *                           **Host-data contract:** when non-NULL,
+ *                           `extra_per_object->data` is read at
+ *                           graph-build time because our `gh_add` only
+ *                           supports last-dim bias broadcast (not the
+ *                           [16,3,256] + [16,256] pattern needed here).
+ *                           Callers must pass a tensor whose host
+ *                           buffer is already populated. Once phase 2.5
+ *                           wires a graph-produced extra tensor, swap
+ *                           this path to expand + gh_add.
+ * @out_masks:               [16, 3, 4H, 4W] per-object multimask
+ *                           logits.
+ * @out_iou_scores:          [16, 3] predicted IoU per mask (no sigmoid,
+ *                           iou_prediction_use_sigmoid=False).
+ * @out_obj_score_logits:    [16, 1] object-present logit per multiplex
+ *                           slot.
+ * @out_sam_tokens:          [16, 3, 256] mask-token output embeddings
+ *                           (pre-projection). Caller picks the best-IoU
+ *                           slot and feeds it through obj_ptr_proj to
+ *                           obtain the obj_ptr.
+ *
+ * Returns SAM3_OK on success. Returns SAM3_EINVAL on bad arguments,
+ * SAM3_ENOMEM on arena exhaustion or graph-capacity exhaustion. All
+ * outputs are always written together on success.
+ *
+ * Scratch sizing: production H=W=72 sets the peak at the final mask
+ * matmul `[48, 32] @ [32, 4H*4W=82944]` which materialises ~380 MiB of
+ * FP32 output. Budget the arena accordingly.
+ */
+/*
+ * sam3_v2_image_pe_layer - Build the dense positional encoding for the
+ *                          multiplex mask decoder.
+ *
+ * Produces [grid_h*grid_w, 256] where each row is
+ * `[sin(2*pi*(2*coord-1) @ basis), cos(...)]` in row-major (y, x) order
+ * with coords = ((x + 0.5)/W, (y + 0.5)/H). Mirrors
+ * PositionEmbeddingRandom.forward in
+ * reference/sam3/sam3/sam/prompt_encoder.py.
+ *
+ * @g:       Graph being built. Unused — kept for API symmetry with the
+ *           other v2 forwards. May be NULL.
+ * @arena:   Arena for the output tensor.
+ * @basis:   Learned Gaussian basis (trk->image_pe_gauss), shape [2, 128].
+ * @grid_h:  Target grid height.
+ * @grid_w:  Target grid width.
+ *
+ * Returns the populated PE tensor, or NULL on arena exhaustion or bad
+ * arguments.
+ */
+struct sam3_tensor *sam3_v2_image_pe_layer(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		struct sam3_tensor *basis,
+		int grid_h,
+		int grid_w);
+
+enum sam3_error sam3_v2_mask_decoder_forward(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		const struct sam3_v2_mask_decoder *md,
+		struct sam3_tensor *image_embeddings,
+		struct sam3_tensor *image_pe,
+		struct sam3_tensor *feat_s1,
+		struct sam3_tensor *feat_s0,
+		struct sam3_tensor *extra_per_object,
+		struct sam3_tensor **out_masks,
+		struct sam3_tensor **out_iou_scores,
+		struct sam3_tensor **out_obj_score_logits,
+		struct sam3_tensor **out_sam_tokens);
+
+/*
+ * sam3_tracker_v2_track_frame - Process one frame through the SAM 3.1
+ * multiplex tracker in single-object (slot-0-only) mode.
+ *
+ * Wraps the three v2 forwards into a single per-frame pipeline:
+ *   1. pix_feat conditioning (memory_attn if @bank has entries,
+ *      otherwise additive `interactivity_no_mem_embed` fallback).
+ *   2. Multiplex mask decoder on the conditioned pix_feat +
+ *      high-res features.
+ *   3. Slot-0 output slicing, plus obj_ptr projection on the 3
+ *      multimask sam_tokens.
+ *
+ * Maskmem encoding of the output mask is NOT run here — the caller
+ * picks the best-IoU mask after graph eval, preprocesses it, then runs
+ * sam3_v2_maskmem_forward separately to produce the memory token for
+ * the bank. This mirrors the SAM 3 pipeline's split between
+ * sam3_tracker_track_frame and sam3_memory_encoder_build.
+ *
+ * @trk:          Loaded tracker_v2.
+ * @g:            Graph to build into.
+ * @bank:         Per-object memory bank (read-only). NULL or empty bank
+ *                selects the no-memory path.
+ * @image_embed:  Backbone 1x features [1, H, W, 256] NHWC.
+ * @feat_s1:      Backbone 2x features [1, 2H, 2W, 256] NHWC.
+ * @feat_s0:      Backbone 4x features [1, 4H, 4W, 256] NHWC.
+ * @frame_idx:    Current frame (used for logging only).
+ * @is_cond:      1 for conditioning frames, 0 for propagation.
+ * @arena:        Scratch arena for graph intermediates.
+ * @out_masks:    [3, 4H, 4W] slot-0 multimask mask logits.
+ * @out_iou:      [3] IoU predictions per multimask.
+ * @out_obj_ptrs: [3, 256] obj_ptr projection of each multimask sam_token.
+ *                The caller picks the row matching the best-IoU mask.
+ * @out_score:    [1] slot-0 obj_score logit.
+ *
+ * Returns SAM3_OK on success; SAM3_EINVAL on bad args; SAM3_ENOMEM on
+ * arena/graph exhaustion.
+ */
+enum sam3_error sam3_tracker_v2_track_frame(
+		struct sam3_tracker_v2 *trk,
+		struct sam3_graph *g,
+		const struct sam3_memory_bank *bank,
+		struct sam3_tensor *image_embed,
+		struct sam3_tensor *feat_s1,
+		struct sam3_tensor *feat_s0,
+		int frame_idx,
+		int is_cond,
+		struct sam3_arena *arena,
+		struct sam3_tensor **out_masks,
+		struct sam3_tensor **out_iou,
+		struct sam3_tensor **out_obj_ptrs,
+		struct sam3_tensor **out_score);
 
 #endif /* SAM3_MODEL_TRACKER_V2_H */

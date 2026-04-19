@@ -179,9 +179,9 @@ int main(void)
 	assert_tensor(trk.sam_mask_decoder.final_q_w, "md.final_q_w",
 		       2, 128, 256);
 	assert_tensor(trk.sam_mask_decoder.up0_w, "md.up0_w",
-		       4, 256, 2, 2, 64);
+		       4, 64, 2, 2, 256);
 	assert_tensor(trk.sam_mask_decoder.up3_w, "md.up3_w",
-		       4, 64, 2, 2, 32);
+		       4, 32, 2, 2, 64);
 	for (int m = 0; m < 3; m++) {
 		assert_tensor(trk.sam_mask_decoder.hn_w[m][2], "md.hn_last",
 			       2, 32, 256);

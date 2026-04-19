@@ -24,6 +24,7 @@
 #include "sam3/sam3.h"
 #include "sam3/sam3_types.h"
 #include "model/tracker.h"
+#include "model/tracker_v2.h"
 #include "model/memory_bank.h"
 #include "model/frame_cache.h"
 #include "util/video.h"
@@ -95,6 +96,16 @@ struct sam3_video_session {
 
 	/* Tracker module (owns sub-modules and memory bank) */
 	struct sam3_tracker tracker;
+
+	/*
+	 * SAM 3.1 variant-specific tracker. Exactly one of `tracker` (SAM 3)
+	 * or `tracker_v2` (SAM 3.1) is populated for the session lifetime;
+	 * `variant` selects which. Kept as parallel fields rather than a
+	 * C union so the per-frame pipelines can reference sub-module
+	 * addresses without type punning.
+	 */
+	struct sam3_tracker_v2 tracker_v2;
+	int                    variant;  /* enum sam3_variant */
 
 	/* Loaded video frames */
 	struct sam3_video_frames frames;

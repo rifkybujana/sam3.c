@@ -38,9 +38,26 @@ static int check_broadcast(const struct sam3_tensor *a,
 	if (nb == 1)
 		return 1;
 
-	/* b is [N], a's last dim is N */
-	if (b->n_dims == 1 && a->dims[a->n_dims - 1] == b->dims[0])
-		return b->dims[0];
+	/* Last-dim broadcast: b has as many elements as a's last dim,
+	 * and those elements form b's trailing dim. Accepts
+	 *   b=[N]         (1-D bias)
+	 *   b=[1, N]      (row vector, e.g. prompt_encoder.no_mask_embed)
+	 *   b=[1, 1, N]   (interactivity_no_mem_embed)
+	 * as long as all non-trailing dims of b are 1 so the tile pattern
+	 * matches a straight modulo-N bias add.
+	 */
+	int last = a->dims[a->n_dims - 1];
+	if (nb == last && b->dims[b->n_dims - 1] == last) {
+		int leading_ok = 1;
+		for (int i = 0; i < b->n_dims - 1; i++) {
+			if (b->dims[i] != 1) {
+				leading_ok = 0;
+				break;
+			}
+		}
+		if (leading_ok)
+			return last;
+	}
 
 	return -1;
 }

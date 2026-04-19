@@ -33,6 +33,7 @@
 #include "model/sam3_processor.h"
 #include "model/video_session.h"
 #include "model/tracker.h"
+#include "model/tracker_v2.h"
 #include "model/mask_decoder.h"
 #include "model/graph_helpers.h"
 #include "model/frame_cache.h"
@@ -336,7 +337,16 @@ session_encode_frame(struct sam3_video_session *session,
 		? ctx->proc.model.cached_sam2_4x_nhwc
 		: ctx->proc.model.cached_feat_4x_nhwc;
 
-	out->image_features = sam3_tensor_clone_persist(arena, src_05x);
+	/*
+	 * image_features (0.5x) is only populated for SAM 3's dual-neck
+	 * checkpoints (where the sam2 neck contributes a 4th FPN scale).
+	 * SAM 3.1 ships a tri-neck with no 0.5x output, and its tracker_v2
+	 * reads feat_s1 (1x) as the main backbone embedding — the 0.5x slot
+	 * stays NULL and is not consumed downstream. Tolerate that here.
+	 */
+	out->image_features = src_05x
+		? sam3_tensor_clone_persist(arena, src_05x)
+		: NULL;
 	out->feat_s0 = sam3_tensor_clone_persist(arena, src_2x);
 	out->feat_s1 = sam3_tensor_clone_persist(arena, src_1x);
 	/* feat_4x (288x288 4x skip) tolerates NULL for older models. */
@@ -344,9 +354,29 @@ session_encode_frame(struct sam3_video_session *session,
 		? sam3_tensor_clone_persist(arena, src_4x)
 		: NULL;
 
-	if (!out->image_features || !out->feat_s0 || !out->feat_s1) {
-		sam3_log_error("session_encode_frame: clone frame %d failed",
-			       frame_idx);
+	if (!out->feat_s0 || !out->feat_s1) {
+		sam3_log_error("session_encode_frame: clone frame %d failed "
+			       "(feat_s0=%p feat_s1=%p)",
+			       frame_idx, (void *)out->feat_s0,
+			       (void *)out->feat_s1);
+		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
+		return SAM3_ENOMEM;
+	}
+	if (!out->image_features &&
+	    session->variant != SAM3_VARIANT_SAM3_1) {
+		sam3_log_error("session_encode_frame: image_features missing "
+			       "on non-SAM3.1 frame %d", frame_idx);
+		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
+		return SAM3_ENOMEM;
+	}
+	/*
+	 * SAM 3.1's v2 tracker reads feat_4x as the decoder's skip feed —
+	 * reject clone failures here instead of silently returning a NULL
+	 * feat_4x that trips the v2 pipeline later.
+	 */
+	if (!out->feat_4x && src_4x) {
+		sam3_log_error("session_encode_frame: feat_4x clone failed "
+			       "frame %d (arena exhausted?)", frame_idx);
 		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
 		return SAM3_ENOMEM;
 	}
@@ -387,20 +417,6 @@ enum sam3_error sam3_video_start_ex(sam3_ctx *ctx,
 		return SAM3_EINVAL;
 	}
 
-	/*
-	 * SAM 3.1 uses a different tracker architecture (multiplex-aware
-	 * memory attention + maskmem backbone) than the SAM 3 tracker
-	 * this video path was built for. Loading sam3.1.sam3 weights into
-	 * the SAM 3 tracker would produce garbage masks. Reject cleanly
-	 * until sub-project 2 lands the 3.1 tracker.
-	 */
-	if (ctx->config.variant == SAM3_VARIANT_SAM3_1) {
-		sam3_log_error("video_start: SAM 3.1 video tracking is not "
-			       "yet supported (use a SAM 3 model, or wait "
-			       "for the multiplex tracker)");
-		return SAM3_EVIDEO;
-	}
-
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "video_start");
 
 	session = calloc(1, sizeof(*session));
@@ -432,18 +448,36 @@ enum sam3_error sam3_video_start_ex(sam3_ctx *ctx,
 		goto cleanup;
 	}
 
-	/* Initialize and load the tracker with model weights */
-	err = sam3_tracker_init(&session->tracker);
-	if (err != SAM3_OK) {
-		sam3_log_error("video_start: tracker init failed (%d)", err);
-		goto cleanup;
-	}
-
-	err = sam3_tracker_load(&session->tracker, &ctx->weights,
-				&session->persist);
-	if (err != SAM3_OK) {
-		sam3_log_error("video_start: tracker load failed (%d)", err);
-		goto cleanup;
+	/* Initialize and load the variant-specific tracker. */
+	session->variant = ctx->config.variant;
+	if (session->variant == SAM3_VARIANT_SAM3_1) {
+		err = sam3_tracker_v2_init(&session->tracker_v2);
+		if (err != SAM3_OK) {
+			sam3_log_error("video_start: tracker_v2 init failed (%d)",
+				       err);
+			goto cleanup;
+		}
+		err = sam3_tracker_v2_load(&session->tracker_v2, &ctx->weights,
+					   &session->persist);
+		if (err != SAM3_OK) {
+			sam3_log_error("video_start: tracker_v2 load failed (%d)",
+				       err);
+			goto cleanup;
+		}
+	} else {
+		err = sam3_tracker_init(&session->tracker);
+		if (err != SAM3_OK) {
+			sam3_log_error("video_start: tracker init failed (%d)",
+				       err);
+			goto cleanup;
+		}
+		err = sam3_tracker_load(&session->tracker, &ctx->weights,
+					&session->persist);
+		if (err != SAM3_OK) {
+			sam3_log_error("video_start: tracker load failed (%d)",
+				       err);
+			goto cleanup;
+		}
 	}
 
 	/* Load video frames */
@@ -575,46 +609,578 @@ struct propagate_frame_ctx {
 };
 
 /*
- * video_add_prompts_pipeline - Shared prompt -> tracker -> memory pipeline.
+ * video_track_one_obj - Run the per-frame tracker pipeline for one object.
  *
- * @session:        Video session (already validated non-NULL by caller)
- * @frame_idx:      Frame the prompts apply to (must be in range)
- * @obj_idx:        Internal object index (from sam3_session_get_or_add_obj)
- * @prompts:        Public-API prompt array for sam3_project_prompts
- * @n_prompts:      Length of @prompts (>= 1)
- * @stored_prompt:  Prompt entry to commit to session->prompts before
- *                  the memory bank is updated, so a capacity failure
- *                  cannot leave the two structures out of sync. Its
- *                  frame_idx / obj_internal_idx are overwritten here to
- *                  guarantee consistency with the pipeline arguments.
- * @obj_id:         User-facing obj id, used for log messages only.
- * @result:         Caller-owned result. Zeroed before work starts and on
- *                  failure; filled with heap-allocated masks + IoU on
- *                  success.
- * @shared:         Optional per-frame shared state from propagate_one.
- *                  When non-NULL, frame_cache_get and the img_2d flatten
- *                  are skipped — the pipeline reuses @shared->cf and
- *                  @shared->img_2d and resets the scratch arena to
- *                  @shared->scratch_mark between objects. NULL = run the
- *                  legacy per-call path (used by add_points / add_box).
+ * Shared pipeline used by every (variant, is_cond) combination. Runs the
+ * variant's tracker + memory encoder, commits a memory-bank entry, and
+ * fills @obj_mask with the selected multimask prediction. Variant-specific
+ * logic is bounded to the tracker call (step 4) and the memory encoder
+ * (step 8); everything else is variant-agnostic. See pipeline steps in
+ * the function body for the exact flow.
  *
- * Runs the same five-step pipeline used by add_points / add_box:
- *   1. Project prompts to [N, d_model] tokens (sam3_project_prompts).
- *   2. Reshape cached NHWC image features to [HW, d] for the tracker.
- *   3. Build + evaluate the tracker graph (is_cond=1). Select argmax
- *      IoU as best mask.
- *   4. Upsample the best mask to the memory encoder's interpol_size,
- *      run the memory encoder graph, and clone the spatial features
- *      into the session persist arena.
- *   5. Commit the stored prompt to session->prompts via
- *      sam3_session_add_prompt — this can fail (SAM3_ENOMEM) if the
- *      list is at capacity, in which case we bail out before touching
- *      the memory bank so the two structures stay consistent. On
- *      success, append a conditioning entry to the memory bank and
- *      copy masks + IoU into the caller's result.
+ * @session:        Video session (ctx must be ready; caller pre-validated).
+ * @obj_idx:        Internal object index into session->objects[].
+ * @frame_idx:      Frame to process.
+ * @is_cond:        1 for conditioning frames (add_points / add_box);
+ *                  0 for propagation.
+ * @prompts_opt:    Public prompt array — consumed only by the SAM 3
+ *                  conditioning path. Pass NULL for propagation and for
+ *                  all SAM 3.1 calls.
+ * @n_prompts_opt:  Length of @prompts_opt. 0 when @prompts_opt is NULL.
+ * @shared:         Optional per-frame shared state from propagate_one;
+ *                  NULL selects the per-call path (used by add_points /
+ *                  add_box). When non-NULL, @shared->cf and the arena
+ *                  mark are reused, and for SAM 3 the img_2d flatten is
+ *                  shared across objects on the same frame.
+ * @obj_mask:       Caller-owned output. Zeroed before work starts; on
+ *                  success @obj_mask->mask is heap-allocated and owned
+ *                  by the caller.
  *
- * On error the function logs the failure, frees any heap fields it had
- * attached to @result, and returns the appropriate sam3_error code.
+ * Returns SAM3_OK on success. On error returns SAM3_EINVAL, SAM3_ENOMEM,
+ * or a backend error; @obj_mask->mask is left NULL and counter fields
+ * zeroed so callers can call free(obj_mask->mask) unconditionally.
+ *
+ * The bank entry is committed before this function returns; callers that
+ * need to roll it back must do so explicitly (see
+ * video_add_prompts_pipeline's capacity pre-check).
+ */
+static enum sam3_error
+video_track_one_obj(struct sam3_video_session *session,
+		    int obj_idx, int frame_idx, int is_cond,
+		    const struct sam3_prompt *prompts_opt,
+		    int n_prompts_opt,
+		    const struct propagate_frame_ctx *shared,
+		    struct sam3_video_object_mask *obj_mask)
+{
+	struct sam3_ctx *ctx = session->ctx;
+	if (!ctx || !ctx->proc_ready || !ctx->proc.backend) {
+		sam3_log_error("video_track: context not ready");
+		return SAM3_EINVAL;
+	}
+
+	/*
+	 * Invariant: `trk` and `trk_v2` are mutually exclusive — exactly
+	 * one is non-NULL based on `is_v2`. Every variant-dispatch branch
+	 * below relies on this to dereference the right tracker without
+	 * another NULL check.
+	 */
+	const int is_v2 = (session->variant == SAM3_VARIANT_SAM3_1);
+	struct sam3_tracker     *trk    = is_v2 ? NULL : &session->tracker;
+	struct sam3_tracker_v2  *trk_v2 = is_v2 ? &session->tracker_v2 : NULL;
+	struct sam3_memory_bank *bank   = &session->objects[obj_idx].bank;
+
+	SAM3_PROF_BEGIN(ctx->proc.profiler,
+			is_cond ? "video_track_cond" : "video_track_prop");
+
+	enum sam3_error err = SAM3_OK;
+	struct sam3_frame_features cf;
+	struct sam3_tensor *spatial_persist = NULL;
+	struct sam3_tensor *obj_ptr_persist = NULL;
+
+	/* --- 1. Features ------------------------------------------------- */
+	if (shared) {
+		cf = shared->cf;
+	} else {
+		memset(&cf, 0, sizeof(cf));
+		SAM3_PROF_BEGIN(ctx->proc.profiler, "frame_cache_get");
+		err = sam3_frame_cache_get(&session->frame_cache,
+					   frame_idx, &cf);
+		SAM3_PROF_END(ctx->proc.profiler, "frame_cache_get");
+		if (err != SAM3_OK) {
+			sam3_log_error("video_track: frame %d cache get "
+				       "failed (%d)", frame_idx, err);
+			goto cleanup;
+		}
+	}
+	if (!cf.feat_s0 || !cf.feat_s1 ||
+	    (is_v2 && !cf.feat_4x) ||
+	    (!is_v2 && !cf.image_features)) {
+		sam3_log_error("video_track: frame %d missing features "
+			       "(variant=%d)", frame_idx, session->variant);
+		err = SAM3_EINVAL;
+		goto cleanup;
+	}
+
+	/* --- 2. Clear stale non-cond memory on re-prompt ---------------- */
+	if (is_cond) {
+		int w = session->opts.clear_non_cond_window;
+		if (w <= 0)
+			w = 7;
+		sam3_memory_bank_clear_around_frame(bank, frame_idx, w);
+	}
+
+	/* --- 3. Scratch arena ------------------------------------------- */
+	/*
+	 * Use the processor's large scratch arena for tracker + memory-
+	 * encoder intermediates — the session scratch is too small. When
+	 * propagate_one has flattened feat_s1 into a shared img_2d, reset
+	 * to the post-flatten mark so the shared tensor survives across
+	 * objects while per-object work recycles.
+	 */
+	struct sam3_arena *gfx = &ctx->proc.scratch_arena;
+	if (shared)
+		gfx->offset = shared->scratch_mark;
+	else
+		sam3_arena_reset(gfx);
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+
+	/* --- 4. Variant-dispatched tracker call ------------------------- */
+	struct sam3_tensor *track_masks   = NULL; /* [N_mask, H, W]            */
+	struct sam3_tensor *track_iou     = NULL; /* [N_mask]                  */
+	struct sam3_tensor *track_obj_ptr = NULL; /* sam3:[1,256] v2:[N_mask,256] */
+	struct sam3_tensor *track_score   = NULL; /* [1]                        */
+
+	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_build");
+	if (is_v2) {
+		err = sam3_tracker_v2_track_frame(
+			trk_v2, &g, bank,
+			cf.feat_s1,   /* 1x = main grid, 72x72 */
+			cf.feat_s0,   /* 2x skip, 144x144       */
+			cf.feat_4x,   /* 4x skip, 288x288       */
+			frame_idx, is_cond, gfx,
+			&track_masks, &track_iou,
+			&track_obj_ptr, &track_score);
+	} else {
+		/*
+		 * SAM 3 takes sparse prompt tokens only on conditioning
+		 * frames. Pass NULL on propagation.
+		 */
+		struct sam3_tensor *prompt_tokens = NULL;
+		if (is_cond && prompts_opt && n_prompts_opt > 0) {
+			int frame_size = session->frames.frame_size;
+			SAM3_PROF_BEGIN(ctx->proc.profiler, "prompt_project");
+			prompt_tokens = sam3_tracker_sam_project_prompts(
+				trk, prompts_opt, n_prompts_opt,
+				frame_size, frame_size, gfx);
+			if (!prompt_tokens) {
+				prompt_tokens = sam3_project_prompts(
+					&ctx->proc.model, cf.feat_s1,
+					prompts_opt, n_prompts_opt,
+					frame_size, frame_size, gfx);
+			}
+			SAM3_PROF_END(ctx->proc.profiler, "prompt_project");
+			if (!prompt_tokens) {
+				sam3_log_error("video_track: prompt projection "
+					       "failed (frame %d, obj %d)",
+					       frame_idx, obj_idx);
+				err = SAM3_ENOMEM;
+				goto cleanup;
+			}
+		}
+
+		/*
+		 * SAM 3's tracker takes the 1x feature as a 2D tensor
+		 * [HW, d]. Reuse the flatten propagate_one prepared
+		 * across objects when available.
+		 */
+		struct sam3_tensor *img_2d = NULL;
+		int grid_h = 0, grid_w = 0;
+		if (shared) {
+			img_2d = shared->img_2d;
+			grid_h = shared->grid_h;
+			grid_w = shared->grid_w;
+		} else {
+			struct sam3_tensor *img = cf.feat_s1;
+			if (img->n_dims != 4) {
+				sam3_log_error("video_track: feat_s1 not 4D");
+				err = SAM3_EINVAL;
+				goto cleanup;
+			}
+			grid_h = img->dims[1];
+			grid_w = img->dims[2];
+			int d2[2] = {grid_h * grid_w, img->dims[3]};
+			img_2d = gh_alloc_tensor(gfx, img->dtype, 2, d2);
+			if (!img_2d) {
+				err = SAM3_ENOMEM;
+				goto cleanup;
+			}
+			memcpy(img_2d->data, img->data, img->nbytes);
+		}
+
+		err = sam3_tracker_track_frame(
+			trk, &g, bank,
+			img_2d, grid_h, grid_w,
+			prompt_tokens,
+			cf.feat_4x, cf.feat_s0,
+			frame_idx, is_cond, gfx,
+			&track_masks, &track_iou,
+			&track_obj_ptr, &track_score);
+	}
+	SAM3_PROF_END(ctx->proc.profiler, "tracker_build");
+
+	if (err != SAM3_OK) {
+		sam3_log_error("video_track: tracker build failed "
+			       "(frame %d, obj %d, err %d)",
+			       frame_idx, obj_idx, err);
+		goto cleanup;
+	}
+
+	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_eval");
+	err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
+	SAM3_PROF_END(ctx->proc.profiler, "tracker_eval");
+	if (err != SAM3_OK) {
+		sam3_log_error("video_track: tracker eval failed "
+			       "(frame %d, obj %d, err %d)",
+			       frame_idx, obj_idx, err);
+		goto cleanup;
+	}
+
+	if (!track_masks || track_masks->n_dims != 3) {
+		sam3_log_error("video_track: bad track_masks shape");
+		err = SAM3_EINVAL;
+		goto cleanup;
+	}
+	const int n_masks = track_masks->dims[0];
+	const int final_h = track_masks->dims[1];
+	const int final_w = track_masks->dims[2];
+
+	/* --- 5. Best mask pick ----------------------------------------- */
+	int best_idx = 0;
+	if (track_iou && track_iou->n_dims >= 1 &&
+	    track_iou->dims[0] >= n_masks) {
+		if (is_v2) {
+			/*
+			 * Argmax IoU. Stability-aware selection for SAM 3.1
+			 * lives in sub-project 3's interactive decoder once
+			 * real sparse prompts drive the multimask logits.
+			 */
+			const float *io = (const float *)track_iou->data;
+			float best = io[0];
+			for (int i = 1; i < n_masks; i++) {
+				if (io[i] > best) {
+					best = io[i];
+					best_idx = i;
+				}
+			}
+		} else {
+			float delta  = session->opts.multimask_via_stability
+				       ? session->opts.multimask_stability_delta
+				       : 0.0f;
+			float thresh = session->opts.multimask_via_stability
+				       ? session->opts.multimask_stability_thresh
+				       : 0.0f;
+			best_idx = sam3_mask_decoder_select_with_stability(
+				(const float *)track_masks->data,
+				(const float *)track_iou->data,
+				n_masks, final_h, final_w, delta, thresh);
+		}
+	}
+
+	const float best_iou_value = (track_iou && track_iou->n_dims >= 1 &&
+				      track_iou->dims[0] > best_idx)
+		? ((const float *)track_iou->data)[best_idx]
+		: 1.0f;
+
+	/* --- 6. Stash prev_mask (iter_use_prev_mask_pred on cond) ------- */
+	if (is_cond && session->opts.iter_use_prev_mask_pred &&
+	    track_masks->dims[0] > best_idx) {
+		int slice_dims[3] = {1, final_h, final_w};
+		struct sam3_tensor *prev = gh_alloc_tensor(
+			&session->persist, SAM3_DTYPE_F32, 3, slice_dims);
+		if (prev) {
+			size_t per_mask =
+				(size_t)final_h * final_w * sizeof(float);
+			memcpy(prev->data,
+			       (const float *)track_masks->data
+			         + (size_t)best_idx * final_h * final_w,
+			       per_mask);
+			session->objects[obj_idx].prev_mask_logits = prev;
+			session->objects[obj_idx].prev_mask_frame  = frame_idx;
+		} else {
+			sam3_log_warn("video_track: prev_mask clone failed "
+				      "(frame %d, obj %d)", frame_idx, obj_idx);
+		}
+	}
+
+	/*
+	 * --- 7. Occlusion gating ----------------------------------------
+	 *
+	 * SAM 3: apply_occlusion_gating broadcasts no_obj_ptr over the
+	 *   full [1, 256] obj_ptr tensor in-place; the gated tensor is
+	 *   what we memcpy into the persist obj_ptr below.
+	 *
+	 * SAM 3.1: obj_ptr is [N_mask, 256] and we pick best_idx after the
+	 *   fact, so we skip the obj_ptr broadcast here and zero the
+	 *   persist copy when not appearing in step 8. The mask gating to
+	 *   NO_OBJ_SCORE is identical.
+	 */
+	struct sam3_tensor *no_obj_ptr = is_v2
+		? NULL
+		: trk->no_obj_ptr;
+	struct sam3_tensor *no_obj_embed = is_v2
+		? NULL  /* v2 no_obj_embed_spatial is [16, 256], applied later */
+		: trk->no_obj_embed_spatial;
+	int is_appearing = apply_occlusion_gating(
+		track_masks,
+		is_v2 ? NULL : track_obj_ptr,
+		NULL, track_score, no_obj_ptr, no_obj_embed);
+
+	/* --- 8. Persist the best obj_ptr ------------------------------- */
+	struct sam3_tensor *best_obj_ptr_scratch = NULL;
+	{
+		int op_dims[2] = {1, SAM3_V2_HIDDEN_DIM};
+		best_obj_ptr_scratch = gh_alloc_tensor(gfx, SAM3_DTYPE_F32,
+						      2, op_dims);
+		if (!best_obj_ptr_scratch) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		const size_t D = (size_t)SAM3_V2_HIDDEN_DIM * sizeof(float);
+		if (!is_v2) {
+			/* Already pre-selected by sam3_tracker_track_frame
+			 * and gated in-place by apply_occlusion_gating. */
+			memcpy(best_obj_ptr_scratch->data,
+			       track_obj_ptr->data, D);
+		} else if (is_appearing) {
+			memcpy(best_obj_ptr_scratch->data,
+			       (const float *)track_obj_ptr->data
+			         + (size_t)best_idx * SAM3_V2_HIDDEN_DIM,
+			       D);
+		} else {
+			memset(best_obj_ptr_scratch->data, 0, D);
+		}
+	}
+
+	/* --- 9. Best mask → [1, H, W, 1] NHWC scratch tensor ----------- */
+	struct sam3_tensor *best_mask_nhwc;
+	{
+		int dims_nhwc[4] = {1, final_h, final_w, 1};
+		best_mask_nhwc = gh_alloc_tensor(gfx, SAM3_DTYPE_F32, 4,
+						 dims_nhwc);
+		if (!best_mask_nhwc) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		size_t per_mask = (size_t)final_h * final_w;
+		memcpy(best_mask_nhwc->data,
+		       (const float *)track_masks->data
+		         + (size_t)best_idx * per_mask,
+		       per_mask * sizeof(float));
+	}
+
+	/* --- 10. Variant-dispatched memory encoder --------------------- */
+	sam3_graph_init(&g);
+	struct sam3_tensor *mem_feat = NULL;
+	struct sam3_tensor *mem_pos  = NULL;
+
+	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_build");
+	if (is_v2) {
+		/*
+		 * Multiplex packing: put the best mask into slot-0 channel 0
+		 * and zero the remaining 31 channels. Proper multiplex
+		 * layout (channels 0..15 active, 16..31 no-obj complements)
+		 * is sub-project 4's concern.
+		 */
+		int pf_H  = cf.feat_s1->dims[1];
+		int pf_W  = cf.feat_s1->dims[2];
+		int big_H = pf_H * 16;
+		int big_W = pf_W * 16;
+		int mm_C  = SAM3_V2_MULTIPLEX_IN_CHANNELS;
+		int mm_dims[4] = {1, big_H, big_W, mm_C};
+		struct sam3_tensor *multi_mask = gh_alloc_tensor(
+			gfx, SAM3_DTYPE_F32, 4, mm_dims);
+		if (!multi_mask) {
+			err = SAM3_ENOMEM;
+		} else {
+			memset(multi_mask->data, 0, multi_mask->nbytes);
+			int up_h = big_H / final_h;
+			int up_w = big_W / final_w;
+			if (up_h < 1) up_h = 1;
+			if (up_w < 1) up_w = 1;
+			const float *src =
+				(const float *)track_masks->data
+				  + (size_t)best_idx * final_h * final_w;
+			float *dst = (float *)multi_mask->data;
+			for (int y = 0; y < big_H; y++) {
+				int sy = y / up_h;
+				if (sy >= final_h) sy = final_h - 1;
+				for (int x = 0; x < big_W; x++) {
+					int sx = x / up_w;
+					if (sx >= final_w) sx = final_w - 1;
+					dst[((size_t)y * big_W + x)
+					    * mm_C + 0] =
+						src[sy * final_w + sx];
+				}
+			}
+			mem_feat = sam3_v2_maskmem_forward(
+				&g, gfx, &trk_v2->maskmem,
+				cf.feat_s1, multi_mask,
+				/*skip_mask_sigmoid=*/0);
+			if (!mem_feat)
+				err = SAM3_ENOMEM;
+		}
+	} else {
+		/* Python mask_for_mem: threshold (cond) vs sigmoid (prop),
+		 * then scale/bias. Done in-place on best_mask_nhwc. */
+		preprocess_mask_for_mem_enc(best_mask_nhwc,
+					    /*is_mask_from_pts=*/is_cond,
+					    trk->sigmoid_scale,
+					    trk->sigmoid_bias);
+		int up_factor = trk->mem_encoder.interpol_h / final_h;
+		if (up_factor < 1) up_factor = 1;
+		struct sam3_tensor *mask_up = gh_upsample(
+			&g, gfx, best_mask_nhwc, up_factor);
+		if (!mask_up) {
+			err = SAM3_ENOMEM;
+		} else {
+			err = sam3_memory_encoder_build(
+				&trk->mem_encoder, &g,
+				cf.feat_s1, mask_up, gfx,
+				&mem_feat, &mem_pos);
+		}
+	}
+	SAM3_PROF_END(ctx->proc.profiler, "memenc_build");
+	if (err != SAM3_OK) {
+		sam3_log_error("video_track: memenc build failed "
+			       "(frame %d, obj %d, err %d)",
+			       frame_idx, obj_idx, err);
+		goto cleanup;
+	}
+
+	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_eval");
+	err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
+	SAM3_PROF_END(ctx->proc.profiler, "memenc_eval");
+	if (err != SAM3_OK) {
+		sam3_log_error("video_track: memenc eval failed "
+			       "(frame %d, obj %d, err %d)",
+			       frame_idx, obj_idx, err);
+		goto cleanup;
+	}
+	if (!mem_feat || mem_feat->n_dims != 4) {
+		sam3_log_error("video_track: bad mem_feat shape");
+		err = SAM3_EINVAL;
+		goto cleanup;
+	}
+
+	/*
+	 * SAM 3 post-encoder gating: add no_obj_embed_spatial when the
+	 * object isn't appearing so the stored memory reflects occlusion.
+	 * v2's no_obj_embed_spatial has a different shape (16, 256) and
+	 * is applied via a different mechanism; skipped here.
+	 */
+	if (!is_v2) {
+		apply_occlusion_gating(NULL, NULL, mem_feat,
+				       track_score, no_obj_ptr, no_obj_embed);
+	}
+
+	/* --- 11. Flatten + clone to persist ---------------------------- */
+	{
+		int mH = mem_feat->dims[1];
+		int mW = mem_feat->dims[2];
+		int mC = mem_feat->dims[3];
+		struct sam3_tensor flat_view = *mem_feat;
+		flat_view.n_dims  = 2;
+		flat_view.dims[0] = mH * mW;
+		flat_view.dims[1] = mC;
+		flat_view.dims[2] = 0;
+		flat_view.dims[3] = 0;
+		sam3_tensor_compute_strides(&flat_view);
+		flat_view.ephemeral = 0;
+		spatial_persist = sam3_tensor_clone_persist(
+			&session->persist, &flat_view);
+	}
+	if (!spatial_persist) {
+		sam3_log_error("video_track: spatial clone failed");
+		err = SAM3_ENOMEM;
+		goto cleanup;
+	}
+	obj_ptr_persist = sam3_tensor_clone_persist(&session->persist,
+						    best_obj_ptr_scratch);
+	if (!obj_ptr_persist) {
+		sam3_log_error("video_track: obj_ptr clone failed");
+		err = SAM3_ENOMEM;
+		goto cleanup;
+	}
+
+	/* --- 12. Commit bank entry ------------------------------------- */
+	{
+		struct sam3_memory_entry entry;
+		memset(&entry, 0, sizeof(entry));
+		entry.spatial_features = spatial_persist;
+		entry.obj_pointer      = obj_ptr_persist;
+		entry.frame_idx        = frame_idx;
+		entry.is_conditioning  = is_cond;
+		entry.obj_score        = compute_eff_iou_score(
+			track_score, best_iou_value);
+		sam3_memory_bank_add(bank, &entry);
+	}
+
+	/* --- 13. Fill caller's obj_mask -------------------------------- */
+	obj_mask->mask_h    = final_h;
+	obj_mask->mask_w    = final_w;
+	obj_mask->iou_score = best_iou_value;
+	obj_mask->obj_score_logit = (track_score && track_score->data)
+		? ((const float *)track_score->data)[0]
+		: 0.0f;
+	obj_mask->is_occluded = !is_appearing;
+	{
+		size_t mask_bytes =
+			(size_t)final_h * final_w * sizeof(float);
+		obj_mask->mask = malloc(mask_bytes);
+		if (!obj_mask->mask) {
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+		memcpy(obj_mask->mask,
+		       (const float *)track_masks->data
+		         + (size_t)best_idx * final_h * final_w,
+		       mask_bytes);
+	}
+
+	session->frames_tracked[frame_idx] = 1;
+
+	sam3_log_debug("video_track: frame %d obj %d variant=%d is_cond=%d "
+		       "iou=%.3f mask=%dx%d appearing=%d",
+		       frame_idx, obj_idx, session->variant, is_cond,
+		       (double)obj_mask->iou_score, final_h, final_w,
+		       is_appearing);
+	(void)mem_pos;  /* SAM 3 memory encoder returns but caller ignores */
+
+cleanup:
+	if (err != SAM3_OK && obj_mask) {
+		free(obj_mask->mask);
+		obj_mask->mask = NULL;
+		obj_mask->mask_h = 0;
+		obj_mask->mask_w = 0;
+	}
+	SAM3_PROF_END(ctx->proc.profiler,
+		       is_cond ? "video_track_cond" : "video_track_prop");
+	return err;
+}
+
+/*
+ * video_add_prompts_pipeline - Conditioning wrapper around video_track_one_obj.
+ *
+ * Runs the shared per-object pipeline with is_cond=1, then commits the
+ * stored prompt record and marks the per-object prompted-frame bitmap.
+ *
+ * @session:       Video session.
+ * @frame_idx:     Frame the prompt applies to.
+ * @obj_idx:       Internal object index into session->objects[].
+ * @prompts:       Public prompt array (points / box) forwarded to the
+ *                 shared pipeline.
+ * @n_prompts:     Length of @prompts (>= 1).
+ * @stored_prompt: Prompt record to append to session->prompts; frame_idx
+ *                 and obj_internal_idx are overwritten here so the
+ *                 stored record cannot drift from the pipeline args.
+ * @obj_id:        User-facing obj id, used for log messages only.
+ * @shared:        Optional per-frame shared state from propagate_one.
+ * @result:        Caller-owned result. Zeroed before work starts; on
+ *                 success result->objects is calloc'd with one entry.
+ *
+ * Returns SAM3_OK on success, SAM3_ENOMEM if the prompt list or the
+ * conditioning ring is at capacity, or any error from the shared
+ * pipeline.
+ *
+ * Capacity pre-check: the shared pipeline commits the bank entry
+ * before returning, so rolling back on a later sam3_session_add_prompt
+ * failure is unsafe (sam3_memory_bank_add silently drops at the
+ * 16-entry cond cap; see src/model/memory_bank.c:35-47). Pre-checking
+ * both the prompts[] capacity and the cond-ring capacity up front
+ * avoids the race: once both checks pass, the post-pipeline append is
+ * guaranteed to succeed.
  */
 static enum sam3_error
 video_add_prompts_pipeline(struct sam3_video_session *session,
@@ -626,558 +1192,63 @@ video_add_prompts_pipeline(struct sam3_video_session *session,
 			   const struct propagate_frame_ctx *shared,
 			   struct sam3_video_frame_result *result)
 {
-	struct sam3_ctx *ctx;
-	struct sam3_tracker *trk;
-	struct sam3_frame_features cf;
-	struct sam3_arena *gfx_scratch;
-	struct sam3_tensor *img_2d = NULL;
-	struct sam3_tensor *prompt_tokens = NULL;
-	struct sam3_tensor *track_masks = NULL;
-	struct sam3_tensor *track_iou = NULL;
-	struct sam3_tensor *best_mask_nhwc = NULL;
-	struct sam3_tensor *mask_up = NULL;
-	struct sam3_tensor *mem_feat = NULL;
-	struct sam3_tensor *mem_pos = NULL;
-	struct sam3_tensor *spatial_persist = NULL;
-	struct sam3_graph g;
-	int grid_h = 0, grid_w = 0;
-	int frame_size;
-	int n_masks = 0, final_h = 0, final_w = 0;
-	int best_idx = 0;
-	int mem_H, mem_W, mem_C, mem_HW;
-	size_t mask_bytes = 0;
-	enum sam3_error err = SAM3_OK;
-
-	ctx = session->ctx;
-	if (!ctx || !ctx->proc_ready || !ctx->proc.backend) {
-		sam3_log_error("video_add_prompts: context not ready");
-		err = SAM3_EINVAL;
-		goto cleanup;
+	if (session->n_prompts >= session->cap_prompts) {
+		sam3_log_error("video_add_prompts: prompt list at capacity "
+			       "(%d/%d), refusing to run tracker",
+			       session->n_prompts, session->cap_prompts);
+		return SAM3_ENOMEM;
 	}
-
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "video_add_prompts");
-
-	trk = &session->tracker;
-	if (shared) {
-		cf = shared->cf;
-	} else {
-		memset(&cf, 0, sizeof(cf));
-		SAM3_PROF_BEGIN(ctx->proc.profiler, "frame_cache_get");
-		err = sam3_frame_cache_get(&session->frame_cache,
-					   frame_idx, &cf);
-		SAM3_PROF_END(ctx->proc.profiler, "frame_cache_get");
-		if (err != SAM3_OK) {
-			sam3_log_error("video_add_prompts: frame %d cache get "
-				       "failed (%d)", frame_idx, err);
-			goto cleanup;
+	{
+		const struct sam3_memory_bank *b =
+			&session->objects[obj_idx].bank;
+		if (b->n_cond >= SAM3_MAX_MEMORY_FRAMES) {
+			sam3_log_error("video_add_prompts: cond bank full "
+				       "(%d/%d) for obj %d, refusing to run "
+				       "tracker", b->n_cond,
+				       SAM3_MAX_MEMORY_FRAMES, obj_id);
+			return SAM3_ENOMEM;
 		}
 	}
-	if (!cf.image_features || !cf.feat_s0 || !cf.feat_s1) {
-		sam3_log_error("video_add_prompts: frame %d features missing",
-			       frame_idx);
-		err = SAM3_EINVAL;
-		goto cleanup;
-	}
 
-	/*
-	 * Use the processor's large (3 GiB) scratch arena for graph
-	 * intermediates rather than the session's 256 MiB scratch.
-	 * The tracker graph (4-layer memory attention + full mask
-	 * decoder) needs several hundred MiB of intermediates at the
-	 * 5184-patch grid size. The session scratch is reserved for
-	 * small per-call bookkeeping.
-	 *
-	 * Shared-frame path: propagate_one already allocated @shared->img_2d
-	 * in this arena and captured the post-flatten offset. Resetting to
-	 * that mark (instead of 0) preserves the shared flatten across the
-	 * per-object loop while still recycling per-object prompt / graph
-	 * scratch between iterations.
-	 */
-	gfx_scratch = &ctx->proc.scratch_arena;
-	if (shared)
-		gfx_scratch->offset = shared->scratch_mark;
-	else
-		sam3_arena_reset(gfx_scratch);
+	struct sam3_video_object_mask om;
+	memset(&om, 0, sizeof(om));
+	om.obj_id = obj_id;
 
-	/*
-	 * Python clear_non_cond_mem_around_input: when a new conditioning
-	 * prompt arrives on a previously-tracked frame, the propagated
-	 * non-cond entries within the memory window are stale. Drop them
-	 * from this object's bank before re-running the decoder.
-	 */
-	int clear_window = session->opts.clear_non_cond_window;
-	if (clear_window <= 0)
-		clear_window = 7;
-	sam3_memory_bank_clear_around_frame(
-		&session->objects[obj_idx].bank,
-		frame_idx, clear_window);
-
-	/* Project prompt coordinates to [N, d_model] tokens on CPU.
-	 * The video tracker uses SAM's prompt encoder (sam_prompt_encoder
-	 * weights) when available. The SAM path produces 2 tokens per
-	 * point (pe_layer + point_embeddings[label] + not_a_point
-	 * padding) which matches the two-way transformer's expected
-	 * input format. Fall back to the SAM3 geometry encoder when the
-	 * weights aren't loaded (older checkpoints). */
-	frame_size = session->frames.frame_size;
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "prompt_project");
-	prompt_tokens = sam3_tracker_sam_project_prompts(
-		trk, prompts, n_prompts, frame_size, frame_size,
-		gfx_scratch);
-	if (!prompt_tokens) {
-		prompt_tokens = sam3_project_prompts(&ctx->proc.model,
-						     cf.feat_s1,
-						     prompts, n_prompts,
-						     frame_size, frame_size,
-						     gfx_scratch);
-	}
-	SAM3_PROF_END(ctx->proc.profiler, "prompt_project");
-	if (!prompt_tokens) {
-		sam3_log_error("video_add_prompts: prompt projection failed");
-		err = SAM3_ENOMEM;
-		goto cleanup;
-	}
-
-	/*
-	 * Python reference uses main = 72x72 grid (image_size 1008 /
-	 * stride 14). Our cache layout is:
-	 *   image_features = neck_05x (36x36 = 0.5x)
-	 *   feat_s1        = neck_1x  (72x72 = 1x = main)
-	 *   feat_s0        = neck_2x  (144x144 = 2x)
-	 *   feat_4x        = neck_4x  (288x288 = 4x)
-	 * So the tracker's main-grid input is cf.feat_s1, not
-	 * image_features. (An earlier revert to image_features kept
-	 * frame-0 outputs non-zero but at the wrong 36x36 scale — masks
-	 * came out with structural bias but not clean silhouettes. The
-	 * weights are trained for 72x72; stick with that here.)
-	 *
-	 * Shared-frame path: reuse the flatten propagate_one already did.
-	 */
-	if (shared) {
-		img_2d = shared->img_2d;
-		grid_h = shared->grid_h;
-		grid_w = shared->grid_w;
-	} else {
-		struct sam3_tensor *img = cf.feat_s1;
-		int HW, d;
-		int dims2[2];
-
-		if (img->n_dims != 4) {
-			sam3_log_error("video_add_prompts: feat_s1 expected "
-				       "4D, got %d", img->n_dims);
-			err = SAM3_EINVAL;
-			goto cleanup;
-		}
-		grid_h = img->dims[1];
-		grid_w = img->dims[2];
-		HW = grid_h * grid_w;
-		d  = img->dims[3];
-		dims2[0] = HW;
-		dims2[1] = d;
-		img_2d = gh_alloc_tensor(gfx_scratch, img->dtype,
-					 2, dims2);
-		if (!img_2d) {
-			sam3_log_error("video_add_prompts: img_2d alloc "
-				       "failed");
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-		memcpy(img_2d->data, img->data, img->nbytes);
-	}
-
-	/*
-	 * Build and evaluate the tracker graph (memory attention +
-	 * mask decoder). Mask-decoder skip params expect (when main=72):
-	 *   feat_s0 param → 4x main scale (288x288) = cf.feat_4x
-	 *   feat_s1 param → 2x main scale (144x144) = cf.feat_s0
-	 */
-	struct sam3_tensor *cond_obj_ptr = NULL;
-	struct sam3_tensor *cond_obj_score = NULL;
-	sam3_graph_init(&g);
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_build");
-	err = sam3_tracker_track_frame(trk, &g,
-				       &session->objects[obj_idx].bank,
-				       img_2d, grid_h, grid_w,
-				       prompt_tokens,
-				       cf.feat_4x, cf.feat_s0,
-				       frame_idx, /*is_cond=*/1,
-				       gfx_scratch,
-				       &track_masks, &track_iou,
-				       &cond_obj_ptr, &cond_obj_score);
-	SAM3_PROF_END(ctx->proc.profiler, "tracker_build");
+	enum sam3_error err = video_track_one_obj(
+		session, obj_idx, frame_idx, /*is_cond=*/1,
+		prompts, n_prompts, shared, &om);
 	if (err != SAM3_OK) {
-		sam3_log_error("video_add_prompts: track_frame failed (%d)",
+		free(om.mask);
+		return err;
+	}
+
+	struct sam3_video_prompt sp = *stored_prompt;
+	sp.frame_idx        = frame_idx;
+	sp.obj_internal_idx = obj_idx;
+	err = sam3_session_add_prompt(session, &sp);
+	if (err != SAM3_OK) {
+		/* Should not trigger given the pre-check above; logged as an
+		 * invariant violation rather than a recoverable path. The
+		 * bank entry is already committed and cannot be rolled back
+		 * safely (silent-drop case in sam3_memory_bank_add). */
+		sam3_log_error("video_add_prompts: prompt store failed (%d) "
+			       "after capacity pre-check — bank entry leaked",
 			       err);
-		goto cleanup;
+		free(om.mask);
+		return err;
 	}
 
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_eval");
-	err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
-	SAM3_PROF_END(ctx->proc.profiler, "tracker_eval");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_add_prompts: tracker graph eval "
-			       "failed (%d)", err);
-		goto cleanup;
-	}
-
-#ifdef SAM3_DEBUG_DUMP
-	{
-		auto_dump_tensor("/tmp/dbg_tracker_img2d.bin", img_2d);
-		auto_dump_tensor("/tmp/dbg_tracker_prompt.bin", prompt_tokens);
-		auto_dump_tensor("/tmp/dbg_tracker_masks.bin", track_masks);
-		auto_dump_tensor("/tmp/dbg_tracker_iou.bin", track_iou);
-		auto_dump_tensor("/tmp/dbg_tracker_obj_score.bin",
-				 cond_obj_score);
-		extern struct sam3_tensor *sam3_dbg_pixel_out;
-		extern struct sam3_tensor *sam3_dbg_pix_ct1;
-		extern struct sam3_tensor *sam3_dbg_pix_ct1_input;
-		extern struct sam3_tensor *sam3_dbg_pix_skip1;
-		extern struct sam3_tensor *sam3_dbg_pix_after_skip1;
-		extern struct sam3_tensor *sam3_dbg_xformer_in_img;
-		extern struct sam3_tensor *sam3_dbg_xformer_in_tokens;
-		extern struct sam3_tensor *sam3_dbg_xformer_layer0_q;
-		auto_dump_tensor("/tmp/dbg_xformer_in_img.bin",
-				 sam3_dbg_xformer_in_img);
-		auto_dump_tensor("/tmp/dbg_xformer_in_tokens.bin",
-				 sam3_dbg_xformer_in_tokens);
-		auto_dump_tensor("/tmp/dbg_xformer_layer0_q.bin",
-				 sam3_dbg_xformer_layer0_q);
-		auto_dump_tensor("/tmp/dbg_pix_ct1_input.bin",
-				 sam3_dbg_pix_ct1_input);
-		auto_dump_tensor("/tmp/dbg_pix_ct1.bin", sam3_dbg_pix_ct1);
-		auto_dump_tensor("/tmp/dbg_pix_skip1_proj.bin",
-				 sam3_dbg_pix_skip1);
-		auto_dump_tensor("/tmp/dbg_pix_after_skip1.bin",
-				 sam3_dbg_pix_after_skip1);
-		auto_dump_tensor("/tmp/dbg_tracker_pixel_out.bin",
-				 sam3_dbg_pixel_out);
-	}
-#endif
-
-	/*
-	 * Decoder output is [n_masks, final_h, final_w] with
-	 * final_h = grid_h * 4 = 288. Pick the argmax-IoU mask and
-	 * reshape that single slice to NHWC [1, final_h, final_w, 1]
-	 * so it can feed gh_upsample.
-	 */
-	if (!track_masks || track_masks->n_dims != 3) {
-		sam3_log_error("video_add_prompts: bad track_masks shape");
-		err = SAM3_EINVAL;
-		goto cleanup;
-	}
-	n_masks = track_masks->dims[0];
-	final_h = track_masks->dims[1];
-	final_w = track_masks->dims[2];
-
-	/*
-	 * Select best mask: when IoU scores are available, use
-	 * stability-aware selection (or fall back to argmax when
-	 * stability opts are disabled). Done BEFORE occlusion gating
-	 * so the result->best_mask field reflects the raw prediction
-	 * (Python semantics).
-	 */
-	if (track_iou && track_iou->n_dims >= 1 &&
-	    track_iou->dims[0] >= n_masks &&
-	    track_masks && track_masks->n_dims == 3) {
-		float delta  = session->opts.multimask_via_stability
-			       ? session->opts.multimask_stability_delta
-			       : 0.0f;
-		float thresh = session->opts.multimask_via_stability
-			       ? session->opts.multimask_stability_thresh
-			       : 0.0f;
-		best_idx = sam3_mask_decoder_select_with_stability(
-			(const float *)track_masks->data,
-			(const float *)track_iou->data,
-			n_masks,
-			track_masks->dims[1], /* H */
-			track_masks->dims[2], /* W */
-			delta, thresh);
-	}
-
-	/*
-	 * iter_use_prev_mask_pred: stash the selected conditioning mask
-	 * logits for this (obj, frame) so a future re-prompt on the same
-	 * pair can feed them into the decoder as a dense prompt input.
-	 * The decoder-side feed is a follow-up; the stash is cheap and
-	 * keeps session->objects[].prev_mask_* consistent with the last
-	 * conditioning evaluation.
-	 */
-	if (session->opts.iter_use_prev_mask_pred &&
-	    track_masks && track_masks->n_dims == 3 &&
-	    track_masks->dims[0] > best_idx) {
-		int H = track_masks->dims[1];
-		int W = track_masks->dims[2];
-		int slice_dims[3] = {1, H, W};
-		struct sam3_tensor *prev = gh_alloc_tensor(
-			&session->persist, SAM3_DTYPE_F32, 3, slice_dims);
-		if (prev) {
-			size_t per_mask = (size_t)H * W * sizeof(float);
-			const float *src = (const float *)track_masks->data;
-			memcpy(prev->data,
-			       src + (size_t)best_idx * (size_t)H * W,
-			       per_mask);
-			session->objects[obj_idx].prev_mask_logits = prev;
-			session->objects[obj_idx].prev_mask_frame = frame_idx;
-		} else {
-			sam3_log_warn("video_add_prompts: prev_mask clone "
-				      "failed (frame %d, obj %d)", frame_idx,
-				      obj_idx);
-		}
-	}
-
-	/*
-	 * Python occlusion gating: when object_score_logit <= 0,
-	 *   masks     -> NO_OBJ_SCORE
-	 *   obj_ptr   -> no_obj_ptr
-	 * Done BEFORE the mask upsample/memory-encoder pass so that
-	 * the stored memory features see the gated mask.
-	 */
-	apply_occlusion_gating(track_masks, cond_obj_ptr, NULL,
-			       cond_obj_score, trk->no_obj_ptr,
-			       trk->no_obj_embed_spatial);
-
-	{
-		int dims_nhwc[4] = {1, final_h, final_w, 1};
-		const float *src;
-		size_t per_mask;
-
-		best_mask_nhwc = gh_alloc_tensor(gfx_scratch,
-						 SAM3_DTYPE_F32, 4, dims_nhwc);
-		if (!best_mask_nhwc) {
-			sam3_log_error("video_add_prompts: best_mask alloc "
-				       "failed");
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-		src = (const float *)track_masks->data;
-		per_mask = (size_t)final_h * (size_t)final_w;
-		memcpy(best_mask_nhwc->data,
-		       src + (size_t)best_idx * per_mask,
-		       per_mask * sizeof(float));
-	}
-
-	/*
-	 * Python mask_for_mem preprocessing (is_mask_from_pts=True here:
-	 * this frame carries a user prompt). sam3_memory_encoder_build
-	 * runs with skip_mask_sigmoid-style semantics — no internal
-	 * sigmoid — so the caller is responsible for the threshold/scale/
-	 * bias transform below.
-	 */
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "mask_postprocess");
-	preprocess_mask_for_mem_enc(best_mask_nhwc,
-				    /*is_mask_from_pts=*/1,
-				    trk->sigmoid_scale,
-				    trk->sigmoid_bias);
-	SAM3_PROF_END(ctx->proc.profiler, "mask_postprocess");
-
-	/*
-	 * Memory encoder expects masks at interpol_size (1152x1152).
-	 * The actual tracker grid size varies with backbone stride, so
-	 * compute the upsample factor dynamically. Typical values:
-	 *   tracker grid 72 → mask 288 → factor 4
-	 *   tracker grid 36 → mask 144 → factor 8
-	 */
-	sam3_graph_init(&g);
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "mask_upsample");
-	{
-		int up_factor = trk->mem_encoder.interpol_h / final_h;
-		if (up_factor < 1)
-			up_factor = 1;
-		mask_up = gh_upsample(&g, gfx_scratch, best_mask_nhwc, up_factor);
-	}
-	SAM3_PROF_END(ctx->proc.profiler, "mask_upsample");
-	if (!mask_up) {
-		sam3_log_error("video_add_prompts: mask upsample failed");
-		err = SAM3_ENOMEM;
-		goto cleanup;
-	}
-
-	/* Memory encoder fuses the downsampled mask (72x72) with the
-	 * backbone 1x feature (feat_s1), NOT image_features which is the
-	 * 0.5x (36x36) neck output. Python reference uses the highest-
-	 * resolution backbone feature here. */
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_build");
-	err = sam3_memory_encoder_build(&trk->mem_encoder, &g,
-					cf.feat_s1, mask_up,
-					gfx_scratch,
-					&mem_feat, &mem_pos);
-	SAM3_PROF_END(ctx->proc.profiler, "memenc_build");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_add_prompts: memory encoder build "
-			       "failed (%d)", err);
-		goto cleanup;
-	}
-
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_eval");
-	err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
-	SAM3_PROF_END(ctx->proc.profiler, "memenc_eval");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_add_prompts: memory encoder eval "
-			       "failed (%d)", err);
-		goto cleanup;
-	}
-
-	/*
-	 * Memory bank expects spatial_features as [HW, mem_dim].
-	 * mem_feat from the encoder is [1, H, W, out_dim]; flatten
-	 * in-place (same nbytes, just new dims/strides) and clone
-	 * into the session persist arena so it survives after the
-	 * scratch arena is reset.
-	 */
-	if (!mem_feat || mem_feat->n_dims != 4) {
-		sam3_log_error("video_add_prompts: bad mem_feat shape");
-		err = SAM3_EINVAL;
-		goto cleanup;
-	}
-
-	/*
-	 * Python: maskmem_features += (1 - is_obj_appearing) *
-	 *                             no_obj_embed_spatial
-	 * (sam3_tracker_base.py:843-848). Apply after memory encoder
-	 * so the stored entry reflects the occlusion state.
-	 */
-	apply_occlusion_gating(NULL, NULL, mem_feat,
-			       cond_obj_score, trk->no_obj_ptr,
-			       trk->no_obj_embed_spatial);
-	mem_H  = mem_feat->dims[1];
-	mem_W  = mem_feat->dims[2];
-	mem_C  = mem_feat->dims[3];
-	mem_HW = mem_H * mem_W;
-
-	{
-		struct sam3_tensor flat_view = *mem_feat;
-		flat_view.n_dims = 2;
-		flat_view.dims[0] = mem_HW;
-		flat_view.dims[1] = mem_C;
-		flat_view.dims[2] = 0;
-		flat_view.dims[3] = 0;
-		sam3_tensor_compute_strides(&flat_view);
-		flat_view.ephemeral = 0;
-
-		spatial_persist = sam3_tensor_clone_persist(
-			&session->persist, &flat_view);
-	}
-	if (!spatial_persist) {
-		sam3_log_error("video_add_prompts: spatial clone failed");
-		err = SAM3_ENOMEM;
-		goto cleanup;
-	}
-
-	/*
-	 * Commit the prompt to the session FIRST. If the prompt list
-	 * is at capacity, sam3_session_add_prompt returns SAM3_ENOMEM
-	 * and we bail out before touching the memory bank, so the
-	 * session and bank cannot drift out of sync. We overwrite
-	 * frame_idx and obj_internal_idx from the pipeline args so
-	 * the stored record cannot drift from what actually ran.
-	 */
-	{
-		struct sam3_video_prompt sp = *stored_prompt;
-		sp.frame_idx        = frame_idx;
-		sp.obj_internal_idx = obj_idx;
-		err = sam3_session_add_prompt(session, &sp);
-		if (err != SAM3_OK) {
-			sam3_log_error("video_add_prompts: prompt store "
-				       "failed (%d)", err);
-			goto cleanup;
-		}
-	}
-
-	/*
-	 * Prompt stored — now commit the conditioning entry to the
-	 * memory bank. Any failure after this point leaves the bank
-	 * and prompt list in agreement (one entry each per prompt).
-	 *
-	 * Persist the obj_ptr (already gated) so it flows into
-	 * subsequent frames' memory attention. obj_score uses the
-	 * Python eff_iou_score (cal_mem_score) so SAM2Long-style
-	 * memory selection consults the occlusion-aware metric.
-	 */
-	struct sam3_tensor *cond_obj_ptr_persist = NULL;
-	if (cond_obj_ptr) {
-		cond_obj_ptr_persist = sam3_tensor_clone_persist(
-			&session->persist, cond_obj_ptr);
-		if (!cond_obj_ptr_persist) {
-			sam3_log_error("video_add_prompts: obj_ptr clone failed");
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-	}
-	{
-		float raw_iou = (track_iou && track_iou->data &&
-				 track_iou->n_dims >= 1 &&
-				 track_iou->dims[0] > best_idx)
-				? ((const float *)track_iou->data)[best_idx]
-				: 1.0f;
-		struct sam3_memory_entry entry;
-		memset(&entry, 0, sizeof(entry));
-		entry.spatial_features = spatial_persist;
-		entry.obj_pointer     = cond_obj_ptr_persist;
-		entry.frame_idx        = frame_idx;
-		entry.is_conditioning  = 1;
-		entry.obj_score        = compute_eff_iou_score(
-			cond_obj_score, raw_iou);
-		sam3_memory_bank_add(&session->objects[obj_idx].bank, &entry);
-	}
-
-	/*
-	 * Populate result as sam3_video_frame_result with n_objects=1.
-	 * result->objects[0] carries the mask logits for the prompted object.
-	 * We surface the best-IoU mask in objects[0].mask (single plane).
-	 */
-	result->frame_idx = frame_idx;
-	result->n_objects = 1;
-	result->objects = calloc(1, sizeof(struct sam3_video_object_mask));
-	if (!result->objects) {
-		sam3_log_error("video_add_prompts: result objects alloc failed");
-		err = SAM3_ENOMEM;
-		goto cleanup;
-	}
-	result->objects[0].obj_id = obj_id;
-	result->objects[0].mask_h = final_h;
-	result->objects[0].mask_w = final_w;
-	result->objects[0].iou_score = (track_iou && track_iou->n_dims >= 1 &&
-					track_iou->dims[0] > best_idx)
-				       ? ((const float *)track_iou->data)[best_idx]
-				       : 1.0f;
-	result->objects[0].obj_score_logit = (cond_obj_score && cond_obj_score->data)
-					     ? ((const float *)cond_obj_score->data)[0]
-					     : 0.0f;
-	result->objects[0].is_occluded =
-		(result->objects[0].obj_score_logit <= 0.0f) ? 1 : 0;
-
-	mask_bytes = (size_t)final_h * (size_t)final_w * sizeof(float);
-	result->objects[0].mask = malloc(mask_bytes);
-	if (!result->objects[0].mask) {
-		sam3_log_error("video_add_prompts: result mask alloc failed");
-		err = SAM3_ENOMEM;
-		goto cleanup;
-	}
-	{
-		const float *src = (const float *)track_masks->data;
-		size_t per_mask = (size_t)final_h * (size_t)final_w;
-		memcpy(result->objects[0].mask,
-		       src + (size_t)best_idx * per_mask,
-		       mask_bytes);
-	}
-
-	/* Mark this object's prompted-frame bitmap */
 	sam3_session_obj_mark_prompted(session, obj_idx, frame_idx);
 
-	session->frames_tracked[frame_idx] = 1;
-
-	sam3_log_debug("video_add_prompts: frame %d, obj %d, %d prompts, "
-		       "mask %dx%d, bank n_cond=%d",
-		       frame_idx, obj_id, n_prompts, final_h, final_w,
-		       session->objects[obj_idx].bank.n_cond);
-
-cleanup:
-	if (err != SAM3_OK)
-		sam3_video_frame_result_free(result);
-	(void)mem_pos;  /* returned by encoder but not used here */
-	if (ctx)
-		SAM3_PROF_END(ctx->proc.profiler, "video_add_prompts");
-	return err;
+	result->frame_idx = frame_idx;
+	result->n_objects = 1;
+	result->objects   = calloc(1, sizeof(*result->objects));
+	if (!result->objects) {
+		free(om.mask);
+		return SAM3_ENOMEM;
+	}
+	result->objects[0] = om;
+	return SAM3_OK;
 }
 
 /*
@@ -1407,22 +1478,21 @@ video_replay_stored_prompt(struct sam3_video_session *session,
 }
 
 /*
- * video_propagate_pure_tracking_obj - Run the tracker on a non-prompted
- *                                     frame for one specific object and
- *                                     commit a non-conditioning memory
- *                                     bank entry to its bank.
+ * video_propagate_pure_tracking_obj - Propagation wrapper around
+ *                                     video_track_one_obj.
  *
- * @session:  Video session
- * @obj_idx:  Internal object index (index into session->objects[])
- * @f:        Frame index (0..nf-1, validated by caller)
- * @obj_mask: Output per-object mask. Caller zeros up-front; on success
- *            obj_mask->mask is malloc'd and the caller owns it.
+ * Thin pass-through: runs the shared per-object pipeline with is_cond=0
+ * and no sparse prompt, committing a non-conditioning bank entry and
+ * filling @obj_mask.
  *
- * The flow mirrors video_add_prompts_pipeline but passes NULL for the
- * sparse prompt (pure tracking), appends the memory entry with
- * is_conditioning=0 to session->objects[obj_idx].bank, and writes
- * the best-IoU mask into obj_mask. Object pointers are cloned into
- * session->persist so the bank survives the next graph arena reset.
+ * @session:  Video session.
+ * @obj_idx:  Internal object index into session->objects[].
+ * @f:        Frame index (validated by caller).
+ * @shared:   Optional per-frame shared state from propagate_one.
+ * @obj_mask: Caller-owned output; on success obj_mask->mask is
+ *            heap-allocated and owned by the caller.
+ *
+ * Returns SAM3_OK on success or any error from video_track_one_obj.
  */
 static enum sam3_error
 video_propagate_pure_tracking_obj(struct sam3_video_session *session,
@@ -1430,362 +1500,9 @@ video_propagate_pure_tracking_obj(struct sam3_video_session *session,
 				  const struct propagate_frame_ctx *shared,
 				  struct sam3_video_object_mask *obj_mask)
 {
-	struct sam3_ctx *ctx;
-	struct sam3_tracker *trk;
-	struct sam3_frame_features cf;
-	struct sam3_arena *gfx_scratch;
-	struct sam3_tensor *img_2d = NULL;
-	struct sam3_tensor *track_masks = NULL;
-	struct sam3_tensor *track_iou = NULL;
-	struct sam3_tensor *obj_ptr = NULL;
-	struct sam3_tensor *best_mask_nhwc = NULL;
-	struct sam3_tensor *mask_up = NULL;
-	struct sam3_tensor *mem_feat = NULL;
-	struct sam3_tensor *mem_pos = NULL;
-	struct sam3_tensor *spatial_persist = NULL;
-	struct sam3_tensor *obj_ptr_persist = NULL;
-	struct sam3_graph g;
-	int grid_h = 0, grid_w = 0;
-	int n_masks = 0, final_h = 0, final_w = 0;
-	int best_idx = 0;
-	float best_iou_value = 1.0f;
-	int mem_H, mem_W, mem_C, mem_HW;
-	enum sam3_error err = SAM3_OK;
-
-	ctx = session->ctx;
-	if (!ctx || !ctx->proc_ready || !ctx->proc.backend) {
-		sam3_log_error("video_propagate_obj: context not ready");
-		err = SAM3_EINVAL;
-		goto cleanup;
-	}
-
-	trk = &session->tracker;
-	if (shared) {
-		cf = shared->cf;
-	} else {
-		memset(&cf, 0, sizeof(cf));
-		SAM3_PROF_BEGIN(ctx->proc.profiler, "frame_cache_get");
-		err = sam3_frame_cache_get(&session->frame_cache, f, &cf);
-		SAM3_PROF_END(ctx->proc.profiler, "frame_cache_get");
-		if (err != SAM3_OK) {
-			sam3_log_error("video_propagate_obj: frame %d cache get "
-				       "failed (%d)", f, err);
-			goto cleanup;
-		}
-	}
-	if (!cf.image_features || !cf.feat_s0 || !cf.feat_s1) {
-		sam3_log_error("video_propagate_obj: frame %d features missing",
-			       f);
-		err = SAM3_EINVAL;
-		goto cleanup;
-	}
-
-	/* Same 3 GiB scratch as the conditioning path. When @shared is set,
-	 * propagate_one already flattened feat_s1 into this arena and marked
-	 * the tail — reset to that mark so the shared img_2d survives. */
-	gfx_scratch = &ctx->proc.scratch_arena;
-	if (shared)
-		gfx_scratch->offset = shared->scratch_mark;
-	else
-		sam3_arena_reset(gfx_scratch);
-
-	/* Flatten NHWC backbone features → [HW, d] for tracker main.
-	 * Python reference operates at main=72x72 (image_size/stride).
-	 * Cache layout: feat_s1 = neck_1x = 72x72 1x feature.
-	 *
-	 * Shared-frame path: reuse the flatten propagate_one already did. */
-	if (shared) {
-		img_2d = shared->img_2d;
-		grid_h = shared->grid_h;
-		grid_w = shared->grid_w;
-	} else {
-		struct sam3_tensor *img = cf.feat_s1;
-		int HW, d;
-		int dims2[2];
-
-		if (img->n_dims != 4) {
-			sam3_log_error("video_propagate_obj: feat_s1 expected "
-				       "4D, got %d", img->n_dims);
-			err = SAM3_EINVAL;
-			goto cleanup;
-		}
-		grid_h = img->dims[1];
-		grid_w = img->dims[2];
-		HW = grid_h * grid_w;
-		d  = img->dims[3];
-		dims2[0] = HW;
-		dims2[1] = d;
-		img_2d = gh_alloc_tensor(gfx_scratch, img->dtype, 2, dims2);
-		if (!img_2d) {
-			sam3_log_error("video_propagate_obj: img_2d alloc failed");
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-		memcpy(img_2d->data, img->data, img->nbytes);
-	}
-
-	/* Tracker graph: pure tracking — prompt=NULL, is_cond=0.
-	 * Skip-feature argument order matches the conditioning path
-	 * (main=feat_s1 at 72x72). */
-	struct sam3_tensor *track_obj_score = NULL;
-	sam3_graph_init(&g);
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_build");
-	err = sam3_tracker_track_frame(trk, &g,
-				       &session->objects[obj_idx].bank,
-				       img_2d, grid_h, grid_w,
-				       /*prompt=*/NULL,
-				       cf.feat_4x, cf.feat_s0,
-				       f, /*is_cond=*/0,
-				       gfx_scratch,
-				       &track_masks, &track_iou,
-				       &obj_ptr, &track_obj_score);
-	SAM3_PROF_END(ctx->proc.profiler, "tracker_build");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_propagate_obj: track_frame failed "
-			       "(frame %d, obj %d, err=%d)", f, obj_idx, err);
-		goto cleanup;
-	}
-
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_eval");
-	err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
-	SAM3_PROF_END(ctx->proc.profiler, "tracker_eval");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_propagate_obj: tracker eval failed "
-			       "(frame %d, obj %d, err=%d)", f, obj_idx, err);
-		goto cleanup;
-	}
-
-	if (!track_masks || track_masks->n_dims != 3) {
-		sam3_log_error("video_propagate_obj: bad track_masks shape "
-			       "(frame %d, obj %d)", f, obj_idx);
-		err = SAM3_EINVAL;
-		goto cleanup;
-	}
-	n_masks = track_masks->dims[0];
-	final_h = track_masks->dims[1];
-	final_w = track_masks->dims[2];
-
-	/* Select best mask using stability-aware pick — before gating. */
-	if (track_iou && track_iou->n_dims >= 1 &&
-	    track_iou->dims[0] >= n_masks &&
-	    track_masks && track_masks->n_dims == 3) {
-		float delta  = session->opts.multimask_via_stability
-			       ? session->opts.multimask_stability_delta
-			       : 0.0f;
-		float thresh = session->opts.multimask_via_stability
-			       ? session->opts.multimask_stability_thresh
-			       : 0.0f;
-		best_idx = sam3_mask_decoder_select_with_stability(
-			(const float *)track_masks->data,
-			(const float *)track_iou->data,
-			n_masks,
-			track_masks->dims[1], /* H */
-			track_masks->dims[2], /* W */
-			delta, thresh);
-		/* best_iou_value reflects the selected mask's IoU, regardless
-		 * of whether it was picked via stability or argmax fallback. */
-		best_iou_value = ((const float *)track_iou->data)[best_idx];
-	}
-
-	/*
-	 * Python occlusion gating: masks -> NO_OBJ_SCORE, obj_ptr ->
-	 * no_obj_ptr when object_score_logit <= 0. Done before the
-	 * upsample/memory-encoder pass.
-	 */
-	apply_occlusion_gating(track_masks, obj_ptr, NULL,
-			       track_obj_score, trk->no_obj_ptr,
-			       trk->no_obj_embed_spatial);
-
-	/* Extract the best mask into [1, final_h, final_w, 1] NHWC. */
-	{
-		int dims_nhwc[4] = {1, final_h, final_w, 1};
-		const float *src;
-		size_t per_mask;
-
-		best_mask_nhwc = gh_alloc_tensor(gfx_scratch,
-						 SAM3_DTYPE_F32, 4, dims_nhwc);
-		if (!best_mask_nhwc) {
-			sam3_log_error("video_propagate_obj: best_mask alloc "
-				       "failed (frame %d, obj %d)", f, obj_idx);
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-		src = (const float *)track_masks->data;
-		per_mask = (size_t)final_h * (size_t)final_w;
-		memcpy(best_mask_nhwc->data,
-		       src + (size_t)best_idx * per_mask,
-		       per_mask * sizeof(float));
-	}
-
-	/*
-	 * Python mask_for_mem preprocessing (is_mask_from_pts=False here:
-	 * propagation frames never carry user inputs in the C API). The
-	 * encoder runs without an internal sigmoid.
-	 */
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "mask_postprocess");
-	preprocess_mask_for_mem_enc(best_mask_nhwc,
-				    /*is_mask_from_pts=*/0,
-				    trk->sigmoid_scale,
-				    trk->sigmoid_bias);
-	SAM3_PROF_END(ctx->proc.profiler, "mask_postprocess");
-
-	/* Memory encoder: upsample to interpol_size then encoder graph. */
-	sam3_graph_init(&g);
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "mask_upsample");
-	{
-		int up_factor = trk->mem_encoder.interpol_h / final_h;
-		if (up_factor < 1)
-			up_factor = 1;
-		mask_up = gh_upsample(&g, gfx_scratch, best_mask_nhwc, up_factor);
-	}
-	SAM3_PROF_END(ctx->proc.profiler, "mask_upsample");
-	if (!mask_up) {
-		sam3_log_error("video_propagate_obj: mask upsample failed "
-			       "(frame %d, obj %d)", f, obj_idx);
-		err = SAM3_ENOMEM;
-		goto cleanup;
-	}
-
-	/* Memory encoder uses 1x feature (feat_s1) — see note on the
-	 * conditioning path above. */
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_build");
-	err = sam3_memory_encoder_build(&trk->mem_encoder, &g,
-					cf.feat_s1, mask_up,
-					gfx_scratch,
-					&mem_feat, &mem_pos);
-	SAM3_PROF_END(ctx->proc.profiler, "memenc_build");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_propagate_obj: memory encoder build "
-			       "failed (frame %d, obj %d, err=%d)",
-			       f, obj_idx, err);
-		goto cleanup;
-	}
-
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_eval");
-	err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
-	SAM3_PROF_END(ctx->proc.profiler, "memenc_eval");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_propagate_obj: memory encoder eval "
-			       "failed (frame %d, obj %d, err=%d)",
-			       f, obj_idx, err);
-		goto cleanup;
-	}
-
-	if (!mem_feat || mem_feat->n_dims != 4) {
-		sam3_log_error("video_propagate_obj: bad mem_feat shape "
-			       "(frame %d, obj %d)", f, obj_idx);
-		err = SAM3_EINVAL;
-		goto cleanup;
-	}
-
-	/* Python: maskmem_features += (1 - is_obj_appearing) *
-	 *                             no_obj_embed_spatial */
-	apply_occlusion_gating(NULL, NULL, mem_feat,
-			       track_obj_score, trk->no_obj_ptr,
-			       trk->no_obj_embed_spatial);
-	mem_H  = mem_feat->dims[1];
-	mem_W  = mem_feat->dims[2];
-	mem_C  = mem_feat->dims[3];
-	mem_HW = mem_H * mem_W;
-
-	/* Flatten [1,H,W,C] -> [HW,C] and clone to session->persist so
-	 * the entry survives the next scratch reset. */
-	{
-		struct sam3_tensor flat_view = *mem_feat;
-		flat_view.n_dims = 2;
-		flat_view.dims[0] = mem_HW;
-		flat_view.dims[1] = mem_C;
-		flat_view.dims[2] = 0;
-		flat_view.dims[3] = 0;
-		sam3_tensor_compute_strides(&flat_view);
-		flat_view.ephemeral = 0;
-
-		spatial_persist = sam3_tensor_clone_persist(
-			&session->persist, &flat_view);
-	}
-	if (!spatial_persist) {
-		sam3_log_error("video_propagate_obj: spatial clone failed "
-			       "(frame %d, obj %d)", f, obj_idx);
-		err = SAM3_ENOMEM;
-		goto cleanup;
-	}
-
-	/* Clone the object pointer too — tracker returns it on the
-	 * scratch arena so we must copy it before committing to the bank. */
-	if (obj_ptr) {
-		obj_ptr_persist = sam3_tensor_clone_persist(
-			&session->persist, obj_ptr);
-		if (!obj_ptr_persist) {
-			sam3_log_error("video_propagate_obj: obj_ptr clone "
-				       "failed (frame %d, obj %d)",
-				       f, obj_idx);
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-	}
-
-	{
-		struct sam3_memory_entry entry;
-		memset(&entry, 0, sizeof(entry));
-		entry.spatial_features = spatial_persist;
-		entry.obj_pointer     = obj_ptr_persist;
-		entry.frame_idx        = f;
-		entry.is_conditioning  = 0;
-		/*
-		 * Python cal_mem_score:
-		 *   obj_score_norm = (sigmoid(s)*2 - 1 if s > 0 else 0)
-		 *   eff_iou        = obj_score_norm * iou_score
-		 * Used by SAM3-Long memory selection to threshold frames.
-		 */
-		entry.obj_score        = compute_eff_iou_score(
-			track_obj_score, best_iou_value);
-		sam3_memory_bank_add(&session->objects[obj_idx].bank, &entry);
-	}
-
-	/* Populate the per-object output mask. */
-	obj_mask->mask_h = final_h;
-	obj_mask->mask_w = final_w;
-	obj_mask->iou_score = best_iou_value;
-	obj_mask->obj_score_logit = (track_obj_score && track_obj_score->data)
-				    ? ((const float *)track_obj_score->data)[0]
-				    : 0.0f;
-	obj_mask->is_occluded = (obj_mask->obj_score_logit <= 0.0f) ? 1 : 0;
-	{
-		size_t mask_bytes = (size_t)final_h * (size_t)final_w *
-				    sizeof(float);
-		obj_mask->mask = malloc(mask_bytes);
-		if (!obj_mask->mask) {
-			sam3_log_error("video_propagate_obj: obj_mask alloc "
-				       "failed (frame %d, obj %d)",
-				       f, obj_idx);
-			err = SAM3_ENOMEM;
-			goto cleanup;
-		}
-		const float *src = (const float *)track_masks->data;
-		size_t per_mask = (size_t)final_h * (size_t)final_w;
-		memcpy(obj_mask->mask,
-		       src + (size_t)best_idx * per_mask,
-		       mask_bytes);
-	}
-
-	session->frames_tracked[f] = 1;
-
-	sam3_log_debug("video_propagate_obj: frame %d obj %d tracked, "
-		       "mask %dx%d, best_iou %.3f, bank n_cond=%d n_nc=%d",
-		       f, obj_idx, final_h, final_w,
-		       (double)best_iou_value,
-		       session->objects[obj_idx].bank.n_cond,
-		       session->objects[obj_idx].bank.n_non_cond);
-
-cleanup:
-	if (err != SAM3_OK) {
-		free(obj_mask->mask);
-		obj_mask->mask = NULL;
-		obj_mask->mask_h = 0;
-		obj_mask->mask_w = 0;
-	}
-	(void)mem_pos;
-	return err;
+	return video_track_one_obj(session, obj_idx, f, /*is_cond=*/0,
+				   /*prompts_opt=*/NULL, /*n_prompts_opt=*/0,
+				   shared, obj_mask);
 }
 
 /*
@@ -1907,33 +1624,60 @@ propagate_one(struct sam3_video_session *session, int f,
 	 * not ready, cache lookup fails, or feat_s1 has an unexpected
 	 * shape — keeps correctness paths identical to the legacy code.
 	 */
+	/*
+	 * Per-frame shared-state prefetch. Only the SAM 3 tracker consumes
+	 * the img_2d flatten — SAM 3.1's v2 tracker takes NHWC features
+	 * directly. Also, tri-neck SAM 3.1 encodes leave `image_features`
+	 * NULL by design (no 0.5x scale), so gating on it here would
+	 * accidentally reject valid SAM 3.1 frames. Gate on variant.
+	 *
+	 * For SAM 3.1 we still prefetch the frame cache and stash the
+	 * arena mark — per-object resets reuse both — but skip the 1.3 MiB
+	 * img_2d memcpy that nobody reads.
+	 */
 	struct sam3_ctx *ctx = session->ctx;
 	struct propagate_frame_ctx fctx;
 	const struct propagate_frame_ctx *shared = NULL;
 	if (ctx && ctx->proc_ready && ctx->proc.backend) {
+		const int is_v2 =
+			(session->variant == SAM3_VARIANT_SAM3_1);
 		memset(&fctx, 0, sizeof(fctx));
 		SAM3_PROF_BEGIN(prof, "frame_cache_get");
 		enum sam3_error cf_err = sam3_frame_cache_get(
 			&session->frame_cache, f, &fctx.cf);
 		SAM3_PROF_END(prof, "frame_cache_get");
-		if (cf_err == SAM3_OK &&
-		    fctx.cf.image_features &&
-		    fctx.cf.feat_s0 &&
-		    fctx.cf.feat_s1 &&
-		    fctx.cf.feat_s1->n_dims == 4) {
+		int feats_ok = (cf_err == SAM3_OK &&
+				fctx.cf.feat_s0 &&
+				fctx.cf.feat_s1 &&
+				fctx.cf.feat_s1->n_dims == 4 &&
+				(is_v2
+				 ? (fctx.cf.feat_4x != NULL)
+				 : (fctx.cf.image_features != NULL)));
+		if (feats_ok) {
 			struct sam3_arena *scratch = &ctx->proc.scratch_arena;
 			sam3_arena_reset(scratch);
 
 			struct sam3_tensor *img = fctx.cf.feat_s1;
 			fctx.grid_h = img->dims[1];
 			fctx.grid_w = img->dims[2];
-			int dims2[2] = {fctx.grid_h * fctx.grid_w,
-					img->dims[3]};
-			fctx.img_2d = gh_alloc_tensor(scratch, img->dtype,
-						      2, dims2);
-			if (fctx.img_2d) {
-				memcpy(fctx.img_2d->data, img->data,
-				       img->nbytes);
+
+			int shared_ok = 1;
+			if (!is_v2) {
+				int dims2[2] = {fctx.grid_h * fctx.grid_w,
+						img->dims[3]};
+				fctx.img_2d = gh_alloc_tensor(scratch,
+							      img->dtype,
+							      2, dims2);
+				if (fctx.img_2d) {
+					memcpy(fctx.img_2d->data, img->data,
+					       img->nbytes);
+				} else {
+					shared_ok = 0;
+				}
+			} else {
+				fctx.img_2d = NULL;  /* unused by v2 tracker */
+			}
+			if (shared_ok) {
 				fctx.scratch_mark = scratch->offset;
 				shared = &fctx;
 			}
@@ -2278,6 +2022,20 @@ enum sam3_error sam3_video_add_mask(sam3_video_session *session,
 		return SAM3_EINVAL;
 
 	memset(result, 0, sizeof(*result));
+
+	/*
+	 * SAM 3.1 mask prompts route through the multiplex maskmem backbone
+	 * instead of the SAM 3 memory encoder. Sub-project 3's interactive
+	 * decoder + the v2 mask downsampler would wire this cleanly; until
+	 * then, reject with a clear error rather than dereferencing the
+	 * zero-initialized SAM 3 tracker below.
+	 */
+	if (session->variant == SAM3_VARIANT_SAM3_1) {
+		sam3_log_error("video_add_mask: not yet supported for SAM 3.1 "
+			       "(use add_points / propagate; sub-project 3 "
+			       "will add mask prompts)");
+		return SAM3_EVIDEO;
+	}
 
 	ctx = session->ctx;
 	if (!ctx || !ctx->proc_ready || !ctx->proc.backend) {

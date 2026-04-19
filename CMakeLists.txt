@@ -280,6 +280,12 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
+	# test_sam3_1_track opens models/sam3.1.sam3 + assets/kids.mp4
+	if(TARGET test_sam3_1_track)
+		target_compile_definitions(test_sam3_1_track PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
 	# test_maskmem_v2_forward runs the forward graph; same dependency.
 	if(TARGET test_maskmem_v2_forward)
 		target_compile_definitions(test_maskmem_v2_forward PRIVATE
@@ -289,6 +295,12 @@ if(SAM3_TESTS)
 	# test_memory_attn_v2_forward also loads sam3.1.sam3.
 	if(TARGET test_memory_attn_v2_forward)
 		target_compile_definitions(test_memory_attn_v2_forward PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
+	# test_mask_decoder_v2_forward also loads sam3.1.sam3.
+	if(TARGET test_mask_decoder_v2_forward)
+		target_compile_definitions(test_mask_decoder_v2_forward PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 

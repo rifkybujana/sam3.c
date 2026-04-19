@@ -13,13 +13,18 @@
  *   - sam3_v2_memory_attn_forward (phase 2.3b): 4-layer decoupled
  *     RoPE transformer (DecoupledTransformerDecoderLayerv2) with the
  *     SAM 3.1 multiplex config baked in.
+ *   - sam3_v2_mask_decoder_forward (phase 2.4b): 2-layer two-way
+ *     transformer + output upscaling + hypernetwork + heads, matching
+ *     MultiplexMaskDecoder.predict_masks.
  *
- * Key types:  sam3_tracker_v2, sam3_v2_memory_attn, sam3_v2_maskmem
+ * Key types:  sam3_tracker_v2, sam3_v2_memory_attn, sam3_v2_maskmem,
+ *             sam3_v2_mask_decoder
  * Depends on: tracker_v2.h, graph_helpers.h, util/log.h
  * Used by:    sam3_video.c (variant dispatch, phase 2.5),
  *             tests/test_tracker_v2_load.c,
  *             tests/test_maskmem_v2_forward.c,
- *             tests/test_memory_attn_v2_forward.c
+ *             tests/test_memory_attn_v2_forward.c,
+ *             tests/test_mask_decoder_v2_forward.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
@@ -31,6 +36,7 @@
 
 #include "tracker_v2.h"
 #include "graph_helpers.h"
+#include "memory_bank.h"
 #include "util/log.h"
 #include "core/graph.h"
 
@@ -376,12 +382,16 @@ static enum sam3_error load_sam_mask_decoder(
 	LD(md->norm_final_w, "transformer.norm_final_attn.weight", 1, 256);
 	LD(md->norm_final_b, "transformer.norm_final_attn.bias",   1, 256);
 
-	/* output_upscaling: conv_transpose2d (OHWI), LN2d, conv_transpose2d */
-	LD(md->up0_w, "output_upscaling.0.weight", 4, 256, 2, 2, 64);
+	/* output_upscaling: conv_transpose2d (OHWI), LN2d, conv_transpose2d.
+	 * Raw PyTorch ConvTranspose2d weight is IOHW [IC, OC, kH, kW]; the
+	 * conv_perm pass in tools/weight_conv_perm.c permutes it to OHWI
+	 * [OC, kH, kW, IC] so this loader matches gh_conv_transpose2d's
+	 * expected layout. */
+	LD(md->up0_w, "output_upscaling.0.weight", 4, 64, 2, 2, 256);
 	LD(md->up0_b, "output_upscaling.0.bias",   1, 64);
 	LD(md->up1_w, "output_upscaling.1.weight", 1, 64);
 	LD(md->up1_b, "output_upscaling.1.bias",   1, 64);
-	LD(md->up3_w, "output_upscaling.3.weight", 4, 64, 2, 2, 32);
+	LD(md->up3_w, "output_upscaling.3.weight", 4, 32, 2, 2, 64);
 	LD(md->up3_b, "output_upscaling.3.bias",   1, 32);
 
 	/* output_hypernetworks_mlps[0..2]: 3-layer MLPs (256 -> 256 -> 256 -> 32) */
@@ -1101,4 +1111,917 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
 	/* ── Final encoder.norm (use_image_in_output=False) ───────── */
 	return gh_layernorm(g, arena, output,
 			    ma->final_norm_w, ma->final_norm_b);
+}
+
+/*
+ * ── SAM 3.1 mask decoder forward (phase 2.4b) ────────────────────────
+ *
+ * MultiplexMaskDecoder.predict_masks + forward wrapper (Python
+ * reference/sam3/sam3/model/multiplex_mask_decoder.py). The SAM 3.1
+ * multiplex config is baked in: multiplex_count=16, num_multimask=3,
+ * use_high_res_features=True, pred_obj_scores=True, ReLU inside the
+ * two-way transformer MLP (TwoWayAttentionBlock default), GELU inside
+ * the output upscaling stack, ReLU inside the MLP heads. We operate on
+ * the canonical B=1 case (per-object processing); the multiplex-joint
+ * forward in sub-project 4 will generalize to B>1 by looping.
+ */
+
+#define V2_DEC_HIDDEN        256
+#define V2_DEC_N_HEADS_SELF  8
+#define V2_DEC_HEAD_DIM_SELF 32        /* 256 / 8 */
+#define V2_DEC_N_HEADS_XA    8
+#define V2_DEC_HEAD_DIM_XA   16        /* 128 / 8 */
+#define V2_DEC_N_TOKENS      80        /* 16 obj_score + 16 iou + 48 mask */
+#define V2_DEC_N_MASK_TOKENS 48        /* 16 * 3 */
+#define V2_DEC_N_MULTIMASK   3
+#define V2_DEC_UPSCALE_1C    64
+#define V2_DEC_UPSCALE_2C    32
+
+/*
+ * mha_sdpa_basic - 8-head SDPA with separate Q/K/V projections.
+ *
+ * Handles both the 256-dim self-attention (d_internal=256, head_dim=32)
+ * and the 128-dim cross-attention (d_internal=128, head_dim=16) paths —
+ * d_internal is inferred from the projection weight shape.
+ *
+ * q_src: [N_q, d_model]; k_src / v_src: [N_kv, d_model].
+ * Returns [N_q, d_model].
+ */
+static struct sam3_tensor *mha_sdpa_basic(
+		struct sam3_graph *g, struct sam3_arena *a,
+		struct sam3_tensor *q_src, struct sam3_tensor *k_src,
+		struct sam3_tensor *v_src,
+		struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+		struct sam3_tensor *k_w, struct sam3_tensor *k_b,
+		struct sam3_tensor *v_w, struct sam3_tensor *v_b,
+		struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+		int n_heads)
+{
+	struct sam3_tensor *q = gh_linear(g, a, q_src, q_w, q_b);
+	struct sam3_tensor *k = gh_linear(g, a, k_src, k_w, k_b);
+	struct sam3_tensor *v = gh_linear(g, a, v_src, v_w, v_b);
+	if (!q || !k || !v)
+		return NULL;
+
+	int N_q = q->dims[0];
+	int N_k = k->dims[0];
+	int D_int = q->dims[1];
+	if (n_heads <= 0 || D_int % n_heads != 0) {
+		sam3_log_error("mha_sdpa_basic: d_internal %d not divisible "
+			       "by n_heads %d", D_int, n_heads);
+		return NULL;
+	}
+	int head_dim = D_int / n_heads;
+
+	int q4[] = {1, N_q, n_heads, head_dim};
+	int k4[] = {1, N_k, n_heads, head_dim};
+	int perm[] = {0, 2, 1, 3};
+	int flat_q[] = {N_q, D_int};
+
+	q = gh_reshape(g, a, q, 4, q4);
+	k = gh_reshape(g, a, k, 4, k4);
+	v = gh_reshape(g, a, v, 4, k4);
+	if (!q || !k || !v)
+		return NULL;
+
+	q = gh_permute(g, a, q, perm);
+	k = gh_permute(g, a, k, perm);
+	v = gh_permute(g, a, v, perm);
+	if (!q || !k || !v)
+		return NULL;
+
+	struct sam3_tensor *attn = gh_sdpa(g, a, q, k, v, NULL, head_dim);
+	if (!attn)
+		return NULL;
+
+	attn = gh_permute(g, a, attn, perm);
+	if (!attn)
+		return NULL;
+	attn = gh_reshape(g, a, attn, 2, flat_q);
+	if (!attn)
+		return NULL;
+
+	return gh_linear(g, a, attn, out_w, out_b);
+}
+
+/*
+ * mlp3_relu - Apply a 3-layer MLP with ReLU between layers (no activation
+ * after the last layer). Matches the `MLP` class in
+ * reference/sam3/sam3/model/multiplex_mask_decoder.py.
+ *
+ * @w/@b arrays must be 3 entries each. Output shape follows the last
+ * linear's out_features.
+ */
+static struct sam3_tensor *mlp3_relu(
+		struct sam3_graph *g, struct sam3_arena *a,
+		struct sam3_tensor *x,
+		struct sam3_tensor *w[3], struct sam3_tensor *b[3])
+{
+	struct sam3_tensor *h;
+	h = gh_linear(g, a, x, w[0], b[0]);
+	if (!h) return NULL;
+	h = gh_relu(g, a, h);
+	if (!h) return NULL;
+	h = gh_linear(g, a, h, w[1], b[1]);
+	if (!h) return NULL;
+	h = gh_relu(g, a, h);
+	if (!h) return NULL;
+	return gh_linear(g, a, h, w[2], b[2]);
+}
+
+/*
+ * materialize_mask_tokens_plus_extra - Pre-add extra_per_object to
+ * mask_tokens at graph-build time.
+ *
+ * mask_tokens is [48, 256] = [16 slots × 3 multimask, 256]. extra is
+ * [16, 256]. The Python reference broadcast-adds extra (unsqueezed to
+ * [16, 1, 256]) over the 3 multimask tokens. Our gh_add only handles
+ * [M, N] + [N] bias-style broadcast, not this 3-way duplicate, so we
+ * pre-expand on the CPU side. This assumes extra_per_object has host
+ * data available (the per-object multiplex controller feeds a static
+ * tensor; when sub-project 4 lands, this can grow a graph-time path).
+ */
+static struct sam3_tensor *materialize_mask_tokens_plus_extra(
+		struct sam3_arena *arena,
+		struct sam3_tensor *mask_tokens,
+		struct sam3_tensor *extra_per_object)
+{
+	if (extra_per_object->n_dims != 2 ||
+	    extra_per_object->dims[0] != SAM3_V2_MULTIPLEX_COUNT ||
+	    extra_per_object->dims[1] != V2_DEC_HIDDEN) {
+		sam3_log_error("mask_decoder_v2: extra_per_object shape "
+			       "%dD must be [16, 256]",
+			       extra_per_object->n_dims);
+		return NULL;
+	}
+
+	int dims[] = {V2_DEC_N_MASK_TOKENS, V2_DEC_HIDDEN};
+	struct sam3_tensor *out = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						   2, dims);
+	if (!out)
+		return NULL;
+
+	const float *mt = (const float *)mask_tokens->data;
+	const float *ex = (const float *)extra_per_object->data;
+	float *dst = (float *)out->data;
+	for (int m = 0; m < SAM3_V2_MULTIPLEX_COUNT; m++) {
+		for (int k = 0; k < V2_DEC_N_MULTIMASK; k++) {
+			int row = m * V2_DEC_N_MULTIMASK + k;
+			for (int c = 0; c < V2_DEC_HIDDEN; c++) {
+				dst[row * V2_DEC_HIDDEN + c] =
+					mt[row * V2_DEC_HIDDEN + c] +
+					ex[m * V2_DEC_HIDDEN + c];
+			}
+		}
+	}
+	return out;
+}
+
+/*
+ * two_way_block - One TwoWayAttentionBlock forward pass (Python
+ * reference/sam3/sam3/sam/transformer.py:110-183).
+ *
+ * Updates @queries (by value through the returned pointer) and @keys (by
+ * the p_keys out-param). query_pe / key_pe are the static positional
+ * encodings added to Q/K before each attention. skip_pe=1 for layer 0
+ * (no PE and no residual in self-attn).
+ */
+static struct sam3_tensor *two_way_block(
+		struct sam3_graph *g, struct sam3_arena *a,
+		const struct sam3_v2_mask_decoder_layer *L,
+		struct sam3_tensor *queries,
+		struct sam3_tensor **p_keys,
+		struct sam3_tensor *query_pe,
+		struct sam3_tensor *key_pe,
+		int skip_pe)
+{
+	struct sam3_tensor *keys = *p_keys;
+	struct sam3_tensor *q, *k, *attn, *mlp;
+
+	/* ── Self-attention on tokens ─────────────────────────────── */
+	if (skip_pe) {
+		attn = mha_sdpa_basic(g, a, queries, queries, queries,
+			L->self_q_w, L->self_q_b, L->self_k_w, L->self_k_b,
+			L->self_v_w, L->self_v_b,
+			L->self_out_w, L->self_out_b, V2_DEC_N_HEADS_SELF);
+		if (!attn) return NULL;
+		queries = attn;   /* no residual */
+	} else {
+		q = gh_add(g, a, queries, query_pe);
+		if (!q) return NULL;
+		attn = mha_sdpa_basic(g, a, q, q, queries,
+			L->self_q_w, L->self_q_b, L->self_k_w, L->self_k_b,
+			L->self_v_w, L->self_v_b,
+			L->self_out_w, L->self_out_b, V2_DEC_N_HEADS_SELF);
+		if (!attn) return NULL;
+		queries = gh_add(g, a, queries, attn);
+		if (!queries) return NULL;
+	}
+	queries = gh_layernorm(g, a, queries, L->norm1_w, L->norm1_b);
+	if (!queries) return NULL;
+
+	/* ── Cross-attention: tokens attend to image ──────────────── */
+	q = gh_add(g, a, queries, query_pe);
+	k = gh_add(g, a, keys, key_pe);
+	if (!q || !k) return NULL;
+	attn = mha_sdpa_basic(g, a, q, k, keys,
+		L->ct2i_q_w, L->ct2i_q_b, L->ct2i_k_w, L->ct2i_k_b,
+		L->ct2i_v_w, L->ct2i_v_b,
+		L->ct2i_out_w, L->ct2i_out_b, V2_DEC_N_HEADS_XA);
+	if (!attn) return NULL;
+	queries = gh_add(g, a, queries, attn);
+	if (!queries) return NULL;
+	queries = gh_layernorm(g, a, queries, L->norm2_w, L->norm2_b);
+	if (!queries) return NULL;
+
+	/* ── MLP on tokens (lin1 → ReLU → lin2) ────────────────────── */
+	mlp = gh_linear(g, a, queries, L->mlp_lin1_w, L->mlp_lin1_b);
+	if (!mlp) return NULL;
+	mlp = gh_relu(g, a, mlp);
+	if (!mlp) return NULL;
+	mlp = gh_linear(g, a, mlp, L->mlp_lin2_w, L->mlp_lin2_b);
+	if (!mlp) return NULL;
+	queries = gh_add(g, a, queries, mlp);
+	if (!queries) return NULL;
+	queries = gh_layernorm(g, a, queries, L->norm3_w, L->norm3_b);
+	if (!queries) return NULL;
+
+	/* ── Cross-attention: image attends to tokens ─────────────── *
+	 * Python calls self.cross_attn_image_to_token(q=k, k=q, v=queries)
+	 * where `q` and `k` are local Python variables (q=queries+pe,
+	 * k=keys+pe). That swap means the actual Q input is image+PE and
+	 * actual K input is tokens+PE, actual V is tokens. */
+	q = gh_add(g, a, queries, query_pe);  /* tokens + pe */
+	k = gh_add(g, a, keys, key_pe);        /* image + pe */
+	if (!q || !k) return NULL;
+	attn = mha_sdpa_basic(g, a, k, q, queries,
+		L->ci2t_q_w, L->ci2t_q_b, L->ci2t_k_w, L->ci2t_k_b,
+		L->ci2t_v_w, L->ci2t_v_b,
+		L->ci2t_out_w, L->ci2t_out_b, V2_DEC_N_HEADS_XA);
+	if (!attn) return NULL;
+	keys = gh_add(g, a, keys, attn);
+	if (!keys) return NULL;
+	keys = gh_layernorm(g, a, keys, L->norm4_w, L->norm4_b);
+	if (!keys) return NULL;
+
+	*p_keys = keys;
+	return queries;
+}
+
+/*
+ * Error-code convention for the graph-build paths below. `gh_*` helpers
+ * return NULL on any failure — arena exhaustion, graph-capacity overflow,
+ * or an internal shape-validation failure — and always log the specific
+ * cause via `sam3_log_error`. We collapse all of these to SAM3_ENOMEM at
+ * the caller boundary because (a) caller-side input shapes are validated
+ * at the top of the forward (so a shape mismatch downstream implies an
+ * internal bug rather than a user error), and (b) the common production
+ * failure mode is genuine resource exhaustion. Consult the error log for
+ * diagnosis.
+ */
+enum sam3_error sam3_v2_mask_decoder_forward(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		const struct sam3_v2_mask_decoder *md,
+		struct sam3_tensor *image_embeddings,
+		struct sam3_tensor *image_pe,
+		struct sam3_tensor *feat_s1,
+		struct sam3_tensor *feat_s0,
+		struct sam3_tensor *extra_per_object,
+		struct sam3_tensor **out_masks,
+		struct sam3_tensor **out_iou_scores,
+		struct sam3_tensor **out_obj_score_logits,
+		struct sam3_tensor **out_sam_tokens)
+{
+	if (!g || !arena || !md || !image_embeddings || !image_pe
+	    || !feat_s1 || !feat_s0
+	    || !out_masks || !out_iou_scores || !out_obj_score_logits
+	    || !out_sam_tokens) {
+		sam3_log_error("mask_decoder_v2: NULL argument");
+		return SAM3_EINVAL;
+	}
+	if (image_embeddings->n_dims != 4 ||
+	    image_embeddings->dims[0] != 1 ||
+	    image_embeddings->dims[3] != V2_DEC_HIDDEN) {
+		sam3_log_error("mask_decoder_v2: image_embeddings must be "
+			       "[1, H, W, 256] NHWC");
+		return SAM3_EINVAL;
+	}
+
+	int H = image_embeddings->dims[1];
+	int W = image_embeddings->dims[2];
+	int HW = H * W;
+
+	if (image_pe->n_dims != 2 ||
+	    image_pe->dims[0] != HW ||
+	    image_pe->dims[1] != V2_DEC_HIDDEN) {
+		sam3_log_error("mask_decoder_v2: image_pe must be [H*W, 256]");
+		return SAM3_EINVAL;
+	}
+	if (feat_s1->n_dims != 4 ||
+	    feat_s1->dims[0] != 1 || feat_s1->dims[1] != 2 * H ||
+	    feat_s1->dims[2] != 2 * W ||
+	    feat_s1->dims[3] != V2_DEC_HIDDEN) {
+		sam3_log_error("mask_decoder_v2: feat_s1 must be "
+			       "[1, 2H, 2W, 256] NHWC");
+		return SAM3_EINVAL;
+	}
+	if (feat_s0->n_dims != 4 ||
+	    feat_s0->dims[0] != 1 || feat_s0->dims[1] != 4 * H ||
+	    feat_s0->dims[2] != 4 * W ||
+	    feat_s0->dims[3] != V2_DEC_HIDDEN) {
+		sam3_log_error("mask_decoder_v2: feat_s0 must be "
+			       "[1, 4H, 4W, 256] NHWC");
+		return SAM3_EINVAL;
+	}
+
+	/* ── 1. Prepare tokens ─────────────────────────────────────── */
+	struct sam3_tensor *mask_tokens = md->mask_tokens;
+	if (extra_per_object) {
+		mask_tokens = materialize_mask_tokens_plus_extra(
+				arena, md->mask_tokens, extra_per_object);
+		if (!mask_tokens)
+			return SAM3_ENOMEM;
+	}
+
+	struct sam3_tensor *parts[3] = {
+		md->obj_score_token,   /* [16, 256] */
+		md->iou_token,         /* [16, 256] */
+		mask_tokens,           /* [48, 256] */
+	};
+	struct sam3_tensor *tokens = gh_concat(g, arena, parts, 3, 0);
+	if (!tokens) return SAM3_ENOMEM;
+
+	/* ── 2. Flatten image embeddings into [H*W, 256] as keys ──── */
+	int keys_dims[] = {HW, V2_DEC_HIDDEN};
+	struct sam3_tensor *keys = gh_reshape(g, arena,
+			image_embeddings, 2, keys_dims);
+	if (!keys) return SAM3_ENOMEM;
+
+	struct sam3_tensor *queries = tokens;
+	struct sam3_tensor *query_pe = tokens;
+	struct sam3_tensor *key_pe = image_pe;
+
+	/* ── 3. Two-way transformer: 2 blocks ──────────────────────── */
+	for (int i = 0; i < 2; i++) {
+		queries = two_way_block(g, arena, &md->layers[i],
+					queries, &keys, query_pe, key_pe,
+					/*skip_pe=*/(i == 0));
+		if (!queries) return SAM3_ENOMEM;
+	}
+
+	/* ── 4. Final token→image attention + norm ─────────────────── */
+	{
+		struct sam3_tensor *q = gh_add(g, arena, queries, query_pe);
+		struct sam3_tensor *k = gh_add(g, arena, keys, key_pe);
+		if (!q || !k) return SAM3_ENOMEM;
+		struct sam3_tensor *fa = mha_sdpa_basic(g, arena, q, k, keys,
+			md->final_q_w, md->final_q_b,
+			md->final_k_w, md->final_k_b,
+			md->final_v_w, md->final_v_b,
+			md->final_out_w, md->final_out_b,
+			V2_DEC_N_HEADS_XA);
+		if (!fa) return SAM3_ENOMEM;
+		queries = gh_add(g, arena, queries, fa);
+		if (!queries) return SAM3_ENOMEM;
+		queries = gh_layernorm(g, arena, queries,
+				md->norm_final_w, md->norm_final_b);
+		if (!queries) return SAM3_ENOMEM;
+	}
+
+	/* ── 5. Slice output tokens ────────────────────────────────── */
+	struct sam3_tensor *obj_score_tok = gh_slice(g, arena, queries, 0,
+			0, SAM3_V2_MULTIPLEX_COUNT);
+	struct sam3_tensor *iou_tok = gh_slice(g, arena, queries, 0,
+			SAM3_V2_MULTIPLEX_COUNT,
+			2 * SAM3_V2_MULTIPLEX_COUNT);
+	struct sam3_tensor *mask_tok_out = gh_slice(g, arena, queries, 0,
+			2 * SAM3_V2_MULTIPLEX_COUNT,
+			V2_DEC_N_TOKENS);
+	if (!obj_score_tok || !iou_tok || !mask_tok_out)
+		return SAM3_ENOMEM;
+
+	/* ── 6. Upscaling: dc1(src)+s1 → ln → gelu → dc2(up)+s0 → gelu ─ */
+	int src_4d[] = {1, H, W, V2_DEC_HIDDEN};
+	struct sam3_tensor *src = gh_reshape(g, arena, keys, 4, src_4d);
+	if (!src) return SAM3_ENOMEM;
+
+	struct sam3_tensor *s1_proj = gh_conv2d(g, arena, feat_s1,
+			md->conv_s1_w, md->conv_s1_b, 1, 0, 1);
+	struct sam3_tensor *s0_proj = gh_conv2d(g, arena, feat_s0,
+			md->conv_s0_w, md->conv_s0_b, 1, 0, 1);
+	if (!s1_proj || !s0_proj) return SAM3_ENOMEM;
+
+	struct sam3_tensor *up = gh_conv_transpose2d(g, arena, src,
+			md->up0_w, md->up0_b, 2, 0);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_add(g, arena, up, s1_proj);
+	if (!up) return SAM3_ENOMEM;
+
+	/* LayerNorm2d in NHWC is LN over the last (C) axis: reshape to 2D
+	 * flat, run gh_layernorm, reshape back to NHWC. */
+	int H2 = 2 * H, W2 = 2 * W;
+	int up1_flat[] = {H2 * W2, V2_DEC_UPSCALE_1C};
+	int up1_nhwc[] = {1, H2, W2, V2_DEC_UPSCALE_1C};
+	up = gh_reshape(g, arena, up, 2, up1_flat);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_layernorm(g, arena, up, md->up1_w, md->up1_b);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_reshape(g, arena, up, 4, up1_nhwc);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_gelu(g, arena, up);
+	if (!up) return SAM3_ENOMEM;
+
+	up = gh_conv_transpose2d(g, arena, up, md->up3_w, md->up3_b, 2, 0);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_add(g, arena, up, s0_proj);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_gelu(g, arena, up);
+	if (!up) return SAM3_ENOMEM;
+	/* up shape: [1, 4H, 4W, 32] */
+
+	/* ── 7. Hypernetwork MLPs ──────────────────────────────────── */
+	int mt_3d[] = {SAM3_V2_MULTIPLEX_COUNT, V2_DEC_N_MULTIMASK,
+		       V2_DEC_HIDDEN};
+	mask_tok_out = gh_reshape(g, arena, mask_tok_out, 3, mt_3d);
+	if (!mask_tok_out) return SAM3_ENOMEM;
+
+	struct sam3_tensor *hyper_parts[V2_DEC_N_MULTIMASK];
+	for (int i = 0; i < V2_DEC_N_MULTIMASK; i++) {
+		struct sam3_tensor *slc = gh_slice(g, arena, mask_tok_out,
+				1, i, i + 1);
+		if (!slc) return SAM3_ENOMEM;
+		int slc_2d[] = {SAM3_V2_MULTIPLEX_COUNT, V2_DEC_HIDDEN};
+		slc = gh_reshape(g, arena, slc, 2, slc_2d);
+		if (!slc) return SAM3_ENOMEM;
+
+		struct sam3_tensor *hn_w[3] = {
+			md->hn_w[i][0], md->hn_w[i][1], md->hn_w[i][2]
+		};
+		struct sam3_tensor *hn_b[3] = {
+			md->hn_b[i][0], md->hn_b[i][1], md->hn_b[i][2]
+		};
+		struct sam3_tensor *h = mlp3_relu(g, arena, slc, hn_w, hn_b);
+		if (!h) return SAM3_ENOMEM;
+		/* h: [16, 32] → reshape to [16, 1, 32] for later concat */
+		int r3[] = {SAM3_V2_MULTIPLEX_COUNT, 1, V2_DEC_UPSCALE_2C};
+		hyper_parts[i] = gh_reshape(g, arena, h, 3, r3);
+		if (!hyper_parts[i]) return SAM3_ENOMEM;
+	}
+
+	struct sam3_tensor *hyper_in = gh_concat(g, arena, hyper_parts,
+						  V2_DEC_N_MULTIMASK, 1);
+	if (!hyper_in) return SAM3_ENOMEM;
+	/* hyper_in: [16, 3, 32] → flatten to [48, 32] for matmul */
+	int hi_2d[] = {V2_DEC_N_MASK_TOKENS, V2_DEC_UPSCALE_2C};
+	hyper_in = gh_reshape(g, arena, hyper_in, 2, hi_2d);
+	if (!hyper_in) return SAM3_ENOMEM;
+
+	/* ── 8. Mask logits: hyper_in @ upscaled^T ────────────────── */
+	int H4 = 4 * H, W4 = 4 * W;
+	int up_2d[] = {H4 * W4, V2_DEC_UPSCALE_2C};
+	up = gh_reshape(g, arena, up, 2, up_2d);
+	if (!up) return SAM3_ENOMEM;
+	struct sam3_tensor *up_t = gh_transpose(g, arena, up);
+	if (!up_t) return SAM3_ENOMEM;
+
+	struct sam3_tensor *masks_flat = gh_matmul(g, arena, hyper_in, up_t);
+	if (!masks_flat) return SAM3_ENOMEM;
+	int mask_4d[] = {SAM3_V2_MULTIPLEX_COUNT, V2_DEC_N_MULTIMASK,
+			 H4, W4};
+	struct sam3_tensor *masks = gh_reshape(g, arena, masks_flat,
+						4, mask_4d);
+	if (!masks) return SAM3_ENOMEM;
+
+	/* ── 9. IoU head (256→256→256→3, ReLU between) ─────────────── */
+	struct sam3_tensor *iou_w[3] = {md->iou_head_w[0],
+					md->iou_head_w[1], md->iou_head_w[2]};
+	struct sam3_tensor *iou_b[3] = {md->iou_head_b[0],
+					md->iou_head_b[1], md->iou_head_b[2]};
+	struct sam3_tensor *iou = mlp3_relu(g, arena, iou_tok, iou_w, iou_b);
+	if (!iou) return SAM3_ENOMEM;
+
+	/* ── 10. Object score head (256→256→256→1, ReLU between) ───── */
+	struct sam3_tensor *score_w[3] = {md->score_head_w[0],
+					  md->score_head_w[1],
+					  md->score_head_w[2]};
+	struct sam3_tensor *score_b[3] = {md->score_head_b[0],
+					  md->score_head_b[1],
+					  md->score_head_b[2]};
+	struct sam3_tensor *obj_logits = mlp3_relu(g, arena, obj_score_tok,
+						   score_w, score_b);
+	if (!obj_logits) return SAM3_ENOMEM;
+
+	*out_masks = masks;
+	*out_iou_scores = iou;
+	*out_obj_score_logits = obj_logits;
+	*out_sam_tokens = mask_tok_out;  /* [16, 3, 256] */
+	return SAM3_OK;
+}
+
+/*
+ * sam3_v2_image_pe_layer - Host-side implementation of the Gaussian PE
+ *                          basis lookup.
+ *
+ * Pure CPU compute: basis is a small [2, 128] weight (mmap-resident f32)
+ * and the output is only [H*W, 256] f32 (~640 KiB at H=W=72), so there's
+ * no benefit to putting sin/cos + matmul into the graph. The result
+ * tensor has its data buffer populated directly and can then feed
+ * downstream graph operations as an input.
+ */
+struct sam3_tensor *sam3_v2_image_pe_layer(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		struct sam3_tensor *basis,
+		int grid_h,
+		int grid_w)
+{
+	(void)g;  /* pure host compute, no graph ops */
+
+	if (!arena || !basis || grid_h <= 0 || grid_w <= 0) {
+		sam3_log_error("image_pe_layer: bad args");
+		return NULL;
+	}
+	if (basis->dtype != SAM3_DTYPE_F32 || !basis->data) {
+		sam3_log_error("image_pe_layer: basis dtype/data missing");
+		return NULL;
+	}
+	if (basis->n_dims != 2 || basis->dims[0] != 2 ||
+	    basis->dims[1] != 128) {
+		sam3_log_error("image_pe_layer: basis must be [2, 128]");
+		return NULL;
+	}
+
+	const int HW = grid_h * grid_w;
+	const int D  = 128;        /* half of 256 */
+	int out_dims[2] = {HW, 2 * D};
+	struct sam3_tensor *pe = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						 2, out_dims);
+	if (!pe)
+		return NULL;
+
+	const float *B = (const float *)basis->data;  /* [2, 128] row-major */
+	float *dst = (float *)pe->data;
+	const float two_pi = 6.28318530717958647692f;
+
+	for (int y = 0; y < grid_h; y++) {
+		float ny = ((float)y + 0.5f) / (float)grid_h;
+		float sy = 2.0f * ny - 1.0f;
+		for (int x = 0; x < grid_w; x++) {
+			float nx = ((float)x + 0.5f) / (float)grid_w;
+			float sx = 2.0f * nx - 1.0f;
+			float *row = dst + (size_t)(y * grid_w + x) * 2 * D;
+			for (int k = 0; k < D; k++) {
+				/* proj_k = sx * B[0, k] + sy * B[1, k] */
+				float v = sx * B[0 * D + k]
+					+ sy * B[1 * D + k];
+				v *= two_pi;
+				row[k]       = sinf(v);
+				row[D + k]   = cosf(v);
+			}
+		}
+	}
+
+	return pe;
+}
+
+/*
+ * Cap on the number of most-recent bank entries fed into memory
+ * attention. Each entry contributes HW=5184 spatial tokens at the
+ * production 72×72 grid, so capping keeps the memory-attention K/V
+ * tensors manageable (2 × 5184 = 10368 tokens fit comfortably in a
+ * 3 GiB scratch arena).
+ */
+#define V2_MAX_MEM_ENTRIES_IN_ATTN 2
+
+/*
+ * v2_build_memory_from_bank - Materialise a [1, Nm, 256] memory tensor
+ * from the N most-recent entries of a per-object bank.
+ *
+ * Lays out all spatial_features rows first, then one obj_ptr row per
+ * entry. Also fills @memory_image with the same spatial rows (zeros on
+ * the obj_ptr tail) — the image-side K side of the decoupled cross-
+ * attention uses these as additive keys.
+ *
+ * Returns the number of obj_ptr rows appended (i.e. num_k_exclude_rope
+ * for memory_attn_forward). Returns -1 on failure; 0 and a valid
+ * allocation when there are zero usable entries.
+ */
+static int v2_build_memory_from_bank(
+		struct sam3_arena *arena,
+		const struct sam3_memory_bank *bank,
+		struct sam3_tensor **out_memory,
+		struct sam3_tensor **out_memory_image,
+		int *out_Nm)
+{
+	const struct sam3_memory_entry *picks[V2_MAX_MEM_ENTRIES_IN_ATTN];
+	int n_pick = 0;
+
+	/* Walk newest-first across non_cond (end of ring) then cond. */
+	for (int i = bank->n_non_cond - 1;
+	     i >= 0 && n_pick < V2_MAX_MEM_ENTRIES_IN_ATTN; i--) {
+		if (bank->non_cond[i].spatial_features)
+			picks[n_pick++] = &bank->non_cond[i];
+	}
+	for (int i = bank->n_cond - 1;
+	     i >= 0 && n_pick < V2_MAX_MEM_ENTRIES_IN_ATTN; i--) {
+		if (bank->cond[i].spatial_features)
+			picks[n_pick++] = &bank->cond[i];
+	}
+	if (n_pick == 0) {
+		*out_memory = NULL;
+		*out_memory_image = NULL;
+		*out_Nm = 0;
+		return 0;
+	}
+
+	int total_spatial = 0;
+	int total_obj_ptrs = 0;
+	for (int i = 0; i < n_pick; i++) {
+		if (picks[i]->spatial_features->dims[1] != SAM3_V2_HIDDEN_DIM)
+			return -1;
+		total_spatial += picks[i]->spatial_features->dims[0];
+		if (picks[i]->obj_pointer)
+			total_obj_ptrs++;
+	}
+	int Nm = total_spatial + total_obj_ptrs;
+
+	int dims[3] = {1, Nm, SAM3_V2_HIDDEN_DIM};
+	struct sam3_tensor *memory = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						     3, dims);
+	struct sam3_tensor *memory_image = gh_alloc_tensor(arena,
+							   SAM3_DTYPE_F32,
+							   3, dims);
+	if (!memory || !memory_image)
+		return -1;
+	memset(memory->data, 0, memory->nbytes);
+	memset(memory_image->data, 0, memory_image->nbytes);
+
+	float *mp = (float *)memory->data;
+	float *mip = (float *)memory_image->data;
+	size_t row = 0;
+
+	/* Pass 1: all spatial rows. */
+	for (int i = 0; i < n_pick; i++) {
+		const struct sam3_tensor *sf = picks[i]->spatial_features;
+		size_t n = (size_t)sf->dims[0] * SAM3_V2_HIDDEN_DIM;
+		memcpy(mp  + row * SAM3_V2_HIDDEN_DIM, sf->data,
+		       n * sizeof(float));
+		memcpy(mip + row * SAM3_V2_HIDDEN_DIM, sf->data,
+		       n * sizeof(float));
+		row += sf->dims[0];
+	}
+	/* Pass 2: obj_ptr rows (no image-side contribution). */
+	for (int i = 0; i < n_pick; i++) {
+		if (!picks[i]->obj_pointer)
+			continue;
+		const struct sam3_tensor *op = picks[i]->obj_pointer;
+		int n_elems = sam3_tensor_nelems(op);
+		if (n_elems < SAM3_V2_HIDDEN_DIM)
+			continue;  /* malformed; skip */
+		memcpy(mp + row * SAM3_V2_HIDDEN_DIM, op->data,
+		       SAM3_V2_HIDDEN_DIM * sizeof(float));
+		row++;
+	}
+
+	*out_memory = memory;
+	*out_memory_image = memory_image;
+	*out_Nm = Nm;
+	return total_obj_ptrs;
+}
+
+enum sam3_error sam3_tracker_v2_track_frame(
+		struct sam3_tracker_v2 *trk,
+		struct sam3_graph *g,
+		const struct sam3_memory_bank *bank,
+		struct sam3_tensor *image_embed,
+		struct sam3_tensor *feat_s1,
+		struct sam3_tensor *feat_s0,
+		int frame_idx,
+		int is_cond,
+		struct sam3_arena *arena,
+		struct sam3_tensor **out_masks,
+		struct sam3_tensor **out_iou,
+		struct sam3_tensor **out_obj_ptrs,
+		struct sam3_tensor **out_score)
+{
+	if (!trk || !g || !image_embed || !feat_s1 || !feat_s0 || !arena
+	    || !out_masks || !out_iou || !out_obj_ptrs || !out_score) {
+		sam3_log_error("tracker_v2_track_frame: NULL arg");
+		return SAM3_EINVAL;
+	}
+	if (image_embed->n_dims != 4 || image_embed->dims[0] != 1 ||
+	    image_embed->dims[3] != SAM3_V2_HIDDEN_DIM ||
+	    image_embed->dtype != SAM3_DTYPE_F32) {
+		sam3_log_error("tracker_v2_track_frame: image_embed must be "
+			       "[1,H,W,256] F32");
+		return SAM3_EINVAL;
+	}
+	if (!trk->interactivity_no_mem_embed ||
+	    !trk->image_pe_gauss) {
+		sam3_log_error("tracker_v2_track_frame: tracker weights missing");
+		return SAM3_EINVAL;
+	}
+
+	const int H = image_embed->dims[1];
+	const int W = image_embed->dims[2];
+	const int HW = H * W;
+	const int D = SAM3_V2_HIDDEN_DIM;
+
+	/*
+	 * High-res features must match the mask decoder's contract:
+	 * feat_s1 is the 2x scale, feat_s0 is the 4x scale. Catch swaps at
+	 * the API boundary instead of deep inside sam3_v2_mask_decoder_forward
+	 * — the convention inverts SAM 3's naming and is easy to miswire.
+	 */
+	if (feat_s1->n_dims != 4 || feat_s1->dims[0] != 1 ||
+	    feat_s1->dims[1] != 2 * H || feat_s1->dims[2] != 2 * W ||
+	    feat_s1->dims[3] != D) {
+		sam3_log_error("tracker_v2_track_frame: feat_s1 must be "
+			       "[1,%d,%d,%d] NHWC (2x scale)",
+			       2 * H, 2 * W, D);
+		return SAM3_EINVAL;
+	}
+	if (feat_s0->n_dims != 4 || feat_s0->dims[0] != 1 ||
+	    feat_s0->dims[1] != 4 * H || feat_s0->dims[2] != 4 * W ||
+	    feat_s0->dims[3] != D) {
+		sam3_log_error("tracker_v2_track_frame: feat_s0 must be "
+			       "[1,%d,%d,%d] NHWC (4x scale)",
+			       4 * H, 4 * W, D);
+		return SAM3_EINVAL;
+	}
+
+	sam3_log_debug("tracker_v2_track_frame: frame=%d is_cond=%d HW=%d "
+		       "bank_entries=%d",
+		       frame_idx, is_cond, HW,
+		       bank ? sam3_memory_bank_total(bank) : 0);
+
+	struct sam3_tensor *pix_feat_with_mem = NULL;
+
+	int total_entries = bank ? sam3_memory_bank_total(bank) : 0;
+	int use_memory_attn = (bank != NULL) && (total_entries > 0);
+
+	if (!use_memory_attn) {
+		/*
+		 * No memory: compute pix_feat + interactivity_no_mem_embed
+		 * on the host side. image_embed is materialised (came from
+		 * the frame cache) so this is a straight CPU pass.
+		 */
+		int dims[4] = {1, H, W, D};
+		pix_feat_with_mem = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						    4, dims);
+		if (!pix_feat_with_mem)
+			return SAM3_ENOMEM;
+		const float *src = (const float *)image_embed->data;
+		const float *add = (const float *)
+			trk->interactivity_no_mem_embed->data;  /* [1,1,256] */
+		float *dst = (float *)pix_feat_with_mem->data;
+		for (int i = 0; i < HW; i++) {
+			for (int c = 0; c < D; c++)
+				dst[i * D + c] = src[i * D + c] + add[c];
+		}
+	} else {
+		/*
+		 * Memory path: flatten image_embed to [1, HW, 256], build
+		 * memory inputs from the bank, run the 4-layer decoupled
+		 * transformer, reshape back to [1, H, W, 256].
+		 *
+		 * NOTE: the image-side K projection of the decoupled cross-
+		 * attention consumes `memory_image` — we fill it with the
+		 * same spatial rows as `memory` (zero tail for obj_ptrs).
+		 * Not physically the "current-frame image features broadcast
+		 * across the memory axis" that Python uses, but good enough
+		 * for the phase-2.5 plumbing test.
+		 */
+		int tgt_dims[3] = {1, HW, D};
+		struct sam3_tensor *tgt = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+							  3, tgt_dims);
+		if (!tgt)
+			return SAM3_ENOMEM;
+		memcpy(tgt->data, image_embed->data,
+		       (size_t)HW * D * sizeof(float));
+
+		struct sam3_tensor *memory = NULL;
+		struct sam3_tensor *memory_image = NULL;
+		int Nm = 0;
+		int num_k_exclude = v2_build_memory_from_bank(
+			arena, bank, &memory, &memory_image, &Nm);
+		if (num_k_exclude < 0 || !memory || !memory_image || Nm == 0) {
+			sam3_log_warn("tracker_v2_track_frame: memory build "
+				      "failed, falling back to no_mem path");
+			int dims[4] = {1, H, W, D};
+			pix_feat_with_mem = gh_alloc_tensor(arena,
+							    SAM3_DTYPE_F32,
+							    4, dims);
+			if (!pix_feat_with_mem)
+				return SAM3_ENOMEM;
+			const float *src = (const float *)image_embed->data;
+			const float *add = (const float *)
+				trk->interactivity_no_mem_embed->data;
+			float *dst = (float *)pix_feat_with_mem->data;
+			for (int i = 0; i < HW; i++)
+				for (int c = 0; c < D; c++)
+					dst[i * D + c] = src[i * D + c] + add[c];
+		} else {
+			struct sam3_tensor *cond_2d =
+				sam3_v2_memory_attn_forward(
+					g, arena, &trk->transformer,
+					tgt, NULL, tgt,
+					memory, memory_image, NULL,
+					W, num_k_exclude);
+			if (!cond_2d)
+				return SAM3_ENOMEM;
+			int dims_4d[4] = {1, H, W, D};
+			pix_feat_with_mem = gh_reshape(g, arena, cond_2d,
+						       4, dims_4d);
+			if (!pix_feat_with_mem)
+				return SAM3_ENOMEM;
+		}
+	}
+
+	/* Dense positional encoding for the multiplex mask decoder. */
+	struct sam3_tensor *image_pe = sam3_v2_image_pe_layer(
+		g, arena, trk->image_pe_gauss, H, W);
+	if (!image_pe)
+		return SAM3_ENOMEM;
+
+	/* Multiplex mask decoder. extra_per_object = NULL (single-object
+	 * plumbing; multiplex joint forward is sub-project 4). */
+	struct sam3_tensor *all_masks = NULL;
+	struct sam3_tensor *all_iou   = NULL;
+	struct sam3_tensor *all_score = NULL;
+	struct sam3_tensor *all_sam   = NULL;
+	enum sam3_error err = sam3_v2_mask_decoder_forward(
+		g, arena, &trk->sam_mask_decoder,
+		pix_feat_with_mem, image_pe, feat_s1, feat_s0, NULL,
+		&all_masks, &all_iou, &all_score, &all_sam);
+	if (err != SAM3_OK)
+		return err;
+
+	/* Slice slot 0 from the 16-slot multiplex outputs, then collapse
+	 * the leading singleton dim for caller convenience.
+	 *
+	 * masks : [16, 3, 4H, 4W] → [1, 3, 4H, 4W] → [3, 4H, 4W]
+	 * iou   : [16, 3]         → [1, 3]         → [3]
+	 * score : [16, 1]         → [1, 1]         → [1]
+	 * sam   : [16, 3, 256]    → [1, 3, 256]    → [3, 256]
+	 */
+	struct sam3_tensor *s_masks = gh_slice(g, arena, all_masks, 0, 0, 1);
+	if (!s_masks)
+		return SAM3_ENOMEM;
+	int masks3_dims[3] = {3, 4 * H, 4 * W};
+	struct sam3_tensor *slot0_masks = gh_reshape(g, arena, s_masks,
+						     3, masks3_dims);
+	if (!slot0_masks)
+		return SAM3_ENOMEM;
+
+	struct sam3_tensor *s_iou = gh_slice(g, arena, all_iou, 0, 0, 1);
+	if (!s_iou)
+		return SAM3_ENOMEM;
+	int iou_dims[1] = {3};
+	struct sam3_tensor *slot0_iou = gh_reshape(g, arena, s_iou,
+						   1, iou_dims);
+	if (!slot0_iou)
+		return SAM3_ENOMEM;
+
+	struct sam3_tensor *s_score = gh_slice(g, arena, all_score, 0, 0, 1);
+	if (!s_score)
+		return SAM3_ENOMEM;
+	int score_dims[1] = {1};
+	struct sam3_tensor *slot0_score = gh_reshape(g, arena, s_score,
+						     1, score_dims);
+	if (!slot0_score)
+		return SAM3_ENOMEM;
+
+	struct sam3_tensor *s_sam = gh_slice(g, arena, all_sam, 0, 0, 1);
+	if (!s_sam)
+		return SAM3_ENOMEM;
+	int sam2_dims[2] = {3, D};
+	struct sam3_tensor *slot0_sam = gh_reshape(g, arena, s_sam,
+						   2, sam2_dims);
+	if (!slot0_sam)
+		return SAM3_ENOMEM;
+
+	/* Project all 3 sam_tokens through obj_ptr_proj (256→256→256→256).
+	 * Caller picks the row matching the best-IoU mask after eval. */
+	struct sam3_tensor *obj_w[3] = {
+		trk->obj_ptr_proj.fc_w[0],
+		trk->obj_ptr_proj.fc_w[1],
+		trk->obj_ptr_proj.fc_w[2],
+	};
+	struct sam3_tensor *obj_b[3] = {
+		trk->obj_ptr_proj.fc_b[0],
+		trk->obj_ptr_proj.fc_b[1],
+		trk->obj_ptr_proj.fc_b[2],
+	};
+	struct sam3_tensor *obj_ptrs = mlp3_relu(g, arena, slot0_sam,
+						 obj_w, obj_b);
+	if (!obj_ptrs)
+		return SAM3_ENOMEM;
+
+	*out_masks    = slot0_masks;
+	*out_iou      = slot0_iou;
+	*out_obj_ptrs = obj_ptrs;
+	*out_score    = slot0_score;
+	return SAM3_OK;
 }

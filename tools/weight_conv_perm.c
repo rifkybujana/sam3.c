@@ -93,9 +93,15 @@ static int is_conv2d_weight(const char *name)
 		return 1;
 
 	/* Mask decoder multi-scale skip Conv2d:
-	 * tracker_model.mask_decoder.conv_s0/conv_s1.weight */
+	 * tracker_model.mask_decoder.conv_s0/conv_s1.weight  (SAM 3)
+	 * tracker_v2.sam_mask_decoder.conv_s0/conv_s1.weight (SAM 3.1)
+	 * Both are 1x1 so the permute is a no-op byte-wise, but routing
+	 * them through the allowlist is harmless and keeps the shape
+	 * declarations explicit. */
 	if (str_ends_with(name, ".mask_decoder.conv_s0.weight") ||
-	    str_ends_with(name, ".mask_decoder.conv_s1.weight"))
+	    str_ends_with(name, ".mask_decoder.conv_s1.weight") ||
+	    str_ends_with(name, ".sam_mask_decoder.conv_s0.weight") ||
+	    str_ends_with(name, ".sam_mask_decoder.conv_s1.weight"))
 		return 1;
 
 	/* Memory encoder (maskmem_backbone): 4D conv weights used by the
@@ -167,9 +173,13 @@ static int is_conv_transpose_weight(const char *name)
 		return 1;
 
 	/* Mask decoder pixel upscaling ConvTranspose2d:
-	 * tracker_model.mask_decoder.upscale_conv1/2.weight */
+	 * tracker_model.mask_decoder.upscale_conv1/2.weight  (SAM 3)
+	 * tracker_v2.sam_mask_decoder.output_upscaling.{0,3}.weight
+	 *   (SAM 3.1 — 2-stage ConvTranspose 256->64, 64->32). */
 	if (str_ends_with(name, ".mask_decoder.upscale_conv1.weight") ||
-	    str_ends_with(name, ".mask_decoder.upscale_conv2.weight"))
+	    str_ends_with(name, ".mask_decoder.upscale_conv2.weight") ||
+	    str_ends_with(name, ".sam_mask_decoder.output_upscaling.0.weight") ||
+	    str_ends_with(name, ".sam_mask_decoder.output_upscaling.3.weight"))
 		return 1;
 
 	return 0;

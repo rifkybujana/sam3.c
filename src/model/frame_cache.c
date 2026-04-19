@@ -162,11 +162,18 @@ spill_slot_to_cpu(struct sam3_frame_cache_slot *s,
 		return SAM3_OK;
 	}
 
-	void *im = malloc(s->image_features->nbytes);
+	/*
+	 * image_features is NULL for SAM 3.1 tri-neck encodes (no 0.5x
+	 * scale in that checkpoint). feat_4x is also optional for older
+	 * single-scale backbones. Only feat_s0 / feat_s1 are required.
+	 */
+	void *im = s->image_features ? malloc(s->image_features->nbytes) : NULL;
 	void *s0 = malloc(s->feat_s0->nbytes);
 	void *s1 = malloc(s->feat_s1->nbytes);
 	void *s4 = s->feat_4x ? malloc(s->feat_4x->nbytes) : NULL;
-	if (!im || !s0 || !s1 || (s->feat_4x && !s4)) {
+	int im_ok = (!s->image_features) || (im != NULL);
+	int s4_ok = (!s->feat_4x)        || (s4 != NULL);
+	if (!im_ok || !s0 || !s1 || !s4_ok) {
 		free(im); free(s0); free(s1); free(s4);
 		/* Spill malloc failed; drop the slot instead. */
 		s->image_features = NULL;
@@ -179,9 +186,11 @@ spill_slot_to_cpu(struct sam3_frame_cache_slot *s,
 		return SAM3_OK;
 	}
 
-	memcpy(im, s->image_features->data, s->image_features->nbytes);
-	memcpy(s0, s->feat_s0->data,        s->feat_s0->nbytes);
-	memcpy(s1, s->feat_s1->data,        s->feat_s1->nbytes);
+	if (s->image_features)
+		memcpy(im, s->image_features->data,
+		       s->image_features->nbytes);
+	memcpy(s0, s->feat_s0->data, s->feat_s0->nbytes);
+	memcpy(s1, s->feat_s1->data, s->feat_s1->nbytes);
 	if (s->feat_4x)
 		memcpy(s4, s->feat_4x->data, s->feat_4x->nbytes);
 
@@ -189,8 +198,10 @@ spill_slot_to_cpu(struct sam3_frame_cache_slot *s,
 	 * rebuild the backend tensors without the encoder. Clearing the
 	 * data pointer keeps these copies from being mistaken for live
 	 * arena-backed tensors. */
-	s->spill_hdr_image_features      = *s->image_features;
-	s->spill_hdr_image_features.data = NULL;
+	if (s->image_features) {
+		s->spill_hdr_image_features      = *s->image_features;
+		s->spill_hdr_image_features.data = NULL;
+	}
 	s->spill_hdr_feat_s0             = *s->feat_s0;
 	s->spill_hdr_feat_s0.data        = NULL;
 	s->spill_hdr_feat_s1             = *s->feat_s1;
@@ -316,11 +327,16 @@ spill_promote(struct sam3_frame_cache *cache,
 
 	struct sam3_tensor tmp;
 
-	tmp      = s->spill_hdr_image_features;
-	tmp.data = s->spill_image_features;
-	out->image_features = sam3_tensor_clone_persist(arena, &tmp);
-	if (!out->image_features)
-		return SAM3_ENOMEM;
+	/* image_features is optional (NULL on SAM 3.1 tri-neck). */
+	if (s->spill_image_features) {
+		tmp      = s->spill_hdr_image_features;
+		tmp.data = s->spill_image_features;
+		out->image_features = sam3_tensor_clone_persist(arena, &tmp);
+		if (!out->image_features)
+			return SAM3_ENOMEM;
+	} else {
+		out->image_features = NULL;
+	}
 
 	tmp      = s->spill_hdr_feat_s0;
 	tmp.data = s->spill_feat_s0;
@@ -369,10 +385,14 @@ enum sam3_error sam3_frame_cache_get(struct sam3_frame_cache *cache,
 		return SAM3_OK;
 	}
 
+	/*
+	 * spill_image_features is NULL for SAM 3.1 tri-neck encodes; treat
+	 * it as optional and only require feat_s0 + feat_s1 for the
+	 * promote fast path.
+	 */
 	int use_promote = (s->tier == SAM3_FRAME_TIER_CPU_SPILL &&
-			   s->spill_image_features != NULL &&
-			   s->spill_feat_s0        != NULL &&
-			   s->spill_feat_s1        != NULL);
+			   s->spill_feat_s0 != NULL &&
+			   s->spill_feat_s1 != NULL);
 	if (use_promote)
 		cache->n_spill_promotes++;
 	else if (s->tier == SAM3_FRAME_TIER_CPU_SPILL)
