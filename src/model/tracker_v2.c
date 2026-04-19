@@ -1,20 +1,31 @@
 /*
- * src/model/tracker_v2.c - SAM 3.1 multiplex tracker loader (phase 2.1)
+ * src/model/tracker_v2.c - SAM 3.1 multiplex tracker (loader + forwards)
  *
- * Implements sam3_tracker_v2_init and sam3_tracker_v2_load. This commit
- * only handles the "small" sub-modules: maskmem backbone (38 tensors),
- * object-pointer MLPs and linear layers (12 tensors), and the singleton
- * embeddings (6 tensors) — 56 total. The memory-attention transformer
- * and mask decoders land in phases 2.3-2.5.
+ * Loader (sam3_tracker_v2_init / sam3_tracker_v2_load) populates the
+ * tracker_v2 struct from a SAM 3.1 .sam3 file: maskmem backbone
+ * (38 tensors), memory-attention transformer (122 tensors), SAM mask
+ * decoder (125 tensors), obj_ptr MLPs + linears (12 tensors), and
+ * singleton embeddings (6 tensors) — 303 tensors end-to-end.
  *
- * Key types:  sam3_tracker_v2
+ * Forwards:
+ *   - sam3_v2_maskmem_forward (phase 2.2): pix_feat + masks -> memory
+ *     tokens via the multiplex-aware SimpleMaskEncoder + CXBlock fuser.
+ *   - sam3_v2_memory_attn_forward (phase 2.3b): 4-layer decoupled
+ *     RoPE transformer (DecoupledTransformerDecoderLayerv2) with the
+ *     SAM 3.1 multiplex config baked in.
+ *
+ * Key types:  sam3_tracker_v2, sam3_v2_memory_attn, sam3_v2_maskmem
  * Depends on: tracker_v2.h, graph_helpers.h, util/log.h
- * Used by:    sam3_video.c (phase 2.5)
+ * Used by:    sam3_video.c (variant dispatch, phase 2.5),
+ *             tests/test_tracker_v2_load.c,
+ *             tests/test_maskmem_v2_forward.c,
+ *             tests/test_memory_attn_v2_forward.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -669,25 +680,321 @@ struct sam3_tensor *sam3_v2_maskmem_forward(
 }
 
 /*
- * PHASE 2.3B STUB — the decoupled 8-head RoPE memory attention.
+ * ── Memory-attention forward (phase 2.3b, full implementation) ────
  *
- * Needs three sub-pieces that don't exist as graph helpers today:
- *   (a) Multi-head attention with pre-projected Q/K/V and optional
- *       RoPE on a configurable per-head stride. Existing
- *       gh_multihead_attention_rope_sep always projects internally
- *       from a single input and assumes one position basis for both
- *       Q and K.
- *   (b) RoPE tables for the 72x72 image feature grid that match the
- *       `SimpleRoPEAttention(rope_theta=10000, feat_sizes=[72,72])`
- *       config (2D axial RoPE, not the 1D sequence RoPE used in the
- *       text encoder).
- *   (c) A `num_k_exclude_rope` knob so obj_ptr memory tokens bypass
- *       the rotation while maskmem tokens don't.
- *
- * Returning NULL here instead of silently producing garbage keeps
- * sam3_video_start_ex's SAM-3.1 reject honest: tracking fails cleanly
- * until this implementation lands.
+ * 8-head decoupled RoPE transformer encoder, 4 layers. See the header
+ * doc for the full semantics of each layer. The config is hard-coded
+ * because no other SAM 3.1 variant ships today.
  */
+
+/* Fixed config baked into the .sam3 weights. */
+#define V2_ATTN_HEADS           8
+#define V2_ATTN_HEAD_DIM        (SAM3_V2_HIDDEN_DIM / V2_ATTN_HEADS)  /* 32 */
+#define V2_ATTN_HALF            (V2_ATTN_HEAD_DIM / 2)                /* 16 */
+#define V2_ATTN_QUARTER         (V2_ATTN_HEAD_DIM / 4)                /* 8 */
+#define V2_ROPE_THETA           10000.0f
+/* pos_enc_at_input=True scales src_pos by 0.1 before the residual add.
+ * Matches TransformerEncoderDecoupledCrossAttention.forward in
+ * reference/sam3/sam3/model/decoder.py. */
+#define V2_POS_ENC_INPUT_SCALE  0.1f
+
+/*
+ * build_rope_2d_axial - Fill [n_pos, head_dim/2] cos/sin tables for a
+ * grid_w × grid_w 2D axial RoPE basis.
+ *
+ * Matches Python compute_axial_cis(dim=head_dim, end_x=grid_w,
+ * end_y=grid_w, theta=10000). First head_dim/4 entries encode the x
+ * (column) axis, last head_dim/4 entries encode the y (row) axis —
+ * exactly the convention used by the ViT encoder's
+ * precompute_rope_table in src/model/image_encoder.c.
+ */
+static enum sam3_error build_rope_2d_axial(
+		struct sam3_arena *arena, int grid_w,
+		struct sam3_tensor **out_cos, struct sam3_tensor **out_sin)
+{
+	int n_pos = grid_w * grid_w;
+	int dims[] = {n_pos, V2_ATTN_HALF};
+
+	*out_cos = gh_alloc_tensor(arena, SAM3_DTYPE_F32, 2, dims);
+	*out_sin = gh_alloc_tensor(arena, SAM3_DTYPE_F32, 2, dims);
+	if (!*out_cos || !*out_sin)
+		return SAM3_ENOMEM;
+
+	float freqs[V2_ATTN_QUARTER];
+	for (int i = 0; i < V2_ATTN_QUARTER; i++)
+		freqs[i] = 1.0f / powf(V2_ROPE_THETA,
+				       (float)(i * 4) / (float)V2_ATTN_HEAD_DIM);
+
+	float *cos_d = (float *)(*out_cos)->data;
+	float *sin_d = (float *)(*out_sin)->data;
+	for (int py = 0; py < grid_w; py++) {
+		for (int px = 0; px < grid_w; px++) {
+			int pos = py * grid_w + px;
+			float *cr = cos_d + pos * V2_ATTN_HALF;
+			float *sr = sin_d + pos * V2_ATTN_HALF;
+			for (int i = 0; i < V2_ATTN_QUARTER; i++) {
+				float ax = (float)px * freqs[i];
+				cr[i] = cosf(ax);
+				sr[i] = sinf(ax);
+			}
+			for (int i = 0; i < V2_ATTN_QUARTER; i++) {
+				float ay = (float)py * freqs[i];
+				cr[V2_ATTN_QUARTER + i] = cosf(ay);
+				sr[V2_ATTN_QUARTER + i] = sinf(ay);
+			}
+		}
+	}
+	return SAM3_OK;
+}
+
+/*
+ * tile_rope_table - Repeat an [n, half] table `r` times along axis 0
+ * to produce an [r*n, half] table. Matches repeat_freqs_k semantics
+ * in apply_rotary_enc: the same cis values are re-applied for each
+ * memory-frame slot so tokens at the same spatial position share
+ * the same rotation regardless of which slot they live in.
+ *
+ * When r == 1 returns @base unchanged (shared pointer). The returned
+ * table must be treated as read-only — gh_rope consumes it as a
+ * constant graph input and never writes back.
+ */
+static struct sam3_tensor *tile_rope_table(
+		struct sam3_arena *arena,
+		struct sam3_tensor *base, int r)
+{
+	if (r <= 0)
+		return NULL;
+	if (r == 1)
+		return base;
+
+	int n = base->dims[0];
+	int half = base->dims[1];
+	int dims[] = {n * r, half};
+
+	struct sam3_tensor *out = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						   2, dims);
+	if (!out)
+		return NULL;
+
+	const float *src = (const float *)base->data;
+	float *dst = (float *)out->data;
+	size_t row = (size_t)half * sizeof(float);
+	for (int i = 0; i < r; i++)
+		memcpy(dst + (size_t)i * n * half, src, row * (size_t)n);
+	return out;
+}
+
+/*
+ * mha_sdpa_with_rope - Shared attention body: project Q/K/V → RoPE on Q
+ * and (part of) K → fused SDPA → output projection.
+ *
+ * All of q_in/k_in/v_in are expected in [B, N, d_model] layout. They
+ * have already been projected by the caller (memory attention's
+ * decoupled queries and keys are summed from two sources, which does
+ * not fit the "single input, internal projection" helper).
+ *
+ * @cos_q/sin_q:       [N_q, head_dim/2] RoPE tables for Q.
+ * @cos_k/sin_k:       [N_k - num_k_exclude, head_dim/2] RoPE tables
+ *                     for the first N_k - num_k_exclude rows of K,
+ *                     or NULL to skip K-side RoPE entirely.
+ * @num_k_exclude:     trailing K rows that skip RoPE.
+ * @out_proj_w/_b:     linear projection applied after SDPA.
+ *
+ * Returns tensor [B, N_q, d_model] on success.
+ */
+static struct sam3_tensor *mha_sdpa_with_rope(
+		struct sam3_graph *g, struct sam3_arena *a,
+		struct sam3_tensor *q, struct sam3_tensor *k,
+		struct sam3_tensor *v,
+		struct sam3_tensor *cos_q, struct sam3_tensor *sin_q,
+		struct sam3_tensor *cos_k, struct sam3_tensor *sin_k,
+		int num_k_exclude,
+		struct sam3_tensor *out_w, struct sam3_tensor *out_b)
+{
+	int B = q->dims[0];
+	int Nq = q->dims[1];
+	int D = q->dims[2];
+	int Nk = k->dims[1];
+	int H = V2_ATTN_HEADS;
+	int HD = V2_ATTN_HEAD_DIM;
+
+	int r4q[] = {B, Nq, H, HD};
+	int r4k[] = {B, Nk, H, HD};
+	int perm[] = {0, 2, 1, 3};
+	int r3[]  = {B, Nq, D};
+
+	/* Reshape to [B, N, H, HD] for RoPE. */
+	q = gh_reshape(g, a, q, 4, r4q);
+	k = gh_reshape(g, a, k, 4, r4k);
+	v = gh_reshape(g, a, v, 4, r4k);
+	if (!q || !k || !v)
+		return NULL;
+
+	/* RoPE on Q (full length) and K (first Nk - num_k_exclude). */
+	q = gh_rope(g, a, q, cos_q, sin_q, 0, 1.0f);
+	if (!q)
+		return NULL;
+
+	/* cos_k == NULL is the "skip K-side RoPE entirely" contract. In
+	 * the current call path that only happens when the outer forward
+	 * sees k_rope_len <= 0 (all memory tokens excluded from RoPE —
+	 * e.g. Nm == num_k_exclude_rope, which would mean the memory
+	 * bank is pure obj_ptr tokens). Self-attention always passes
+	 * cos_q for both Q and K. */
+	if (cos_k && sin_k) {
+		int k_rope_len = Nk - num_k_exclude;
+		if (k_rope_len < 0)
+			return NULL;
+		if (num_k_exclude > 0) {
+			struct sam3_tensor *k_rope =
+				gh_slice(g, a, k, 1, 0, k_rope_len);
+			struct sam3_tensor *k_no =
+				gh_slice(g, a, k, 1, k_rope_len, Nk);
+			if (!k_rope || !k_no)
+				return NULL;
+			k_rope = gh_rope(g, a, k_rope, cos_k, sin_k,
+					 0, 1.0f);
+			if (!k_rope)
+				return NULL;
+			struct sam3_tensor *pair[2] = {k_rope, k_no};
+			k = gh_concat(g, a, pair, 2, 1);
+			if (!k)
+				return NULL;
+		} else {
+			k = gh_rope(g, a, k, cos_k, sin_k, 0, 1.0f);
+			if (!k)
+				return NULL;
+		}
+	}
+
+	/* Permute to [B, H, N, HD] for SDPA. */
+	q = gh_permute(g, a, q, perm);
+	k = gh_permute(g, a, k, perm);
+	v = gh_permute(g, a, v, perm);
+	if (!q || !k || !v)
+		return NULL;
+
+	struct sam3_tensor *attn = gh_sdpa(g, a, q, k, v, NULL, HD);
+	if (!attn)
+		return NULL;
+
+	/* Back to [B, Nq, H, HD] then [B, Nq, D]. */
+	attn = gh_permute(g, a, attn, perm);
+	if (!attn)
+		return NULL;
+	attn = gh_reshape(g, a, attn, 3, r3);
+	if (!attn)
+		return NULL;
+
+	return gh_linear(g, a, attn, out_w, out_b);
+}
+
+/*
+ * memory_attn_layer - Build one DecoupledTransformerDecoderLayerv2
+ * forward in pre-norm, cross-attention-second mode.
+ *
+ * Residual accumulator `output` is [B, Nq, 256]. Cross-attention
+ * draws from memory / memory_image of length Nm. All positional
+ * behaviours (pos_enc_at_attn=False, pos_enc_at_cross_attn_queries=
+ * False, pos_enc_at_cross_attn_keys=True) are baked in.
+ */
+static struct sam3_tensor *memory_attn_layer(
+		struct sam3_graph *g, struct sam3_arena *a,
+		const struct sam3_v2_memory_attn_layer *L,
+		struct sam3_tensor *output,
+		struct sam3_tensor *image,
+		struct sam3_tensor *memory,
+		struct sam3_tensor *memory_image,
+		struct sam3_tensor *memory_image_pos,
+		struct sam3_tensor *cos_q, struct sam3_tensor *sin_q,
+		struct sam3_tensor *cos_k, struct sam3_tensor *sin_k,
+		int num_k_exclude)
+{
+	/* ── Self-attention ───────────────────────────────────────── */
+	struct sam3_tensor *tgt2 = gh_layernorm(g, a, output,
+						L->norm1_w, L->norm1_b);
+	if (!tgt2)
+		return NULL;
+
+	struct sam3_tensor *q = gh_linear(g, a, tgt2, L->self_q_w, L->self_q_b);
+	struct sam3_tensor *k = gh_linear(g, a, tgt2, L->self_k_w, L->self_k_b);
+	struct sam3_tensor *v = gh_linear(g, a, tgt2, L->self_v_w, L->self_v_b);
+	if (!q || !k || !v)
+		return NULL;
+
+	struct sam3_tensor *attn = mha_sdpa_with_rope(
+		g, a, q, k, v,
+		cos_q, sin_q, cos_q, sin_q, 0,
+		L->self_out_w, L->self_out_b);
+	if (!attn)
+		return NULL;
+	output = gh_add(g, a, output, attn);
+	if (!output)
+		return NULL;
+
+	/* ── Decoupled cross-attention ────────────────────────────── */
+	tgt2 = gh_layernorm(g, a, output, L->norm2_w, L->norm2_b);
+	if (!tgt2)
+		return NULL;
+
+	/* q = image_cross_attn_q_proj(image) + cross_attn_q_proj(tgt2) */
+	struct sam3_tensor *q_tgt = gh_linear(g, a, tgt2,
+					       L->cross_q_w, L->cross_q_b);
+	struct sam3_tensor *q_img = gh_linear(g, a, image,
+					       L->img_q_w, L->img_q_b);
+	if (!q_tgt || !q_img)
+		return NULL;
+	q = gh_add(g, a, q_img, q_tgt);
+	if (!q)
+		return NULL;
+
+	/* k = image_cross_attn_k_proj(memory_image)
+	 *     + cross_attn_k_proj(memory) + memory_image_pos */
+	struct sam3_tensor *k_mem = gh_linear(g, a, memory,
+					       L->cross_k_w, L->cross_k_b);
+	struct sam3_tensor *k_img = gh_linear(g, a, memory_image,
+					       L->img_k_w, L->img_k_b);
+	if (!k_mem || !k_img)
+		return NULL;
+	k = gh_add(g, a, k_img, k_mem);
+	if (!k)
+		return NULL;
+	if (memory_image_pos) {
+		k = gh_add(g, a, k, memory_image_pos);
+		if (!k)
+			return NULL;
+	}
+
+	v = gh_linear(g, a, memory, L->cross_v_w, L->cross_v_b);
+	if (!v)
+		return NULL;
+
+	attn = mha_sdpa_with_rope(
+		g, a, q, k, v,
+		cos_q, sin_q, cos_k, sin_k, num_k_exclude,
+		L->cross_out_w, L->cross_out_b);
+	if (!attn)
+		return NULL;
+	output = gh_add(g, a, output, attn);
+	if (!output)
+		return NULL;
+
+	/* ── FFN ──────────────────────────────────────────────────── */
+	tgt2 = gh_layernorm(g, a, output, L->norm3_w, L->norm3_b);
+	if (!tgt2)
+		return NULL;
+	tgt2 = gh_linear(g, a, tgt2, L->lin1_w, L->lin1_b);
+	if (!tgt2)
+		return NULL;
+	tgt2 = gh_gelu(g, a, tgt2);
+	if (!tgt2)
+		return NULL;
+	tgt2 = gh_linear(g, a, tgt2, L->lin2_w, L->lin2_b);
+	if (!tgt2)
+		return NULL;
+	return gh_add(g, a, output, tgt2);
+}
+
 struct sam3_tensor *sam3_v2_memory_attn_forward(
 		struct sam3_graph *g,
 		struct sam3_arena *arena,
@@ -695,15 +1002,103 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
 		struct sam3_tensor *tgt,
 		struct sam3_tensor *tgt_pos,
 		struct sam3_tensor *image,
-		struct sam3_tensor *image_pos,
 		struct sam3_tensor *memory,
-		struct sam3_tensor *memory_pos,
+		struct sam3_tensor *memory_image,
+		struct sam3_tensor *memory_image_pos,
+		int grid_w,
 		int num_k_exclude_rope)
 {
-	(void)g; (void)arena; (void)ma; (void)tgt; (void)tgt_pos;
-	(void)image; (void)image_pos; (void)memory; (void)memory_pos;
-	(void)num_k_exclude_rope;
-	sam3_log_error("sam3_v2_memory_attn_forward: not yet implemented "
-		       "(phase 2.3b)");
-	return NULL;
+	if (!g || !arena || !ma || !tgt || !image
+	    || !memory || !memory_image)
+		return NULL;
+	if (tgt->n_dims != 3 || image->n_dims != 3
+	    || memory->n_dims != 3 || memory_image->n_dims != 3) {
+		sam3_log_error("memory_attn: inputs must be 3D [B,N,D]");
+		return NULL;
+	}
+
+	int B  = tgt->dims[0];
+	int Nq = tgt->dims[1];
+	int D  = tgt->dims[2];
+	int Nm = memory->dims[1];
+
+	if (D != SAM3_V2_HIDDEN_DIM) {
+		sam3_log_error("memory_attn: d_model %d != %d",
+			       D, SAM3_V2_HIDDEN_DIM);
+		return NULL;
+	}
+	if (grid_w <= 0) {
+		sam3_log_error("memory_attn: grid_w must be positive, got %d",
+			       grid_w);
+		return NULL;
+	}
+	if (Nq != grid_w * grid_w) {
+		sam3_log_error("memory_attn: Nq %d != grid_w*grid_w (%d)",
+			       Nq, grid_w * grid_w);
+		return NULL;
+	}
+	if (image->dims[0] != B || image->dims[1] != Nq
+	    || image->dims[2] != D
+	    || memory_image->dims[0] != B || memory_image->dims[1] != Nm
+	    || memory_image->dims[2] != D) {
+		sam3_log_error("memory_attn: image/memory_image shape mismatch");
+		return NULL;
+	}
+	if (num_k_exclude_rope < 0 || num_k_exclude_rope > Nm) {
+		sam3_log_error("memory_attn: num_k_exclude_rope %d out of "
+			       "range [0, %d]", num_k_exclude_rope, Nm);
+		return NULL;
+	}
+
+	/* ── Build 2D axial RoPE tables ───────────────────────────── */
+	struct sam3_tensor *cos_q = NULL, *sin_q = NULL;
+	if (build_rope_2d_axial(arena, grid_w, &cos_q, &sin_q) != SAM3_OK)
+		return NULL;
+
+	struct sam3_tensor *cos_k = NULL, *sin_k = NULL;
+	int k_rope_len = Nm - num_k_exclude_rope;
+	if (k_rope_len > 0) {
+		if (k_rope_len % Nq != 0) {
+			sam3_log_error("memory_attn: K rope len %d not a "
+				       "multiple of Nq %d",
+				       k_rope_len, Nq);
+			return NULL;
+		}
+		int r = k_rope_len / Nq;
+		cos_k = tile_rope_table(arena, cos_q, r);
+		sin_k = tile_rope_table(arena, sin_q, r);
+		if (!cos_k || !sin_k)
+			return NULL;
+	}
+
+	/* ── pos_enc_at_input=True: output = tgt + 0.1 * tgt_pos ──── */
+	struct sam3_tensor *output = tgt;
+	if (tgt_pos) {
+		int one[] = {1};
+		struct sam3_tensor *scale = gh_alloc_tensor(arena,
+			SAM3_DTYPE_F32, 1, one);
+		if (!scale)
+			return NULL;
+		((float *)scale->data)[0] = V2_POS_ENC_INPUT_SCALE;
+		struct sam3_tensor *scaled = gh_mul(g, arena, tgt_pos, scale);
+		if (!scaled)
+			return NULL;
+		output = gh_add(g, arena, tgt, scaled);
+		if (!output)
+			return NULL;
+	}
+
+	/* ── 4 layers ─────────────────────────────────────────────── */
+	for (int i = 0; i < 4; i++) {
+		output = memory_attn_layer(g, arena, &ma->layers[i],
+			output, image, memory, memory_image,
+			memory_image_pos, cos_q, sin_q, cos_k, sin_k,
+			num_k_exclude_rope);
+		if (!output)
+			return NULL;
+	}
+
+	/* ── Final encoder.norm (use_image_in_output=False) ───────── */
+	return gh_layernorm(g, arena, output,
+			    ma->final_norm_w, ma->final_norm_b);
 }

@@ -16,7 +16,10 @@
  *
  * Key types:  sam3_tracker_v2
  * Depends on: core/tensor.h, core/weight.h, core/alloc.h
- * Used by:    model/sam3_video.c (variant dispatch), tests/test_tracker_v2_load.c
+ * Used by:    model/sam3_video.c (variant dispatch),
+ *             tests/test_tracker_v2_load.c,
+ *             tests/test_maskmem_v2_forward.c,
+ *             tests/test_memory_attn_v2_forward.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
@@ -368,58 +371,81 @@ struct sam3_tensor *sam3_v2_maskmem_forward(
 		int skip_mask_sigmoid);
 
 /*
- * sam3_v2_memory_attn_forward - Build the memory-attention graph for a
- * single tracker frame.
+ * sam3_v2_memory_attn_forward - Build the 4-layer decoupled memory
+ * attention graph for a single tracker frame.
  *
- * PHASE 2.3B STUB. Returns NULL unconditionally; phase 2.3b fills in
- * the 8-head decoupled RoPE attention. The interface below describes
- * what the full implementation will consume.
+ * Mirrors TransformerEncoderDecoupledCrossAttention.forward in the
+ * upstream SAM 3.1 reference (sam3/model/decoder.py). The SAM 3.1
+ * multiplex config selects pre_norm=True, pos_enc_at_input=True,
+ * pos_enc_at_attn=False, pos_enc_at_cross_attn_queries=False,
+ * pos_enc_at_cross_attn_keys=True, use_image_in_output=False,
+ * cross_attention_first=False — the implementation hard-codes this
+ * config because no other variant ships in sam3.1_multiplex.pt.
  *
  * @g:                Graph being built.
- * @arena:            Arena for intermediate tensors.
- * @ma:               Loaded memory-attention transformer (4 layers).
- * @tgt:              Object queries [B, Nq, 256].
- * @tgt_pos:          Positional encoding for object queries [B, Nq, 256]
- *                    (unused when pos_enc_at_attn=false, which matches
- *                    the upstream SAM 3.1 config).
- * @image:            Image features [B, HW, 256] for the current frame.
- * @image_pos:        Image positional encoding [B, HW, 256] (fed as the
- *                    image-side K-projection input, NOT summed into Q).
- * @memory:           Memory-bank tokens from prior frames
- *                    [B, N_mem, 256]. Includes obj_ptr tokens + maskmem
- *                    tokens.
- * @memory_pos:       Memory positional encoding [B, N_mem, 256]
- *                    (summed into the image-side K projection).
- * @num_k_exclude_rope: Number of memory K tokens to skip RoPE on
- *                    (obj_ptr tokens do not receive RoPE; see upstream
- *                    SimpleRoPEAttention kwarg).
+ * @arena:            Arena for intermediate tensors and RoPE tables.
+ * @ma:               Loaded memory-attention transformer (4 layers +
+ *                    final norm).
+ * @tgt:              Object queries [B, Nq, 256]. In the SAM 3.1
+ *                    tracker this is the current frame's vision
+ *                    features (flattened row-major from the grid_w ×
+ *                    grid_w grid).
+ * @tgt_pos:          Positional encoding for object queries
+ *                    [B, Nq, 256] or NULL. When non-NULL the layer
+ *                    applies `tgt = tgt + 0.1 * tgt_pos` before the
+ *                    first encoder layer (pos_enc_at_input=True). The
+ *                    layer-level self/cross-attn projections ignore
+ *                    this tensor afterwards.
+ * @image:            Current-frame image features [B, Nq, 256], fed
+ *                    to the image_cross_attn_q_proj side of the
+ *                    decoupled cross-attention. In the tracker this
+ *                    is the same tensor as `tgt` before conditioning.
+ * @memory:           Memory-bank tokens [B, Nm, 256] (maskmem features
+ *                    + obj_ptr tokens, concatenated). Drives
+ *                    cross_attn_{k,v}_proj.
+ * @memory_image:     Image-side memory tokens [B, Nm, 256], zero-
+ *                    padded on the obj_ptr segment by the caller so Nm
+ *                    matches `memory`'s length. Drives
+ *                    image_cross_attn_k_proj.
+ * @memory_image_pos: Positional encoding for the image-side memory
+ *                    tokens [B, Nm, 256] or NULL. When non-NULL it is
+ *                    added to K after the two K projections
+ *                    (pos_enc_at_cross_attn_keys=True).
+ * @grid_w:           Square grid width used for 2D axial RoPE (72 in
+ *                    the production 1008/14 config). Must satisfy
+ *                    Nq == grid_w * grid_w.
+ * @num_k_exclude_rope: Number of trailing memory K tokens that skip
+ *                    RoPE (obj_ptr tokens are not rotated; see
+ *                    SimpleRoPEAttention.forward kwarg).
  *
- * Semantics per layer (`DecoupledTransformerDecoderLayerv2`):
+ * Semantics per layer (`DecoupledTransformerDecoderLayerv2` in
+ * pre-norm, cross-attention-second mode):
  *
  *   ## Self-attention on tgt (8-head RoPE)
  *   tgt2 = norm1(tgt)
  *   q = self_attn_q_proj(tgt2)
  *   k = self_attn_k_proj(tgt2)
  *   v = self_attn_v_proj(tgt2)
- *   tgt = tgt + self_attn_out_proj(attn_rope(q, k, v))
+ *   tgt = tgt + self_attn_out_proj(attn_rope_axial(q, k, v))
  *
  *   ## Decoupled cross-attention (image + memory, 8-head RoPE)
  *   tgt2 = norm2(tgt)
  *   q = image_cross_attn_q_proj(image) + cross_attn_q_proj(tgt2)
  *   k = image_cross_attn_k_proj(memory_image) +
- *         cross_attn_k_proj(memory)
+ *         cross_attn_k_proj(memory) + memory_image_pos
  *   v = cross_attn_v_proj(memory)
- *   tgt = tgt + cross_attn_out_proj(attn_rope(q, k, v))
+ *   tgt = tgt + cross_attn_out_proj(attn_rope_axial_repeat_k(
+ *                 q, k, v, num_k_exclude_rope=num_k_exclude_rope))
  *
  *   ## FFN
  *   tgt2 = norm3(tgt)
  *   tgt = tgt + linear2(GELU(linear1(tgt2)))
  *
- * Final: encoder.norm(tgt) after all 4 layers.
+ * Final (use_image_in_output=False): `out = encoder.norm(tgt)` after
+ * all 4 layers. Output shape [B, Nq, 256].
  *
- * `memory_image` in the reference is the per-frame image features
- * concatenated across the 7 memory slots with positional offsets; the
- * caller sets it up from the memory bank's stored pix_feat snapshots.
+ * Returns NULL on arena exhaustion, graph capacity exhaustion, or
+ * shape mismatch.
  */
 struct sam3_tensor *sam3_v2_memory_attn_forward(
 		struct sam3_graph *g,
@@ -428,9 +454,10 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
 		struct sam3_tensor *tgt,
 		struct sam3_tensor *tgt_pos,
 		struct sam3_tensor *image,
-		struct sam3_tensor *image_pos,
 		struct sam3_tensor *memory,
-		struct sam3_tensor *memory_pos,
+		struct sam3_tensor *memory_image,
+		struct sam3_tensor *memory_image_pos,
+		int grid_w,
 		int num_k_exclude_rope);
 
 #endif /* SAM3_MODEL_TRACKER_V2_H */
