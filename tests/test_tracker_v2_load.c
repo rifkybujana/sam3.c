@@ -129,6 +129,39 @@ int main(void)
 	assert_tensor(trk.no_obj_ptr_linear_w, "no_obj_ptr.w", 2, 256, 256);
 	assert_tensor(trk.no_obj_ptr_linear_b, "no_obj_ptr.b", 1, 256);
 
+	/* ── Memory-attention transformer (phase 2.3a) ──────────────────── */
+	printf("  transformer.layers (4 decoupled layers)\n");
+	for (int li = 0; li < 4; li++) {
+		struct sam3_v2_memory_attn_layer *L =
+			&trk.transformer.layers[li];
+
+		/* self_attn QKV + out: all [256, 256] + [256] */
+		assert_tensor(L->self_q_w, "self_q_w", 2, 256, 256);
+		assert_tensor(L->self_q_b, "self_q_b", 1, 256);
+		assert_tensor(L->self_out_w, "self_out_w", 2, 256, 256);
+
+		/* cross_attn QKV + out */
+		assert_tensor(L->cross_q_w, "cross_q_w", 2, 256, 256);
+		assert_tensor(L->cross_v_w, "cross_v_w", 2, 256, 256);
+		assert_tensor(L->cross_out_w, "cross_out_w", 2, 256, 256);
+
+		/* image_cross_attn: q and k only */
+		assert_tensor(L->img_q_w, "img_q_w", 2, 256, 256);
+		assert_tensor(L->img_k_w, "img_k_w", 2, 256, 256);
+
+		/* FFN */
+		assert_tensor(L->lin1_w, "lin1_w", 2, 2048, 256);
+		assert_tensor(L->lin1_b, "lin1_b", 1, 2048);
+		assert_tensor(L->lin2_w, "lin2_w", 2, 256, 2048);
+
+		/* 3 LayerNorms */
+		assert_tensor(L->norm1_w, "norm1_w", 1, 256);
+		assert_tensor(L->norm2_w, "norm2_w", 1, 256);
+		assert_tensor(L->norm3_w, "norm3_w", 1, 256);
+	}
+	assert_tensor(trk.transformer.final_norm_w, "final_norm_w", 1, 256);
+	assert_tensor(trk.transformer.final_norm_b, "final_norm_b", 1, 256);
+
 	/* ── Singletons ─────────────────────────────────────────────────── */
 	printf("  singleton embeddings\n");
 	assert_tensor(trk.image_pe_gauss, "image_pe_gauss", 2, 2, 128);
@@ -146,7 +179,7 @@ int main(void)
 	sam3_arena_free(&arena);
 	sam3_weight_close(&wf);
 
-	printf("test_tracker_v2_load: PASS (phase-2.1 all %d tensors)\n",
-	       SAM3_V2_PHASE_2_1_TENSORS);
+	printf("test_tracker_v2_load: PASS (phase-2.3a all %d tensors)\n",
+	       SAM3_V2_PHASE_2_3A_TENSORS);
 	return 0;
 }

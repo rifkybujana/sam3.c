@@ -196,6 +196,79 @@ static enum sam3_error load_mlp3(struct sam3_v2_mlp3 *mlp,
 	return SAM3_OK;
 }
 
+static enum sam3_error load_memory_attn(struct sam3_v2_memory_attn *ma,
+					const struct sam3_weight_file *wf,
+					struct sam3_arena *arena)
+{
+	char buf[SAM3_WEIGHT_NAME_MAX];
+	const int d = SAM3_V2_HIDDEN_DIM;
+	const int d_ffn = 2048;
+
+#define LX(dst, field_suffix, ndims_, ...) \
+	do { \
+		snprintf(buf, sizeof(buf), \
+			 "tracker_v2.transformer.encoder.layers.%d." \
+			 field_suffix, i); \
+		const char *_name = buf; \
+		LOAD(dst, SAM3_DTYPE_F32, (ndims_), __VA_ARGS__); \
+	} while (0)
+
+	for (int i = 0; i < 4; i++) {
+		struct sam3_v2_memory_attn_layer *L = &ma->layers[i];
+
+		/* self_attn */
+		LX(L->self_q_w, "self_attn_q_proj.weight", 2, d, d);
+		LX(L->self_q_b, "self_attn_q_proj.bias",   1, d);
+		LX(L->self_k_w, "self_attn_k_proj.weight", 2, d, d);
+		LX(L->self_k_b, "self_attn_k_proj.bias",   1, d);
+		LX(L->self_v_w, "self_attn_v_proj.weight", 2, d, d);
+		LX(L->self_v_b, "self_attn_v_proj.bias",   1, d);
+		LX(L->self_out_w, "self_attn_out_proj.weight", 2, d, d);
+		LX(L->self_out_b, "self_attn_out_proj.bias",   1, d);
+
+		/* cross_attn */
+		LX(L->cross_q_w, "cross_attn_q_proj.weight", 2, d, d);
+		LX(L->cross_q_b, "cross_attn_q_proj.bias",   1, d);
+		LX(L->cross_k_w, "cross_attn_k_proj.weight", 2, d, d);
+		LX(L->cross_k_b, "cross_attn_k_proj.bias",   1, d);
+		LX(L->cross_v_w, "cross_attn_v_proj.weight", 2, d, d);
+		LX(L->cross_v_b, "cross_attn_v_proj.bias",   1, d);
+		LX(L->cross_out_w, "cross_attn_out_proj.weight", 2, d, d);
+		LX(L->cross_out_b, "cross_attn_out_proj.bias",   1, d);
+
+		/* image_cross_attn — q and k only (v/out shared with cross) */
+		LX(L->img_q_w, "image_cross_attn_q_proj.weight", 2, d, d);
+		LX(L->img_q_b, "image_cross_attn_q_proj.bias",   1, d);
+		LX(L->img_k_w, "image_cross_attn_k_proj.weight", 2, d, d);
+		LX(L->img_k_b, "image_cross_attn_k_proj.bias",   1, d);
+
+		/* FFN */
+		LX(L->lin1_w, "linear1.weight", 2, d_ffn, d);
+		LX(L->lin1_b, "linear1.bias",   1, d_ffn);
+		LX(L->lin2_w, "linear2.weight", 2, d, d_ffn);
+		LX(L->lin2_b, "linear2.bias",   1, d);
+
+		/* 3 LayerNorms */
+		LX(L->norm1_w, "norm1.weight", 1, d);
+		LX(L->norm1_b, "norm1.bias",   1, d);
+		LX(L->norm2_w, "norm2.weight", 1, d);
+		LX(L->norm2_b, "norm2.bias",   1, d);
+		LX(L->norm3_w, "norm3.weight", 1, d);
+		LX(L->norm3_b, "norm3.bias",   1, d);
+	}
+#undef LX
+
+	{
+		const char *_name = "tracker_v2.transformer.encoder.norm.weight";
+		LOAD(ma->final_norm_w, SAM3_DTYPE_F32, 1, d);
+	}
+	{
+		const char *_name = "tracker_v2.transformer.encoder.norm.bias";
+		LOAD(ma->final_norm_b, SAM3_DTYPE_F32, 1, d);
+	}
+	return SAM3_OK;
+}
+
 static enum sam3_error load_singletons(struct sam3_tracker_v2 *trk,
 				       const struct sam3_weight_file *wf,
 				       struct sam3_arena *arena)
@@ -256,6 +329,9 @@ enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
 	err = load_maskmem(&trk->maskmem, wf, arena);
 	if (err != SAM3_OK) return err;
 
+	err = load_memory_attn(&trk->transformer, wf, arena);
+	if (err != SAM3_OK) return err;
+
 	err = load_mlp3(&trk->obj_ptr_proj, "tracker_v2.obj_ptr_proj",
 			wf, arena);
 	if (err != SAM3_OK) return err;
@@ -280,8 +356,8 @@ enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
 	err = load_singletons(trk, wf, arena);
 	if (err != SAM3_OK) return err;
 
-	sam3_log_info("tracker_v2: loaded phase-2.1 weights "
-		      "(maskmem + obj_ptr + singletons)");
+	sam3_log_info("tracker_v2: loaded phase-2.3a weights "
+		      "(maskmem + transformer + obj_ptr + singletons)");
 	return SAM3_OK;
 }
 

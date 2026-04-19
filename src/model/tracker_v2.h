@@ -101,11 +101,67 @@ struct sam3_v2_mlp3 {
 };
 
 /*
+ * Decoupled memory-attention layer (one of 4 in `transformer.encoder`).
+ *
+ * Python: DecoupledTransformerDecoderLayerv2 — three attention blocks
+ * share the FFN but each has its own q/k/v/out projections:
+ *
+ *   self_attn         (8-head RoPE): object-query ↔ object-query
+ *   cross_attn        (8-head RoPE): object-query ← memory-bank tokens
+ *   image_cross_attn  (q/k only):    object-query ↔ image features;
+ *     V and out are *shared* with cross_attn (that's what makes it
+ *     "decoupled" — the query side has its own projections while the
+ *     value/output path feeds the same buffer the memory-attn updates).
+ *
+ * Plus an FFN (linear1, GELU, linear2) and three LayerNorms
+ * (norm1 before self_attn, norm2 before cross_attn, norm3 before FFN).
+ */
+struct sam3_v2_memory_attn_layer {
+	/* self_attn */
+	struct sam3_tensor *self_q_w, *self_q_b;
+	struct sam3_tensor *self_k_w, *self_k_b;
+	struct sam3_tensor *self_v_w, *self_v_b;
+	struct sam3_tensor *self_out_w, *self_out_b;
+
+	/* cross_attn (obj-query ← memory) */
+	struct sam3_tensor *cross_q_w, *cross_q_b;
+	struct sam3_tensor *cross_k_w, *cross_k_b;
+	struct sam3_tensor *cross_v_w, *cross_v_b;
+	struct sam3_tensor *cross_out_w, *cross_out_b;
+
+	/* image_cross_attn — only q and k projections; shares V+out with
+	 * cross_attn. */
+	struct sam3_tensor *img_q_w, *img_q_b;
+	struct sam3_tensor *img_k_w, *img_k_b;
+
+	/* FFN: 256 -> 2048 -> 256 */
+	struct sam3_tensor *lin1_w, *lin1_b;
+	struct sam3_tensor *lin2_w, *lin2_b;
+
+	/* 3 LayerNorms */
+	struct sam3_tensor *norm1_w, *norm1_b;
+	struct sam3_tensor *norm2_w, *norm2_b;
+	struct sam3_tensor *norm3_w, *norm3_b;
+};
+
+/*
+ * Memory-attention encoder: 4 layers + a final LayerNorm.
+ */
+struct sam3_v2_memory_attn {
+	struct sam3_v2_memory_attn_layer layers[4];
+	struct sam3_tensor *final_norm_w;
+	struct sam3_tensor *final_norm_b;
+};
+
+/*
  * Top-level SAM 3.1 tracker. Sub-modules reserved for later phases
- * (transformer, sam_mask_decoder, interactive path) are placeholders
- * for now — see the sub-project-2 spec.
+ * (sam_mask_decoder, interactive path) are placeholders for now —
+ * see the sub-project-2 spec.
  */
 struct sam3_tracker_v2 {
+	/* --- memory attention transformer (phase 2.3a, 122 tensors) --- */
+	struct sam3_v2_memory_attn transformer;
+
 	/* --- maskmem backbone (phase 2.1, 38 tensors) --- */
 	struct sam3_v2_maskmem maskmem;
 
@@ -158,6 +214,7 @@ struct sam3_tracker_v2 {
  * 6 (singletons) = 54.
  */
 #define SAM3_V2_PHASE_2_1_TENSORS 54
+#define SAM3_V2_PHASE_2_3A_TENSORS (54 + 122)  /* + transformer */
 
 /*
  * sam3_tracker_v2_init - Zero the struct and seed config constants.
