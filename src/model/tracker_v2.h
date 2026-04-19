@@ -278,4 +278,70 @@ struct sam3_tensor *sam3_v2_maskmem_forward(
 		struct sam3_tensor *masks,
 		int skip_mask_sigmoid);
 
+/*
+ * sam3_v2_memory_attn_forward - Build the memory-attention graph for a
+ * single tracker frame.
+ *
+ * PHASE 2.3B STUB. Returns NULL unconditionally; phase 2.3b fills in
+ * the 8-head decoupled RoPE attention. The interface below describes
+ * what the full implementation will consume.
+ *
+ * @g:                Graph being built.
+ * @arena:            Arena for intermediate tensors.
+ * @ma:               Loaded memory-attention transformer (4 layers).
+ * @tgt:              Object queries [B, Nq, 256].
+ * @tgt_pos:          Positional encoding for object queries [B, Nq, 256]
+ *                    (unused when pos_enc_at_attn=false, which matches
+ *                    the upstream SAM 3.1 config).
+ * @image:            Image features [B, HW, 256] for the current frame.
+ * @image_pos:        Image positional encoding [B, HW, 256] (fed as the
+ *                    image-side K-projection input, NOT summed into Q).
+ * @memory:           Memory-bank tokens from prior frames
+ *                    [B, N_mem, 256]. Includes obj_ptr tokens + maskmem
+ *                    tokens.
+ * @memory_pos:       Memory positional encoding [B, N_mem, 256]
+ *                    (summed into the image-side K projection).
+ * @num_k_exclude_rope: Number of memory K tokens to skip RoPE on
+ *                    (obj_ptr tokens do not receive RoPE; see upstream
+ *                    SimpleRoPEAttention kwarg).
+ *
+ * Semantics per layer (`DecoupledTransformerDecoderLayerv2`):
+ *
+ *   ## Self-attention on tgt (8-head RoPE)
+ *   tgt2 = norm1(tgt)
+ *   q = self_attn_q_proj(tgt2)
+ *   k = self_attn_k_proj(tgt2)
+ *   v = self_attn_v_proj(tgt2)
+ *   tgt = tgt + self_attn_out_proj(attn_rope(q, k, v))
+ *
+ *   ## Decoupled cross-attention (image + memory, 8-head RoPE)
+ *   tgt2 = norm2(tgt)
+ *   q = image_cross_attn_q_proj(image) + cross_attn_q_proj(tgt2)
+ *   k = image_cross_attn_k_proj(memory_image) +
+ *         cross_attn_k_proj(memory)
+ *   v = cross_attn_v_proj(memory)
+ *   tgt = tgt + cross_attn_out_proj(attn_rope(q, k, v))
+ *
+ *   ## FFN
+ *   tgt2 = norm3(tgt)
+ *   tgt = tgt + linear2(GELU(linear1(tgt2)))
+ *
+ * Final: encoder.norm(tgt) after all 4 layers.
+ *
+ * `memory_image` in the reference is the per-frame image features
+ * concatenated across the 7 memory slots with positional offsets; the
+ * caller sets it up from the memory bank's stored pix_feat snapshots.
+ */
+struct sam3_tensor *sam3_v2_memory_attn_forward(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		const struct sam3_v2_memory_attn *ma,
+		struct sam3_tensor *tgt,
+		struct sam3_tensor *tgt_pos,
+		struct sam3_tensor *image,
+		struct sam3_tensor *image_pos,
+		struct sam3_tensor *memory,
+		struct sam3_tensor *memory_pos,
+		int num_k_exclude_rope);
+
 #endif /* SAM3_MODEL_TRACKER_V2_H */

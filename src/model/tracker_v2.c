@@ -469,3 +469,43 @@ struct sam3_tensor *sam3_v2_maskmem_forward(
 
 	return x;
 }
+
+/*
+ * PHASE 2.3B STUB — the decoupled 8-head RoPE memory attention.
+ *
+ * Needs three sub-pieces that don't exist as graph helpers today:
+ *   (a) Multi-head attention with pre-projected Q/K/V and optional
+ *       RoPE on a configurable per-head stride. Existing
+ *       gh_multihead_attention_rope_sep always projects internally
+ *       from a single input and assumes one position basis for both
+ *       Q and K.
+ *   (b) RoPE tables for the 72x72 image feature grid that match the
+ *       `SimpleRoPEAttention(rope_theta=10000, feat_sizes=[72,72])`
+ *       config (2D axial RoPE, not the 1D sequence RoPE used in the
+ *       text encoder).
+ *   (c) A `num_k_exclude_rope` knob so obj_ptr memory tokens bypass
+ *       the rotation while maskmem tokens don't.
+ *
+ * Returning NULL here instead of silently producing garbage keeps
+ * sam3_video_start_ex's SAM-3.1 reject honest: tracking fails cleanly
+ * until this implementation lands.
+ */
+struct sam3_tensor *sam3_v2_memory_attn_forward(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		const struct sam3_v2_memory_attn *ma,
+		struct sam3_tensor *tgt,
+		struct sam3_tensor *tgt_pos,
+		struct sam3_tensor *image,
+		struct sam3_tensor *image_pos,
+		struct sam3_tensor *memory,
+		struct sam3_tensor *memory_pos,
+		int num_k_exclude_rope)
+{
+	(void)g; (void)arena; (void)ma; (void)tgt; (void)tgt_pos;
+	(void)image; (void)image_pos; (void)memory; (void)memory_pos;
+	(void)num_k_exclude_rope;
+	sam3_log_error("sam3_v2_memory_attn_forward: not yet implemented "
+		       "(phase 2.3b)");
+	return NULL;
+}
