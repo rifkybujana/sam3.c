@@ -21,6 +21,7 @@
 #include "tracker_v2.h"
 #include "graph_helpers.h"
 #include "util/log.h"
+#include "core/graph.h"
 
 /*
  * Helper: load a Conv2d weight from OHWI mmap with an explicit
@@ -285,3 +286,110 @@ enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
 }
 
 #undef LOAD
+
+/* ── Forward graph builders (phase 2.2) ─────────────────────────────── */
+
+/*
+ * Apply one CXBlock (ConvNeXt) in channels-last:
+ *   y = dwconv(x)
+ *   y = layernorm(y)
+ *   y = linear(pwconv1, gelu)
+ *   y = linear(pwconv2)
+ *   y = y * gamma
+ *   return x + y
+ */
+static struct sam3_tensor *cxblock_forward(
+		struct sam3_graph *g, struct sam3_arena *a,
+		const struct sam3_v2_cxblock *blk,
+		struct sam3_tensor *x)
+{
+	int dim = x->dims[3];
+	struct sam3_tensor *residual = x;
+
+	/* Depthwise conv: groups == channels. Weight is OHWI [C, 7, 7, 1]. */
+	struct sam3_tensor *y = gh_conv2d(g, a, x,
+		blk->dwconv_w, blk->dwconv_b, 1, 3, dim);
+	if (!y) return NULL;
+
+	y = gh_layernorm(g, a, y, blk->norm_w, blk->norm_b);
+	if (!y) return NULL;
+
+	y = gh_linear(g, a, y, blk->pwconv1_w, blk->pwconv1_b);
+	if (!y) return NULL;
+
+	y = gh_gelu(g, a, y);
+	if (!y) return NULL;
+
+	y = gh_linear(g, a, y, blk->pwconv2_w, blk->pwconv2_b);
+	if (!y) return NULL;
+
+	y = gh_mul(g, a, y, blk->gamma);
+	if (!y) return NULL;
+
+	return gh_add(g, a, residual, y);
+}
+
+struct sam3_tensor *sam3_v2_maskmem_forward(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		const struct sam3_v2_maskmem *mm,
+		struct sam3_tensor *pix_feat,
+		struct sam3_tensor *masks,
+		int skip_mask_sigmoid)
+{
+	if (!g || !arena || !mm || !pix_feat || !masks)
+		return NULL;
+	if (pix_feat->n_dims != 4 || masks->n_dims != 4)
+		return NULL;
+
+	struct sam3_tensor *x = masks;
+
+	/* 1. Sigmoid the mask logits (unless caller already applied). */
+	if (!skip_mask_sigmoid) {
+		x = gh_sigmoid(g, arena, x);
+		if (!x) return NULL;
+	}
+
+	/* 2. Four-stage downsampler: Conv2d(k=3, s=2, p=1) + LN2d + GELU. */
+	for (int s = 0; s < 4; s++) {
+		x = gh_conv2d(g, arena, x,
+			       mm->mask_downsampler.conv_w[s],
+			       mm->mask_downsampler.conv_b[s],
+			       2, 1, 1);
+		if (!x) return NULL;
+
+		/* LayerNorm2d in channels-first is equivalent to LayerNorm
+		 * over the last dim in NHWC — our layout. */
+		x = gh_layernorm(g, arena, x,
+				  mm->mask_downsampler.norm_w[s],
+				  mm->mask_downsampler.norm_b[s]);
+		if (!x) return NULL;
+
+		x = gh_gelu(g, arena, x);
+		if (!x) return NULL;
+	}
+
+	/* 3. Final 1x1 projection to hidden_dim (256). */
+	x = gh_conv2d(g, arena, x,
+		       mm->mask_downsampler.proj_w,
+		       mm->mask_downsampler.proj_b,
+		       1, 0, 1);
+	if (!x) return NULL;
+
+	/* 4. Project pix_feat through a 1x1 conv (pix_feat_proj). */
+	struct sam3_tensor *pix = gh_conv2d(g, arena, pix_feat,
+		mm->pix_feat_proj_w, mm->pix_feat_proj_b, 1, 0, 1);
+	if (!pix) return NULL;
+
+	/* 5. Element-wise sum of projected pix_feat and downsampled masks. */
+	x = gh_add(g, arena, pix, x);
+	if (!x) return NULL;
+
+	/* 6. Two CXBlocks in the fuser. */
+	for (int i = 0; i < 2; i++) {
+		x = cxblock_forward(g, arena, &mm->fuser[i], x);
+		if (!x) return NULL;
+	}
+
+	return x;
+}

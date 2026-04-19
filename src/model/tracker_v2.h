@@ -28,6 +28,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "core/alloc.h"
+#include "core/graph.h"
 
 /*
  * Multiplex bucket size. The SAM 3.1 checkpoint bakes 16 into several
@@ -185,5 +186,39 @@ enum sam3_error sam3_tracker_v2_init(struct sam3_tracker_v2 *trk);
 enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
 				     const struct sam3_weight_file *wf,
 				     struct sam3_arena *arena);
+
+/*
+ * sam3_v2_maskmem_forward - Build the graph that encodes a
+ * (pix_feat, masks) pair into a memory-tokens tensor.
+ *
+ * @g:         Graph being built.
+ * @arena:     Arena for intermediate tensors.
+ * @mm:        Loaded maskmem sub-module.
+ * @pix_feat:  [1, H, W, 256] NHWC — usually the 1x-scale neck output
+ *             (H=W=72 in production).
+ * @masks:     [1, H*16, W*16, 32] NHWC — multiplex-packed mask logits
+ *             (pre-sigmoid). In production H*16=W*16=1152.
+ *
+ * Shape:
+ *   masks -> sigmoid -> 4-stage Conv+LN+GELU downsampler (stride 2 each)
+ *         -> 1x1 proj -> [1, H, W, 256]
+ *   pix_feat -> pix_feat_proj (1x1) -> [1, H, W, 256]
+ *   sum + 2x CXBlock fuser -> [1, H, W, 256]
+ *
+ * Returns the output tensor on success. Returns NULL on allocation
+ * failure; the caller must have space in the arena for the
+ * intermediate activations (the 1152-scale mask path is the peak;
+ * budget at least ~170 MiB of scratch for production sizes).
+ *
+ * The caller is responsible for sigmoid preprocessing if it wants to
+ * pass in already-sigmoid-ed masks: pass `skip_mask_sigmoid = 1`.
+ */
+struct sam3_tensor *sam3_v2_maskmem_forward(
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		const struct sam3_v2_maskmem *mm,
+		struct sam3_tensor *pix_feat,
+		struct sam3_tensor *masks,
+		int skip_mask_sigmoid);
 
 #endif /* SAM3_MODEL_TRACKER_V2_H */

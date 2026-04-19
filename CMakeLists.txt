@@ -280,6 +280,12 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
+	# test_maskmem_v2_forward runs the forward graph; same dependency.
+	if(TARGET test_maskmem_v2_forward)
+		target_compile_definitions(test_maskmem_v2_forward PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
 	# test_cli_common needs tools/ include path and cli_common.c
 	if(TARGET test_cli_common)
 		target_sources(test_cli_common PRIVATE tools/cli_common.c)
