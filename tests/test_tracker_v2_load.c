@@ -162,6 +162,45 @@ int main(void)
 	assert_tensor(trk.transformer.final_norm_w, "final_norm_w", 1, 256);
 	assert_tensor(trk.transformer.final_norm_b, "final_norm_b", 1, 256);
 
+	/* ── SAM mask decoder (phase 2.4a) ──────────────────────────────── */
+	printf("  sam_mask_decoder (2-layer transformer + heads)\n");
+	for (int li = 0; li < 2; li++) {
+		struct sam3_v2_mask_decoder_layer *L =
+			&trk.sam_mask_decoder.layers[li];
+		/* self_attn is full 256-dim */
+		assert_tensor(L->self_q_w, "md.self_q_w", 2, 256, 256);
+		/* cross attn downsampled to 128 */
+		assert_tensor(L->ct2i_q_w, "md.ct2i_q_w", 2, 128, 256);
+		assert_tensor(L->ct2i_out_w, "md.ct2i_out_w", 2, 256, 128);
+		assert_tensor(L->ci2t_q_w, "md.ci2t_q_w", 2, 128, 256);
+		assert_tensor(L->mlp_lin1_w, "md.mlp_lin1_w", 2, 2048, 256);
+		assert_tensor(L->norm4_w, "md.norm4_w", 1, 256);
+	}
+	assert_tensor(trk.sam_mask_decoder.final_q_w, "md.final_q_w",
+		       2, 128, 256);
+	assert_tensor(trk.sam_mask_decoder.up0_w, "md.up0_w",
+		       4, 256, 2, 2, 64);
+	assert_tensor(trk.sam_mask_decoder.up3_w, "md.up3_w",
+		       4, 64, 2, 2, 32);
+	for (int m = 0; m < 3; m++) {
+		assert_tensor(trk.sam_mask_decoder.hn_w[m][2], "md.hn_last",
+			       2, 32, 256);
+	}
+	assert_tensor(trk.sam_mask_decoder.iou_head_w[2], "md.iou_head_last",
+		       2, 3, 256);
+	assert_tensor(trk.sam_mask_decoder.score_head_w[2],
+		       "md.score_head_last", 2, 1, 256);
+	assert_tensor(trk.sam_mask_decoder.conv_s0_w, "md.conv_s0_w",
+		       4, 32, 1, 1, 256);
+	assert_tensor(trk.sam_mask_decoder.conv_s1_w, "md.conv_s1_w",
+		       4, 64, 1, 1, 256);
+	assert_tensor(trk.sam_mask_decoder.iou_token,    "md.iou_token",
+		       2, 16, 256);
+	assert_tensor(trk.sam_mask_decoder.mask_tokens,  "md.mask_tokens",
+		       2, 48, 256);
+	assert_tensor(trk.sam_mask_decoder.obj_score_token,
+		       "md.obj_score_token", 2, 16, 256);
+
 	/* ── Singletons ─────────────────────────────────────────────────── */
 	printf("  singleton embeddings\n");
 	assert_tensor(trk.image_pe_gauss, "image_pe_gauss", 2, 2, 128);
@@ -179,7 +218,7 @@ int main(void)
 	sam3_arena_free(&arena);
 	sam3_weight_close(&wf);
 
-	printf("test_tracker_v2_load: PASS (phase-2.3a all %d tensors)\n",
-	       SAM3_V2_PHASE_2_3A_TENSORS);
+	printf("test_tracker_v2_load: PASS (phase-2.4a all %d tensors)\n",
+	       SAM3_V2_PHASE_2_4A_TENSORS);
 	return 0;
 }

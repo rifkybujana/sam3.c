@@ -269,6 +269,201 @@ static enum sam3_error load_memory_attn(struct sam3_v2_memory_attn *ma,
 	return SAM3_OK;
 }
 
+static enum sam3_error load_mask_decoder_layer(
+		struct sam3_v2_mask_decoder_layer *L, int layer_idx,
+		const struct sam3_weight_file *wf, struct sam3_arena *arena)
+{
+	char buf[SAM3_WEIGHT_NAME_MAX];
+#define LM(dst, field, ndims_, ...) \
+	do { \
+		snprintf(buf, sizeof(buf), \
+			 "tracker_v2.sam_mask_decoder.transformer." \
+			 "layers.%d." field, layer_idx); \
+		const char *_name = buf; \
+		LOAD(dst, SAM3_DTYPE_F32, (ndims_), __VA_ARGS__); \
+	} while (0)
+
+	/* self_attn (full 256-dim) */
+	LM(L->self_q_w, "self_attn.q_proj.weight", 2, 256, 256);
+	LM(L->self_q_b, "self_attn.q_proj.bias",   1, 256);
+	LM(L->self_k_w, "self_attn.k_proj.weight", 2, 256, 256);
+	LM(L->self_k_b, "self_attn.k_proj.bias",   1, 256);
+	LM(L->self_v_w, "self_attn.v_proj.weight", 2, 256, 256);
+	LM(L->self_v_b, "self_attn.v_proj.bias",   1, 256);
+	LM(L->self_out_w, "self_attn.out_proj.weight", 2, 256, 256);
+	LM(L->self_out_b, "self_attn.out_proj.bias",   1, 256);
+
+	/* cross_attn_token_to_image (downsample-2: 256 -> 128 -> 256) */
+	LM(L->ct2i_q_w, "cross_attn_token_to_image.q_proj.weight", 2, 128, 256);
+	LM(L->ct2i_q_b, "cross_attn_token_to_image.q_proj.bias",   1, 128);
+	LM(L->ct2i_k_w, "cross_attn_token_to_image.k_proj.weight", 2, 128, 256);
+	LM(L->ct2i_k_b, "cross_attn_token_to_image.k_proj.bias",   1, 128);
+	LM(L->ct2i_v_w, "cross_attn_token_to_image.v_proj.weight", 2, 128, 256);
+	LM(L->ct2i_v_b, "cross_attn_token_to_image.v_proj.bias",   1, 128);
+	LM(L->ct2i_out_w, "cross_attn_token_to_image.out_proj.weight", 2, 256, 128);
+	LM(L->ct2i_out_b, "cross_attn_token_to_image.out_proj.bias",   1, 256);
+
+	/* cross_attn_image_to_token (same shapes) */
+	LM(L->ci2t_q_w, "cross_attn_image_to_token.q_proj.weight", 2, 128, 256);
+	LM(L->ci2t_q_b, "cross_attn_image_to_token.q_proj.bias",   1, 128);
+	LM(L->ci2t_k_w, "cross_attn_image_to_token.k_proj.weight", 2, 128, 256);
+	LM(L->ci2t_k_b, "cross_attn_image_to_token.k_proj.bias",   1, 128);
+	LM(L->ci2t_v_w, "cross_attn_image_to_token.v_proj.weight", 2, 128, 256);
+	LM(L->ci2t_v_b, "cross_attn_image_to_token.v_proj.bias",   1, 128);
+	LM(L->ci2t_out_w, "cross_attn_image_to_token.out_proj.weight", 2, 256, 128);
+	LM(L->ci2t_out_b, "cross_attn_image_to_token.out_proj.bias",   1, 256);
+
+	/* MLP (256 -> 2048 -> 256) */
+	LM(L->mlp_lin1_w, "mlp.lin1.weight", 2, 2048, 256);
+	LM(L->mlp_lin1_b, "mlp.lin1.bias",   1, 2048);
+	LM(L->mlp_lin2_w, "mlp.lin2.weight", 2, 256, 2048);
+	LM(L->mlp_lin2_b, "mlp.lin2.bias",   1, 256);
+
+	/* 4 LayerNorms */
+	LM(L->norm1_w, "norm1.weight", 1, 256);
+	LM(L->norm1_b, "norm1.bias",   1, 256);
+	LM(L->norm2_w, "norm2.weight", 1, 256);
+	LM(L->norm2_b, "norm2.bias",   1, 256);
+	LM(L->norm3_w, "norm3.weight", 1, 256);
+	LM(L->norm3_b, "norm3.bias",   1, 256);
+	LM(L->norm4_w, "norm4.weight", 1, 256);
+	LM(L->norm4_b, "norm4.bias",   1, 256);
+#undef LM
+	return SAM3_OK;
+}
+
+static enum sam3_error load_sam_mask_decoder(
+		struct sam3_v2_mask_decoder *md,
+		const struct sam3_weight_file *wf, struct sam3_arena *arena)
+{
+	char buf[SAM3_WEIGHT_NAME_MAX];
+	enum sam3_error err;
+
+	/* 2-layer transformer */
+	for (int i = 0; i < 2; i++) {
+		err = load_mask_decoder_layer(&md->layers[i], i, wf, arena);
+		if (err != SAM3_OK) return err;
+	}
+
+#define LD(dst, path, ndims_, ...) \
+	do { \
+		snprintf(buf, sizeof(buf), \
+			 "tracker_v2.sam_mask_decoder." path); \
+		const char *_name = buf; \
+		LOAD(dst, SAM3_DTYPE_F32, (ndims_), __VA_ARGS__); \
+	} while (0)
+
+	/* final_attn_token_to_image (downsample-2) */
+	LD(md->final_q_w, "transformer.final_attn_token_to_image.q_proj.weight", 2, 128, 256);
+	LD(md->final_q_b, "transformer.final_attn_token_to_image.q_proj.bias",   1, 128);
+	LD(md->final_k_w, "transformer.final_attn_token_to_image.k_proj.weight", 2, 128, 256);
+	LD(md->final_k_b, "transformer.final_attn_token_to_image.k_proj.bias",   1, 128);
+	LD(md->final_v_w, "transformer.final_attn_token_to_image.v_proj.weight", 2, 128, 256);
+	LD(md->final_v_b, "transformer.final_attn_token_to_image.v_proj.bias",   1, 128);
+	LD(md->final_out_w, "transformer.final_attn_token_to_image.out_proj.weight", 2, 256, 128);
+	LD(md->final_out_b, "transformer.final_attn_token_to_image.out_proj.bias",   1, 256);
+	LD(md->norm_final_w, "transformer.norm_final_attn.weight", 1, 256);
+	LD(md->norm_final_b, "transformer.norm_final_attn.bias",   1, 256);
+
+	/* output_upscaling: conv_transpose2d (OHWI), LN2d, conv_transpose2d */
+	LD(md->up0_w, "output_upscaling.0.weight", 4, 256, 2, 2, 64);
+	LD(md->up0_b, "output_upscaling.0.bias",   1, 64);
+	LD(md->up1_w, "output_upscaling.1.weight", 1, 64);
+	LD(md->up1_b, "output_upscaling.1.bias",   1, 64);
+	LD(md->up3_w, "output_upscaling.3.weight", 4, 64, 2, 2, 32);
+	LD(md->up3_b, "output_upscaling.3.bias",   1, 32);
+
+	/* output_hypernetworks_mlps[0..2]: 3-layer MLPs (256 -> 256 -> 256 -> 32) */
+	for (int m = 0; m < 3; m++) {
+		char mbuf[SAM3_WEIGHT_NAME_MAX];
+		int out_dims[3] = {256, 256, 32};
+		int in_dims[3]  = {256, 256, 256};
+		for (int L = 0; L < 3; L++) {
+			snprintf(mbuf, sizeof(mbuf),
+				 "tracker_v2.sam_mask_decoder."
+				 "output_hypernetworks_mlps.%d.layers.%d.weight",
+				 m, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->hn_w[m][L], SAM3_DTYPE_F32, 2,
+				     out_dims[L], in_dims[L]);
+			}
+			snprintf(mbuf, sizeof(mbuf),
+				 "tracker_v2.sam_mask_decoder."
+				 "output_hypernetworks_mlps.%d.layers.%d.bias",
+				 m, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->hn_b[m][L], SAM3_DTYPE_F32, 1,
+				     out_dims[L]);
+			}
+		}
+	}
+
+	/* iou_prediction_head: 3-layer MLP (256 -> 256 -> 256 -> 3) */
+	{
+		int out_dims[3] = {256, 256, 3};
+		int in_dims[3]  = {256, 256, 256};
+		char mbuf[SAM3_WEIGHT_NAME_MAX];
+		for (int L = 0; L < 3; L++) {
+			snprintf(mbuf, sizeof(mbuf),
+				 "tracker_v2.sam_mask_decoder."
+				 "iou_prediction_head.layers.%d.weight", L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->iou_head_w[L], SAM3_DTYPE_F32, 2,
+				     out_dims[L], in_dims[L]);
+			}
+			snprintf(mbuf, sizeof(mbuf),
+				 "tracker_v2.sam_mask_decoder."
+				 "iou_prediction_head.layers.%d.bias", L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->iou_head_b[L], SAM3_DTYPE_F32, 1,
+				     out_dims[L]);
+			}
+		}
+	}
+
+	/* pred_obj_score_head: 3-layer MLP (256 -> 256 -> 256 -> 1) */
+	{
+		int out_dims[3] = {256, 256, 1};
+		int in_dims[3]  = {256, 256, 256};
+		char mbuf[SAM3_WEIGHT_NAME_MAX];
+		for (int L = 0; L < 3; L++) {
+			snprintf(mbuf, sizeof(mbuf),
+				 "tracker_v2.sam_mask_decoder."
+				 "pred_obj_score_head.layers.%d.weight", L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->score_head_w[L], SAM3_DTYPE_F32, 2,
+				     out_dims[L], in_dims[L]);
+			}
+			snprintf(mbuf, sizeof(mbuf),
+				 "tracker_v2.sam_mask_decoder."
+				 "pred_obj_score_head.layers.%d.bias", L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->score_head_b[L], SAM3_DTYPE_F32, 1,
+				     out_dims[L]);
+			}
+		}
+	}
+
+	/* High-res feature convs (OHWI) */
+	LD(md->conv_s0_w, "conv_s0.weight", 4, 32, 1, 1, 256);
+	LD(md->conv_s0_b, "conv_s0.bias",   1, 32);
+	LD(md->conv_s1_w, "conv_s1.weight", 4, 64, 1, 1, 256);
+	LD(md->conv_s1_b, "conv_s1.bias",   1, 64);
+
+	/* Learned output tokens (multiplex-sized) */
+	LD(md->iou_token,        "iou_token.weight",        2, 16, 256);
+	LD(md->mask_tokens,      "mask_tokens.weight",      2, 48, 256);
+	LD(md->obj_score_token,  "obj_score_token.weight",  2, 16, 256);
+#undef LD
+	return SAM3_OK;
+}
+
 static enum sam3_error load_singletons(struct sam3_tracker_v2 *trk,
 				       const struct sam3_weight_file *wf,
 				       struct sam3_arena *arena)
@@ -332,6 +527,9 @@ enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
 	err = load_memory_attn(&trk->transformer, wf, arena);
 	if (err != SAM3_OK) return err;
 
+	err = load_sam_mask_decoder(&trk->sam_mask_decoder, wf, arena);
+	if (err != SAM3_OK) return err;
+
 	err = load_mlp3(&trk->obj_ptr_proj, "tracker_v2.obj_ptr_proj",
 			wf, arena);
 	if (err != SAM3_OK) return err;
@@ -356,8 +554,8 @@ enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
 	err = load_singletons(trk, wf, arena);
 	if (err != SAM3_OK) return err;
 
-	sam3_log_info("tracker_v2: loaded phase-2.3a weights "
-		      "(maskmem + transformer + obj_ptr + singletons)");
+	sam3_log_info("tracker_v2: loaded phase-2.4a weights "
+		      "(maskmem + transformer + mask_decoder + obj_ptr + singletons)");
 	return SAM3_OK;
 }
 

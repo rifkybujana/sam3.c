@@ -154,6 +154,91 @@ struct sam3_v2_memory_attn {
 };
 
 /*
+ * SAM mask-decoder two-way transformer layer. Cross-attention uses a
+ * 128-dim projected head (attention downsample rate = 2 on 256 model
+ * dim). Self-attention keeps full 256 dim.
+ */
+struct sam3_v2_mask_decoder_layer {
+	/* self_attn: 256 -> 256 (q/k/v/out) */
+	struct sam3_tensor *self_q_w, *self_q_b;
+	struct sam3_tensor *self_k_w, *self_k_b;
+	struct sam3_tensor *self_v_w, *self_v_b;
+	struct sam3_tensor *self_out_w, *self_out_b;
+
+	/* cross_attn_token_to_image: 256 -> 128 (qkv), 128 -> 256 (out) */
+	struct sam3_tensor *ct2i_q_w, *ct2i_q_b;
+	struct sam3_tensor *ct2i_k_w, *ct2i_k_b;
+	struct sam3_tensor *ct2i_v_w, *ct2i_v_b;
+	struct sam3_tensor *ct2i_out_w, *ct2i_out_b;
+
+	/* cross_attn_image_to_token: same shapes as above */
+	struct sam3_tensor *ci2t_q_w, *ci2t_q_b;
+	struct sam3_tensor *ci2t_k_w, *ci2t_k_b;
+	struct sam3_tensor *ci2t_v_w, *ci2t_v_b;
+	struct sam3_tensor *ci2t_out_w, *ci2t_out_b;
+
+	/* mlp: 256 -> 2048 -> 256 */
+	struct sam3_tensor *mlp_lin1_w, *mlp_lin1_b;
+	struct sam3_tensor *mlp_lin2_w, *mlp_lin2_b;
+
+	/* 4 LayerNorms */
+	struct sam3_tensor *norm1_w, *norm1_b;
+	struct sam3_tensor *norm2_w, *norm2_b;
+	struct sam3_tensor *norm3_w, *norm3_b;
+	struct sam3_tensor *norm4_w, *norm4_b;
+};
+
+/*
+ * SAM 3.1 multiplex-capable mask decoder (`sam_mask_decoder`, 125
+ * tensors). Structure mirrors SAM 3's mask decoder, with two small
+ * but important additions:
+ *
+ *   - conv_s0 / conv_s1 — 1x1 convs on the 4x/2x neck scales,
+ *     producing 32-ch and 64-ch high-res feature maps that feed the
+ *     upscaling stage.
+ *   - multiplex-sized output tokens: iou_token [16, 256],
+ *     mask_tokens [48, 256] (16 obj × 3 multimask outputs),
+ *     obj_score_token [16, 256].
+ */
+struct sam3_v2_mask_decoder {
+	/* 2-layer two-way transformer */
+	struct sam3_v2_mask_decoder_layer layers[2];
+
+	/* final_attn_token_to_image (same shape as cross_attn_*_to_*) */
+	struct sam3_tensor *final_q_w, *final_q_b;
+	struct sam3_tensor *final_k_w, *final_k_b;
+	struct sam3_tensor *final_v_w, *final_v_b;
+	struct sam3_tensor *final_out_w, *final_out_b;
+	struct sam3_tensor *norm_final_w, *norm_final_b;
+
+	/* output_upscaling: ConvT2d -> LN2d -> GELU -> ConvT2d */
+	struct sam3_tensor *up0_w, *up0_b;   /* [256, 2, 2, 64] OHWI */
+	struct sam3_tensor *up1_w, *up1_b;   /* LN2d [64] */
+	struct sam3_tensor *up3_w, *up3_b;   /* [64, 2, 2, 32] OHWI */
+
+	/* output_hypernetworks_mlps: 3 MLPs, each 256->256->32 */
+	struct sam3_tensor *hn_w[3][3];  /* [mlp_idx][layer_idx] */
+	struct sam3_tensor *hn_b[3][3];
+
+	/* iou_prediction_head: 3-layer MLP 256 -> 256 -> 256 -> 3 */
+	struct sam3_tensor *iou_head_w[3];
+	struct sam3_tensor *iou_head_b[3];
+
+	/* pred_obj_score_head: 3-layer MLP 256 -> 256 -> 256 -> 1 */
+	struct sam3_tensor *score_head_w[3];
+	struct sam3_tensor *score_head_b[3];
+
+	/* High-res feature convs (neck 4x / 2x) */
+	struct sam3_tensor *conv_s0_w, *conv_s0_b;  /* [32, 1, 1, 256] */
+	struct sam3_tensor *conv_s1_w, *conv_s1_b;  /* [64, 1, 1, 256] */
+
+	/* Learned output tokens */
+	struct sam3_tensor *iou_token;       /* [16, 256] */
+	struct sam3_tensor *mask_tokens;     /* [48, 256] = 16 × 3 */
+	struct sam3_tensor *obj_score_token; /* [16, 256] */
+};
+
+/*
  * Top-level SAM 3.1 tracker. Sub-modules reserved for later phases
  * (sam_mask_decoder, interactive path) are placeholders for now —
  * see the sub-project-2 spec.
@@ -161,6 +246,9 @@ struct sam3_v2_memory_attn {
 struct sam3_tracker_v2 {
 	/* --- memory attention transformer (phase 2.3a, 122 tensors) --- */
 	struct sam3_v2_memory_attn transformer;
+
+	/* --- SAM mask decoder (phase 2.4a, 125 tensors) --- */
+	struct sam3_v2_mask_decoder sam_mask_decoder;
 
 	/* --- maskmem backbone (phase 2.1, 38 tensors) --- */
 	struct sam3_v2_maskmem maskmem;
@@ -215,6 +303,7 @@ struct sam3_tracker_v2 {
  */
 #define SAM3_V2_PHASE_2_1_TENSORS 54
 #define SAM3_V2_PHASE_2_3A_TENSORS (54 + 122)  /* + transformer */
+#define SAM3_V2_PHASE_2_4A_TENSORS (54 + 122 + 125)  /* + sam_mask_decoder */
 
 /*
  * sam3_tracker_v2_init - Zero the struct and seed config constants.
