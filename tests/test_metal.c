@@ -33,7 +33,7 @@
 
 #ifdef SAM3_HAS_METAL
 
-/* --- Helpers ────── --- */
+/* --- Helpers  --- */
 
 static struct sam3_tensor make_tensor(enum sam3_dtype dtype,
 				      int n_dims, const int *dims)
@@ -60,7 +60,7 @@ static int float_arrays_match(const float *a, const float *b,
 	return 1;
 }
 
-/* --- Test: init and free ────────────── --- */
+/* --- Test: init and free  --- */
 
 static void test_metal_init_free(void)
 {
@@ -73,7 +73,7 @@ static void test_metal_init_free(void)
 	sam3_backend_free(be);
 }
 
-/* --- Test: tensor allocation ────────── --- */
+/* --- Test: tensor allocation  --- */
 
 static void test_metal_alloc_tensor(void)
 {
@@ -257,7 +257,7 @@ static void test_metal_matmul_large_k_parity(void)
 	sam3_backend_free(cpu);
 }
 
-/* --- Test: add ─── --- */
+/* --- Test: add  --- */
 
 static void test_metal_add(void)
 {
@@ -297,7 +297,7 @@ static void test_metal_add(void)
 	sam3_backend_free(cpu);
 }
 
-/* --- Test: softmax ── --- */
+/* --- Test: softmax  --- */
 
 static void test_metal_softmax(void)
 {
@@ -334,7 +334,7 @@ static void test_metal_softmax(void)
 	sam3_backend_free(cpu);
 }
 
-/* --- Test: reshape ── --- */
+/* --- Test: reshape  --- */
 
 static void test_metal_reshape(void)
 {
@@ -862,7 +862,7 @@ static void test_metal_sdpa_mask_cache(void)
 	sam3_backend_free(cpu);
 }
 
-/* --- Test: SiLU fused kernel ────────── --- */
+/* --- Test: SiLU fused kernel  --- */
 
 static void test_metal_silu(void)
 {
@@ -939,7 +939,7 @@ static void test_metal_silu_large(void)
 	sam3_backend_free(cpu);
 }
 
-/* --- Test: Q8_0 GPU dequantization ───── --- */
+/* --- Test: Q8_0 GPU dequantization  --- */
 
 /*
  * Validate that the GPU Q8_0->F16 dequant kernel produces correct
@@ -1008,7 +1008,7 @@ static void test_metal_dequant_q8_gpu(void)
 	sam3_backend_free(metal);
 }
 
-/* --- Test: backend factory ──────────── --- */
+/* --- Test: backend factory  --- */
 
 static void test_backend_factory_metal(void)
 {
@@ -1327,7 +1327,7 @@ static void test_metal_map_presize(void)
 
 #endif /* SAM3_HAS_METAL */
 
-/* --- Main ──────── --- */
+/* --- Main  --- */
 
 int main(void)
 {

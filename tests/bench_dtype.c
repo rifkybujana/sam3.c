@@ -53,7 +53,7 @@ static double get_time_ms(void)
 	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-/* --- Random fill helpers ──────────────── --- */
+/* --- Random fill helpers  --- */
 
 static void fill_random_f32(float *buf, int n)
 {
@@ -77,7 +77,7 @@ static void fill_random_bf16(uint16_t *buf, int n)
 	}
 }
 
-/* --- Tensor setup helpers ─────────────── --- */
+/* --- Tensor setup helpers  --- */
 
 static void make_tensor_2d(struct sam3_tensor *t, void *data,
 			   enum sam3_dtype dtype, int rows, int cols)
@@ -365,7 +365,7 @@ static double bench_add_bf16(int n, struct sam3_threadpool *pool)
 	return (bytes / (avg_ms / 1000.0)) / 1e9;
 }
 
-/* --- Main ────────── --- */
+/* --- Main  --- */
 
 int main(void)
 {

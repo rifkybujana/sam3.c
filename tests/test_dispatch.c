@@ -80,7 +80,7 @@ static struct sam3_node make_unary_node(enum sam3_op op,
 	return node;
 }
 
-/* --- Tests ───────── --- */
+/* --- Tests  --- */
 
 /*
  * Dispatch must return SAM3_EDTYPE when inputs have different dtypes.

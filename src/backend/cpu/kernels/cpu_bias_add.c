@@ -21,7 +21,7 @@
 #include "util/log.h"
 #include "util/threadpool.h"
 
-/* --- F32 bias add ── --- */
+/* --- F32 bias add  --- */
 
 struct bias_add_par_ctx {
 	const float *x;

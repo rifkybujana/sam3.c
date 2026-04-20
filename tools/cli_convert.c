@@ -277,7 +277,7 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	return 0;
 }
 
-/* --- Quantizing reader wrapper ────────── --- */
+/* --- Quantizing reader wrapper  --- */
 
 struct quant_reader_state {
 	struct weight_reader *inner;

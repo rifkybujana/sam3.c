@@ -181,7 +181,7 @@ static int load_corpus(const char *path, char **out_buf, char ***out_lines,
 	return 0;
 }
 
-/* --- Main ────────── --- */
+/* --- Main  --- */
 
 int main(int argc, char **argv)
 {
@@ -189,7 +189,7 @@ int main(int argc, char **argv)
 	printf("========================\n");
 	printf("Warmup: %d | Timed: %d\n\n", WARMUP_ITERS, TIMED_ITERS);
 
-	/* --- Byte-level mode ─────────── --- */
+	/* --- Byte-level mode  --- */
 	struct sam3_tokenizer tok;
 	enum sam3_error err = sam3_tokenizer_init(&tok);
 	if (err != SAM3_OK) {
@@ -245,7 +245,7 @@ int main(int argc, char **argv)
 
 	sam3_tokenizer_free(&tok);
 
-	/* --- Corpus throughput ───────── --- */
+	/* --- Corpus throughput  --- */
 	const char *corpus_path = (argc > 1)
 		? argv[1]
 		: "tests/data/bench_corpus.txt";

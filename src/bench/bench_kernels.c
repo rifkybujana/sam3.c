@@ -348,7 +348,7 @@ static int bench_elementwise(const struct sam3_bench_config *cfg,
 	return count;
 }
 
-/* --- Softmax benchmarks ── --- */
+/* --- Softmax benchmarks  --- */
 
 static int bench_softmax(const struct sam3_bench_config *cfg,
 			 struct sam3_backend *be,
@@ -598,7 +598,7 @@ static int bench_transpose(const struct sam3_bench_config *cfg,
 	return count;
 }
 
-/* --- Public entry point ── --- */
+/* --- Public entry point  --- */
 
 int sam3_bench_run_kernels(const struct sam3_bench_config *cfg,
 			   struct sam3_backend *be,

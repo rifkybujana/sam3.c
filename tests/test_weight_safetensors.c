@@ -48,7 +48,7 @@ fail:
 	return -1;
 }
 
-/* --- Test 1: single tensor read ───────── --- */
+/* --- Test 1: single tensor read  --- */
 
 static void test_safetensors_read(void)
 {
@@ -90,7 +90,7 @@ static void test_safetensors_read(void)
 	reader.ops->close(&reader);
 }
 
-/* --- Test 2: multi-tensor ─────────────── --- */
+/* --- Test 2: multi-tensor  --- */
 
 static void test_safetensors_multi_tensor(void)
 {
@@ -224,7 +224,7 @@ static void test_safetensors_end_to_end(void)
 	sam3_weight_close(&wf);
 }
 
-/* --- Main ────────── --- */
+/* --- Main  --- */
 
 int main(void)
 {

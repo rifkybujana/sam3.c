@@ -135,7 +135,7 @@ static enum sam3_error write_test_file(void)
 	return sam3_weight_write(TEST_FILE, &test_config, &reader);
 }
 
-/* --- Tests ───────── --- */
+/* --- Tests  --- */
 
 static void test_weight_roundtrip(void)
 {

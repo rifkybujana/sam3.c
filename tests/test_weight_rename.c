@@ -26,7 +26,7 @@
 /* Include weight_rename.h from tools/ — build system adds include path */
 #include "weight_rename.h"
 
-/* --- Mock reader ─── --- */
+/* --- Mock reader  --- */
 
 #define MOCK_MAX_TENSORS 64
 
@@ -119,7 +119,7 @@ static int find_output(struct weight_reader *rr, const char *expected_name)
 	return -1;
 }
 
-/* --- ViT backbone tests ──────────────── --- */
+/* --- ViT backbone tests  --- */
 
 static void test_vit_qkv_split(void)
 {
@@ -250,7 +250,7 @@ static void test_vit_mlp(void)
 	rr.ops->close(&rr);
 }
 
-/* --- Neck tests ──── --- */
+/* --- Neck tests  --- */
 
 static void test_neck(void)
 {
@@ -287,7 +287,7 @@ static void test_neck(void)
 	rr.ops->close(&rr);
 }
 
-/* --- Mask decoder tests ───────────────── --- */
+/* --- Mask decoder tests  --- */
 
 static void test_mask_decoder_tokens(void)
 {
@@ -609,7 +609,7 @@ static void test_mask_decoder_conv_s(void)
 	rr.ops->close(&rr);
 }
 
-/* --- Prompt encoder tests ─────────────── --- */
+/* --- Prompt encoder tests  --- */
 
 static void test_prompt_encoder(void)
 {
@@ -637,7 +637,7 @@ static void test_prompt_encoder(void)
 	rr.ops->close(&rr);
 }
 
-/* --- Memory attention tests ───────────── --- */
+/* --- Memory attention tests  --- */
 /*
  * C memory_attn.c loads weights with PyTorch attribute names directly
  * (out_proj, cross_attn_image, norm1, linear1, etc.) so the rename
@@ -801,7 +801,7 @@ static void test_passthrough(void)
 	rr.ops->close(&rr);
 }
 
-/* --- Main ────────── --- */
+/* --- Main  --- */
 
 int main(void)
 {

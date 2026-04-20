@@ -51,7 +51,7 @@ int main(void)
 		return 0;
 	}
 
-	/* --- 1. Backend + arenas ──────────── --- */
+	/* --- 1. Backend + arenas  --- */
 	struct sam3_cpu_backend cpu;
 	memset(&cpu, 0, sizeof(cpu));
 	cpu.base.type = SAM3_BACKEND_CPU;
@@ -63,7 +63,7 @@ int main(void)
 	memset(&weight_arena, 0, sizeof(weight_arena));
 	ASSERT_EQ(sam3_arena_init(&weight_arena, 8 * 1024 * 1024), SAM3_OK);
 
-	/* --- 2. Load maskmem weights ───────── --- */
+	/* --- 2. Load maskmem weights  --- */
 	struct sam3_weight_file wf;
 	memset(&wf, 0, sizeof(wf));
 	ASSERT_EQ(sam3_weight_open(&wf, MODEL_PATH), SAM3_OK);

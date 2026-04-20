@@ -37,7 +37,7 @@ static int model_available(void)
 	return access(VIDEO_TEST_MODEL_PATH, F_OK) == 0;
 }
 
-/* --- Null-safety tests ──────────────── --- */
+/* --- Null-safety tests  --- */
 
 static void test_video_frame_count_null(void)
 {
@@ -165,7 +165,7 @@ static void test_video_start_no_model(void)
 	sam3_free(ctx);
 }
 
-/* --- End-to-end: eager feature cache ─── --- */
+/* --- End-to-end: eager feature cache  --- */
 
 static void test_video_start_caches_features(void)
 {

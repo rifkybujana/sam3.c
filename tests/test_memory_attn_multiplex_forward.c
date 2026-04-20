@@ -67,7 +67,7 @@ int main(void)
 		return 0;
 	}
 
-	/* --- 1. Backend + arenas ──────────── --- */
+	/* --- 1. Backend + arenas  --- */
 	struct sam3_cpu_backend cpu;
 	memset(&cpu, 0, sizeof(cpu));
 	cpu.base.type = SAM3_BACKEND_CPU;
@@ -79,7 +79,7 @@ int main(void)
 	memset(&weight_arena, 0, sizeof(weight_arena));
 	ASSERT_EQ(sam3_arena_init(&weight_arena, 16 * 1024 * 1024), SAM3_OK);
 
-	/* --- 2. Load tracker_multiplex weights ─────── --- */
+	/* --- 2. Load tracker_multiplex weights  --- */
 	struct sam3_weight_file wf;
 	memset(&wf, 0, sizeof(wf));
 	ASSERT_EQ(sam3_weight_open(&wf, MODEL_PATH), SAM3_OK);
@@ -88,7 +88,7 @@ int main(void)
 	ASSERT_EQ(sam3_tracker_multiplex_init(&trk), SAM3_OK);
 	ASSERT_EQ(sam3_tracker_multiplex_load(&trk, &wf, &weight_arena), SAM3_OK);
 
-	/* --- 3. Build synthetic inputs ────── --- */
+	/* --- 3. Build synthetic inputs  --- */
 	int nq_dims[] = {1, TEST_NQ, TEST_HIDDEN};
 	int nm_dims[] = {1, TEST_NM, TEST_HIDDEN};
 

@@ -93,7 +93,7 @@ int main(void)
 	assert_tensor(trk.maskmem.mask_downsampler.proj_b,
 		       "mask_ds.proj_b", 1, 256);
 
-	/* --- Maskmem pix_feat_proj + fuser ─── --- */
+	/* --- Maskmem pix_feat_proj + fuser  --- */
 	printf("  maskmem.pix_feat_proj + fuser\n");
 	assert_tensor(trk.maskmem.pix_feat_proj_w,
 		       "maskmem.pix_feat_proj_w", 4, 256, 1, 1, 256);
@@ -113,7 +113,7 @@ int main(void)
 		assert_tensor(blk->gamma,    "fuser.gamma",    1, 256);
 	}
 
-	/* --- obj_ptr_proj (3-layer MLP) ────── --- */
+	/* --- obj_ptr_proj (3-layer MLP)  --- */
 	printf("  obj_ptr_proj\n");
 	for (int i = 0; i < 3; i++) {
 		assert_tensor(trk.obj_ptr_proj.fc_w[i], "obj_ptr.fc_w", 2,
@@ -122,7 +122,7 @@ int main(void)
 			       256);
 	}
 
-	/* --- Small projections ─────────────── --- */
+	/* --- Small projections  --- */
 	printf("  obj_ptr_tpos_proj + no_obj_ptr_linear\n");
 	assert_tensor(trk.obj_ptr_tpos_proj_w, "obj_ptr_tpos.w", 2, 256, 256);
 	assert_tensor(trk.obj_ptr_tpos_proj_b, "obj_ptr_tpos.b", 1, 256);
@@ -162,7 +162,7 @@ int main(void)
 	assert_tensor(trk.transformer.final_norm_w, "final_norm_w", 1, 256);
 	assert_tensor(trk.transformer.final_norm_b, "final_norm_b", 1, 256);
 
-	/* --- SAM mask decoder (phase 2.4a) ─── --- */
+	/* --- SAM mask decoder (phase 2.4a)  --- */
 	printf("  sam_mask_decoder (2-layer transformer + heads)\n");
 	for (int li = 0; li < 2; li++) {
 		struct sam3_multiplex_mask_decoder_layer *L =

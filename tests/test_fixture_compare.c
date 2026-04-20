@@ -39,7 +39,7 @@
 #define FIXTURE_DIR SAM3_SOURCE_DIR "/tests/fixtures"
 #define MODEL_PATH  SAM3_SOURCE_DIR "/models/sam3.sam3"
 
-/* --- Helpers ─────── --- */
+/* --- Helpers  --- */
 
 static int fixtures_available(void)
 {
@@ -351,7 +351,7 @@ static float compute_detected_mask_iou(const float *c_masks,
 	return n_detected > 0 ? total_iou / (float)n_detected : 0.0f;
 }
 
-/* --- Test: input normalization ────────── --- */
+/* --- Test: input normalization  --- */
 
 static void test_input_normalization(void)
 {
@@ -517,7 +517,7 @@ static void test_end_to_end_fixture_input(void)
 			"features");
 	}
 
-	/* --- Run segmentation ─────── --- */
+	/* --- Run segmentation  --- */
 	prompts[0].type = SAM3_PROMPT_POINT;
 	prompts[0].point.x = 500.0f;
 	prompts[0].point.y = 400.0f;
@@ -577,7 +577,7 @@ static void test_end_to_end_fixture_input(void)
 		FIXTURE_DIR "/09_seg_head/instance_proj.safetensors",
 		"instance_features", 5.0f);
 
-	/* --- Compare final masks ──── --- */
+	/* --- Compare final masks  --- */
 	printf("\n  Final output comparison:\n");
 
 	ASSERT_EQ(result.n_masks, msk_dims[1]);
@@ -623,7 +623,7 @@ cleanup:
 	free(py_logits);
 }
 
-/* --- Test: bus/person text-only fixture ── --- */
+/* --- Test: bus/person text-only fixture  --- */
 
 #define BUS_FIXTURE_DIR SAM3_SOURCE_DIR "/tests/fixtures/bus_person"
 
@@ -806,7 +806,7 @@ static void test_bus_person_text_only(void)
 		BUS_FIXTURE_DIR "/09_seg_head/instance_proj.safetensors",
 		"instance_features", 5.0f);
 
-	/* --- Compare final masks ──── --- */
+	/* --- Compare final masks  --- */
 	printf("\n  Final output comparison:\n");
 
 	ASSERT_EQ(result.n_masks, msk_dims[1]);
@@ -1004,7 +1004,7 @@ cleanup:
 	free(py_logits);
 }
 
-/* --- Main ────────── --- */
+/* --- Main  --- */
 
 int main(void)
 {

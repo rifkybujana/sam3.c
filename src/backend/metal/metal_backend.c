@@ -49,7 +49,7 @@ static int metal_map_dtype(enum sam3_dtype dt, mlx_dtype *out)
 	}
 }
 
-/* --- Tensor-to-mlx_array lookup table ── --- */
+/* --- Tensor-to-mlx_array lookup table  --- */
 
 /*
  * Tombstone sentinel for deleted slots in the open-addressing hash
@@ -438,7 +438,7 @@ static mlx_array metal_wrap_tensor(struct sam3_metal_backend *mtl,
 	return arr;
 }
 
-/* --- Op dispatch ── --- */
+/* --- Op dispatch  --- */
 
 /* Ensure cached GELU constants (0.5, 1/sqrt(2), 1.0) exist for the dtype. */
 static void metal_ensure_gelu_consts(struct sam3_metal_backend *mtl,
@@ -1527,7 +1527,7 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 	return SAM3_OK;
 }
 
-/* --- Backend vtable implementation ───── --- */
+/* --- Backend vtable implementation  --- */
 
 static enum sam3_error metal_init(struct sam3_backend *be)
 {

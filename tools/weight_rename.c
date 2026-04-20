@@ -30,7 +30,7 @@
 #include "weight_rename.h"
 #include "util/log.h"
 
-/* --- Data structures ── --- */
+/* --- Data structures  --- */
 
 struct rename_entry {
 	int  inner_idx;
@@ -1442,7 +1442,7 @@ static int handle_tracker_multiplex(struct rename_entry *out, int inner_idx,
 	return add_entry(out, inner_idx, buf);
 }
 
-/* --- Prefix table (longest-match-wins) ── --- */
+/* --- Prefix table (longest-match-wins)  --- */
 
 struct prefix_rule {
 	const char *py_prefix;
@@ -1655,7 +1655,7 @@ static const struct weight_reader_ops rename_reader_ops = {
 	.close            = rr_close,
 };
 
-/* --- Public init ─── --- */
+/* --- Public init  --- */
 
 /*
  * Persistent state — only one rename reader exists at a time in

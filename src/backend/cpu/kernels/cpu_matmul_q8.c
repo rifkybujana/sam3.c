@@ -133,7 +133,7 @@ static void matmul_q8_rows(const float *a,
 	}
 }
 
-/* --- Thread-parallel dispatch ─────────── --- */
+/* --- Thread-parallel dispatch --- */
 
 struct matmul_q8_ctx {
 	const float                *a;

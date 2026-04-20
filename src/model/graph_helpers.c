@@ -25,7 +25,7 @@
 #include "graph_helpers.h"
 #include "memory_bank.h"
 
-/* --- Tensor allocation ──────────────── --- */
+/* --- Tensor allocation --- */
 
 struct sam3_tensor *gh_alloc_tensor(struct sam3_arena *arena,
 				    enum sam3_dtype dtype,
@@ -164,7 +164,7 @@ struct sam3_tensor *gh_load_mmap_optional(
 	return t;
 }
 
-/* --- Unary activation ops ───────────── --- */
+/* --- Unary activation ops --- */
 
 static struct sam3_tensor *gh_unary(struct sam3_graph *g,
 				    struct sam3_arena *a,
@@ -216,7 +216,7 @@ struct sam3_tensor *gh_softmax(struct sam3_graph *g, struct sam3_arena *a,
 	return gh_unary(g, a, SAM3_OP_SOFTMAX, input);
 }
 
-/* --- Binary element-wise ops ────────── --- */
+/* --- Binary element-wise ops  --- */
 
 struct sam3_tensor *gh_add(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *x, struct sam3_tensor *b)
@@ -302,7 +302,7 @@ struct sam3_tensor *gh_linear(struct sam3_graph *g, struct sam3_arena *a,
 	return out;
 }
 
-/* --- Layer normalization ────────────── --- */
+/* --- Layer normalization  --- */
 
 struct sam3_tensor *gh_layernorm(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input,
@@ -329,7 +329,7 @@ struct sam3_tensor *gh_layernorm(struct sam3_graph *g, struct sam3_arena *a,
 	}
 }
 
-/* --- Reshape ───── --- */
+/* --- Reshape  --- */
 
 struct sam3_tensor *gh_reshape(struct sam3_graph *g, struct sam3_arena *a,
 			       struct sam3_tensor *input,
@@ -355,7 +355,7 @@ struct sam3_tensor *gh_reshape(struct sam3_graph *g, struct sam3_arena *a,
 				 (struct sam3_tensor *[]){input}, 1, out);
 }
 
-/* --- Transpose ─── --- */
+/* --- Transpose  --- */
 
 struct sam3_tensor *gh_transpose(struct sam3_graph *g, struct sam3_arena *a,
 				 struct sam3_tensor *input)
@@ -422,7 +422,7 @@ struct sam3_tensor *gh_permute(struct sam3_graph *g, struct sam3_arena *a,
 	return result;
 }
 
-/* --- Window partition / unpartition ─── --- */
+/* --- Window partition / unpartition  --- */
 
 struct sam3_tensor *gh_window_partition(struct sam3_graph *g,
 					struct sam3_arena *a,
@@ -491,7 +491,7 @@ struct sam3_tensor *gh_window_unpartition(struct sam3_graph *g,
 	return out;
 }
 
-/* --- Concat ────── --- */
+/* --- Concat  --- */
 
 /*
  * gh_concat_small - Concatenate up to SAM3_NODE_MAX_INPUTS tensors.
@@ -565,7 +565,7 @@ struct sam3_tensor *gh_concat(struct sam3_graph *g, struct sam3_arena *a,
 	return gh_concat_small(g, a, chunks, n_chunks, axis);
 }
 
-/* --- Slice ─────── --- */
+/* --- Slice  --- */
 
 struct sam3_tensor *gh_slice(struct sam3_graph *g, struct sam3_arena *a,
 			     struct sam3_tensor *input,
@@ -595,7 +595,7 @@ struct sam3_tensor *gh_slice(struct sam3_graph *g, struct sam3_arena *a,
 	return result;
 }
 
-/* --- Embedding ─── --- */
+/* --- Embedding  --- */
 
 struct sam3_tensor *gh_embed(struct sam3_graph *g, struct sam3_arena *a,
 			     struct sam3_tensor *table,
@@ -614,7 +614,7 @@ struct sam3_tensor *gh_embed(struct sam3_graph *g, struct sam3_arena *a,
 		(struct sam3_tensor *[]){table, indices}, 2, out);
 }
 
-/* --- Upsample ──── --- */
+/* --- Upsample  --- */
 
 struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 				struct sam3_tensor *input, int scale)
@@ -641,7 +641,7 @@ struct sam3_tensor *gh_upsample(struct sam3_graph *g, struct sam3_arena *a,
 	return result;
 }
 
-/* --- Rotary position embedding ──────── --- */
+/* --- Rotary position embedding  --- */
 
 struct sam3_tensor *gh_rope(struct sam3_graph *g, struct sam3_arena *a,
 			     struct sam3_tensor *input,
@@ -699,7 +699,7 @@ struct sam3_tensor *gh_sdpa(struct sam3_graph *g, struct sam3_arena *a,
 	return output;
 }
 
-/* --- Multi-head attention ───────────── --- */
+/* --- Multi-head attention  --- */
 
 struct sam3_tensor *gh_multihead_attention_rope(
 	struct sam3_graph *g, struct sam3_arena *a,
@@ -1236,7 +1236,7 @@ struct sam3_tensor *gh_cross_attention_sep(
 	return gh_linear(g, arena, merged, out_w, out_b);
 }
 
-/* --- MLP ───────── --- */
+/* --- MLP  --- */
 
 struct sam3_tensor *gh_mlp(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *input,
@@ -1258,7 +1258,7 @@ struct sam3_tensor *gh_mlp(struct sam3_graph *g, struct sam3_arena *a,
 	return gh_linear(g, a, activated, fc2_w, fc2_b);
 }
 
-/* --- Group normalization ────────────── --- */
+/* --- Group normalization  --- */
 
 struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 				 struct sam3_tensor *input,
@@ -1292,7 +1292,7 @@ struct sam3_tensor *gh_groupnorm(struct sam3_graph *g, struct sam3_arena *a,
 	return out;
 }
 
-/* --- Batch normalization ────────────── --- */
+/* --- Batch normalization  --- */
 
 struct sam3_tensor *gh_batchnorm(struct sam3_graph *g, struct sam3_arena *a,
 				 struct sam3_tensor *input,
@@ -1318,7 +1318,7 @@ struct sam3_tensor *gh_batchnorm(struct sam3_graph *g, struct sam3_arena *a,
 				 inputs, n_inputs, out);
 }
 
-/* --- Convolution helpers ─────────────── --- */
+/* --- Convolution helpers  --- */
 
 /*
  * conv_add_bias - Add bias [C] to an NHWC 4D tensor via fused op.
@@ -1448,7 +1448,7 @@ struct sam3_tensor *gh_maxpool2d(struct sam3_graph *g, struct sam3_arena *a,
 	return out;
 }
 
-/* --- Tracker memory helpers ─────────── --- */
+/* --- Tracker memory helpers  --- */
 
 struct sam3_tensor *gh_concat_mem(struct sam3_graph *g,
 				  struct sam3_arena *a,

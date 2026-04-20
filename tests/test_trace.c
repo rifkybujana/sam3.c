@@ -39,7 +39,7 @@ make_f32_tensor(struct sam3_tensor *t, float *data, int n)
 	t->nbytes    = (size_t)n * sizeof(float);
 }
 
-/* --- Tests ────────── --- */
+/* --- Tests  --- */
 
 static void
 test_numeric_stats_f32(void)

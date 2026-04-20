@@ -22,7 +22,7 @@
 #include <string.h>
 #include <math.h>
 
-/* --- Helpers ────── --- */
+/* --- Helpers  --- */
 
 static void make_f32_tensor_2d(struct sam3_tensor *t, float *data,
 			       int rows, int cols)
@@ -58,7 +58,7 @@ static void make_q8_tensor_2d(struct sam3_tensor *t, void *data,
 	t->nbytes     = sam3_q8_nbytes(rows * cols);
 }
 
-/* --- Tests ──────── --- */
+/* --- Tests  --- */
 
 /*
  * test_matmul_q8_small - 4x64 @ 64x4 (K=64 = 2 Q8 blocks per row)

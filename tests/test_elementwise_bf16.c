@@ -23,7 +23,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/* --- Helpers ────── --- */
+/* --- Helpers  --- */
 
 static void make_bf16_tensor(struct sam3_tensor *t, uint16_t *data, int n)
 {
@@ -41,7 +41,7 @@ static void make_bf16_tensor(struct sam3_tensor *t, uint16_t *data, int n)
 	t->nbytes     = (size_t)n * sizeof(uint16_t);
 }
 
-/* --- Tests ──────── --- */
+/* --- Tests  --- */
 
 static void test_add_bf16(void)
 {

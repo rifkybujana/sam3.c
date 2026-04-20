@@ -416,7 +416,7 @@ struct sam3_tensor *sam3_tracker_sam_project_prompts(
 	return out;
 }
 
-/* --- Per-frame tracking ─────────────── --- */
+/* --- Per-frame tracking  --- */
 
 enum sam3_error sam3_tracker_track_frame(
 	struct sam3_tracker *trk,
@@ -666,7 +666,7 @@ enum sam3_error sam3_tracker_track_frame(
 	return SAM3_OK;
 }
 
-/* --- Reset ─────── --- */
+/* --- Reset  --- */
 
 enum sam3_error sam3_tracker_reset(struct sam3_tracker *trk)
 {

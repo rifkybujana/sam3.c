@@ -255,7 +255,7 @@ static void test_set_text_parallel_with_set_image(void)
 		sam3_weight_close(&wf);
 	}
 
-	/* --- Compare ───────────────── --- */
+	/* --- Compare  --- */
 	ASSERT_EQ(n_masks_async, n_masks_legacy);
 
 	/* Mask-logit drift (informational). */

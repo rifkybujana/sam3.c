@@ -523,7 +523,7 @@ static enum sam3_error load_singletons(struct sam3_tracker_multiplex *trk,
 	return SAM3_OK;
 }
 
-/* --- Public API ───── --- */
+/* --- Public API  --- */
 
 enum sam3_error sam3_tracker_multiplex_init(struct sam3_tracker_multiplex *trk)
 {
@@ -582,7 +582,7 @@ enum sam3_error sam3_tracker_multiplex_load(struct sam3_tracker_multiplex *trk,
 
 #undef LOAD
 
-/* --- Forward graph builders (phase 2.2) ── --- */
+/* --- Forward graph builders (phase 2.2)  --- */
 
 /*
  * Apply one CXBlock (ConvNeXt) in channels-last:
@@ -690,7 +690,7 @@ struct sam3_tensor *sam3_multiplex_maskmem_forward(
 }
 
 /*
- * ── Memory-attention forward (phase 2.3b, full implementation) ────
+ *  Memory-attention forward (phase 2.3b, full implementation) ────
  *
  * 8-head decoupled RoPE transformer encoder, 4 layers. See the header
  * doc for the full semantics of each layer. The config is hard-coded
@@ -920,7 +920,7 @@ static struct sam3_tensor *memory_attn_layer(
 		struct sam3_tensor *cos_k, struct sam3_tensor *sin_k,
 		int num_k_exclude)
 {
-	/* --- Self-attention ──────────── --- */
+	/* --- Self-attention  --- */
 	struct sam3_tensor *tgt2 = gh_layernorm(g, a, output,
 						L->norm1_w, L->norm1_b);
 	if (!tgt2)
@@ -989,7 +989,7 @@ static struct sam3_tensor *memory_attn_layer(
 	if (!output)
 		return NULL;
 
-	/* --- FFN ── --- */
+	/* --- FFN  --- */
 	tgt2 = gh_layernorm(g, a, output, L->norm3_w, L->norm3_b);
 	if (!tgt2)
 		return NULL;
@@ -1114,7 +1114,7 @@ struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 }
 
 /*
- * ── SAM 3.1 mask decoder forward (phase 2.4b) ────────────────────────
+ *  SAM 3.1 mask decoder forward (phase 2.4b) ────────────────────────
  *
  * MultiplexMaskDecoder.predict_masks + forward wrapper (Python
  * reference/sam3/sam3/model/multiplex_mask_decoder.py). The SAM 3.1
@@ -1298,7 +1298,7 @@ static struct sam3_tensor *two_way_block(
 	struct sam3_tensor *keys = *p_keys;
 	struct sam3_tensor *q, *k, *attn, *mlp;
 
-	/* --- Self-attention on tokens ── --- */
+	/* --- Self-attention on tokens  --- */
 	if (skip_pe) {
 		attn = mha_sdpa_basic(g, a, queries, queries, queries,
 			L->self_q_w, L->self_q_b, L->self_k_w, L->self_k_b,
@@ -1346,7 +1346,7 @@ static struct sam3_tensor *two_way_block(
 	queries = gh_layernorm(g, a, queries, L->norm3_w, L->norm3_b);
 	if (!queries) return NULL;
 
-	/* --- Cross-attention: image attends to tokens ─────────────── *
+	/* --- Cross-attention: image attends to tokens  *
 	 * Python calls self.cross_attn_image_to_token(q=k, k=q, v=queries)
 	 * where `q` and `k` are local Python variables (q=queries+pe,
 	 * k=keys+pe). That swap means the actual Q input is image+PE and
@@ -1435,7 +1435,7 @@ enum sam3_error sam3_multiplex_mask_decoder_forward(
 		return SAM3_EINVAL;
 	}
 
-	/* --- 1. Prepare tokens ────────── --- */
+	/* --- 1. Prepare tokens  --- */
 	struct sam3_tensor *mask_tokens = md->mask_tokens;
 	if (extra_per_object) {
 		mask_tokens = materialize_mask_tokens_plus_extra(
@@ -1489,7 +1489,7 @@ enum sam3_error sam3_multiplex_mask_decoder_forward(
 		if (!queries) return SAM3_ENOMEM;
 	}
 
-	/* --- 5. Slice output tokens ───── --- */
+	/* --- 5. Slice output tokens  --- */
 	struct sam3_tensor *obj_score_tok = gh_slice(g, arena, queries, 0,
 			0, SAM3_MULTIPLEX_COUNT);
 	struct sam3_tensor *iou_tok = gh_slice(g, arena, queries, 0,
@@ -1540,7 +1540,7 @@ enum sam3_error sam3_multiplex_mask_decoder_forward(
 	if (!up) return SAM3_ENOMEM;
 	/* up shape: [1, 4H, 4W, 32] */
 
-	/* --- 7. Hypernetwork MLPs ─────── --- */
+	/* --- 7. Hypernetwork MLPs  --- */
 	int mt_3d[] = {SAM3_MULTIPLEX_COUNT, MUX_DEC_N_MULTIMASK,
 		       MUX_DEC_HIDDEN};
 	mask_tok_out = gh_reshape(g, arena, mask_tok_out, 3, mt_3d);
