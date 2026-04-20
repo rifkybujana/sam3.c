@@ -56,6 +56,20 @@ def _reshape_image_embed(arr, side):
     return arr.reshape(-1)
 
 
+def _reshape_frame_rgb(arr, side):
+    # Both sides: F32 CHW [3, H, W] with H=W=image_size (1008 for SAM
+    # 3.1). C's make_frame_tensor lays out as CHW directly; Python's
+    # img_batch is NCHW [1, 3, H, W] with the batch dim squeezed
+    # before dump. Identical byte layout on both sides.
+    return arr.reshape(-1)
+
+
+def _reshape_feat_s1(arr, side):
+    # C: cached_sam2_1x_nhwc is [1, 72, 72, 256] NHWC; Python dumps
+    # after an NCHW -> NHWC permute so the byte layouts match.
+    return arr.reshape(-1)
+
+
 def _reshape_tgt(arr, side):
     # Both sides are batch-first [1, HW=5184, 256] at encoder entry
     # (Py's encoder has batch_first=True so the forward-hook kwargs see
@@ -85,9 +99,26 @@ def _reshape_sam(arr, side):
     return arr.reshape(16, 3, 256).reshape(-1)
 
 
-LEVEL0_FRAMES = [1, 2]  # overlap of C and Python dumps
+LEVEL0_FRAMES = [1, 2]  # tracker-path overlap of C and Python dumps
+# Image-pipeline dumps (frame_rgb, feat_s1) cover frames 0..2 on both
+# sides because session_encode_frame (C) and forward_image (Py) run
+# for every frame including the cond frame.
+IMAGE_PIPELINE_FRAMES = [0, 1, 2]
 
 PAIRS = []
+# Image-pipeline drill FIRST so divergence is attributed upstream of
+# the tracker reshapes.
+for f in IMAGE_PIPELINE_FRAMES:
+    PAIRS.extend([
+        (f"frame_rgb_f{f}",
+         f"/tmp/dbg_trk_frame_rgb_f{f}.bin",
+         f"/tmp/py_trk_frame_rgb_f{f}.bin",
+         _reshape_frame_rgb),
+        (f"feat_s1_f{f}",
+         f"/tmp/dbg_trk_feat_s1_f{f}.bin",
+         f"/tmp/py_trk_feat_s1_f{f}.bin",
+         _reshape_feat_s1),
+    ])
 for f in LEVEL0_FRAMES:
     PAIRS.extend([
         # Sub-drill (iteration 4): image features pre-flatten on both

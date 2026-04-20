@@ -84,6 +84,11 @@ struct sam3_tensor *sam3_dbg_trk_memattn_layer0    = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_layer1    = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_layer2    = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_layer3    = NULL;
+/* Image-pipeline slots (populated per-frame inside
+ * session_encode_frame; flushed directly there to cover both cond
+ * frame 0 and propagation frames). */
+struct sam3_tensor *sam3_dbg_trk_frame_rgb         = NULL;
+struct sam3_tensor *sam3_dbg_trk_feat_s1           = NULL;
 
 /* Video-path tensor dumper. Used for layer-by-layer parity diffs
  * against the Python reference via scripts/dump_reference_layers.py
@@ -398,6 +403,17 @@ session_encode_frame(struct sam3_video_session *session,
 		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
 		return SAM3_ENOMEM;
 	}
+#ifdef SAM3_DEBUG_DUMP
+	{
+		char pbuf[256];
+		snprintf(pbuf, sizeof(pbuf),
+			 "/tmp/dbg_trk_frame_rgb_f%d.bin", frame_idx);
+		auto_dump_tensor(pbuf, frame);
+		snprintf(pbuf, sizeof(pbuf),
+			 "/tmp/dbg_trk_feat_s1_f%d.bin", frame_idx);
+		auto_dump_tensor(pbuf, out->feat_s1);
+	}
+#endif
 	SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
 	return SAM3_OK;
 }

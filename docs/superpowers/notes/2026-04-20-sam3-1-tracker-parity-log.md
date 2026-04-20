@@ -493,3 +493,107 @@ frames. The next session should:
    `multiplex_build_memory_from_bank`) to close the remaining ~30-row
    shape gap at frame 2.
 
+## Iteration 6 — image-pipeline drill + propagation_convs fix (2026-04-20)
+
+### Setup
+
+- Added per-frame dumps for `frame_rgb` (preprocessed F32 CHW
+  [-1,1]) and `feat_s1` (sam2 1x post-neck NHWC) on both sides.
+  C dumps at the tail of `session_encode_frame` for every cached
+  frame (including cond frame 0); Python dumps via a forward-hook on
+  `model.forward_image`. Extended comparator with `_reshape_frame_rgb`
+  and `_reshape_feat_s1`.
+- SAM 3.1 (tri-neck) + SAM 3 (dual-neck) now share the
+  `sam2_fpn_layers.*` destination prefix on disk. The SAM 3 source
+  path stays `sam2_convs.*`; the SAM 3.1 source path is
+  `propagation_convs.*` via a new `handle_propagation_neck` emitter
+  in `weight_rename.c`.
+
+### Pre-fix diff (propagation_convs NOT loaded)
+
+```
+frame_rgb_f0     cos=0.99983 abs_max=0.1176 abs_mean=0.002497 rel=0.498%
+feat_s1_f0       cos=0.57695 abs_max=3.619  abs_mean=0.4942   rel=111.702% <--- FIRST DIVERGENCE
+frame_rgb_f1     cos=0.99984 abs_max=0.1176 abs_mean=0.002447 rel=0.488%
+feat_s1_f1       cos=0.57287 abs_max=4.686  abs_mean=0.4881   rel=111.642% <--- FIRST DIVERGENCE
+frame_rgb_f2     cos=0.99983 abs_max=0.1333 abs_mean=0.002533 rel=0.506%
+feat_s1_f2       cos=0.57369 abs_max=4.615  abs_mean=0.489    rel=111.695% <--- FIRST DIVERGENCE
+```
+
+### Analysis
+
+- `frame_rgb` matches on all three frames at cos≈0.99984 — the
+  preprocessed inputs (libav-decoded + stbir-linear-resized vs
+  decord-decoded and auto-resized) are effectively identical.
+- `feat_s1` nevertheless diverges at cos≈0.577 on ALL three frames
+  (including the cond frame). So the image-encoder output is wrong in
+  a frame-independent way — static-wiring issue, not state.
+- **Root cause:** SAM 3.1 uses `Sam3TriViTDetNeck` which has three
+  independent sets of conv weights for the simpleFPN — `convs`
+  (detector), `interactive_convs` (prompt/mask), `propagation_convs`
+  (tracker). C's converter had no handler for
+  `detector.backbone.vision_backbone.propagation_convs.*`, so those
+  weights were dropped from the `.sam3` file, `has_sam2_neck` was
+  forced to 0 for the tri-neck, and the tracker fell back to reading
+  the **detector** neck's output as its feat_s1 — a different set of
+  weights producing different features by design.
+
+### Patches
+
+1. **`tools/weight_rename.c`:** factored the sam2-neck renamer into a
+   shared `emit_sam2_fpn(prefix, rest)` helper. Added
+   `handle_propagation_neck` that routes `propagation_convs.{i}.*` to
+   the same `detector_model.vision_encoder.neck.sam2_fpn_layers.{i}.*`
+   destination used by SAM 3's `sam2_convs`. One new entry in the
+   prefix table.
+2. **`src/model/vl_combiner.c`:** removed the `if (n_fpn_scales < 4)
+   has_sam2_neck = 0` special-case. The sam2_neck is now always
+   initialised with the main neck's `n_fpn_scales` (3 for SAM 3.1,
+   4 for SAM 3) and always loaded from `sam2_fpn_layers.*`.
+3. **`src/model/sam3_image.c`:** added NULL guard in debug
+   `dump_tensor` for the tri-neck's missing-scale-3 spfn[3] entry
+   (prevents a `SAM3_DEBUG_DUMP` SEGV during sam2_05x dump).
+
+### Post-fix diff (propagation_convs loaded as sam2_fpn_layers)
+
+```
+frame_rgb_f0     cos=0.99983 abs_max=0.1176 abs_mean=0.002497 rel=0.498%
+feat_s1_f0       cos=0.96899 abs_max=3.474  abs_mean=0.08944  rel=20.216%  <--- FIRST DIVERGENCE
+feat_s1_f1       cos=0.96614 abs_max=3.867  abs_mean=0.09301  rel=21.273%
+feat_s1_f2       cos=0.96644 abs_max=4.134  abs_mean=0.09185  rel=20.978%
+image_embed_f1   cos=0.96614 (= feat_s1_f1, as expected)
+memory_image_f1  cos=0.96899 (up from 0.57695 — bank spatial rows follow feat_s1)
+memory_f1        cos=0.69383 (up from 0.49205 — spatial recovered; obj_ptr tail still 1 vs 16)
+memattn_layer0_f1 cos=0.00383 (still near-orthogonal; K/V still missing 15 obj_ptr tokens)
+```
+
+### Parity test result after fix
+
+- `test_video_parity_kids` SAM 3.1 variant:
+  - Frame 1 IoU: **0.4449** (was 0.0000)
+  - Frame 2 IoU: **0.4853** (was 0.0000)
+  - Frame 3 IoU: 0.0000 (still 0 — compounded from memattn blow-up)
+
+### Remaining divergence
+
+- **~3 % cosine gap on feat_s1** (0.968 vs 0.99 target). Candidates:
+  a) frame_rgb abs_max=0.1176 (≈15/255 in edge pixels) amplified by
+     the ViT, b) a small op mismatch inside the ViT or neck, c)
+     differences in normalization / padding that compound across
+     32 ViT blocks. Warrants a separate bisection pass (dump ViT
+     intermediates) if the remaining fixes don't close the IoU gap.
+- **obj_ptr multiplex:** C bank stores one 256-D pointer per frame;
+  Python stores `[multiplex_count=16, 256]`. This surfaces as a
+  15-row gap per frame in `memory` (K/V stream), which degrades
+  memattn_layer0 to near-zero cosine even with corrected feat_s1.
+  Task 4 in the implementation plan.
+
+### Next step
+
+1. Expand `sam3_memory_entry.obj_pointer` to `[16, 256]` and emit 16
+   rows per entry in `multiplex_build_memory_from_bank`.
+2. Re-run the comparator. memattn_layer0 should track the spatial
+   K/V contribution, and the f2 numerical blow-up should collapse.
+3. If IoU still trails 0.75, drill the residual 3 % feat_s1 gap:
+   dump ViT block outputs or sam2 neck intermediates side by side.
+

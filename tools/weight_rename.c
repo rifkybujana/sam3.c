@@ -419,30 +419,29 @@ passthrough:
 }
 
 /*
- * SAM2 FPN neck: detector.backbone.vision_backbone.sam2_convs.{i}.*
- * -> detector_model.vision_encoder.neck.sam2_fpn_layers.*
+ * Shared FPN rename body. Takes the destination prefix (e.g.
+ * "detector_model.vision_encoder.neck.sam2_fpn_layers.") and the
+ * per-key `rest` ("{i}.dconv_2x2_0.weight" etc). Writes to `out`.
  *
- * Identical structure to handle_neck() (dconv_2x2, conv_1x1, conv_3x3)
- * but writes to sam2_fpn_layers instead of fpn_layers. This duplicate
- * FPN is used by the tracker in EfficientSAM3 checkpoints.
+ * Used by both handle_sam2_neck (SAM 3 dual-neck: sam2_convs) and
+ * handle_propagation_neck (SAM 3.1 tri-neck: propagation_convs).
  */
-static int handle_sam2_neck(struct rename_entry *out, int inner_idx,
-			    const char *rest)
+static int emit_sam2_fpn(struct rename_entry *out, int inner_idx,
+			 const char *dst_prefix, const char *rest)
 {
 	char buf[SAM3_WEIGHT_NAME_MAX];
-	const char *prefix =
-		"detector_model.vision_encoder.neck.sam2_fpn_layers.";
 	const char *r;
 	int idx, consumed;
 
-	/* sam2_convs.{i}.X -> sam2_fpn_layers.{i}.{renamed}.X */
-	if (sscanf(rest, "%d.%n", &idx, &consumed) < 1)
-		goto passthrough;
+	if (sscanf(rest, "%d.%n", &idx, &consumed) < 1) {
+		snprintf(buf, sizeof(buf), "%s%s", dst_prefix, rest);
+		return add_entry(out, inner_idx, buf);
+	}
 
 	const char *attr = rest + consumed;
 
 	char fpn_prefix[SAM3_WEIGHT_NAME_MAX];
-	snprintf(fpn_prefix, sizeof(fpn_prefix), "%s%d.", prefix, idx);
+	snprintf(fpn_prefix, sizeof(fpn_prefix), "%s%d.", dst_prefix, idx);
 
 	/* dconv_2x2_0.X -> scale_layers.0.X */
 	r = strip_prefix(attr, "dconv_2x2_0.");
@@ -487,10 +486,41 @@ static int handle_sam2_neck(struct rename_entry *out, int inner_idx,
 	/* Passthrough within FPN layer */
 	snprintf(buf, sizeof(buf), "%s%s", fpn_prefix, attr);
 	return add_entry(out, inner_idx, buf);
+}
 
-passthrough:
-	snprintf(buf, sizeof(buf), "%s%s", prefix, rest);
-	return add_entry(out, inner_idx, buf);
+/*
+ * SAM2 FPN neck: detector.backbone.vision_backbone.sam2_convs.{i}.*
+ * -> detector_model.vision_encoder.neck.sam2_fpn_layers.*
+ *
+ * Identical structure to handle_neck() (dconv_2x2, conv_1x1, conv_3x3)
+ * but writes to sam2_fpn_layers instead of fpn_layers. This duplicate
+ * FPN is used by the tracker in EfficientSAM3 / SAM 3 checkpoints.
+ */
+static int handle_sam2_neck(struct rename_entry *out, int inner_idx,
+			    const char *rest)
+{
+	return emit_sam2_fpn(out, inner_idx,
+		"detector_model.vision_encoder.neck.sam2_fpn_layers.", rest);
+}
+
+/*
+ * SAM 3.1 propagation FPN neck:
+ * detector.backbone.vision_backbone.propagation_convs.{i}.*
+ * -> detector_model.vision_encoder.neck.sam2_fpn_layers.*
+ *
+ * SAM 3.1's Sam3TriViTDetNeck has three independent conv sets —
+ * `convs` (detector), `interactive_convs` (prompt/mask), and
+ * `propagation_convs` (tracker). The propagation set is what the
+ * video tracker's memory-attn / mask decoder consumes as its image
+ * embeddings (Python's sam2_backbone_out). We reuse the existing
+ * sam2_fpn_layers.* destination so the C runtime's sam2_neck plumbing
+ * loads the tracker's neck weights regardless of the source name.
+ */
+static int handle_propagation_neck(struct rename_entry *out, int inner_idx,
+				   const char *rest)
+{
+	return emit_sam2_fpn(out, inner_idx,
+		"detector_model.vision_encoder.neck.sam2_fpn_layers.", rest);
 }
 
 /*
@@ -1461,6 +1491,8 @@ static const struct prefix_rule prefix_table[] = {
 		handle_vit},
 	{"detector.backbone.vision_backbone.sam2_convs.",
 		handle_sam2_neck},
+	{"detector.backbone.vision_backbone.propagation_convs.",
+		handle_propagation_neck},
 	{"detector.backbone.vision_backbone.convs.",
 		handle_neck},
 	{"detector.backbone.language_backbone.",

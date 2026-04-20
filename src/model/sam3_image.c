@@ -154,6 +154,8 @@ static void cpu_box_refine(const float *q,
 /* Debug: dump a tensor to a raw binary file for Python comparison */
 static void dump_tensor(const char *path, const struct sam3_tensor *t)
 {
+	if (!t)
+		return;
 	int n = 1;
 	for (int i = 0; i < t->n_dims; i++)
 		n *= t->dims[i];

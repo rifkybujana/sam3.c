@@ -203,6 +203,46 @@ def _register_hooks(model, captures):
             model._prepare_memory_conditioned_features = _orig
     hooks.append(_UnpatchHandle())
 
+    # Image-pipeline drill: capture backbone.forward_image input
+    # (img_batch) + its sam2 1x output per call. forward_image is
+    # invoked exactly once per frame in upstream order (frame 0 during
+    # add_new_masks / preflight, then frames 1..N during
+    # propagate_in_video), so the capture index is the frame index.
+    _orig_fwd_image = model.forward_image
+
+    def _patched_forward_image(img_batch, **kwargs):
+        out = _orig_fwd_image(img_batch, **kwargs)
+        # Capture img_batch verbatim (NCHW [1, 3, H, W] F32, [-1, 1]
+        # after mean/std) — matches C's make_frame_tensor CHW F32.
+        # img_batch may be a NestedTensor; unwrap via .tensors.
+        img_t = img_batch
+        if hasattr(img_t, "tensors"):
+            img_t = img_t.tensors
+        captures.setdefault("frame_rgb", []).append(
+            img_t.detach().cpu().float().contiguous())
+        # Capture the sam2 1x backbone+neck output for this frame —
+        # corresponds to C's cached_sam2_1x_nhwc after the sam2 neck.
+        sam2 = out.get("sam2_backbone_out") if isinstance(out, dict) \
+            else None
+        if isinstance(sam2, dict):
+            fpn = sam2.get("backbone_fpn")
+            if isinstance(fpn, list) and len(fpn) > 0:
+                shapes = [tuple(x.tensors.shape) if hasattr(x, "tensors")
+                          else None for x in fpn]
+                print(f"[hook] sam2_backbone_fpn len={len(fpn)} "
+                      f"shapes={shapes}", file=sys.stderr)
+                if hasattr(fpn[-1], "tensors"):
+                    captures.setdefault("feat_s1", []).append(
+                        fpn[-1].tensors.detach().cpu().float().contiguous())
+        return out
+
+    model.forward_image = _patched_forward_image
+
+    class _UnpatchFwdImage:
+        def remove(self_inner):
+            model.forward_image = _orig_fwd_image
+    hooks.append(_UnpatchFwdImage())
+
     return hooks
 
 
@@ -263,6 +303,32 @@ def _flush_captures_delta(captures, cursors, frame_idx):
         if isinstance(t, torch.Tensor):
             _dump(f"/tmp/py_trk_image_embed_f{frame_idx}.bin", t)
     cursors[slot] = end
+
+    # Image-pipeline drill: frame_rgb (NCHW img_batch input) and
+    # feat_s1 (NCHW sam2 1x post-neck). Captured once per frame via
+    # forward_image forward-hook, in frame-index order. Dump the
+    # latest unconsumed one — if >1 new entries, prefer the last.
+    for slot in ("frame_rgb", "feat_s1"):
+        start = cursors.get(slot, 0)
+        end = len(captures.get(slot, []))
+        if end > start:
+            t = captures[slot][end - 1]
+            if isinstance(t, torch.Tensor):
+                # Drop the batch dim and permute NCHW -> CHW for
+                # frame_rgb to match C's make_frame_tensor layout;
+                # NCHW -> NHWC for feat_s1 to match cached_sam2_1x_nhwc.
+                if slot == "frame_rgb" and t.dim() == 4:
+                    out = t.squeeze(0).contiguous()
+                elif slot == "feat_s1" and t.dim() == 4:
+                    out = t.permute(0, 2, 3, 1).contiguous()
+                else:
+                    out = t
+                arr = out.numpy().astype(np.float32)
+                path = f"/tmp/py_trk_{slot}_f{frame_idx}.bin"
+                arr.tofile(path)
+                print(f"dump: {path} shape={tuple(arr.shape)}",
+                      file=sys.stderr)
+        cursors[slot] = end
 
     slot = "memattn_out"
     start = cursors.get(slot, 0)
