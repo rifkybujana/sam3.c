@@ -67,6 +67,18 @@ struct sam3_tensor *sam3_dbg_xformer_in_img = NULL;
 struct sam3_tensor *sam3_dbg_xformer_in_tokens = NULL;
 struct sam3_tensor *sam3_dbg_xformer_layer0_q = NULL;
 
+/* Tracker-path dump slots (level 0). Populated by tracker_multiplex.c
+ * during each frame; flushed to /tmp/dbg_trk_<slot>_f<frame>.bin after
+ * graph_eval. All tensors are F32 NHWC or flat 2-D / 3-D. */
+struct sam3_tensor *sam3_dbg_trk_memattn_out       = NULL;
+struct sam3_tensor *sam3_dbg_trk_mask_dec_masks    = NULL;
+struct sam3_tensor *sam3_dbg_trk_mask_dec_iou      = NULL;
+struct sam3_tensor *sam3_dbg_trk_mask_dec_score    = NULL;
+struct sam3_tensor *sam3_dbg_trk_mask_dec_sam      = NULL;
+struct sam3_tensor *sam3_dbg_trk_memory            = NULL;
+struct sam3_tensor *sam3_dbg_trk_memory_image      = NULL;
+struct sam3_tensor *sam3_dbg_trk_memory_image_pos  = NULL;
+
 /* Video-path tensor dumper. Used for layer-by-layer parity diffs
  * against the Python reference via scripts/dump_reference_layers.py
  * and scripts/compare_layer_dumps.py. */
@@ -827,6 +839,31 @@ video_track_one_obj(struct sam3_video_session *session,
 			       frame_idx, obj_idx, err);
 		goto cleanup;
 	}
+
+#ifdef SAM3_DEBUG_DUMP
+	if (is_multiplex) {
+		char pbuf[256];
+		#define DUMP_TRK(slot) do { \
+			extern struct sam3_tensor *sam3_dbg_trk_##slot; \
+			if (sam3_dbg_trk_##slot) { \
+				snprintf(pbuf, sizeof(pbuf), \
+					 "/tmp/dbg_trk_" #slot "_f%d.bin", \
+					 frame_idx); \
+				auto_dump_tensor(pbuf, sam3_dbg_trk_##slot); \
+				sam3_dbg_trk_##slot = NULL; \
+			} \
+		} while (0)
+		DUMP_TRK(memattn_out);
+		DUMP_TRK(mask_dec_masks);
+		DUMP_TRK(mask_dec_iou);
+		DUMP_TRK(mask_dec_score);
+		DUMP_TRK(mask_dec_sam);
+		DUMP_TRK(memory);
+		DUMP_TRK(memory_image);
+		DUMP_TRK(memory_image_pos);
+		#undef DUMP_TRK
+	}
+#endif
 
 	if (!track_masks || track_masks->n_dims != 3) {
 		sam3_log_error("video_track: bad track_masks shape");

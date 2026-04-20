@@ -2090,6 +2090,16 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 				for (int c = 0; c < D; c++)
 					dst[i * D + c] = src[i * D + c] + add[c];
 		} else {
+#ifdef SAM3_DEBUG_DUMP
+			{
+				extern struct sam3_tensor *sam3_dbg_trk_memory;
+				extern struct sam3_tensor *sam3_dbg_trk_memory_image;
+				extern struct sam3_tensor *sam3_dbg_trk_memory_image_pos;
+				sam3_dbg_trk_memory           = memory;
+				sam3_dbg_trk_memory_image     = memory_image;
+				sam3_dbg_trk_memory_image_pos = memory_image_pos;
+			}
+#endif
 			struct sam3_tensor *cond_2d =
 				sam3_multiplex_memory_attn_forward(
 					g, arena, &trk->transformer,
@@ -2099,6 +2109,12 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 					W, num_k_exclude);
 			if (!cond_2d)
 				return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+			{
+				extern struct sam3_tensor *sam3_dbg_trk_memattn_out;
+				sam3_dbg_trk_memattn_out = cond_2d;
+			}
+#endif
 			int dims_4d[4] = {1, H, W, D};
 			pix_feat_with_mem = gh_reshape(g, arena, cond_2d,
 						       4, dims_4d);
@@ -2140,6 +2156,19 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		&all_masks, &all_iou, &all_score, &all_sam);
 	if (err != SAM3_OK)
 		return err;
+
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_mask_dec_masks;
+		extern struct sam3_tensor *sam3_dbg_trk_mask_dec_iou;
+		extern struct sam3_tensor *sam3_dbg_trk_mask_dec_score;
+		extern struct sam3_tensor *sam3_dbg_trk_mask_dec_sam;
+		sam3_dbg_trk_mask_dec_masks = all_masks;
+		sam3_dbg_trk_mask_dec_iou   = all_iou;
+		sam3_dbg_trk_mask_dec_score = all_score;
+		sam3_dbg_trk_mask_dec_sam   = all_sam;
+	}
+#endif
 
 	/* Slice slot 0 from the 16-slot multiplex outputs, then collapse
 	 * the leading singleton dim for caller convenience.
