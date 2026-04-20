@@ -223,8 +223,9 @@ static enum sam3_error load_repmixer_block(
 		wf, K("token_mixer.mixer.rbr_skip.running_var"),
 		arena, SAM3_DTYPE_F32, 1, dims);
 
-	/* token_mixer.mixer.rbr_conv[0] — depthwise conv 1×11 + BN. */
-	dims[0] = width; dims[1] = 1; dims[2] = 1; dims[3] = 11;
+	/* token_mixer.mixer.rbr_conv[0] — depthwise conv 1×11 + BN.
+	 * Weight stored as OHWI [width, 1, 11, 1] after converter permutation. */
+	dims[0] = width; dims[1] = 1; dims[2] = 11; dims[3] = 1;
 	R->mixer_conv_w = gh_load_mmap(
 		wf, K("token_mixer.mixer.rbr_conv.0.conv.weight"),
 		arena, SAM3_DTYPE_F32, 4, dims);
@@ -243,8 +244,9 @@ static enum sam3_error load_repmixer_block(
 		arena, SAM3_DTYPE_F32, 1, dims);
 
 	/* (Optional) token_mixer.mixer.rbr_scale — 1×1 conv + BN.
+	 * Weight stored as OHWI [width, 1, 1, width] after converter permutation.
 	 * NULL on miss is silent; build skips this branch when NULL. */
-	dims[0] = width; dims[1] = width; dims[2] = 1; dims[3] = 1;
+	dims[0] = width; dims[1] = 1; dims[2] = 1; dims[3] = width;
 	R->mixer_scale_w = gh_load_mmap_optional(
 		wf, K("token_mixer.mixer.rbr_scale.conv.weight"),
 		arena, SAM3_DTYPE_F32, 4, dims);
@@ -262,8 +264,9 @@ static enum sam3_error load_repmixer_block(
 		wf, K("token_mixer.mixer.rbr_scale.bn.running_var"),
 		arena, SAM3_DTYPE_F32, 1, dims);
 
-	/* convffn.conv — depthwise 1×11 + BN. */
-	dims[0] = width; dims[1] = 1; dims[2] = 1; dims[3] = 11;
+	/* convffn.conv — depthwise 1×11 + BN.
+	 * Weight stored as OHWI [width, 1, 11, 1] after converter permutation. */
+	dims[0] = width; dims[1] = 1; dims[2] = 11; dims[3] = 1;
 	R->convffn_dw_w = gh_load_mmap(
 		wf, K("convffn.conv.conv.weight"),
 		arena, SAM3_DTYPE_F32, 4, dims);
@@ -281,8 +284,11 @@ static enum sam3_error load_repmixer_block(
 		wf, K("convffn.conv.bn.running_var"),
 		arena, SAM3_DTYPE_F32, 1, dims);
 
-	/* convffn.fc1 / convffn.fc2 — 1×1 convs with bias. */
-	dims[0] = mlp_dim; dims[1] = width; dims[2] = 1; dims[3] = 1;
+	/* convffn.fc1 / convffn.fc2 — 1×1 convs with bias.
+	 * 1×1 conv weights have identical memory layout in OIHW and OHWI,
+	 * so no converter permutation is needed. Declare as OHWI
+	 * [OC, 1, 1, IC] so gh_conv2d reads KH=1, KW=1, C_in correctly. */
+	dims[0] = mlp_dim; dims[1] = 1; dims[2] = 1; dims[3] = width;
 	R->convffn_fc1_w = gh_load_mmap(
 		wf, K("convffn.fc1.weight"),
 		arena, SAM3_DTYPE_F32, 4, dims);
@@ -291,7 +297,7 @@ static enum sam3_error load_repmixer_block(
 		wf, K("convffn.fc1.bias"),
 		arena, SAM3_DTYPE_F32, 1, dims);
 
-	dims[0] = width; dims[1] = mlp_dim; dims[2] = 1; dims[3] = 1;
+	dims[0] = width; dims[1] = 1; dims[2] = 1; dims[3] = mlp_dim;
 	R->convffn_fc2_w = gh_load_mmap(
 		wf, K("convffn.fc2.weight"),
 		arena, SAM3_DTYPE_F32, 4, dims);
@@ -513,6 +519,152 @@ enum sam3_error sam3_mobileclip_text_load(
 }
 
 /*
+ * build_repmixer_block - One RepMixer block (S0 indices 0 and 5).
+ *
+ * Caller provides x as [seq_len, width] (2D). The function reshapes to
+ * NHWC [1, 1, seq_len, width] for conv/BN ops and reshapes back to
+ * [seq_len, width] before returning.
+ *
+ * Token-mixer residual: x + tm_layer_scale * (mixer_out - norm_out)
+ * (SUBTRACTION, not addition). eps=1e-5 for every BN (hardcoded in op).
+ *
+ * @R:     RepMixer weights for this block
+ * @width: cfg->width (channel count = 512 for S0)
+ */
+static struct sam3_tensor *build_repmixer_block(
+	struct sam3_graph *g,
+	const struct sam3_mobileclip_layer_repmixer *R,
+	struct sam3_tensor *x,
+	int width,
+	int seq_len,
+	struct sam3_arena *arena)
+{
+	struct sam3_tensor *norm_out, *y_skip, *y_conv, *mixer_out, *t;
+	struct sam3_tensor *y, *scale4d;
+	int nhwc[4], seq2[2];
+
+	/* Reshape [seq_len, width] -> NHWC [1, 1, seq_len, width] for conv/BN. */
+	nhwc[0] = 1; nhwc[1] = 1; nhwc[2] = seq_len; nhwc[3] = width;
+	x = gh_reshape(g, arena, x, 4, nhwc);
+	if (!x)
+		return NULL;
+
+	/* --- token_mixer.norm — single BN on the input. --- */
+	norm_out = gh_batchnorm(g, arena, x,
+				R->norm_skip_w, R->norm_skip_b,
+				R->norm_skip_rm, R->norm_skip_rv);
+	if (!norm_out)
+		return NULL;
+
+	/* --- token_mixer.mixer.rbr_skip — BN-only branch. --- */
+	y_skip = gh_batchnorm(g, arena, x,
+			      R->mixer_skip_w, R->mixer_skip_b,
+			      R->mixer_skip_rm, R->mixer_skip_rv);
+	if (!y_skip)
+		return NULL;
+
+	/* --- token_mixer.mixer.rbr_conv[0] — depthwise 1×11 conv + BN. ---
+	 * Weight is OHWI [C, 1, 11, 1], pad_h=0 pad_w=5 to preserve seq_len. */
+	t = gh_conv2d_hw(g, arena, x, R->mixer_conv_w, /*bias*/ NULL,
+			 /*stride*/ 1, /*pad_h*/ 0, /*pad_w*/ 5,
+			 /*groups*/ width);
+	if (!t)
+		return NULL;
+	y_conv = gh_batchnorm(g, arena, t,
+			      R->mixer_conv_bn_w, R->mixer_conv_bn_b,
+			      R->mixer_conv_bn_rm, R->mixer_conv_bn_rv);
+	if (!y_conv)
+		return NULL;
+
+	mixer_out = gh_add(g, arena, y_skip, y_conv);
+	if (!mixer_out)
+		return NULL;
+
+	/* --- Optional rbr_scale branch — 1×1 pointwise conv + BN. --- */
+	if (R->mixer_scale_w) {
+		struct sam3_tensor *y_scale;
+
+		t = gh_conv2d_hw(g, arena, x, R->mixer_scale_w, /*bias*/ NULL,
+				 1, 0, 0, /*groups*/ 1);
+		if (!t)
+			return NULL;
+		y_scale = gh_batchnorm(g, arena, t,
+				       R->mixer_scale_bn_w,
+				       R->mixer_scale_bn_b,
+				       R->mixer_scale_bn_rm,
+				       R->mixer_scale_bn_rv);
+		if (!y_scale)
+			return NULL;
+		mixer_out = gh_add(g, arena, mixer_out, y_scale);
+		if (!mixer_out)
+			return NULL;
+	}
+
+	/* --- Token-mixer residual: x + tm_layer_scale * (mixer_out - norm_out). ---
+	 * tm_layer_scale is [C,1,1]; reshape to [1,1,1,C] for NHWC broadcast. */
+	t = gh_sub(g, arena, mixer_out, norm_out);
+	if (!t)
+		return NULL;
+
+	nhwc[0] = 1; nhwc[1] = 1; nhwc[2] = 1; nhwc[3] = width;
+	scale4d = gh_reshape(g, arena, R->tm_layer_scale, 4, nhwc);
+	if (!scale4d)
+		return NULL;
+
+	t = gh_mul(g, arena, t, scale4d);
+	if (!t)
+		return NULL;
+
+	x = gh_add(g, arena, x, t);
+	if (!x)
+		return NULL;
+
+	/* --- ConvFFN: depthwise 1×11 + BN -> 1×1 fc1 -> GELU -> 1×1 fc2. --- */
+	y = gh_conv2d_hw(g, arena, x, R->convffn_dw_w, /*bias*/ NULL,
+			 1, 0, 5, /*groups*/ width);
+	if (!y)
+		return NULL;
+	y = gh_batchnorm(g, arena, y,
+			 R->convffn_dw_bn_w, R->convffn_dw_bn_b,
+			 R->convffn_dw_bn_rm, R->convffn_dw_bn_rv);
+	if (!y)
+		return NULL;
+
+	y = gh_conv2d_hw(g, arena, y, R->convffn_fc1_w, R->convffn_fc1_b,
+			 1, 0, 0, /*groups*/ 1);
+	if (!y)
+		return NULL;
+
+	y = gh_gelu(g, arena, y);
+	if (!y)
+		return NULL;
+
+	y = gh_conv2d_hw(g, arena, y, R->convffn_fc2_w, R->convffn_fc2_b,
+			 1, 0, 0, /*groups*/ 1);
+	if (!y)
+		return NULL;
+
+	/* Outer block residual: x + outer_layer_scale * y.
+	 * outer_layer_scale is [C,1,1]; reshape to [1,1,1,C] for NHWC broadcast. */
+	nhwc[0] = 1; nhwc[1] = 1; nhwc[2] = 1; nhwc[3] = width;
+	scale4d = gh_reshape(g, arena, R->outer_layer_scale, 4, nhwc);
+	if (!scale4d)
+		return NULL;
+
+	y = gh_mul(g, arena, y, scale4d);
+	if (!y)
+		return NULL;
+
+	x = gh_add(g, arena, x, y);
+	if (!x)
+		return NULL;
+
+	/* Reshape NHWC [1, 1, seq_len, width] back to [seq_len, width]. */
+	seq2[0] = seq_len; seq2[1] = width;
+	return gh_reshape(g, arena, x, 2, seq2);
+}
+
+/*
  * build_std_block - One pre-norm transformer block, non-causal, no RoPE.
  *
  * Mirrors the reference pre_norm_mha + pre_norm_ffn layout.
@@ -629,19 +781,17 @@ struct sam3_tensor *sam3_mobileclip_text_build(
 	if (!x)
 		return NULL;
 
-	/* 3. Transformer blocks (no causal mask). RepMixer errors until
-	 *    Phase 6 wires it. */
+	/* 3. Transformer blocks (no causal mask). */
 	for (i = 0; i < cfg->n_layers; i++) {
 		const struct sam3_mobileclip_layer *Lslot = &enc->layers[i];
 		if (Lslot->is_repmixer) {
-			sam3_log_error(
-				"mobileclip_build: RepMixer block %d "
-				"reached before Phase 6 wired it", i);
-			return NULL;
+			x = build_repmixer_block(g, &Lslot->u.repmixer, x,
+						 cfg->width, seq_len, arena);
+		} else {
+			x = build_std_block(g, &Lslot->u.std, x,
+					    cfg->n_heads, cfg->width,
+					    seq_len, arena);
 		}
-		x = build_std_block(g, &Lslot->u.std, x,
-				    cfg->n_heads, cfg->width,
-				    seq_len, arena);
 		if (!x)
 			return NULL;
 	}
@@ -773,14 +923,13 @@ struct sam3_tensor *sam3_mobileclip_text_build_perblock(
 			return NULL;
 
 		if (Lslot->is_repmixer) {
-			sam3_log_error("mobileclip_perblock: RepMixer block %d "
-				       "reached before Phase 6 wired it", i);
-			return NULL;
+			x = build_repmixer_block(&g, &Lslot->u.repmixer, x,
+						 cfg->width, seq_len, scratch);
+		} else {
+			x = build_std_block(&g, &Lslot->u.std, x,
+					    cfg->n_heads, cfg->width,
+					    seq_len, scratch);
 		}
-
-		x = build_std_block(&g, &Lslot->u.std, x,
-				    cfg->n_heads, cfg->width,
-				    seq_len, scratch);
 		if (!x)
 			return NULL;
 

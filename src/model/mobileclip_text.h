@@ -74,14 +74,14 @@ struct sam3_mobileclip_layer_repmixer {
 	struct sam3_tensor *mixer_skip_rm, *mixer_skip_rv;
 
 	/* token_mixer.mixer.rbr_conv[0] — depthwise conv + BN branch. */
-	struct sam3_tensor *mixer_conv_w;                    /* [C,1,1,11] */
+	struct sam3_tensor *mixer_conv_w;                    /* [C,1,11,1] OHWI */
 	struct sam3_tensor *mixer_conv_bn_w, *mixer_conv_bn_b;
 	struct sam3_tensor *mixer_conv_bn_rm, *mixer_conv_bn_rv;
 
 	/* (Optional) token_mixer.mixer.rbr_scale — 1×1 conv + BN branch.
 	 * Absent in the audited S0 checkpoint; loader leaves NULL when
 	 * keys are missing and build_repmixer_block skips the branch. */
-	struct sam3_tensor *mixer_scale_w;                   /* [C,C,1,1] or NULL */
+	struct sam3_tensor *mixer_scale_w;                   /* [C,1,1,C] OHWI or NULL */
 	struct sam3_tensor *mixer_scale_bn_w, *mixer_scale_bn_b;
 	struct sam3_tensor *mixer_scale_bn_rm, *mixer_scale_bn_rv;
 
@@ -89,7 +89,7 @@ struct sam3_mobileclip_layer_repmixer {
 	struct sam3_tensor *tm_layer_scale;                  /* [C,1,1] */
 
 	/* convffn.conv — depthwise 1×11 conv + BN. */
-	struct sam3_tensor *convffn_dw_w;                    /* [C,1,1,11] */
+	struct sam3_tensor *convffn_dw_w;                    /* [C,1,11,1] OHWI */
 	struct sam3_tensor *convffn_dw_bn_w, *convffn_dw_bn_b;
 	struct sam3_tensor *convffn_dw_bn_rm, *convffn_dw_bn_rv;
 

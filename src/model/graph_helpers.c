@@ -230,6 +230,23 @@ struct sam3_tensor *gh_add(struct sam3_graph *g, struct sam3_arena *a,
 				 (struct sam3_tensor *[]){x, b}, 2, out);
 }
 
+struct sam3_tensor *gh_sub(struct sam3_graph *g, struct sam3_arena *a,
+			   struct sam3_tensor *x, struct sam3_tensor *y)
+{
+	/* Allocate a scalar [-1] constant and broadcast-multiply y, then add. */
+	int one_dim[1] = { 1 };
+	struct sam3_tensor *neg = gh_alloc_tensor(a, SAM3_DTYPE_F32, 1, one_dim);
+	if (!neg)
+		return NULL;
+	*(float *)neg->data = -1.0f;
+
+	struct sam3_tensor *ny = gh_mul(g, a, y, neg);
+	if (!ny)
+		return NULL;
+
+	return gh_add(g, a, x, ny);
+}
+
 struct sam3_tensor *gh_mul(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *x, struct sam3_tensor *b)
 {
@@ -1371,6 +1388,46 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 	node->params[0] = stride;
 	node->params[1] = padding;
 	node->params[2] = groups;
+
+	if (bias)
+		out = conv_add_bias(g, a, out, bias);
+
+	return out;
+}
+
+struct sam3_tensor *gh_conv2d_hw(struct sam3_graph *g, struct sam3_arena *a,
+				 struct sam3_tensor *input,
+				 struct sam3_tensor *weight,
+				 struct sam3_tensor *bias,
+				 int stride, int pad_h, int pad_w,
+				 int groups)
+{
+	int N = input->dims[0];
+	int H = input->dims[1];
+	int W = input->dims[2];
+	int OC = weight->dims[0];
+	int KH = weight->dims[1];
+	int KW = weight->dims[2];
+
+	int OH = (H + 2 * pad_h - KH) / stride + 1;
+	int OW = (W + 2 * pad_w - KW) / stride + 1;
+
+	int out_dims[] = {N, OH, OW, OC};
+	struct sam3_tensor *out = gh_alloc_tensor(a, input->dtype,
+						  4, out_dims);
+	if (!out)
+		return NULL;
+
+	struct sam3_tensor *inputs[] = {input, weight};
+	out = sam3_graph_add_op(g, SAM3_OP_CONV2D, inputs, 2, out);
+	if (!out)
+		return NULL;
+
+	struct sam3_node *node = &g->nodes[g->n_nodes - 1];
+	node->params[0] = stride;
+	node->params[1] = pad_h;
+	node->params[2] = groups;
+	node->params[3] = pad_w; /* non-zero enables asymmetric H/W padding */
 
 	if (bias)
 		out = conv_add_bias(g, a, out, bias);
