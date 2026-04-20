@@ -277,7 +277,48 @@ test_perblock_parity(int text_backbone, int ctx_len, const char *dir)
 	/* 1e-2 tolerance: F32 accumulation across 12 transformer blocks
 	 * produces ~1e-3 to 8e-3 drift vs PyTorch reference due to
 	 * differing BLAS kernel ordering. */
+	fprintf(stderr,
+		"per-token %s: max abs err vs reference = %.4e\n",
+		dir, max_err);
 	ASSERT(max_err < 1e-2f);
+
+	/* Pooled output check: pick the EOT row from out_tokens, compare to pooled.npy. */
+	{
+		int eot_idx = 0;
+		int32_t max_tok = tokens[0];
+		int pi;
+		float pooled_ref[256];
+		int p_dims[4];
+		int p_n_dims;
+		const float *ours_pooled;
+		float pooled_max_err;
+
+		for (pi = 1; pi < ctx_len; pi++) {
+			if (tokens[pi] > max_tok) {
+				max_tok = tokens[pi];
+				eot_idx = pi;
+			}
+		}
+
+		snprintf(path, sizeof(path), "%s/pooled.npy", dir);
+		ASSERT(test_npy_load_f32(path, pooled_ref,
+					 p_dims, &p_n_dims) == 0);
+		ASSERT(p_n_dims == 1);
+		ASSERT(p_dims[0] == 256);
+
+		ours_pooled = (const float *)out->data + eot_idx * 256;
+		pooled_max_err = 0.0f;
+		for (pi = 0; pi < 256; pi++) {
+			float e = fabsf(ours_pooled[pi] - pooled_ref[pi]);
+			if (e > pooled_max_err)
+				pooled_max_err = e;
+		}
+		fprintf(stderr,
+			"pooled %s: max abs err vs reference = %.4e"
+			" (eot_idx=%d)\n",
+			dir, pooled_max_err, eot_idx);
+		ASSERT(pooled_max_err < 1e-2f);
+	}
 
 	sam3_backend_free(be);
 	sam3_arena_free(&persist);
