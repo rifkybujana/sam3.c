@@ -157,21 +157,162 @@ enum sam3_error sam3_mobileclip_text_iface_init_impl(
 
 /* --- Helpers for weight loading --- */
 
+/* --- load_repmixer_block --- */
+
 /*
- * load_required - Lookup tensor by name; log error and return NULL on miss.
+ * load_repmixer_block - Populate one repmixer layer slot.
  *
- * Used by Task 6.1 for RepMixer keys that must be present. Kept here so
- * the symbol is defined before sam3_mobileclip_text_load.
+ * @R:           Repmixer struct to fill (zeroed by caller).
+ * @wf:          Open weight file.
+ * @arena:       Arena for tensor descriptors.
+ * @layer_idx:   The transformer.<layer_idx> index in the source state-dict.
+ * @width:       cfg.width (channel count, 512 for S0).
+ * @mlp_dim:     cfg.mlp_dim (2048 for S0).
+ *
+ * BN params are required by the audited S0 checkpoint (no fold). All four
+ * (weight, bias, running_mean, running_var) per BN must load successfully;
+ * a missing key is a model-format error. The optional rbr_scale branch
+ * tolerates absence — when NULL, build skips the branch.
  */
-static struct sam3_tensor *load_required(
-	const struct sam3_weight_file *wf, struct sam3_arena *arena,
-	const char *name, enum sam3_dtype dtype, int n_dims, const int *dims)
+static enum sam3_error load_repmixer_block(
+	struct sam3_mobileclip_layer_repmixer *R,
+	const struct sam3_weight_file *wf,
+	struct sam3_arena *arena,
+	int layer_idx, int width, int mlp_dim)
 {
-	struct sam3_tensor *t = gh_load_mmap_optional(
-		wf, name, arena, dtype, n_dims, dims);
-	if (!t)
-		sam3_log_error("mobileclip: required tensor %s not found", name);
-	return t;
+	char k[256];
+	int dims[4];
+
+#define K(suffix) \
+	(snprintf(k, sizeof(k), ENC_PFX "transformer.%d." suffix, \
+		  layer_idx), k)
+
+	/* Outer + token-mixer scales: shape [width, 1, 1] */
+	dims[0] = width; dims[1] = 1; dims[2] = 1;
+	R->outer_layer_scale = gh_load_mmap(wf, K("layer_scale"),
+					    arena, SAM3_DTYPE_F32, 3, dims);
+	R->tm_layer_scale    = gh_load_mmap(wf, K("token_mixer.layer_scale"),
+					    arena, SAM3_DTYPE_F32, 3, dims);
+
+	/* token_mixer.norm.rbr_skip — single BN, shape [width] each. */
+	dims[0] = width;
+	R->norm_skip_w  = gh_load_mmap(
+		wf, K("token_mixer.norm.rbr_skip.weight"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->norm_skip_b  = gh_load_mmap(
+		wf, K("token_mixer.norm.rbr_skip.bias"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->norm_skip_rm = gh_load_mmap(
+		wf, K("token_mixer.norm.rbr_skip.running_mean"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->norm_skip_rv = gh_load_mmap(
+		wf, K("token_mixer.norm.rbr_skip.running_var"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+	/* token_mixer.mixer.rbr_skip — BN-only branch. */
+	R->mixer_skip_w  = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_skip.weight"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_skip_b  = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_skip.bias"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_skip_rm = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_skip.running_mean"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_skip_rv = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_skip.running_var"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+	/* token_mixer.mixer.rbr_conv[0] — depthwise conv 1×11 + BN. */
+	dims[0] = width; dims[1] = 1; dims[2] = 1; dims[3] = 11;
+	R->mixer_conv_w = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_conv.0.conv.weight"),
+		arena, SAM3_DTYPE_F32, 4, dims);
+	dims[0] = width;
+	R->mixer_conv_bn_w  = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_conv.0.bn.weight"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_conv_bn_b  = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_conv.0.bn.bias"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_conv_bn_rm = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_conv.0.bn.running_mean"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_conv_bn_rv = gh_load_mmap(
+		wf, K("token_mixer.mixer.rbr_conv.0.bn.running_var"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+	/* (Optional) token_mixer.mixer.rbr_scale — 1×1 conv + BN.
+	 * NULL on miss is silent; build skips this branch when NULL. */
+	dims[0] = width; dims[1] = width; dims[2] = 1; dims[3] = 1;
+	R->mixer_scale_w = gh_load_mmap_optional(
+		wf, K("token_mixer.mixer.rbr_scale.conv.weight"),
+		arena, SAM3_DTYPE_F32, 4, dims);
+	dims[0] = width;
+	R->mixer_scale_bn_w  = gh_load_mmap_optional(
+		wf, K("token_mixer.mixer.rbr_scale.bn.weight"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_scale_bn_b  = gh_load_mmap_optional(
+		wf, K("token_mixer.mixer.rbr_scale.bn.bias"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_scale_bn_rm = gh_load_mmap_optional(
+		wf, K("token_mixer.mixer.rbr_scale.bn.running_mean"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->mixer_scale_bn_rv = gh_load_mmap_optional(
+		wf, K("token_mixer.mixer.rbr_scale.bn.running_var"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+	/* convffn.conv — depthwise 1×11 + BN. */
+	dims[0] = width; dims[1] = 1; dims[2] = 1; dims[3] = 11;
+	R->convffn_dw_w = gh_load_mmap(
+		wf, K("convffn.conv.conv.weight"),
+		arena, SAM3_DTYPE_F32, 4, dims);
+	dims[0] = width;
+	R->convffn_dw_bn_w  = gh_load_mmap(
+		wf, K("convffn.conv.bn.weight"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->convffn_dw_bn_b  = gh_load_mmap(
+		wf, K("convffn.conv.bn.bias"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->convffn_dw_bn_rm = gh_load_mmap(
+		wf, K("convffn.conv.bn.running_mean"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+	R->convffn_dw_bn_rv = gh_load_mmap(
+		wf, K("convffn.conv.bn.running_var"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+	/* convffn.fc1 / convffn.fc2 — 1×1 convs with bias. */
+	dims[0] = mlp_dim; dims[1] = width; dims[2] = 1; dims[3] = 1;
+	R->convffn_fc1_w = gh_load_mmap(
+		wf, K("convffn.fc1.weight"),
+		arena, SAM3_DTYPE_F32, 4, dims);
+	dims[0] = mlp_dim;
+	R->convffn_fc1_b = gh_load_mmap(
+		wf, K("convffn.fc1.bias"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+	dims[0] = width; dims[1] = mlp_dim; dims[2] = 1; dims[3] = 1;
+	R->convffn_fc2_w = gh_load_mmap(
+		wf, K("convffn.fc2.weight"),
+		arena, SAM3_DTYPE_F32, 4, dims);
+	dims[0] = width;
+	R->convffn_fc2_b = gh_load_mmap(
+		wf, K("convffn.fc2.bias"),
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+#undef K
+
+	if (!R->mixer_conv_w || !R->convffn_dw_w ||
+	    !R->convffn_fc1_w || !R->convffn_fc2_w) {
+		sam3_log_error("mobileclip: RepMixer block %d incomplete",
+			       layer_idx);
+		return SAM3_EMODEL;
+	}
+
+	sam3_log_info("mobileclip_s0: RepMixer block %d loaded%s",
+		      layer_idx,
+		      R->mixer_scale_w ? " (rbr_scale present)" : "");
+	return SAM3_OK;
 }
 
 /* --- sam3_mobileclip_text_load --- */
@@ -256,6 +397,11 @@ enum sam3_error sam3_mobileclip_text_load(
 		}
 		if (is_rep) {
 			enc->layers[i].is_repmixer = 1;
+			enum sam3_error e = load_repmixer_block(
+				&enc->layers[i].u.repmixer, wf, arena,
+				i, cfg->width, cfg->mlp_dim);
+			if (e != SAM3_OK)
+				return e;
 			continue;
 		}
 		enc->layers[i].is_repmixer = 0;
