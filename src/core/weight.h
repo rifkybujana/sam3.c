@@ -90,6 +90,7 @@ struct sam3_weight_file {
 	uint32_t                              hash_capacity;
 	pthread_t                             prefetch_thread;
 	int                                   prefetch_active;
+	uint32_t                              text_backbone; /* derived from header */
 };
 
 #define SAM3_WEIGHT_HASH_EMPTY UINT32_MAX

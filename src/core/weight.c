@@ -377,7 +377,7 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 		memset(wf, 0, sizeof(*wf));
 		return SAM3_EMODEL;
 	}
-	(void)text_backbone; /* will be surfaced in Task 1.4 */
+	wf->text_backbone = text_backbone;
 
 	/* Validate tensor table fits in file */
 	size_t table_size = (size_t)hdr->n_tensors *
