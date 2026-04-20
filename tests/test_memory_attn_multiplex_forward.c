@@ -1,7 +1,7 @@
 /*
- * tests/test_memory_attn_v2_forward.c - Memory attention v2 forward smoke test.
+ * tests/test_memory_attn_multiplex_forward.c - Memory attention multiplex forward smoke test.
  *
- * Loads the tracker_v2 memory-attention transformer from
+ * Loads the tracker_multiplex memory-attention transformer from
  * models/sam3.1.sam3 and runs one forward pass on a miniature 8x8
  * grid (Nq=64) with synthetic inputs. Verifies that the 4-layer
  * decoupled RoPE transformer compiles a runnable graph, produces the
@@ -10,8 +10,8 @@
  * waits for the full CUDA / BatchedDatapoint reference path to be
  * unblocked (tracked in the sub-project 2 design spec).
  *
- * Key types:  sam3_tracker_v2, sam3_v2_memory_attn
- * Depends on: model/tracker_v2.h, model/graph_helpers.h, backend/cpu,
+ * Key types:  sam3_tracker_multiplex, sam3_multiplex_memory_attn
+ * Depends on: model/tracker_multiplex.h, model/graph_helpers.h, backend/cpu,
  *             core/graph.h, test_helpers.h
  * Used by:    CTest
  *
@@ -28,7 +28,7 @@
 #include "core/weight.h"
 #include "core/alloc.h"
 #include "core/graph.h"
-#include "model/tracker_v2.h"
+#include "model/tracker_multiplex.h"
 #include "model/graph_helpers.h"
 #include "backend/cpu/cpu_backend.h"
 #include "backend/backend.h"
@@ -62,12 +62,12 @@ static void fill_pattern(float *dst, int n, float step, int period)
 int main(void)
 {
 	if (access(MODEL_PATH, F_OK) != 0) {
-		printf("test_memory_attn_v2_forward: SKIP (%s missing)\n",
+		printf("test_memory_attn_multiplex_forward: SKIP (%s missing)\n",
 		       MODEL_PATH);
 		return 0;
 	}
 
-	/* ── 1. Backend + arenas ───────────────────────────────────────── */
+	/* --- 1. Backend + arenas ──────────── --- */
 	struct sam3_cpu_backend cpu;
 	memset(&cpu, 0, sizeof(cpu));
 	cpu.base.type = SAM3_BACKEND_CPU;
@@ -79,16 +79,16 @@ int main(void)
 	memset(&weight_arena, 0, sizeof(weight_arena));
 	ASSERT_EQ(sam3_arena_init(&weight_arena, 16 * 1024 * 1024), SAM3_OK);
 
-	/* ── 2. Load tracker_v2 weights ──────────────────────────────────── */
+	/* --- 2. Load tracker_multiplex weights ─────── --- */
 	struct sam3_weight_file wf;
 	memset(&wf, 0, sizeof(wf));
 	ASSERT_EQ(sam3_weight_open(&wf, MODEL_PATH), SAM3_OK);
 
-	struct sam3_tracker_v2 trk;
-	ASSERT_EQ(sam3_tracker_v2_init(&trk), SAM3_OK);
-	ASSERT_EQ(sam3_tracker_v2_load(&trk, &wf, &weight_arena), SAM3_OK);
+	struct sam3_tracker_multiplex trk;
+	ASSERT_EQ(sam3_tracker_multiplex_init(&trk), SAM3_OK);
+	ASSERT_EQ(sam3_tracker_multiplex_load(&trk, &wf, &weight_arena), SAM3_OK);
 
-	/* ── 3. Build synthetic inputs ─────────────────────────────────── */
+	/* --- 3. Build synthetic inputs ────── --- */
 	int nq_dims[] = {1, TEST_NQ, TEST_HIDDEN};
 	int nm_dims[] = {1, TEST_NM, TEST_HIDDEN};
 
@@ -120,7 +120,7 @@ int main(void)
 	fill_pattern((float *)memory_image_pos->data,
 		     TEST_NM * TEST_HIDDEN, 0.01f, 41);
 
-	/* ── 4. Two-pass forward: both pos-enc inputs set, then both NULL ─ */
+	/* --- 4. Two-pass forward: both pos-enc inputs set, then both NULL --- */
 	struct sam3_tensor *pass_tgt_pos[2]  = {tgt_pos, NULL};
 	struct sam3_tensor *pass_mem_ip[2]   = {memory_image_pos, NULL};
 	const char *labels[2] = {"full_pos", "no_pos"};
@@ -129,7 +129,7 @@ int main(void)
 		struct sam3_graph graph;
 		sam3_graph_init(&graph);
 
-		struct sam3_tensor *out = sam3_v2_memory_attn_forward(
+		struct sam3_tensor *out = sam3_multiplex_memory_attn_forward(
 				&graph, &cpu.arena, &trk.transformer,
 				tgt, pass_tgt_pos[pass], image,
 				memory, memory_image, pass_mem_ip[pass],
@@ -145,7 +145,7 @@ int main(void)
 				&cpu.base, &graph);
 		ASSERT_EQ(err, SAM3_OK);
 
-		/* ── 5. Verify finite, non-trivial output ───────────── */
+		/* --- 5. Verify finite, non-trivial output --- */
 		const float *od = (const float *)out->data;
 		int n_out = TEST_NQ * TEST_HIDDEN;
 		int any_nan = 0;
@@ -167,7 +167,7 @@ int main(void)
 		double mean_sq = sum_sq / (double)n_out;
 		ASSERT(mean_sq > 1e-4);
 
-		printf("test_memory_attn_v2_forward[%s]: PASS "
+		printf("test_memory_attn_multiplex_forward[%s]: PASS "
 		       "(out [%d,%d,%d] abs_max=%.4f mean_sq=%.4f)\n",
 		       labels[pass],
 		       out->dims[0], out->dims[1], out->dims[2],

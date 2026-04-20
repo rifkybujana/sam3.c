@@ -2,7 +2,7 @@
  * tests/test_sam3_1_track.c - End-to-end SAM 3.1 video-tracker smoke test.
  *
  * Drives sam3_video_start -> add_points -> propagate(BOTH) against a
- * SAM 3.1 model + a small video clip. Verifies that the tracker_v2
+ * SAM 3.1 model + a small video clip. Verifies that the tracker_multiplex
  * pipeline wired in phase 2.5 runs without crashing and produces
  * finite, non-trivial masks per frame (not all zeros, not constant).
  *
@@ -114,7 +114,7 @@ int main(void)
 	ASSERT_NOT_NULL(sess);
 
 	/* Add a point prompt on frame 0. The point content is effectively
-	 * ignored by the current v2 pipeline (no interactive decoder yet)
+	 * ignored by the current multiplex pipeline (no interactive decoder yet)
 	 * but it still registers the object and runs the tracker. */
 	struct sam3_point pt;
 	memset(&pt, 0, sizeof(pt));

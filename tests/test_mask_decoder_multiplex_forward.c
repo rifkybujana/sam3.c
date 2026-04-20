@@ -1,7 +1,7 @@
 /*
- * tests/test_mask_decoder_v2_forward.c - SAM 3.1 mask decoder forward smoke test.
+ * tests/test_mask_decoder_multiplex_forward.c - SAM 3.1 mask decoder forward smoke test.
  *
- * Loads the tracker_v2 sam_mask_decoder from models/sam3.1.sam3 and runs
+ * Loads the tracker_multiplex sam_mask_decoder from models/sam3.1.sam3 and runs
  * one forward pass on a miniature 8x8 grid with synthetic inputs. Verifies
  * that the 2-layer two-way transformer + upscaling + hypernetwork + heads
  * compile a runnable graph, produce the expected multiplex-shaped output
@@ -10,8 +10,8 @@
  * reference path (tracked in the sub-project 2 TODO's "deferred polish"
  * section).
  *
- * Key types:  sam3_tracker_v2, sam3_v2_mask_decoder
- * Depends on: model/tracker_v2.h, model/graph_helpers.h, backend/cpu,
+ * Key types:  sam3_tracker_multiplex, sam3_multiplex_mask_decoder
+ * Depends on: model/tracker_multiplex.h, model/graph_helpers.h, backend/cpu,
  *             core/graph.h, test_helpers.h
  * Used by:    CTest
  *
@@ -28,7 +28,7 @@
 #include "core/weight.h"
 #include "core/alloc.h"
 #include "core/graph.h"
-#include "model/tracker_v2.h"
+#include "model/tracker_multiplex.h"
 #include "model/graph_helpers.h"
 #include "backend/cpu/cpu_backend.h"
 #include "backend/backend.h"
@@ -50,7 +50,7 @@
 #define TEST_W         8
 #define TEST_C         256
 #define TEST_HW        (TEST_H * TEST_W)
-#define TEST_MUX       SAM3_V2_MULTIPLEX_COUNT    /* 16 */
+#define TEST_MUX       SAM3_MULTIPLEX_COUNT    /* 16 */
 #define TEST_NMASK     3                          /* num_multimask_outputs */
 
 static void fill_pattern(float *dst, int n, float step, int period)
@@ -84,12 +84,12 @@ static void check_finite_nontrivial(const struct sam3_tensor *t,
 int main(void)
 {
 	if (access(MODEL_PATH, F_OK) != 0) {
-		printf("test_mask_decoder_v2_forward: SKIP (%s missing)\n",
+		printf("test_mask_decoder_multiplex_forward: SKIP (%s missing)\n",
 		       MODEL_PATH);
 		return 0;
 	}
 
-	/* ── 1. Backend + arenas ───────────────────────────────────────── */
+	/* --- 1. Backend + arenas ──────────── --- */
 	struct sam3_cpu_backend cpu;
 	memset(&cpu, 0, sizeof(cpu));
 	cpu.base.type = SAM3_BACKEND_CPU;
@@ -101,16 +101,16 @@ int main(void)
 	memset(&weight_arena, 0, sizeof(weight_arena));
 	ASSERT_EQ(sam3_arena_init(&weight_arena, 16 * 1024 * 1024), SAM3_OK);
 
-	/* ── 2. Load tracker_v2 weights ──────────────────────────────────── */
+	/* --- 2. Load tracker_multiplex weights ─────── --- */
 	struct sam3_weight_file wf;
 	memset(&wf, 0, sizeof(wf));
 	ASSERT_EQ(sam3_weight_open(&wf, MODEL_PATH), SAM3_OK);
 
-	struct sam3_tracker_v2 trk;
-	ASSERT_EQ(sam3_tracker_v2_init(&trk), SAM3_OK);
-	ASSERT_EQ(sam3_tracker_v2_load(&trk, &wf, &weight_arena), SAM3_OK);
+	struct sam3_tracker_multiplex trk;
+	ASSERT_EQ(sam3_tracker_multiplex_init(&trk), SAM3_OK);
+	ASSERT_EQ(sam3_tracker_multiplex_load(&trk, &wf, &weight_arena), SAM3_OK);
 
-	/* ── 3. Build synthetic inputs ─────────────────────────────────── */
+	/* --- 3. Build synthetic inputs ────── --- */
 	int img_dims[]   = {1, TEST_H, TEST_W, TEST_C};
 	int pe_dims[]    = {TEST_HW, TEST_C};
 	int s1_dims[]    = {1, TEST_H * 2, TEST_W * 2, TEST_C};
@@ -140,7 +140,7 @@ int main(void)
 	fill_pattern((float *)extra_emb->data,
 		     TEST_MUX * TEST_C, 0.01f, 13);
 
-	/* ── 4. Two passes: with extra_per_object, and without ────────── */
+	/* --- 4. Two passes: with extra_per_object, and without --- */
 	struct sam3_tensor *pass_extra[2] = {extra_emb, NULL};
 	const char *labels[2] = {"with_extra", "no_extra"};
 
@@ -153,7 +153,7 @@ int main(void)
 		struct sam3_tensor *obj_logits = NULL;
 		struct sam3_tensor *sam_tok   = NULL;
 
-		enum sam3_error err = sam3_v2_mask_decoder_forward(
+		enum sam3_error err = sam3_multiplex_mask_decoder_forward(
 				&graph, &cpu.arena, &trk.sam_mask_decoder,
 				image_embed, image_pe, feat_s1, feat_s0,
 				pass_extra[pass],
@@ -184,12 +184,12 @@ int main(void)
 		err = cpu.base.ops->graph_eval(&cpu.base, &graph);
 		ASSERT_EQ(err, SAM3_OK);
 
-		printf("test_mask_decoder_v2_forward[%s]:\n", labels[pass]);
+		printf("test_mask_decoder_multiplex_forward[%s]:\n", labels[pass]);
 		check_finite_nontrivial(masks, "masks");
 		check_finite_nontrivial(ious, "iou_scores");
 		check_finite_nontrivial(obj_logits, "obj_score_logits");
 		check_finite_nontrivial(sam_tok, "sam_tokens");
-		printf("test_mask_decoder_v2_forward[%s]: PASS\n",
+		printf("test_mask_decoder_multiplex_forward[%s]: PASS\n",
 		       labels[pass]);
 	}
 

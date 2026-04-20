@@ -1,13 +1,13 @@
 /*
- * tests/test_tracker_v2_load.c - Round-trip sam3_tracker_v2 weight load.
+ * tests/test_tracker_multiplex_load.c - Round-trip sam3_tracker_multiplex weight load.
  *
- * Opens models/sam3.1.sam3 (skips if absent), runs sam3_tracker_v2_init
- * + sam3_tracker_v2_load, and asserts that every phase-2.1 tensor
+ * Opens models/sam3.1.sam3 (skips if absent), runs sam3_tracker_multiplex_init
+ * + sam3_tracker_multiplex_load, and asserts that every phase-2.1 tensor
  * resolved to a non-NULL tensor with the expected shape. The test does
  * not exercise any forward graph — forward functions land in phase 2.2+.
  *
- * Key types:  sam3_tracker_v2
- * Depends on: model/tracker_v2.h, core/weight.h, test_helpers.h
+ * Key types:  sam3_tracker_multiplex
+ * Depends on: model/tracker_multiplex.h, core/weight.h, test_helpers.h
  * Used by:    CTest
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -23,7 +23,7 @@
 #include "sam3/sam3.h"
 #include "core/weight.h"
 #include "core/alloc.h"
-#include "model/tracker_v2.h"
+#include "model/tracker_multiplex.h"
 #include "test_helpers.h"
 
 #ifndef SAM3_SOURCE_DIR
@@ -57,7 +57,7 @@ static void assert_tensor(const struct sam3_tensor *t, const char *label,
 int main(void)
 {
 	if (access(MODEL_PATH, F_OK) != 0) {
-		printf("test_tracker_v2_load: SKIP (model missing at %s)\n",
+		printf("test_tracker_multiplex_load: SKIP (model missing at %s)\n",
 		       MODEL_PATH);
 		return 0;
 	}
@@ -70,11 +70,11 @@ int main(void)
 	memset(&arena, 0, sizeof(arena));
 	ASSERT_EQ(sam3_arena_init(&arena, 1024 * 1024), SAM3_OK);
 
-	struct sam3_tracker_v2 trk;
-	ASSERT_EQ(sam3_tracker_v2_init(&trk), SAM3_OK);
-	ASSERT_EQ(sam3_tracker_v2_load(&trk, &wf, &arena), SAM3_OK);
+	struct sam3_tracker_multiplex trk;
+	ASSERT_EQ(sam3_tracker_multiplex_init(&trk), SAM3_OK);
+	ASSERT_EQ(sam3_tracker_multiplex_load(&trk, &wf, &arena), SAM3_OK);
 
-	/* ── Maskmem mask downsampler (4 conv stages + final 1x1) ─────── */
+	/* --- Maskmem mask downsampler (4 conv stages + final 1x1) --- */
 	printf("  maskmem.mask_downsampler\n");
 	int chans[5] = {32, 16, 64, 256, 1024};
 	for (int s = 0; s < 4; s++) {
@@ -93,14 +93,14 @@ int main(void)
 	assert_tensor(trk.maskmem.mask_downsampler.proj_b,
 		       "mask_ds.proj_b", 1, 256);
 
-	/* ── Maskmem pix_feat_proj + fuser ──────────────────────────────── */
+	/* --- Maskmem pix_feat_proj + fuser ─── --- */
 	printf("  maskmem.pix_feat_proj + fuser\n");
 	assert_tensor(trk.maskmem.pix_feat_proj_w,
 		       "maskmem.pix_feat_proj_w", 4, 256, 1, 1, 256);
 	assert_tensor(trk.maskmem.pix_feat_proj_b,
 		       "maskmem.pix_feat_proj_b", 1, 256);
 	for (int i = 0; i < 2; i++) {
-		struct sam3_v2_cxblock *blk = &trk.maskmem.fuser[i];
+		struct sam3_multiplex_cxblock *blk = &trk.maskmem.fuser[i];
 		assert_tensor(blk->dwconv_w, "fuser.dwconv_w", 4,
 			       256, 7, 7, 1);
 		assert_tensor(blk->dwconv_b, "fuser.dwconv_b", 1, 256);
@@ -113,7 +113,7 @@ int main(void)
 		assert_tensor(blk->gamma,    "fuser.gamma",    1, 256);
 	}
 
-	/* ── obj_ptr_proj (3-layer MLP) ─────────────────────────────────── */
+	/* --- obj_ptr_proj (3-layer MLP) ────── --- */
 	printf("  obj_ptr_proj\n");
 	for (int i = 0; i < 3; i++) {
 		assert_tensor(trk.obj_ptr_proj.fc_w[i], "obj_ptr.fc_w", 2,
@@ -122,17 +122,17 @@ int main(void)
 			       256);
 	}
 
-	/* ── Small projections ──────────────────────────────────────────── */
+	/* --- Small projections ─────────────── --- */
 	printf("  obj_ptr_tpos_proj + no_obj_ptr_linear\n");
 	assert_tensor(trk.obj_ptr_tpos_proj_w, "obj_ptr_tpos.w", 2, 256, 256);
 	assert_tensor(trk.obj_ptr_tpos_proj_b, "obj_ptr_tpos.b", 1, 256);
 	assert_tensor(trk.no_obj_ptr_linear_w, "no_obj_ptr.w", 2, 256, 256);
 	assert_tensor(trk.no_obj_ptr_linear_b, "no_obj_ptr.b", 1, 256);
 
-	/* ── Memory-attention transformer (phase 2.3a) ──────────────────── */
+	/* --- Memory-attention transformer (phase 2.3a) --- */
 	printf("  transformer.layers (4 decoupled layers)\n");
 	for (int li = 0; li < 4; li++) {
-		struct sam3_v2_memory_attn_layer *L =
+		struct sam3_multiplex_memory_attn_layer *L =
 			&trk.transformer.layers[li];
 
 		/* self_attn QKV + out: all [256, 256] + [256] */
@@ -162,10 +162,10 @@ int main(void)
 	assert_tensor(trk.transformer.final_norm_w, "final_norm_w", 1, 256);
 	assert_tensor(trk.transformer.final_norm_b, "final_norm_b", 1, 256);
 
-	/* ── SAM mask decoder (phase 2.4a) ──────────────────────────────── */
+	/* --- SAM mask decoder (phase 2.4a) ─── --- */
 	printf("  sam_mask_decoder (2-layer transformer + heads)\n");
 	for (int li = 0; li < 2; li++) {
-		struct sam3_v2_mask_decoder_layer *L =
+		struct sam3_multiplex_mask_decoder_layer *L =
 			&trk.sam_mask_decoder.layers[li];
 		/* self_attn is full 256-dim */
 		assert_tensor(L->self_q_w, "md.self_q_w", 2, 256, 256);
@@ -201,7 +201,7 @@ int main(void)
 	assert_tensor(trk.sam_mask_decoder.obj_score_token,
 		       "md.obj_score_token", 2, 16, 256);
 
-	/* ── Singletons ─────────────────────────────────────────────────── */
+	/* --- Singletons ─ --- */
 	printf("  singleton embeddings\n");
 	assert_tensor(trk.image_pe_gauss, "image_pe_gauss", 2, 2, 128);
 	assert_tensor(trk.maskmem_tpos_enc, "maskmem_tpos_enc", 4,
@@ -218,7 +218,7 @@ int main(void)
 	sam3_arena_free(&arena);
 	sam3_weight_close(&wf);
 
-	printf("test_tracker_v2_load: PASS (phase-2.4a all %d tensors)\n",
-	       SAM3_V2_PHASE_2_4A_TENSORS);
+	printf("test_tracker_multiplex_load: PASS (phase-2.4a all %d tensors)\n",
+	       SAM3_MULTIPLEX_PHASE_2_4A_TENSORS);
 	return 0;
 }

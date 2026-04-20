@@ -33,7 +33,7 @@
 #include "model/sam3_processor.h"
 #include "model/video_session.h"
 #include "model/tracker.h"
-#include "model/tracker_v2.h"
+#include "model/tracker_multiplex.h"
 #include "model/mask_decoder.h"
 #include "model/graph_helpers.h"
 #include "model/frame_cache.h"
@@ -340,7 +340,7 @@ session_encode_frame(struct sam3_video_session *session,
 	/*
 	 * image_features (0.5x) is only populated for SAM 3's dual-neck
 	 * checkpoints (where the sam2 neck contributes a 4th FPN scale).
-	 * SAM 3.1 ships a tri-neck with no 0.5x output, and its tracker_v2
+	 * SAM 3.1 ships a tri-neck with no 0.5x output, and its tracker_multiplex
 	 * reads feat_s1 (1x) as the main backbone embedding — the 0.5x slot
 	 * stays NULL and is not consumed downstream. Tolerate that here.
 	 */
@@ -370,9 +370,9 @@ session_encode_frame(struct sam3_video_session *session,
 		return SAM3_ENOMEM;
 	}
 	/*
-	 * SAM 3.1's v2 tracker reads feat_4x as the decoder's skip feed —
+	 * SAM 3.1's multiplex tracker reads feat_4x as the decoder's skip feed —
 	 * reject clone failures here instead of silently returning a NULL
-	 * feat_4x that trips the v2 pipeline later.
+	 * feat_4x that trips the multiplex pipeline later.
 	 */
 	if (!out->feat_4x && src_4x) {
 		sam3_log_error("session_encode_frame: feat_4x clone failed "
@@ -451,16 +451,16 @@ enum sam3_error sam3_video_start_ex(sam3_ctx *ctx,
 	/* Initialize and load the variant-specific tracker. */
 	session->variant = ctx->config.variant;
 	if (session->variant == SAM3_VARIANT_SAM3_1) {
-		err = sam3_tracker_v2_init(&session->tracker_v2);
+		err = sam3_tracker_multiplex_init(&session->tracker_multiplex);
 		if (err != SAM3_OK) {
-			sam3_log_error("video_start: tracker_v2 init failed (%d)",
+			sam3_log_error("video_start: tracker_multiplex init failed (%d)",
 				       err);
 			goto cleanup;
 		}
-		err = sam3_tracker_v2_load(&session->tracker_v2, &ctx->weights,
+		err = sam3_tracker_multiplex_load(&session->tracker_multiplex, &ctx->weights,
 					   &session->persist);
 		if (err != SAM3_OK) {
-			sam3_log_error("video_start: tracker_v2 load failed (%d)",
+			sam3_log_error("video_start: tracker_multiplex load failed (%d)",
 				       err);
 			goto cleanup;
 		}
@@ -659,14 +659,14 @@ video_track_one_obj(struct sam3_video_session *session,
 	}
 
 	/*
-	 * Invariant: `trk` and `trk_v2` are mutually exclusive — exactly
-	 * one is non-NULL based on `is_v2`. Every variant-dispatch branch
+	 * Invariant: `trk` and `trk_mux` are mutually exclusive — exactly
+	 * one is non-NULL based on `is_multiplex`. Every variant-dispatch branch
 	 * below relies on this to dereference the right tracker without
 	 * another NULL check.
 	 */
-	const int is_v2 = (session->variant == SAM3_VARIANT_SAM3_1);
-	struct sam3_tracker     *trk    = is_v2 ? NULL : &session->tracker;
-	struct sam3_tracker_v2  *trk_v2 = is_v2 ? &session->tracker_v2 : NULL;
+	const int is_multiplex = (session->variant == SAM3_VARIANT_SAM3_1);
+	struct sam3_tracker     *trk    = is_multiplex ? NULL : &session->tracker;
+	struct sam3_tracker_multiplex  *trk_mux = is_multiplex ? &session->tracker_multiplex : NULL;
 	struct sam3_memory_bank *bank   = &session->objects[obj_idx].bank;
 
 	SAM3_PROF_BEGIN(ctx->proc.profiler,
@@ -693,8 +693,8 @@ video_track_one_obj(struct sam3_video_session *session,
 		}
 	}
 	if (!cf.feat_s0 || !cf.feat_s1 ||
-	    (is_v2 && !cf.feat_4x) ||
-	    (!is_v2 && !cf.image_features)) {
+	    (is_multiplex && !cf.feat_4x) ||
+	    (!is_multiplex && !cf.image_features)) {
 		sam3_log_error("video_track: frame %d missing features "
 			       "(variant=%d)", frame_idx, session->variant);
 		err = SAM3_EINVAL;
@@ -729,13 +729,13 @@ video_track_one_obj(struct sam3_video_session *session,
 	/* --- 4. Variant-dispatched tracker call ------------------------- */
 	struct sam3_tensor *track_masks   = NULL; /* [N_mask, H, W]            */
 	struct sam3_tensor *track_iou     = NULL; /* [N_mask]                  */
-	struct sam3_tensor *track_obj_ptr = NULL; /* sam3:[1,256] v2:[N_mask,256] */
+	struct sam3_tensor *track_obj_ptr = NULL; /* sam3:[1,256] mux:[N_mask,256] */
 	struct sam3_tensor *track_score   = NULL; /* [1]                        */
 
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_build");
-	if (is_v2) {
-		err = sam3_tracker_v2_track_frame(
-			trk_v2, &g, bank,
+	if (is_multiplex) {
+		err = sam3_tracker_multiplex_track_frame(
+			trk_mux, &g, bank,
 			cf.feat_s1,   /* 1x = main grid, 72x72 */
 			cf.feat_s0,   /* 2x skip, 144x144       */
 			cf.feat_4x,   /* 4x skip, 288x288       */
@@ -840,7 +840,7 @@ video_track_one_obj(struct sam3_video_session *session,
 	int best_idx = 0;
 	if (track_iou && track_iou->n_dims >= 1 &&
 	    track_iou->dims[0] >= n_masks) {
-		if (is_v2) {
+		if (is_multiplex) {
 			/*
 			 * Argmax IoU. Stability-aware selection for SAM 3.1
 			 * lives in sub-project 3's interactive decoder once
@@ -906,29 +906,29 @@ video_track_one_obj(struct sam3_video_session *session,
 	 *   persist copy when not appearing in step 8. The mask gating to
 	 *   NO_OBJ_SCORE is identical.
 	 */
-	struct sam3_tensor *no_obj_ptr = is_v2
+	struct sam3_tensor *no_obj_ptr = is_multiplex
 		? NULL
 		: trk->no_obj_ptr;
-	struct sam3_tensor *no_obj_embed = is_v2
-		? NULL  /* v2 no_obj_embed_spatial is [16, 256], applied later */
+	struct sam3_tensor *no_obj_embed = is_multiplex
+		? NULL  /* multiplex no_obj_embed_spatial is [16, 256], applied later */
 		: trk->no_obj_embed_spatial;
 	int is_appearing = apply_occlusion_gating(
 		track_masks,
-		is_v2 ? NULL : track_obj_ptr,
+		is_multiplex ? NULL : track_obj_ptr,
 		NULL, track_score, no_obj_ptr, no_obj_embed);
 
 	/* --- 8. Persist the best obj_ptr ------------------------------- */
 	struct sam3_tensor *best_obj_ptr_scratch = NULL;
 	{
-		int op_dims[2] = {1, SAM3_V2_HIDDEN_DIM};
+		int op_dims[2] = {1, SAM3_MULTIPLEX_HIDDEN_DIM};
 		best_obj_ptr_scratch = gh_alloc_tensor(gfx, SAM3_DTYPE_F32,
 						      2, op_dims);
 		if (!best_obj_ptr_scratch) {
 			err = SAM3_ENOMEM;
 			goto cleanup;
 		}
-		const size_t D = (size_t)SAM3_V2_HIDDEN_DIM * sizeof(float);
-		if (!is_v2) {
+		const size_t D = (size_t)SAM3_MULTIPLEX_HIDDEN_DIM * sizeof(float);
+		if (!is_multiplex) {
 			/* Already pre-selected by sam3_tracker_track_frame
 			 * and gated in-place by apply_occlusion_gating. */
 			memcpy(best_obj_ptr_scratch->data,
@@ -936,7 +936,7 @@ video_track_one_obj(struct sam3_video_session *session,
 		} else if (is_appearing) {
 			memcpy(best_obj_ptr_scratch->data,
 			       (const float *)track_obj_ptr->data
-			         + (size_t)best_idx * SAM3_V2_HIDDEN_DIM,
+			         + (size_t)best_idx * SAM3_MULTIPLEX_HIDDEN_DIM,
 			       D);
 		} else {
 			memset(best_obj_ptr_scratch->data, 0, D);
@@ -966,7 +966,7 @@ video_track_one_obj(struct sam3_video_session *session,
 	struct sam3_tensor *mem_pos  = NULL;
 
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_build");
-	if (is_v2) {
+	if (is_multiplex) {
 		/*
 		 * Multiplex packing: put the best mask into slot-0 channel 0
 		 * and zero the remaining 31 channels. Proper multiplex
@@ -977,7 +977,7 @@ video_track_one_obj(struct sam3_video_session *session,
 		int pf_W  = cf.feat_s1->dims[2];
 		int big_H = pf_H * 16;
 		int big_W = pf_W * 16;
-		int mm_C  = SAM3_V2_MULTIPLEX_IN_CHANNELS;
+		int mm_C  = SAM3_MULTIPLEX_IN_CHANNELS;
 		int mm_dims[4] = {1, big_H, big_W, mm_C};
 		struct sam3_tensor *multi_mask = gh_alloc_tensor(
 			gfx, SAM3_DTYPE_F32, 4, mm_dims);
@@ -1004,8 +1004,8 @@ video_track_one_obj(struct sam3_video_session *session,
 						src[sy * final_w + sx];
 				}
 			}
-			mem_feat = sam3_v2_maskmem_forward(
-				&g, gfx, &trk_v2->maskmem,
+			mem_feat = sam3_multiplex_maskmem_forward(
+				&g, gfx, &trk_mux->maskmem,
 				cf.feat_s1, multi_mask,
 				/*skip_mask_sigmoid=*/0);
 			if (!mem_feat)
@@ -1057,10 +1057,10 @@ video_track_one_obj(struct sam3_video_session *session,
 	/*
 	 * SAM 3 post-encoder gating: add no_obj_embed_spatial when the
 	 * object isn't appearing so the stored memory reflects occlusion.
-	 * v2's no_obj_embed_spatial has a different shape (16, 256) and
+	 * The multiplex no_obj_embed_spatial has a different shape (16, 256) and
 	 * is applied via a different mechanism; skipped here.
 	 */
-	if (!is_v2) {
+	if (!is_multiplex) {
 		apply_occlusion_gating(NULL, NULL, mem_feat,
 				       track_score, no_obj_ptr, no_obj_embed);
 	}
@@ -1614,32 +1614,30 @@ propagate_one(struct sam3_video_session *session, int f,
 	}
 
 	/*
-	 * Build per-frame shared state: flatten feat_s1 once and capture
-	 * the arena offset. Each per-object call resets scratch to this
-	 * mark instead of 0, so the flatten is paid once per frame rather
-	 * than once per object. On multi-object clips (8 objs) this drops
-	 * 7 redundant ~1.3 MB memcpys plus the matching arena churn.
+	 * Per-frame shared-state prefetch. Flatten feat_s1 (SAM 3 path
+	 * only) once and stash the arena mark; each per-object call resets
+	 * scratch to this mark instead of 0, so the flatten is paid once
+	 * per frame rather than once per object. On multi-object clips
+	 * (8 objs) this drops 7 redundant ~1.3 MiB memcpys plus the
+	 * matching arena churn.
+	 *
+	 * Variant gating: only the SAM 3 tracker consumes the img_2d
+	 * flatten — the SAM 3.1 multiplex tracker takes NHWC features
+	 * directly. Tri-neck SAM 3.1 encodes also leave `image_features`
+	 * NULL by design (no 0.5x scale), so gating on it would
+	 * accidentally reject valid SAM 3.1 frames. SAM 3.1 still
+	 * prefetches the frame cache and stashes the arena mark, but skips
+	 * the 1.3 MiB img_2d memcpy that nobody reads.
 	 *
 	 * Fall back to per-object flatten (shared = NULL) if context is
 	 * not ready, cache lookup fails, or feat_s1 has an unexpected
-	 * shape — keeps correctness paths identical to the legacy code.
-	 */
-	/*
-	 * Per-frame shared-state prefetch. Only the SAM 3 tracker consumes
-	 * the img_2d flatten — SAM 3.1's v2 tracker takes NHWC features
-	 * directly. Also, tri-neck SAM 3.1 encodes leave `image_features`
-	 * NULL by design (no 0.5x scale), so gating on it here would
-	 * accidentally reject valid SAM 3.1 frames. Gate on variant.
-	 *
-	 * For SAM 3.1 we still prefetch the frame cache and stash the
-	 * arena mark — per-object resets reuse both — but skip the 1.3 MiB
-	 * img_2d memcpy that nobody reads.
+	 * shape — keeps correctness paths identical.
 	 */
 	struct sam3_ctx *ctx = session->ctx;
 	struct propagate_frame_ctx fctx;
 	const struct propagate_frame_ctx *shared = NULL;
 	if (ctx && ctx->proc_ready && ctx->proc.backend) {
-		const int is_v2 =
+		const int is_multiplex =
 			(session->variant == SAM3_VARIANT_SAM3_1);
 		memset(&fctx, 0, sizeof(fctx));
 		SAM3_PROF_BEGIN(prof, "frame_cache_get");
@@ -1650,7 +1648,7 @@ propagate_one(struct sam3_video_session *session, int f,
 				fctx.cf.feat_s0 &&
 				fctx.cf.feat_s1 &&
 				fctx.cf.feat_s1->n_dims == 4 &&
-				(is_v2
+				(is_multiplex
 				 ? (fctx.cf.feat_4x != NULL)
 				 : (fctx.cf.image_features != NULL)));
 		if (feats_ok) {
@@ -1662,7 +1660,7 @@ propagate_one(struct sam3_video_session *session, int f,
 			fctx.grid_w = img->dims[2];
 
 			int shared_ok = 1;
-			if (!is_v2) {
+			if (!is_multiplex) {
 				int dims2[2] = {fctx.grid_h * fctx.grid_w,
 						img->dims[3]};
 				fctx.img_2d = gh_alloc_tensor(scratch,
@@ -1675,7 +1673,7 @@ propagate_one(struct sam3_video_session *session, int f,
 					shared_ok = 0;
 				}
 			} else {
-				fctx.img_2d = NULL;  /* unused by v2 tracker */
+				fctx.img_2d = NULL;  /* unused by multiplex tracker */
 			}
 			if (shared_ok) {
 				fctx.scratch_mark = scratch->offset;
@@ -2026,7 +2024,7 @@ enum sam3_error sam3_video_add_mask(sam3_video_session *session,
 	/*
 	 * SAM 3.1 mask prompts route through the multiplex maskmem backbone
 	 * instead of the SAM 3 memory encoder. Sub-project 3's interactive
-	 * decoder + the v2 mask downsampler would wire this cleanly; until
+	 * decoder + the multiplex mask downsampler would wire this cleanly; until
 	 * then, reject with a clear error rather than dereferencing the
 	 * zero-initialized SAM 3 tracker below.
 	 */

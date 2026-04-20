@@ -274,9 +274,9 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
-	# test_tracker_v2_load opens models/sam3.1.sam3
-	if(TARGET test_tracker_v2_load)
-		target_compile_definitions(test_tracker_v2_load PRIVATE
+	# test_tracker_multiplex_load opens models/sam3.1.sam3
+	if(TARGET test_tracker_multiplex_load)
+		target_compile_definitions(test_tracker_multiplex_load PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
@@ -286,21 +286,21 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
-	# test_maskmem_v2_forward runs the forward graph; same dependency.
-	if(TARGET test_maskmem_v2_forward)
-		target_compile_definitions(test_maskmem_v2_forward PRIVATE
+	# test_maskmem_multiplex_forward runs the forward graph; same dependency.
+	if(TARGET test_maskmem_multiplex_forward)
+		target_compile_definitions(test_maskmem_multiplex_forward PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
-	# test_memory_attn_v2_forward also loads sam3.1.sam3.
-	if(TARGET test_memory_attn_v2_forward)
-		target_compile_definitions(test_memory_attn_v2_forward PRIVATE
+	# test_memory_attn_multiplex_forward also loads sam3.1.sam3.
+	if(TARGET test_memory_attn_multiplex_forward)
+		target_compile_definitions(test_memory_attn_multiplex_forward PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
-	# test_mask_decoder_v2_forward also loads sam3.1.sam3.
-	if(TARGET test_mask_decoder_v2_forward)
-		target_compile_definitions(test_mask_decoder_v2_forward PRIVATE
+	# test_mask_decoder_multiplex_forward also loads sam3.1.sam3.
+	if(TARGET test_mask_decoder_multiplex_forward)
+		target_compile_definitions(test_mask_decoder_multiplex_forward PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 

@@ -8,8 +8,9 @@
  * sam3.h.
  *
  * Key types:  sam3_video_session, sam3_video_object, sam3_video_prompt
- * Depends on: model/tracker.h, model/memory_bank.h, model/frame_cache.h,
- *             util/video.h, sam3/sam3.h, sam3/sam3_types.h, core/alloc.h
+ * Depends on: model/tracker.h, model/tracker_multiplex.h, model/memory_bank.h,
+ *             model/frame_cache.h, util/video.h, sam3/sam3.h,
+ *             sam3/sam3_types.h, core/alloc.h
  * Used by:    model/sam3_video.c, tests/test_video_session.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -24,7 +25,7 @@
 #include "sam3/sam3.h"
 #include "sam3/sam3_types.h"
 #include "model/tracker.h"
-#include "model/tracker_v2.h"
+#include "model/tracker_multiplex.h"
 #include "model/memory_bank.h"
 #include "model/frame_cache.h"
 #include "util/video.h"
@@ -99,12 +100,12 @@ struct sam3_video_session {
 
 	/*
 	 * SAM 3.1 variant-specific tracker. Exactly one of `tracker` (SAM 3)
-	 * or `tracker_v2` (SAM 3.1) is populated for the session lifetime;
+	 * or `tracker_multiplex` (SAM 3.1) is populated for the session lifetime;
 	 * `variant` selects which. Kept as parallel fields rather than a
 	 * C union so the per-frame pipelines can reference sub-module
 	 * addresses without type punning.
 	 */
-	struct sam3_tracker_v2 tracker_v2;
+	struct sam3_tracker_multiplex tracker_multiplex;
 	int                    variant;  /* enum sam3_variant */
 
 	/* Loaded video frames */

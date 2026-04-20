@@ -1,5 +1,5 @@
 /*
- * src/model/tracker_v2.h - SAM 3.1 multiplex tracker (scaffold)
+ * src/model/tracker_multiplex.h - SAM 3.1 multiplex tracker (scaffold)
  *
  * The SAM 3.1 video tracker. The memory-attention transformer and mask
  * decoder are different architectures from SAM 3's (8-head decoupled
@@ -14,19 +14,20 @@
  * and filled in by phases 2.2-2.5 (see
  * docs/superpowers/specs/2026-04-19-sam3-1-multiplex-tracker-design.md).
  *
- * Key types:  sam3_tracker_v2
- * Depends on: core/tensor.h, core/weight.h, core/alloc.h
+ * Key types:  sam3_tracker_multiplex
+ * Depends on: core/tensor.h, core/weight.h, core/alloc.h, core/graph.h
  * Used by:    model/sam3_video.c (variant dispatch),
- *             tests/test_tracker_v2_load.c,
- *             tests/test_maskmem_v2_forward.c,
- *             tests/test_memory_attn_v2_forward.c
+ *             tests/test_tracker_multiplex_load.c,
+ *             tests/test_maskmem_multiplex_forward.c,
+ *             tests/test_memory_attn_multiplex_forward.c,
+ *             tests/test_mask_decoder_multiplex_forward.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
-#ifndef SAM3_MODEL_TRACKER_V2_H
-#define SAM3_MODEL_TRACKER_V2_H
+#ifndef SAM3_MODEL_TRACKER_MULTIPLEX_H
+#define SAM3_MODEL_TRACKER_MULTIPLEX_H
 
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -40,20 +41,20 @@ struct sam3_memory_bank;  /* fwd decl: memory_bank.h */
  * tensors (no_obj_embed_spatial, output_{valid,invalid}_embed,
  * maskmem downsampler input channels = 16*2 = 32).
  */
-#define SAM3_V2_MULTIPLEX_COUNT       16
-#define SAM3_V2_MULTIPLEX_IN_CHANNEL_MULT  2
-#define SAM3_V2_MULTIPLEX_IN_CHANNELS \
-	(SAM3_V2_MULTIPLEX_COUNT * SAM3_V2_MULTIPLEX_IN_CHANNEL_MULT)  /* 32 */
+#define SAM3_MULTIPLEX_COUNT       16
+#define SAM3_MULTIPLEX_IN_CHANNEL_MULT  2
+#define SAM3_MULTIPLEX_IN_CHANNELS \
+	(SAM3_MULTIPLEX_COUNT * SAM3_MULTIPLEX_IN_CHANNEL_MULT)  /* 32 */
 
-#define SAM3_V2_NUM_MASKMEM   7
-#define SAM3_V2_HIDDEN_DIM    256
+#define SAM3_MULTIPLEX_NUM_MASKMEM   7
+#define SAM3_MULTIPLEX_HIDDEN_DIM    256
 
 /*
  * CXBlock (ConvNeXt-style fuser layer). Two of these live in
  * maskmem_backbone.fuser. Each one owns depthwise conv + layer norm +
  * pointwise conv1 + pointwise conv2 + a layer-scale gamma.
  */
-struct sam3_v2_cxblock {
+struct sam3_multiplex_cxblock {
 	struct sam3_tensor *dwconv_w;   /* [256, 1, 7, 7] depthwise */
 	struct sam3_tensor *dwconv_b;   /* [256] */
 	struct sam3_tensor *norm_w;     /* [256] */
@@ -71,7 +72,7 @@ struct sam3_v2_cxblock {
  *
  * channels:  32 -> 16 -> 64 -> 256 -> 1024 -> 256
  */
-struct sam3_v2_mask_downsampler {
+struct sam3_multiplex_mask_downsampler {
 	/* conv/norm/(gelu) stack, 4 stages */
 	struct sam3_tensor *conv_w[4];  /* OHWI [out, 3, 3, in] */
 	struct sam3_tensor *conv_b[4];
@@ -88,11 +89,11 @@ struct sam3_v2_mask_downsampler {
  *     -> [B, 256, 72, 72]
  *   pix_feat -> pix_feat_proj -> + masks -> fuser (2 CXBlocks) -> out
  */
-struct sam3_v2_maskmem {
-	struct sam3_v2_mask_downsampler mask_downsampler;
+struct sam3_multiplex_maskmem {
+	struct sam3_multiplex_mask_downsampler mask_downsampler;
 	struct sam3_tensor             *pix_feat_proj_w; /* OHWI [256,1,1,256] */
 	struct sam3_tensor             *pix_feat_proj_b; /* [256] */
-	struct sam3_v2_cxblock          fuser[2];
+	struct sam3_multiplex_cxblock          fuser[2];
 };
 
 /*
@@ -100,7 +101,7 @@ struct sam3_v2_maskmem {
  * obj_ptr_proj and the interactive path's own copy). 256->256->256->256
  * with biases.
  */
-struct sam3_v2_mlp3 {
+struct sam3_multiplex_mlp3 {
 	struct sam3_tensor *fc_w[3];
 	struct sam3_tensor *fc_b[3];
 };
@@ -121,7 +122,7 @@ struct sam3_v2_mlp3 {
  * Plus an FFN (linear1, GELU, linear2) and three LayerNorms
  * (norm1 before self_attn, norm2 before cross_attn, norm3 before FFN).
  */
-struct sam3_v2_memory_attn_layer {
+struct sam3_multiplex_memory_attn_layer {
 	/* self_attn */
 	struct sam3_tensor *self_q_w, *self_q_b;
 	struct sam3_tensor *self_k_w, *self_k_b;
@@ -152,8 +153,8 @@ struct sam3_v2_memory_attn_layer {
 /*
  * Memory-attention encoder: 4 layers + a final LayerNorm.
  */
-struct sam3_v2_memory_attn {
-	struct sam3_v2_memory_attn_layer layers[4];
+struct sam3_multiplex_memory_attn {
+	struct sam3_multiplex_memory_attn_layer layers[4];
 	struct sam3_tensor *final_norm_w;
 	struct sam3_tensor *final_norm_b;
 };
@@ -163,7 +164,7 @@ struct sam3_v2_memory_attn {
  * 128-dim projected head (attention downsample rate = 2 on 256 model
  * dim). Self-attention keeps full 256 dim.
  */
-struct sam3_v2_mask_decoder_layer {
+struct sam3_multiplex_mask_decoder_layer {
 	/* self_attn: 256 -> 256 (q/k/v/out) */
 	struct sam3_tensor *self_q_w, *self_q_b;
 	struct sam3_tensor *self_k_w, *self_k_b;
@@ -205,9 +206,9 @@ struct sam3_v2_mask_decoder_layer {
  *     mask_tokens [48, 256] (16 obj × 3 multimask outputs),
  *     obj_score_token [16, 256].
  */
-struct sam3_v2_mask_decoder {
+struct sam3_multiplex_mask_decoder {
 	/* 2-layer two-way transformer */
-	struct sam3_v2_mask_decoder_layer layers[2];
+	struct sam3_multiplex_mask_decoder_layer layers[2];
 
 	/* final_attn_token_to_image (same shape as cross_attn_*_to_*) */
 	struct sam3_tensor *final_q_w, *final_q_b;
@@ -250,18 +251,18 @@ struct sam3_v2_mask_decoder {
  * (sam_mask_decoder, interactive path) are placeholders for now —
  * see the sub-project-2 spec.
  */
-struct sam3_tracker_v2 {
+struct sam3_tracker_multiplex {
 	/* --- memory attention transformer (phase 2.3a, 122 tensors) --- */
-	struct sam3_v2_memory_attn transformer;
+	struct sam3_multiplex_memory_attn transformer;
 
 	/* --- SAM mask decoder (phase 2.4a, 125 tensors) --- */
-	struct sam3_v2_mask_decoder sam_mask_decoder;
+	struct sam3_multiplex_mask_decoder sam_mask_decoder;
 
 	/* --- maskmem backbone (phase 2.1, 38 tensors) --- */
-	struct sam3_v2_maskmem maskmem;
+	struct sam3_multiplex_maskmem maskmem;
 
 	/* --- object pointer MLPs (phase 2.1, 6 tensors) --- */
-	struct sam3_v2_mlp3    obj_ptr_proj;
+	struct sam3_multiplex_mlp3    obj_ptr_proj;
 
 	/* --- small projection layers (phase 2.1, 4 tensors) --- */
 	struct sam3_tensor *obj_ptr_tpos_proj_w;  /* [256, 256] */
@@ -280,14 +281,14 @@ struct sam3_tracker_v2 {
 	/*
 	 * --- Deferred to later phases ---
 	 *
-	 * memory_attn_v2 (phase 2.3): 4-layer 8-head decoupled transformer,
-	 *   122 tensors under tracker_v2.transformer.*
+	 * memory_attn_multiplex (phase 2.3): 4-layer 8-head decoupled transformer,
+	 *   122 tensors under tracker_multiplex.transformer.*
 	 *
-	 * sam_mask_decoder_v2 (phase 2.4): 125 tensors under
-	 *   tracker_v2.sam_mask_decoder.*
+	 * sam_mask_decoder_multiplex (phase 2.4): 125 tensors under
+	 *   tracker_multiplex.sam_mask_decoder.*
 	 *
 	 * interactive_sam_mask_decoder (sub-project 3): 131 tensors under
-	 *   tracker_v2.interactive_sam_mask_decoder.*
+	 *   tracker_multiplex.interactive_sam_mask_decoder.*
 	 *
 	 * interactive_sam_prompt_encoder (sub-project 3): 17 tensors.
 	 *
@@ -303,17 +304,17 @@ struct sam3_tracker_v2 {
 };
 
 /*
- * Number of tensors loaded by sam3_tracker_v2_load at phase 2.1. Used
+ * Number of tensors loaded by sam3_tracker_multiplex_load at phase 2.1. Used
  * by the round-trip test to sanity-check that no plumbing was lost.
  * 38 (maskmem) + 6 (obj_ptr_proj) + 4 (obj_ptr_tpos + no_obj_linear) +
  * 6 (singletons) = 54.
  */
-#define SAM3_V2_PHASE_2_1_TENSORS 54
-#define SAM3_V2_PHASE_2_3A_TENSORS (54 + 122)  /* + transformer */
-#define SAM3_V2_PHASE_2_4A_TENSORS (54 + 122 + 125)  /* + sam_mask_decoder */
+#define SAM3_MULTIPLEX_PHASE_2_1_TENSORS 54
+#define SAM3_MULTIPLEX_PHASE_2_3A_TENSORS (54 + 122)  /* + transformer */
+#define SAM3_MULTIPLEX_PHASE_2_4A_TENSORS (54 + 122 + 125)  /* + sam_mask_decoder */
 
 /*
- * sam3_tracker_v2_init - Zero the struct and seed config constants.
+ * sam3_tracker_multiplex_init - Zero the struct and seed config constants.
  *
  * @trk: caller-allocated tracker struct; memset + field defaults
  *       applied.
@@ -321,27 +322,27 @@ struct sam3_tracker_v2 {
  * Returns SAM3_OK, or SAM3_EINVAL if trk is NULL. Does not allocate
  * tensors.
  */
-enum sam3_error sam3_tracker_v2_init(struct sam3_tracker_v2 *trk);
+enum sam3_error sam3_tracker_multiplex_init(struct sam3_tracker_multiplex *trk);
 
 /*
- * sam3_tracker_v2_load - Populate the struct from a SAM 3.1 .sam3 file.
+ * sam3_tracker_multiplex_load - Populate the struct from a SAM 3.1 .sam3 file.
  *
- * @trk:   Initialized tracker (sam3_tracker_v2_init must have run).
+ * @trk:   Initialized tracker (sam3_tracker_multiplex_init must have run).
  * @wf:    Weight file opened from sam3_convert --variant sam3.1.
  * @arena: Arena for tensor metadata allocations. Tensor data is
  *         referenced directly from the mmap region.
  *
- * All tensors live under the `tracker_v2.` namespace (see the rename
+ * All tensors live under the `tracker_multiplex.` namespace (see the rename
  * handler added alongside the sub-project-2 design spec). Returns
  * SAM3_OK on success. Missing tensors fail the load — this is a real
  * tracker, not a best-effort zero-fill.
  */
-enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
+enum sam3_error sam3_tracker_multiplex_load(struct sam3_tracker_multiplex *trk,
 				     const struct sam3_weight_file *wf,
 				     struct sam3_arena *arena);
 
 /*
- * sam3_v2_maskmem_forward - Build the graph that encodes a
+ * sam3_multiplex_maskmem_forward - Build the graph that encodes a
  * (pix_feat, masks) pair into a memory-tokens tensor.
  *
  * @g:         Graph being built.
@@ -366,16 +367,16 @@ enum sam3_error sam3_tracker_v2_load(struct sam3_tracker_v2 *trk,
  * The caller is responsible for sigmoid preprocessing if it wants to
  * pass in already-sigmoid-ed masks: pass `skip_mask_sigmoid = 1`.
  */
-struct sam3_tensor *sam3_v2_maskmem_forward(
+struct sam3_tensor *sam3_multiplex_maskmem_forward(
 		struct sam3_graph *g,
 		struct sam3_arena *arena,
-		const struct sam3_v2_maskmem *mm,
+		const struct sam3_multiplex_maskmem *mm,
 		struct sam3_tensor *pix_feat,
 		struct sam3_tensor *masks,
 		int skip_mask_sigmoid);
 
 /*
- * sam3_v2_memory_attn_forward - Build the 4-layer decoupled memory
+ * sam3_multiplex_memory_attn_forward - Build the 4-layer decoupled memory
  * attention graph for a single tracker frame.
  *
  * Mirrors TransformerEncoderDecoupledCrossAttention.forward in the
@@ -451,10 +452,10 @@ struct sam3_tensor *sam3_v2_maskmem_forward(
  * Returns NULL on arena exhaustion, graph capacity exhaustion, or
  * shape mismatch.
  */
-struct sam3_tensor *sam3_v2_memory_attn_forward(
+struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 		struct sam3_graph *g,
 		struct sam3_arena *arena,
-		const struct sam3_v2_memory_attn *ma,
+		const struct sam3_multiplex_memory_attn *ma,
 		struct sam3_tensor *tgt,
 		struct sam3_tensor *tgt_pos,
 		struct sam3_tensor *image,
@@ -465,7 +466,7 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
 		int num_k_exclude_rope);
 
 /*
- * sam3_v2_mask_decoder_forward - Build the SAM 3.1 multiplex mask decoder
+ * sam3_multiplex_mask_decoder_forward - Build the SAM 3.1 multiplex mask decoder
  * graph for a single frame.
  *
  * Mirrors MultiplexMaskDecoder.predict_masks in
@@ -527,7 +528,7 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
  * FP32 output. Budget the arena accordingly.
  */
 /*
- * sam3_v2_image_pe_layer - Build the dense positional encoding for the
+ * sam3_multiplex_image_pe_layer - Build the dense positional encoding for the
  *                          multiplex mask decoder.
  *
  * Produces [grid_h*grid_w, 256] where each row is
@@ -537,7 +538,7 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
  * reference/sam3/sam3/sam/prompt_encoder.py.
  *
  * @g:       Graph being built. Unused — kept for API symmetry with the
- *           other v2 forwards. May be NULL.
+ *           other multiplex forwards. May be NULL.
  * @arena:   Arena for the output tensor.
  * @basis:   Learned Gaussian basis (trk->image_pe_gauss), shape [2, 128].
  * @grid_h:  Target grid height.
@@ -546,17 +547,17 @@ struct sam3_tensor *sam3_v2_memory_attn_forward(
  * Returns the populated PE tensor, or NULL on arena exhaustion or bad
  * arguments.
  */
-struct sam3_tensor *sam3_v2_image_pe_layer(
+struct sam3_tensor *sam3_multiplex_image_pe_layer(
 		struct sam3_graph *g,
 		struct sam3_arena *arena,
 		struct sam3_tensor *basis,
 		int grid_h,
 		int grid_w);
 
-enum sam3_error sam3_v2_mask_decoder_forward(
+enum sam3_error sam3_multiplex_mask_decoder_forward(
 		struct sam3_graph *g,
 		struct sam3_arena *arena,
-		const struct sam3_v2_mask_decoder *md,
+		const struct sam3_multiplex_mask_decoder *md,
 		struct sam3_tensor *image_embeddings,
 		struct sam3_tensor *image_pe,
 		struct sam3_tensor *feat_s1,
@@ -568,10 +569,10 @@ enum sam3_error sam3_v2_mask_decoder_forward(
 		struct sam3_tensor **out_sam_tokens);
 
 /*
- * sam3_tracker_v2_track_frame - Process one frame through the SAM 3.1
+ * sam3_tracker_multiplex_track_frame - Process one frame through the SAM 3.1
  * multiplex tracker in single-object (slot-0-only) mode.
  *
- * Wraps the three v2 forwards into a single per-frame pipeline:
+ * Wraps the three multiplex forwards into a single per-frame pipeline:
  *   1. pix_feat conditioning (memory_attn if @bank has entries,
  *      otherwise additive `interactivity_no_mem_embed` fallback).
  *   2. Multiplex mask decoder on the conditioned pix_feat +
@@ -581,11 +582,11 @@ enum sam3_error sam3_v2_mask_decoder_forward(
  *
  * Maskmem encoding of the output mask is NOT run here — the caller
  * picks the best-IoU mask after graph eval, preprocesses it, then runs
- * sam3_v2_maskmem_forward separately to produce the memory token for
+ * sam3_multiplex_maskmem_forward separately to produce the memory token for
  * the bank. This mirrors the SAM 3 pipeline's split between
  * sam3_tracker_track_frame and sam3_memory_encoder_build.
  *
- * @trk:          Loaded tracker_v2.
+ * @trk:          Loaded tracker_multiplex.
  * @g:            Graph to build into.
  * @bank:         Per-object memory bank (read-only). NULL or empty bank
  *                selects the no-memory path.
@@ -604,8 +605,8 @@ enum sam3_error sam3_v2_mask_decoder_forward(
  * Returns SAM3_OK on success; SAM3_EINVAL on bad args; SAM3_ENOMEM on
  * arena/graph exhaustion.
  */
-enum sam3_error sam3_tracker_v2_track_frame(
-		struct sam3_tracker_v2 *trk,
+enum sam3_error sam3_tracker_multiplex_track_frame(
+		struct sam3_tracker_multiplex *trk,
 		struct sam3_graph *g,
 		const struct sam3_memory_bank *bank,
 		struct sam3_tensor *image_embed,
@@ -619,4 +620,4 @@ enum sam3_error sam3_tracker_v2_track_frame(
 		struct sam3_tensor **out_obj_ptrs,
 		struct sam3_tensor **out_score);
 
-#endif /* SAM3_MODEL_TRACKER_V2_H */
+#endif /* SAM3_MODEL_TRACKER_MULTIPLEX_H */
