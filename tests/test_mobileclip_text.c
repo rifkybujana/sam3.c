@@ -313,6 +313,20 @@ test_perblock_parity_l(void)
 				    SAM3_SOURCE_DIR "/tests/fixtures/mobileclip_l");
 }
 
+/* --- test_perblock_parity_s0 --- */
+
+/*
+ * Correctness check: per-block evaluator for MobileCLIP-S0 (6 blocks with
+ * RepMixer at indices 0 and 5, ctx_len=16) against the PyTorch reference
+ * fixtures.
+ */
+static int
+test_perblock_parity_s0(void)
+{
+	return test_perblock_parity(SAM3_TEXT_MOBILECLIP_S0, 16,
+				    SAM3_SOURCE_DIR "/tests/fixtures/mobileclip_s0");
+}
+
 int
 main(void)
 {
@@ -322,6 +336,7 @@ main(void)
 	test_mobileclip_config_for();
 	test_perblock_parity_s1();
 	test_perblock_parity_l();
+	test_perblock_parity_s0();
 
 	if (tests_failed == 0)
 		printf("test_mobileclip_text: PASS (%d tests)\n", tests_run);
