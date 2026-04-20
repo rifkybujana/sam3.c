@@ -102,12 +102,18 @@ def _build_sam3_1_demo_model(checkpoint):
     which hardcodes CUDA bf16 autocast). The returned demo model exposes
     init_state / add_new_masks / propagate_in_video via its
     VideoTrackingMultiplexDemo base class.
+
+    The sam3.1_multiplex.pt checkpoint stores all tracker weights under a
+    `tracker.` prefix (alongside `detector.` — used by dump_reference.py
+    image path). The builder's state_dict is at the top level with no
+    prefix, so we strip `tracker.` before loading.
     """
     from sam3.model_builder import build_sam3_multiplex_video_model
 
-    # Build the multiplex tracker model (returns Sam3VideoTrackingMultiplexDemo).
+    # Build the model with no checkpoint (we load state_dict manually
+    # below after stripping the `tracker.` prefix).
     model = build_sam3_multiplex_video_model(
-        checkpoint_path=checkpoint,
+        checkpoint_path=None,
         load_from_HF=False,
         multiplex_count=16,
         use_fa3=False,
@@ -117,8 +123,115 @@ def _build_sam3_1_demo_model(checkpoint):
         compile=False,
     )
     install_addmm_act_fp32()
+
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if "model" in ckpt and isinstance(ckpt["model"], dict):
+        ckpt = ckpt["model"]
+    # Keys are nested `tracker.model.*` — strip both. The tracker
+    # checkpoint has no vision backbone; the shared ViT lives under
+    # `detector.backbone.*` and the tracker model reads it at
+    # `backbone.*`, so we remap detector backbone keys too.
+    merged = {}
+    for k, v in ckpt.items():
+        if k.startswith("tracker.model."):
+            merged[k[len("tracker.model."):]] = v
+    for k, v in ckpt.items():
+        if k.startswith("detector.backbone."):
+            merged[k[len("detector."):]] = v  # -> backbone.*
+    missing, unexpected = model.load_state_dict(merged, strict=False)
+    print(f"tracker state_dict: loaded {len(merged)}, "
+          f"missing={len(missing)} unexpected={len(unexpected)}",
+          file=sys.stderr)
+    if missing:
+        print(f"first missing: {missing[:3]}", file=sys.stderr)
+    if unexpected:
+        print(f"first unexpected: {unexpected[:3]}", file=sys.stderr)
+
     model = model.float().eval()
     return model
+
+
+def _patch_forward_image_clone_loop():
+    """Upstream VideoTrackingMultiplex.forward_image ends with a "clone
+    to help torch.compile" loop that iterates backbone_out.keys() and
+    dereferences each value as a dict. When the tri-neck backbone
+    returns with need_sam3_out=True, the top-level keys
+    (vision_features, vision_mask, vision_pos_enc, backbone_fpn) are
+    tensors/lists, not dicts, so the loop crashes with
+    IndexError: too many indices for tensor of dimension 4.
+
+    Patch the loop to filter non-dict entries before cloning.
+    """
+    from sam3.model.video_tracking_multiplex import VideoTrackingMultiplex
+    orig = VideoTrackingMultiplex.forward_image
+
+    def _patched(self, img_batch, **kwargs):
+        # Call the original but intercept the clone loop at the end.
+        # Simplest: replicate the original body up to the clone loop,
+        # or disable the clone loop entirely by temporarily patching
+        # _maybe_clone to a no-op + filtering. We do the latter.
+        orig_maybe_clone = self._maybe_clone
+
+        def _safe_clone(x):
+            return orig_maybe_clone(x)
+
+        # We can't easily re-enter the upstream function minus the
+        # broken loop without copy-pasting it. Instead, replace it.
+        backbone_out = orig(self, img_batch, **kwargs)
+        return backbone_out
+
+    # The original loop has already run by the time orig returns and
+    # failed. So we need to replace the *entire* forward_image body to
+    # skip the bad loop. Cleanest: rewrite it.
+
+    def _replacement(self, img_batch, *, need_sam3_out=False,
+                    need_interactive_out=False,
+                    need_propagation_out=False):
+        if self.share_necks:
+            need_propagation_out = need_interactive_out or need_propagation_out
+            need_interactive_out = False
+            backbone_out = self.backbone.forward_image(
+                img_batch,
+                need_sam3_out=need_sam3_out,
+                need_sam2_out=need_propagation_out,
+            )
+            backbone_out["interactive"] = backbone_out["sam2_backbone_out"]
+        else:
+            backbone_out = self.backbone.forward_image(
+                img_batch,
+                need_sam3_out=need_sam3_out,
+                need_interactive_out=need_interactive_out,
+                need_propagation_out=need_propagation_out,
+            )
+        if self.use_high_res_features_in_sam:
+            if need_interactive_out:
+                backbone_out["interactive"]["backbone_fpn"][0].tensors = (
+                    self.interactive_sam_mask_decoder.conv_s0(
+                        backbone_out["interactive"]["backbone_fpn"][0].tensors))
+                backbone_out["interactive"]["backbone_fpn"][1].tensors = (
+                    self.interactive_sam_mask_decoder.conv_s1(
+                        backbone_out["interactive"]["backbone_fpn"][1].tensors))
+            if need_propagation_out:
+                backbone_out["sam2_backbone_out"]["backbone_fpn"][0].tensors = (
+                    self.sam_mask_decoder.conv_s0(
+                        backbone_out["sam2_backbone_out"]["backbone_fpn"][0].tensors))
+                backbone_out["sam2_backbone_out"]["backbone_fpn"][1].tensors = (
+                    self.sam_mask_decoder.conv_s1(
+                        backbone_out["sam2_backbone_out"]["backbone_fpn"][1].tensors))
+        # Clone to help torch.compile — filter to dict entries only.
+        for out_type, sub in list(backbone_out.items()):
+            if not isinstance(sub, dict):
+                continue
+            if "backbone_fpn" not in sub or "vision_pos_enc" not in sub:
+                continue
+            for i in range(len(sub["backbone_fpn"])):
+                sub["backbone_fpn"][i].tensors = self._maybe_clone(
+                    sub["backbone_fpn"][i].tensors)
+                sub["vision_pos_enc"][i] = self._maybe_clone(
+                    sub["vision_pos_enc"][i])
+        return backbone_out
+
+    VideoTrackingMultiplex.forward_image = _replacement
 
 
 def _patch_load_video_frames():
@@ -148,12 +261,20 @@ def _init_state_sam3_1(model, video_path, offload_video_to_cpu=True):
     overrides init_state with a different signature
     (video_height/video_width/num_frames, pre-loaded); we bypass that
     override by calling the base unbound method.
+
+    Also forces inference_state["device"] / ["storage_device"] to CPU —
+    the upstream init_state unconditionally sets them to
+    torch.device("cuda") via a direct constructor (not a tensor-factory
+    call), which our CUDA redirect doesn't catch, and downstream
+    add_new_masks / propagate call .to(state["device"]) which would
+    then trigger torch.cuda._lazy_init.
     """
     _patch_load_video_frames()
+    _patch_forward_image_clone_loop()
     from sam3.model.video_tracking_multiplex_demo import (
         VideoTrackingMultiplexDemo,
     )
-    return VideoTrackingMultiplexDemo.init_state(
+    state = VideoTrackingMultiplexDemo.init_state(
         model,
         video_path=video_path,
         offload_video_to_cpu=offload_video_to_cpu,
@@ -161,6 +282,10 @@ def _init_state_sam3_1(model, video_path, offload_video_to_cpu=True):
         async_loading_frames=False,
         use_cv2=True,
     )
+    if not torch.cuda.is_available():
+        state["device"] = torch.device("cpu")
+        state["storage_device"] = torch.device("cpu")
+    return state
 
 
 def main_sam3_1(args):

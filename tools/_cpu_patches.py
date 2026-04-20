@@ -83,6 +83,11 @@ def install_cuda_redirect():
     torch.Tensor.cuda = lambda self, *a, **kw: self
     torch.nn.Module.cuda = lambda self, *a, **kw: self
 
+    # pin_memory() crashes in unhelpful ways on non-CUDA backends
+    # (e.g. MPS reports a device mismatch when the subsequent
+    # .to(device="cpu") call runs). Make it a no-op.
+    torch.Tensor.pin_memory = lambda self, *a, **kw: self
+
 
 def install_addmm_act_fp32():
     import sam3.perflib.fused as _fused
