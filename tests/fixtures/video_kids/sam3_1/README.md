@@ -78,13 +78,42 @@ On the branch where this fixture was last regenerated:
     parity: frame 2 IoU=0.0000
     parity: frame 3 IoU=0.0000
 
-The 0.0 IoU on propagation frames is a real diagnostic signal —
-C and Python propagate the same seed to wildly different outputs.
-Investigation of the remaining gap is follow-up work and likely
-interacts with sub-project 3 (interactive decoder): the seed itself
-is a placeholder mask on both sides, so each side's frame-0
-obj_ptr / memory state is effectively garbage but *different*
-garbage. Default CI profile excludes this test
+### Root cause of the 0.0 IoU
+
+The 0.0 IoU on propagation frames is *not* numerical drift — it's a
+categorical divergence. Diagnostic data (`test_sam3_1_track` logs
+the raw logits; `tools/sam3_1_dump_seed --propagate-frames 3
+--frames-dir /tmp/c_frames` dumps C's propagation masks):
+
+- **C frame-0 mask**: ~2.4% foreground (matches seed_mask.png
+  exactly, IoU=1.0000).
+- **C propagation frames 1..N**: every pixel is `-1024.0`
+  (`SAM3_NO_OBJ_SCORE`) — i.e. the occlusion gate zeroed the entire
+  mask because the multiplex mask decoder returned
+  `obj_score_logit <= 0`.
+- **Python frames 1..3**: ~6% foreground, localized to a plausible
+  object region.
+
+Python's gating uses the same `score > threshold (=0)` rule
+(`video_tracking_multiplex.py:835`), so the gate itself isn't the
+bug — the bug is that the *C* multiplex mask decoder predicts
+`obj_score_logit <= 0` on every propagation frame, while Python
+predicts `> 0`. Something upstream of the decoder's
+`obj_score_head(sam_tokens[0])` is asymmetric between the two
+implementations, possibly:
+
+- the `extra_per_object` suppression vector (B4), esp. which slot
+  is marked valid/invalid on propagation vs conditioning frames;
+- the memory-attn output's impact on the `obj_score_token`
+  position in the two-way transformer;
+- the obj_ptr temporal positional encoding applied to memory
+  tail rows (B3).
+
+All three land in Phase 2.5b and the smoke test's mixed-sign
+invariant only catches the degenerate frame-0 case. Root-causing
+this is the next sub-project-2 task.
+
+Default CI profile excludes this test
 (`SAM3_BUILD_PARITY_TESTS=OFF`); opt-in users get the real signal
 without breaking CI.
 
