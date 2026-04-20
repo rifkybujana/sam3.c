@@ -27,7 +27,6 @@ C-seeded, Python-propagated parity fixtures for
     # Step 2: Propagate Python from that seed
     cd ../tools
     SAM3_CKPT=/path/to/sam3.1_multiplex.pt \
-    SAM3_BPE=/path/to/bpe_simple_vocab_16e6.txt.gz \
       python gen_video_parity_fixtures.py \
         --variant sam3.1 \
         --video ../assets/kids.mp4 \
@@ -35,16 +34,19 @@ C-seeded, Python-propagated parity fixtures for
         --seed-mask ../tests/fixtures/video_kids/sam3_1/seed_mask.png \
         --out ../tests/fixtures/video_kids/sam3_1/
 
+Python outputs are downsampled to 288×288 (the C decoder's native mask
+resolution — grid 72 × 4) so both sides compare at the same size.
+
 Requires Python 3.10+, PyTorch (CPU-only is supported via
 `tools/_cpu_patches.py`), the upstream reference at `reference/sam3/`,
-and the `decord` video decoder (`pip install decord`). On CPU-only
-machines a full regen has not yet been validated end-to-end: the
-upstream demo hits shim-able issues (e.g. `load_video_frames` kwargs,
-bf16 autocast device) and possibly more as decoder bits materialize.
-If `gen_video_parity_fixtures.py` fails, the current committed
-`seed_mask.png` still lets the C parity test run in its "fixtures
-partially present" skip path. Run on a CUDA machine for highest
-confidence.
+and the `decord` video decoder (`pip install decord` — on Apple Silicon
+use `pip install eva-decord` as a drop-in). On CPU-only machines a full
+regen has not yet been validated end-to-end: the upstream demo hits
+shim-able issues (e.g. `load_video_frames` kwargs, bf16 autocast device)
+and possibly more as decoder bits materialize. If
+`gen_video_parity_fixtures.py` fails, the current committed
+`seed_mask.png` still lets the C parity test remain in its "fixtures
+incomplete" skip path. Run on a CUDA machine for highest confidence.
 
 ## Gating
 

@@ -117,6 +117,7 @@ int main(int argc, char **argv)
 	memset(&r, 0, sizeof(r));
 	if (sam3_video_add_points(sess, 0, 1, &pt, 1, &r) != SAM3_OK) {
 		fprintf(stderr, "sam3_video_add_points failed\n");
+		sam3_video_frame_result_free(&r);
 		sam3_video_end(sess);
 		sam3_free(ctx);
 		return 3;

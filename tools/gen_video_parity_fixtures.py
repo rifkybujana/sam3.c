@@ -193,6 +193,14 @@ def main_sam3_1(args):
         masks=seed_t,
     )
 
+    # The C tracker emits masks at grid_w*4 x grid_h*4 resolution
+    # (image_size=1008 / patch=14 -> grid=72 -> mask=288x288). The Python
+    # video_res output is at the native video resolution (e.g. 720x1280
+    # for kids.mp4), so we must resample to the same 288x288 grid before
+    # saving to keep the C-side IoU compare well-defined. Nearest-neighbor
+    # keeps the binary semantics intact.
+    C_MASK_SIZE = 288
+
     count = 0
     for frame_idx, obj_ids, _low_res, video_res_masks, _obj_scores in \
             model.propagate_in_video(
@@ -205,8 +213,17 @@ def main_sam3_1(args):
             # mask against seed_mask.png directly.
             continue
         for obj_id, m in zip(obj_ids, video_res_masks):
-            arr = (m > 0).cpu().numpy().astype(np.uint8) * 255
-            Image.fromarray(arr.squeeze()).save(os.path.join(
+            binary = (m > 0).float()
+            if binary.dim() == 2:
+                binary = binary[None, None]
+            elif binary.dim() == 3:
+                binary = binary[None]
+            resized = torch.nn.functional.interpolate(
+                binary, size=(C_MASK_SIZE, C_MASK_SIZE),
+                mode="nearest")
+            arr = (resized.squeeze().cpu().numpy() > 0.5).astype(
+                np.uint8) * 255
+            Image.fromarray(arr).save(os.path.join(
                 args.out, "frames",
                 f"frame_{frame_idx:04d}_obj_{obj_id}.png"))
         count += 1

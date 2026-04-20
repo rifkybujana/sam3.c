@@ -125,6 +125,16 @@ static int
 frame_cb(const struct sam3_video_frame_result *r, void *ud)
 {
 	struct cb_state *s = (struct cb_state *)ud;
+
+	/*
+	 * Frame 0 is the cond frame (already sanity-checked vs seed in
+	 * main() before propagation started). The Python generator
+	 * skips frame 0 too, so there is no frame_0000_*.png to compare
+	 * against. Don't count it toward frames_seen either.
+	 */
+	if (r->frame_idx == 0)
+		return 0;
+
 	s->frames_seen++;
 
 	if (r->n_objects < 1 || !r->objects || !r->objects[0].mask) {

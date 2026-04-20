@@ -216,10 +216,14 @@ No runtime dispatch — the two variants share nothing except the skeleton
   (e.g. requires box/logits in addition to mask), fall back to the
   plan's equivalent path in `Sam3MultiplexTracking`.
 - **Mask dimensions.** The C `sam3_video_frame_result.mask_{h,w}`
-  reports the native output resolution (1008×1008 for SAM 3.1 at
-  image_size=1008). Both `sam3_1_dump_seed` and the PNG fixtures write
-  at that native size. The test hard-fails if PNG dims don't match the
-  C frame output — message points to the regen procedure.
+  reports the SAM 3.1 multiplex decoder's native output resolution —
+  **288×288** (grid_w=72 at image_size=1008 / patch=14, upscaled ×4
+  by the mask decoder's two ConvTranspose layers). `sam3_1_dump_seed`
+  writes at that native 288×288 size; the Python generator resamples
+  its higher-resolution `video_res_masks` down to 288×288 (nearest-
+  neighbor) so both sides compare at the same grid. The test hard-
+  fails if PNG dims don't match the C frame output — message points
+  to the regen procedure.
 - **`SAM3_MAX_MEMORY_FRAMES = 16` bank cap.** 3 frames is well under
   the cap — not a concern for this fixture. If the frame count is ever
   raised past 16, the test exercises bank rollover too; note this in
