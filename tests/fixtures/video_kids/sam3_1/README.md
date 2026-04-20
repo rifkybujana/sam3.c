@@ -68,3 +68,27 @@ mask decoder / memory-attn). Frame-0 drift indicates either a
 change in the placeholder obj_ptr path or that the interactive
 decoder (sub-project 3) has landed, in which case the fixture
 needs regeneration.
+
+## Current baseline (2026-04-20)
+
+On the branch where this fixture was last regenerated:
+
+    parity: frame-0 vs seed IoU=1.0000  # C dumper is deterministic
+    parity: frame 1 IoU=0.0000          # complete divergence
+    parity: frame 2 IoU=0.0000
+    parity: frame 3 IoU=0.0000
+
+The 0.0 IoU on propagation frames is a real diagnostic signal —
+C and Python propagate the same seed to wildly different outputs.
+Investigation of the remaining gap is follow-up work and likely
+interacts with sub-project 3 (interactive decoder): the seed itself
+is a placeholder mask on both sides, so each side's frame-0
+obj_ptr / memory state is effectively garbage but *different*
+garbage. Default CI profile excludes this test
+(`SAM3_BUILD_PARITY_TESTS=OFF`); opt-in users get the real signal
+without breaking CI.
+
+The per-frame IoU ≥ 0.75 threshold is intentionally kept at the
+"should pass when correct" level rather than lowered to current
+baseline — the goal is to track progress toward parity, not to
+pin the failing state.
