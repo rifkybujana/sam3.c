@@ -1092,6 +1092,21 @@ struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 			num_k_exclude_rope);
 		if (!output)
 			return NULL;
+#ifdef SAM3_DEBUG_DUMP
+		{
+			extern struct sam3_tensor *sam3_dbg_trk_memattn_layer0;
+			extern struct sam3_tensor *sam3_dbg_trk_memattn_layer1;
+			extern struct sam3_tensor *sam3_dbg_trk_memattn_layer2;
+			extern struct sam3_tensor *sam3_dbg_trk_memattn_layer3;
+			struct sam3_tensor **slots[] = {
+				&sam3_dbg_trk_memattn_layer0,
+				&sam3_dbg_trk_memattn_layer1,
+				&sam3_dbg_trk_memattn_layer2,
+				&sam3_dbg_trk_memattn_layer3,
+			};
+			*slots[i] = output;
+		}
+#endif
 	}
 
 	/* --- Final encoder.norm (use_image_in_output=False) --- */

@@ -78,6 +78,10 @@ struct sam3_tensor *sam3_dbg_trk_mask_dec_sam      = NULL;
 struct sam3_tensor *sam3_dbg_trk_memory            = NULL;
 struct sam3_tensor *sam3_dbg_trk_memory_image      = NULL;
 struct sam3_tensor *sam3_dbg_trk_memory_image_pos  = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_layer0    = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_layer1    = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_layer2    = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_layer3    = NULL;
 
 /* Video-path tensor dumper. Used for layer-by-layer parity diffs
  * against the Python reference via scripts/dump_reference_layers.py
@@ -861,6 +865,10 @@ video_track_one_obj(struct sam3_video_session *session,
 		DUMP_TRK(memory);
 		DUMP_TRK(memory_image);
 		DUMP_TRK(memory_image_pos);
+		DUMP_TRK(memattn_layer0);
+		DUMP_TRK(memattn_layer1);
+		DUMP_TRK(memattn_layer2);
+		DUMP_TRK(memattn_layer3);
 		#undef DUMP_TRK
 	}
 #endif

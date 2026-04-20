@@ -66,6 +66,22 @@ LEVEL0_FRAMES = [1, 2]  # overlap of C and Python dumps
 PAIRS = []
 for f in LEVEL0_FRAMES:
     PAIRS.extend([
+        (f"memattn_layer0_f{f}",
+         f"/tmp/dbg_trk_memattn_layer0_f{f}.bin",
+         f"/tmp/py_trk_memattn_layer0_f{f}.bin",
+         _reshape_memattn),
+        (f"memattn_layer1_f{f}",
+         f"/tmp/dbg_trk_memattn_layer1_f{f}.bin",
+         f"/tmp/py_trk_memattn_layer1_f{f}.bin",
+         _reshape_memattn),
+        (f"memattn_layer2_f{f}",
+         f"/tmp/dbg_trk_memattn_layer2_f{f}.bin",
+         f"/tmp/py_trk_memattn_layer2_f{f}.bin",
+         _reshape_memattn),
+        (f"memattn_layer3_f{f}",
+         f"/tmp/dbg_trk_memattn_layer3_f{f}.bin",
+         f"/tmp/py_trk_memattn_layer3_f{f}.bin",
+         _reshape_memattn),
         (f"memattn_out_f{f}",
          f"/tmp/dbg_trk_memattn_out_f{f}.bin",
          f"/tmp/py_trk_memattn_out_f{f}.bin",

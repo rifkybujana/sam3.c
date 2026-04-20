@@ -77,3 +77,92 @@ compute), we jump to Path γ (memory bank per-entry parity) as the task
 plan instructs. A layout/transpose mismatch on the dump site is also
 on the short suspect list given the zero-cosine magnitude and the
 shape-axis difference between C (`[1, N, C]`) and Python (`[N, 1, C]`).
+
+## Iteration 2 — path α: memory-attn per-layer (2026-04-20)
+
+### Setup
+
+- Branch: `feature/sam3.1-image-path` (unchanged)
+- Adds 4 per-layer dump slots on both C and Python sides:
+  `memattn_layer0..3_f{1,2}`.
+- C hook: bracket the existing 4-layer loop in
+  `sam3_multiplex_memory_attn_forward`
+  (`src/model/tracker_multiplex.c`) so the running `output` is captured
+  into `sam3_dbg_trk_memattn_layer{i}` after each iteration.
+- Python hook: `model.transformer.encoder.layers[i].register_forward_hook`
+  in `scripts/dump_tracker_layers.py`. Each `DecoupledTransformerDecoder
+  Layerv2.forward` returns `(image, output)`; we dump the `output`
+  element (the [HW, B, C]=[5184,1,256] residual accumulator that
+  matches C's per-iteration `output` pointer).
+- Comparator `PAIRS` reordered so the layer rows precede
+  `memattn_out_fN` and the mask-decoder rows, so the "FIRST DIVERGENCE"
+  marker highlights the earliest layer.
+
+### Results
+
+```
+# Tracker layer parity diff (cosine threshold: 0.99)
+# Frames compared: [1, 2] (C also writes _f0 for mask-decoder only; no Python counterpart)
+
+memattn_layer0_f1                        cos=0.01169 abs_max=4.782 abs_mean=0.4981 rel=100.001% <--- FIRST DIVERGENCE
+memattn_layer1_f1                        cos=-0.00769 abs_max=6.212 abs_mean=0.84 rel=139.227% <--- FIRST DIVERGENCE
+memattn_layer2_f1                        cos=0.00000 abs_max=12.24 abs_mean=0.8425 rel=100.000% <--- FIRST DIVERGENCE
+memattn_layer3_f1                        cos=0.00000 abs_max=16.52 abs_mean=1.107 rel=100.000% <--- FIRST DIVERGENCE
+memattn_out_f1                           cos=0.00000 abs_max=7.415 abs_mean=0.9056 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_masks_f1                        cos=0.00000 abs_max=5.565 abs_mean=1.828 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_iou_f1                          cos=0.00000 abs_max=78.63 abs_mean=67.6 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_score_f1                        cos=0.00000 abs_max=1.739 abs_mean=1.283 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_sam_f1                          cos=0.00000 abs_max=8.876 abs_mean=0.9998 rel=100.000% <--- FIRST DIVERGENCE
+memattn_layer0_f2                        cos=0.01110 abs_max=3.939 abs_mean=0.5111 rel=100.001% <--- FIRST DIVERGENCE
+memattn_layer1_f2                        cos=-0.00641 abs_max=6.844 abs_mean=0.8587 rel=137.049% <--- FIRST DIVERGENCE
+memattn_layer2_f2                        cos=0.00000 abs_max=16.98 abs_mean=0.8713 rel=100.000% <--- FIRST DIVERGENCE
+memattn_layer3_f2                        cos=0.00000 abs_max=22.58 abs_mean=1.131 rel=100.000% <--- FIRST DIVERGENCE
+memattn_out_f2                           cos=0.00000 abs_max=7.776 abs_mean=0.9018 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_masks_f2                        cos=0.00000 abs_max=6.153 abs_mean=2 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_iou_f2                          cos=0.00000 abs_max=84.84 abs_mean=74.06 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_score_f2                        cos=0.00000 abs_max=1.512 abs_mean=1.138 rel=100.000% <--- FIRST DIVERGENCE
+mask_dec_sam_f2                          cos=0.00000 abs_max=8.681 abs_mean=0.9952 rel=100.000% <--- FIRST DIVERGENCE
+
+*** First divergent slot: memattn_layer0_f1
+    -> drill down with the level-1 dumps for that path
+```
+
+### Analysis
+
+- **First divergent layer: `memattn_layer0_f1`** (cos ≈ 0.012, effectively
+  orthogonal). The very first layer of the memory-attention stack is
+  already broken.
+- The progression of abs_max through the stack on frame 1 — 4.78 → 6.21
+  → 12.24 → 16.52 — is monotonically increasing, consistent with a
+  structural mismatch at the inputs that the residual path amplifies
+  at every layer, rather than a single bad op inside one specific
+  layer.
+- Layer 0 is broken at its output, which means one of layer 0's
+  **inputs** is already wrong: `output=tgt`, `image`, `memory`,
+  `memory_image`, `memory_image_pos`, the RoPE tables `cos_q/sin_q/
+  cos_k/sin_k`, or `num_k_exclude_rope`. Per the task plan, when the
+  first layer is already divergent we pivot to **Path γ — memory bank
+  contents**, since `memory` and `memory_image` are the tensors that
+  carry cross-frame state and are the most plausible source of
+  structural mismatch.
+- We already have `memory`, `memory_image`, and `memory_image_pos`
+  captured on the C side (the three extra level-0 slots that landed
+  in Task 1). The next iteration adds their Python counterparts and
+  compares, which will localize γ to a specific memory-bank entry or
+  to the tpos/pointer-token concatenation logic.
+
+### Next step
+
+Pivot to **Path γ** — memory bank contents parity. Specifically:
+
+1. Add Python-side hooks on the SAM 3.1 multiplex tracker's memory
+   assembly path so that `memory`, `memory_image`, and
+   `memory_image_pos` (the tensors actually passed to
+   `model.transformer.encoder`) are dumped alongside `tgt`.
+2. Compare against the existing C `dbg_trk_memory*_fN.bin` dumps.
+3. If `tgt` matches but `memory` or `memory_image` diverges, the
+   problem is in how the C tracker builds the memory bank (Path γ
+   specifically — ordering of entries, tpos indexing, obj-ptr token
+   concatenation).
+4. If `tgt` itself diverges, the problem is upstream at the prompt
+   encoder / object feature pipeline — pivot further back.

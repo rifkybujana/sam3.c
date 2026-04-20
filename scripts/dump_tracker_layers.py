@@ -165,6 +165,12 @@ def _register_hooks(model, captures):
         _cap("memattn_out")))
     hooks.append(model.sam_mask_decoder.register_forward_hook(
         _cap("mask_decoder_tuple")))
+
+    # Per-layer hooks on the 4 decoupled transformer layers. These fire
+    # independently of the encoder-level hook above; both capture.
+    for i, layer in enumerate(model.transformer.encoder.layers):
+        hooks.append(layer.register_forward_hook(
+            _cap(f"memattn_layer{i}")))
     return hooks
 
 
@@ -227,6 +233,26 @@ def _flush_captures_delta(captures, cursors, frame_idx):
     if end > start:
         _dump_mask_decoder(captures[slot][end - 1], frame_idx)
     cursors[slot] = end
+
+    # Per-layer memory-attention dumps. Each encoder layer returns a
+    # `(image, output)` tuple (DecoupledTransformerDecoderLayerv2.forward
+    # — `output` is the running [HW, B, C] object-feature stream that
+    # threads through all 4 layers and matches C's per-layer residual
+    # accumulator). We dump the `output` element only.
+    for i in range(4):
+        slot = f"memattn_layer{i}"
+        start = cursors.get(slot, 0)
+        end = len(captures.get(slot, []))
+        if end > start:
+            raw = captures[slot][end - 1]
+            t = None
+            if isinstance(raw, tuple) and len(raw) >= 2:
+                t = raw[1]
+            elif isinstance(raw, torch.Tensor):
+                t = raw
+            if isinstance(t, torch.Tensor):
+                _dump(f"/tmp/py_trk_{slot}_f{frame_idx}.bin", t)
+        cursors[slot] = end
 
 
 def main():
