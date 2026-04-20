@@ -289,14 +289,15 @@ static enum sam3_error load_memory_attn(struct sam3_multiplex_memory_attn *ma,
 
 static enum sam3_error load_mask_decoder_layer(
 		struct sam3_multiplex_mask_decoder_layer *L, int layer_idx,
+		const char *decoder_prefix,
 		const struct sam3_weight_file *wf, struct sam3_arena *arena)
 {
 	char buf[SAM3_WEIGHT_NAME_MAX];
 #define LM(dst, field, ndims_, ...) \
 	do { \
 		snprintf(buf, sizeof(buf), \
-			 "tracker_multiplex.sam_mask_decoder.transformer." \
-			 "layers.%d." field, layer_idx); \
+			 "%s.transformer.layers.%d." field, \
+			 decoder_prefix, layer_idx); \
 		const char *_name = buf; \
 		LOAD(dst, SAM3_DTYPE_F32, (ndims_), __VA_ARGS__); \
 	} while (0)
@@ -352,6 +353,7 @@ static enum sam3_error load_mask_decoder_layer(
 
 static enum sam3_error load_sam_mask_decoder(
 		struct sam3_multiplex_mask_decoder *md,
+		const char *decoder_prefix,
 		const struct sam3_weight_file *wf, struct sam3_arena *arena)
 {
 	char buf[SAM3_WEIGHT_NAME_MAX];
@@ -359,14 +361,14 @@ static enum sam3_error load_sam_mask_decoder(
 
 	/* 2-layer transformer */
 	for (int i = 0; i < 2; i++) {
-		err = load_mask_decoder_layer(&md->layers[i], i, wf, arena);
+		err = load_mask_decoder_layer(&md->layers[i], i,
+					      decoder_prefix, wf, arena);
 		if (err != SAM3_OK) return err;
 	}
 
 #define LD(dst, path, ndims_, ...) \
 	do { \
-		snprintf(buf, sizeof(buf), \
-			 "tracker_multiplex.sam_mask_decoder." path); \
+		snprintf(buf, sizeof(buf), "%s." path, decoder_prefix); \
 		const char *_name = buf; \
 		LOAD(dst, SAM3_DTYPE_F32, (ndims_), __VA_ARGS__); \
 	} while (0)
@@ -402,18 +404,18 @@ static enum sam3_error load_sam_mask_decoder(
 		int in_dims[3]  = {256, 256, 256};
 		for (int L = 0; L < 3; L++) {
 			snprintf(mbuf, sizeof(mbuf),
-				 "tracker_multiplex.sam_mask_decoder."
-				 "output_hypernetworks_mlps.%d.layers.%d.weight",
-				 m, L);
+				 "%s.output_hypernetworks_mlps.%d."
+				 "layers.%d.weight",
+				 decoder_prefix, m, L);
 			{
 				const char *_name = mbuf;
 				LOAD(md->hn_w[m][L], SAM3_DTYPE_F32, 2,
 				     out_dims[L], in_dims[L]);
 			}
 			snprintf(mbuf, sizeof(mbuf),
-				 "tracker_multiplex.sam_mask_decoder."
-				 "output_hypernetworks_mlps.%d.layers.%d.bias",
-				 m, L);
+				 "%s.output_hypernetworks_mlps.%d."
+				 "layers.%d.bias",
+				 decoder_prefix, m, L);
 			{
 				const char *_name = mbuf;
 				LOAD(md->hn_b[m][L], SAM3_DTYPE_F32, 1,
@@ -429,16 +431,16 @@ static enum sam3_error load_sam_mask_decoder(
 		char mbuf[SAM3_WEIGHT_NAME_MAX];
 		for (int L = 0; L < 3; L++) {
 			snprintf(mbuf, sizeof(mbuf),
-				 "tracker_multiplex.sam_mask_decoder."
-				 "iou_prediction_head.layers.%d.weight", L);
+				 "%s.iou_prediction_head.layers.%d.weight",
+				 decoder_prefix, L);
 			{
 				const char *_name = mbuf;
 				LOAD(md->iou_head_w[L], SAM3_DTYPE_F32, 2,
 				     out_dims[L], in_dims[L]);
 			}
 			snprintf(mbuf, sizeof(mbuf),
-				 "tracker_multiplex.sam_mask_decoder."
-				 "iou_prediction_head.layers.%d.bias", L);
+				 "%s.iou_prediction_head.layers.%d.bias",
+				 decoder_prefix, L);
 			{
 				const char *_name = mbuf;
 				LOAD(md->iou_head_b[L], SAM3_DTYPE_F32, 1,
@@ -454,16 +456,16 @@ static enum sam3_error load_sam_mask_decoder(
 		char mbuf[SAM3_WEIGHT_NAME_MAX];
 		for (int L = 0; L < 3; L++) {
 			snprintf(mbuf, sizeof(mbuf),
-				 "tracker_multiplex.sam_mask_decoder."
-				 "pred_obj_score_head.layers.%d.weight", L);
+				 "%s.pred_obj_score_head.layers.%d.weight",
+				 decoder_prefix, L);
 			{
 				const char *_name = mbuf;
 				LOAD(md->score_head_w[L], SAM3_DTYPE_F32, 2,
 				     out_dims[L], in_dims[L]);
 			}
 			snprintf(mbuf, sizeof(mbuf),
-				 "tracker_multiplex.sam_mask_decoder."
-				 "pred_obj_score_head.layers.%d.bias", L);
+				 "%s.pred_obj_score_head.layers.%d.bias",
+				 decoder_prefix, L);
 			{
 				const char *_name = mbuf;
 				LOAD(md->score_head_b[L], SAM3_DTYPE_F32, 1,
@@ -483,6 +485,206 @@ static enum sam3_error load_sam_mask_decoder(
 	LD(md->mask_tokens,      "mask_tokens.weight",      2, 48, 256);
 	LD(md->obj_score_token,  "obj_score_token.weight",  2, 16, 256);
 #undef LD
+	return SAM3_OK;
+}
+
+/*
+ * load_interactive_sam_mask_decoder - Load SAM 3.1 multiplex interactive
+ * mask decoder weights (131 tensors). SAM-style single-object decoder:
+ * [1, 256] iou_token / obj_score_token, [4, 256] mask_tokens, 4
+ * output_hypernetworks_mlps, 4-dim IoU output.
+ *
+ * Transformer layer shapes match the multiplex decoder's layers
+ * (same two-way transformer architecture), so we reuse
+ * load_mask_decoder_layer with the interactive prefix.
+ */
+static enum sam3_error load_interactive_sam_mask_decoder(
+		struct sam3_sam_mask_decoder *md,
+		const struct sam3_weight_file *wf, struct sam3_arena *arena)
+{
+	const char *decoder_prefix =
+		"tracker_multiplex.interactive_sam_mask_decoder";
+	char buf[SAM3_WEIGHT_NAME_MAX];
+	enum sam3_error err;
+
+	/* 2-layer two-way transformer — same shapes as multiplex. */
+	for (int i = 0; i < 2; i++) {
+		err = load_mask_decoder_layer(&md->layers[i], i,
+					      decoder_prefix, wf, arena);
+		if (err != SAM3_OK) return err;
+	}
+
+#define LD(dst, path, ndims_, ...) \
+	do { \
+		snprintf(buf, sizeof(buf), "%s." path, decoder_prefix); \
+		const char *_name = buf; \
+		LOAD(dst, SAM3_DTYPE_F32, (ndims_), __VA_ARGS__); \
+	} while (0)
+
+	/* final_attn_token_to_image (downsample-2). Same shapes as multiplex. */
+	LD(md->final_q_w, "transformer.final_attn_token_to_image.q_proj.weight", 2, 128, 256);
+	LD(md->final_q_b, "transformer.final_attn_token_to_image.q_proj.bias",   1, 128);
+	LD(md->final_k_w, "transformer.final_attn_token_to_image.k_proj.weight", 2, 128, 256);
+	LD(md->final_k_b, "transformer.final_attn_token_to_image.k_proj.bias",   1, 128);
+	LD(md->final_v_w, "transformer.final_attn_token_to_image.v_proj.weight", 2, 128, 256);
+	LD(md->final_v_b, "transformer.final_attn_token_to_image.v_proj.bias",   1, 128);
+	LD(md->final_out_w, "transformer.final_attn_token_to_image.out_proj.weight", 2, 256, 128);
+	LD(md->final_out_b, "transformer.final_attn_token_to_image.out_proj.bias",   1, 256);
+	LD(md->norm_final_w, "transformer.norm_final_attn.weight", 1, 256);
+	LD(md->norm_final_b, "transformer.norm_final_attn.bias",   1, 256);
+
+	/* output_upscaling: ConvT(256->64), LN2d(64), ConvT(64->32). OHWI. */
+	LD(md->up0_w, "output_upscaling.0.weight", 4, 64, 2, 2, 256);
+	LD(md->up0_b, "output_upscaling.0.bias",   1, 64);
+	LD(md->up1_w, "output_upscaling.1.weight", 1, 64);
+	LD(md->up1_b, "output_upscaling.1.bias",   1, 64);
+	LD(md->up3_w, "output_upscaling.3.weight", 4, 32, 2, 2, 64);
+	LD(md->up3_b, "output_upscaling.3.bias",   1, 32);
+
+	/* output_hypernetworks_mlps[0..3]: 4 MLPs, each 256 -> 256 -> 256 -> 32.
+	 * (num_multimask_outputs=3 + 1 single-mask token = 4 tokens.) */
+	for (int m = 0; m < 4; m++) {
+		char mbuf[SAM3_WEIGHT_NAME_MAX];
+		int out_dims[3] = {256, 256, 32};
+		int in_dims[3]  = {256, 256, 256};
+		for (int L = 0; L < 3; L++) {
+			snprintf(mbuf, sizeof(mbuf),
+				 "%s.output_hypernetworks_mlps.%d."
+				 "layers.%d.weight",
+				 decoder_prefix, m, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->hn_w[m][L], SAM3_DTYPE_F32, 2,
+				     out_dims[L], in_dims[L]);
+			}
+			snprintf(mbuf, sizeof(mbuf),
+				 "%s.output_hypernetworks_mlps.%d."
+				 "layers.%d.bias",
+				 decoder_prefix, m, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->hn_b[m][L], SAM3_DTYPE_F32, 1,
+				     out_dims[L]);
+			}
+		}
+	}
+
+	/* iou_prediction_head: 3-layer MLP 256 -> 256 -> 256 -> 4. */
+	{
+		int out_dims[3] = {256, 256, 4};
+		int in_dims[3]  = {256, 256, 256};
+		char mbuf[SAM3_WEIGHT_NAME_MAX];
+		for (int L = 0; L < 3; L++) {
+			snprintf(mbuf, sizeof(mbuf),
+				 "%s.iou_prediction_head.layers.%d.weight",
+				 decoder_prefix, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->iou_head_w[L], SAM3_DTYPE_F32, 2,
+				     out_dims[L], in_dims[L]);
+			}
+			snprintf(mbuf, sizeof(mbuf),
+				 "%s.iou_prediction_head.layers.%d.bias",
+				 decoder_prefix, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->iou_head_b[L], SAM3_DTYPE_F32, 1,
+				     out_dims[L]);
+			}
+		}
+	}
+
+	/* pred_obj_score_head: 3-layer MLP 256 -> 256 -> 256 -> 1 (single
+	 * object; pred_obj_scores_mlp=True). */
+	{
+		int out_dims[3] = {256, 256, 1};
+		int in_dims[3]  = {256, 256, 256};
+		char mbuf[SAM3_WEIGHT_NAME_MAX];
+		for (int L = 0; L < 3; L++) {
+			snprintf(mbuf, sizeof(mbuf),
+				 "%s.pred_obj_score_head.layers.%d.weight",
+				 decoder_prefix, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->score_head_w[L], SAM3_DTYPE_F32, 2,
+				     out_dims[L], in_dims[L]);
+			}
+			snprintf(mbuf, sizeof(mbuf),
+				 "%s.pred_obj_score_head.layers.%d.bias",
+				 decoder_prefix, L);
+			{
+				const char *_name = mbuf;
+				LOAD(md->score_head_b[L], SAM3_DTYPE_F32, 1,
+				     out_dims[L]);
+			}
+		}
+	}
+
+	/* High-res feature convs (OHWI). Same shapes as multiplex. */
+	LD(md->conv_s0_w, "conv_s0.weight", 4, 32, 1, 1, 256);
+	LD(md->conv_s0_b, "conv_s0.bias",   1, 32);
+	LD(md->conv_s1_w, "conv_s1.weight", 4, 64, 1, 1, 256);
+	LD(md->conv_s1_b, "conv_s1.bias",   1, 64);
+
+	/* Learned output tokens — single-object SAM-style shapes. */
+	LD(md->iou_token,        "iou_token.weight",        2, 1, 256);
+	LD(md->mask_tokens,      "mask_tokens.weight",      2, 4, 256);
+	LD(md->obj_score_token,  "obj_score_token.weight",  2, 1, 256);
+#undef LD
+	return SAM3_OK;
+}
+
+/*
+ * load_interactive_prompt_encoder - Load SAM 3.1 multiplex interactive
+ * prompt encoder weights (17 tensors). SAM-style PromptEncoder: point
+ * and box prompts become sparse tokens; mask prompts run through a
+ * stride-2 downsampling stack to become dense spatial features.
+ *
+ * Conv weights arrive in OHWI (post conv_perm pass).
+ */
+static enum sam3_error load_interactive_prompt_encoder(
+		struct sam3_interactive_prompt_encoder *pe,
+		const struct sam3_weight_file *wf, struct sam3_arena *arena)
+{
+	char buf[SAM3_WEIGHT_NAME_MAX];
+#define LP(dst, path, ndims_, ...) \
+	do { \
+		snprintf(buf, sizeof(buf), \
+			 "tracker_multiplex.interactive_sam_prompt_encoder." path); \
+		const char *_name = buf; \
+		LOAD(dst, SAM3_DTYPE_F32, (ndims_), __VA_ARGS__); \
+	} while (0)
+
+	/* mask_downscaling stack */
+	LP(pe->md_conv0_w, "mask_downscaling.0.weight", 4, 4, 2, 2, 1);
+	LP(pe->md_conv0_b, "mask_downscaling.0.bias",   1, 4);
+	LP(pe->md_ln0_w,   "mask_downscaling.1.weight", 1, 4);
+	LP(pe->md_ln0_b,   "mask_downscaling.1.bias",   1, 4);
+	LP(pe->md_conv1_w, "mask_downscaling.3.weight", 4, 16, 2, 2, 4);
+	LP(pe->md_conv1_b, "mask_downscaling.3.bias",   1, 16);
+	LP(pe->md_ln1_w,   "mask_downscaling.4.weight", 1, 16);
+	LP(pe->md_ln1_b,   "mask_downscaling.4.bias",   1, 16);
+	LP(pe->md_conv2_w, "mask_downscaling.6.weight", 4, 256, 1, 1, 16);
+	LP(pe->md_conv2_b, "mask_downscaling.6.bias",   1, 256);
+
+	/* Positional encoding (Gaussian basis). */
+	LP(pe->pe_gauss, "pe_layer.positional_encoding_gaussian_matrix",
+	   2, 2, 128);
+
+	/* Prompt-type embeddings. */
+	LP(pe->no_mask_embed,     "no_mask_embed.weight",     2, 1, 256);
+	LP(pe->not_a_point_embed, "not_a_point_embed.weight", 2, 1, 256);
+	{
+		char pbuf[SAM3_WEIGHT_NAME_MAX];
+		for (int i = 0; i < 4; i++) {
+			snprintf(pbuf, sizeof(pbuf),
+				 "tracker_multiplex.interactive_sam_prompt_encoder."
+				 "point_embeddings.%d.weight", i);
+			const char *_name = pbuf;
+			LOAD(pe->point_embeddings[i], SAM3_DTYPE_F32, 2, 1, 256);
+		}
+	}
+#undef LP
 	return SAM3_OK;
 }
 
@@ -549,8 +751,44 @@ enum sam3_error sam3_tracker_multiplex_load(struct sam3_tracker_multiplex *trk,
 	err = load_memory_attn(&trk->transformer, wf, arena);
 	if (err != SAM3_OK) return err;
 
-	err = load_sam_mask_decoder(&trk->sam_mask_decoder, wf, arena);
+	err = load_sam_mask_decoder(&trk->sam_mask_decoder,
+				    "tracker_multiplex.sam_mask_decoder",
+				    wf, arena);
 	if (err != SAM3_OK) return err;
+
+	/* Sub-project 3: interactive mask decoder (131 tensors, SAM-style
+	 * single-object shapes). Python uses this on seeded (mask-input)
+	 * frames via _use_mask_as_output → _forward_sam_heads(is_interactive=True). */
+	err = load_interactive_sam_mask_decoder(
+		&trk->interactive_sam_mask_decoder, wf, arena);
+	if (err != SAM3_OK) return err;
+
+	/* Sub-project 3: interactive prompt encoder (17 tensors). */
+	err = load_interactive_prompt_encoder(
+		&trk->interactive_sam_prompt_encoder, wf, arena);
+	if (err != SAM3_OK) return err;
+
+	/* Sub-project 3: interactive obj_ptr MLP (6 tensors, MLP3 clone). */
+	err = load_mlp3(&trk->interactive_obj_ptr_proj,
+			"tracker_multiplex.interactive_obj_ptr_proj",
+			wf, arena);
+	if (err != SAM3_OK) return err;
+
+	/* Sub-project 3: interactive mask downsample (2 tensors, single
+	 * Conv2d(1→1, k=4, s=4)). Weight is OHWI [1, 4, 4, 1] post
+	 * conv_perm. */
+	{
+		const char *_name =
+			"tracker_multiplex.interactive_mask_downsample.weight";
+		LOAD(trk->interactive_mask_downsample_w,
+		     SAM3_DTYPE_F32, 4, 1, 4, 4, 1);
+	}
+	{
+		const char *_name =
+			"tracker_multiplex.interactive_mask_downsample.bias";
+		LOAD(trk->interactive_mask_downsample_b,
+		     SAM3_DTYPE_F32, 1, 1);
+	}
 
 	err = load_mlp3(&trk->obj_ptr_proj, "tracker_multiplex.obj_ptr_proj",
 			wf, arena);
@@ -576,8 +814,9 @@ enum sam3_error sam3_tracker_multiplex_load(struct sam3_tracker_multiplex *trk,
 	err = load_singletons(trk, wf, arena);
 	if (err != SAM3_OK) return err;
 
-	sam3_log_info("tracker_multiplex: loaded phase-2.4a weights "
-		      "(maskmem + transformer + mask_decoder + obj_ptr + singletons)");
+	sam3_log_info("tracker_multiplex: loaded weights (maskmem + "
+		      "memory_attn + sam_mask_decoder + interactive_mask_decoder"
+		      " + obj_ptr + singletons)");
 	return SAM3_OK;
 }
 
@@ -914,8 +1153,10 @@ static struct sam3_tensor *memory_attn_layer(
 		struct sam3_tensor *memory_image_pos,
 		struct sam3_tensor *cos_q, struct sam3_tensor *sin_q,
 		struct sam3_tensor *cos_k, struct sam3_tensor *sin_k,
-		int num_k_exclude)
+		int num_k_exclude,
+		int layer_idx)
 {
+	(void)layer_idx;
 	/* --- Self-attention  --- */
 	struct sam3_tensor *tgt2 = gh_layernorm(g, a, output,
 						L->norm1_w, L->norm1_b);
@@ -937,6 +1178,14 @@ static struct sam3_tensor *memory_attn_layer(
 	output = gh_add(g, a, output, attn);
 	if (!output)
 		return NULL;
+
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_sa_out;
+		output->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_sa_out = output;
+	}
+#endif
 
 	/* --- Decoupled cross-attention ─ --- */
 	tgt2 = gh_layernorm(g, a, output, L->norm2_w, L->norm2_b);
@@ -975,12 +1224,33 @@ static struct sam3_tensor *memory_attn_layer(
 	if (!v)
 		return NULL;
 
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_q;
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k;
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_v;
+		q->dbg_force_readback = 1;
+		k->dbg_force_readback = 1;
+		v->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_ca_q = q;
+		sam3_dbg_trk_memattn_l0_ca_k = k;
+		sam3_dbg_trk_memattn_l0_ca_v = v;
+	}
+#endif
+
 	attn = mha_sdpa_with_rope(
 		g, a, q, k, v,
 		cos_q, sin_q, cos_k, sin_k, num_k_exclude,
 		L->cross_out_w, L->cross_out_b);
 	if (!attn)
 		return NULL;
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_attn;
+		attn->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_ca_attn = attn;
+	}
+#endif
 	output = gh_add(g, a, output, attn);
 	if (!output)
 		return NULL;
@@ -1089,7 +1359,7 @@ struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 		output = memory_attn_layer(g, arena, &ma->layers[i],
 			output, image, memory, memory_image,
 			memory_image_pos, cos_q, sin_q, cos_k, sin_k,
-			num_k_exclude_rope);
+			num_k_exclude_rope, i);
 		if (!output)
 			return NULL;
 #ifdef SAM3_DEBUG_DUMP
@@ -1620,6 +1890,469 @@ enum sam3_error sam3_multiplex_mask_decoder_forward(
 	return SAM3_OK;
 }
 
+/* --- Sub-project 3: interactive (seeded-mask) decoder forward --- */
+
+/*
+ * interactive_prompt_encoder_forward_mask_only - Mirror Python's
+ * interactive_sam_prompt_encoder.forward(points=None, masks=mask).
+ *
+ * For the seeded frame path Python enters `_forward_sam_heads` with
+ * mask_inputs and no point_inputs. It then synthesises a dummy
+ * [1 point @ (0,0), label=-1] plus (pad=True) a second dummy point,
+ * so sparse_embeddings comes out as [bs=1, 2, 256] where both rows
+ * equal `not_a_point_embed`. dense_embed comes from mask_downscaling.
+ *
+ * @mask_input: [1, Hp, Wp, 1] NHWC — already at the prompt-encoder's
+ *              mask_input_size (4 × image_embedding_size). For SAM
+ *              3.1 multiplex that's 4 × 72 = 288, so a raw 288 × 288
+ *              detector mask passes through unchanged.
+ * @out_sparse: populated with [1, 2, 256] (two not_a_point_embed rows)
+ * @out_dense:  populated with [1, H, W, 256] NHWC (H, W = 72 for SAM 3.1)
+ */
+static enum sam3_error interactive_prompt_encoder_forward_mask_only(
+		struct sam3_graph *g, struct sam3_arena *arena,
+		const struct sam3_interactive_prompt_encoder *pe,
+		struct sam3_tensor *mask_input,
+		struct sam3_tensor **out_sparse,
+		struct sam3_tensor **out_dense)
+{
+	if (!g || !arena || !pe || !mask_input || !out_sparse || !out_dense)
+		return SAM3_EINVAL;
+	if (mask_input->n_dims != 4 || mask_input->dims[3] != 1) {
+		sam3_log_error("interactive_pe: mask_input must be [1, H, W, 1] NHWC");
+		return SAM3_EINVAL;
+	}
+
+	/* --- sparse: two copies of not_a_point_embed in [1, 2, 256] --- */
+	int sp_dims[3] = {1, 2, MUX_DEC_HIDDEN};
+	struct sam3_tensor *sparse = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						     3, sp_dims);
+	if (!sparse) return SAM3_ENOMEM;
+	{
+		const float *src = (const float *)pe->not_a_point_embed->data;
+		float *dst = (float *)sparse->data;
+		for (int r = 0; r < 2; r++)
+			memcpy(dst + (size_t)r * MUX_DEC_HIDDEN, src,
+			       MUX_DEC_HIDDEN * sizeof(float));
+	}
+	*out_sparse = sparse;
+
+	/* --- dense: mask_downscaling stack --- */
+	struct sam3_tensor *x = mask_input;
+	/* Stage 0: Conv2d(1→4, k=2, s=2) */
+	x = gh_conv2d(g, arena, x, pe->md_conv0_w, pe->md_conv0_b, 2, 0, 1);
+	if (!x) return SAM3_ENOMEM;
+	/* LayerNorm2d in NHWC = LN over last (C) axis. Already NHWC. */
+	x = gh_layernorm(g, arena, x, pe->md_ln0_w, pe->md_ln0_b);
+	if (!x) return SAM3_ENOMEM;
+	x = gh_gelu(g, arena, x);
+	if (!x) return SAM3_ENOMEM;
+	/* Stage 1: Conv2d(4→16, k=2, s=2) */
+	x = gh_conv2d(g, arena, x, pe->md_conv1_w, pe->md_conv1_b, 2, 0, 1);
+	if (!x) return SAM3_ENOMEM;
+	x = gh_layernorm(g, arena, x, pe->md_ln1_w, pe->md_ln1_b);
+	if (!x) return SAM3_ENOMEM;
+	x = gh_gelu(g, arena, x);
+	if (!x) return SAM3_ENOMEM;
+	/* Stage 2: Conv2d(16→256, k=1, s=1) */
+	x = gh_conv2d(g, arena, x, pe->md_conv2_w, pe->md_conv2_b, 1, 0, 1);
+	if (!x) return SAM3_ENOMEM;
+	/* x: [1, Hp/4, Wp/4, 256] */
+	*out_dense = x;
+	return SAM3_OK;
+}
+
+/*
+ * interactive_mask_decoder_forward - SAM-style single-object mask
+ * decoder. Mirrors reference/sam3/sam3/sam/mask_decoder.py
+ * MaskDecoder.forward. Differs from the multiplex decoder:
+ *   - Token stream: [obj_score_token, iou_token, mask_tokens, sparse]
+ *     = [1 + 1 + 4 + N_sparse] tokens total (N_sparse=2 here).
+ *   - image_embeddings += dense_prompt_embeddings (broadcast add).
+ *   - Output: [1, 4, H*4, W*4] masks, [1, 4] iou, [1, 1] obj_score,
+ *     [1, 4, 256] sam_tokens.
+ */
+static enum sam3_error interactive_mask_decoder_forward(
+		struct sam3_graph *g, struct sam3_arena *arena,
+		const struct sam3_sam_mask_decoder *md,
+		struct sam3_tensor *image_embeddings,    /* [1, H, W, 256] */
+		struct sam3_tensor *image_pe,            /* [H*W, 256] */
+		struct sam3_tensor *feat_s1,             /* [1, 2H, 2W, 256] */
+		struct sam3_tensor *feat_s0,             /* [1, 4H, 4W, 256] */
+		struct sam3_tensor *sparse_prompt,       /* [1, N_sparse, 256] */
+		struct sam3_tensor *dense_prompt,        /* [1, H, W, 256] */
+		struct sam3_tensor **out_masks,          /* [1, 4, 4H, 4W] */
+		struct sam3_tensor **out_iou,            /* [1, 4] */
+		struct sam3_tensor **out_obj_score,      /* [1, 1] */
+		struct sam3_tensor **out_sam_tokens)     /* [1, 4, 256] */
+{
+	if (!g || !arena || !md || !image_embeddings || !image_pe ||
+	    !feat_s1 || !feat_s0 || !sparse_prompt || !dense_prompt ||
+	    !out_masks || !out_iou || !out_obj_score || !out_sam_tokens)
+		return SAM3_EINVAL;
+	if (image_embeddings->n_dims != 4 ||
+	    image_embeddings->dims[0] != 1 ||
+	    image_embeddings->dims[3] != MUX_DEC_HIDDEN)
+		return SAM3_EINVAL;
+
+	int H = image_embeddings->dims[1];
+	int W = image_embeddings->dims[2];
+	int HW = H * W;
+	int N_sparse = sparse_prompt->dims[1];
+	(void)N_sparse; /* used via sparse_2d below */
+
+	/* --- 1. image_embeddings + dense_prompt_embeddings --- */
+	struct sam3_tensor *src = gh_add(g, arena, image_embeddings, dense_prompt);
+	if (!src) return SAM3_ENOMEM;
+
+	/* --- 2. Flatten to [HW, 256] for two-way transformer --- */
+	int keys_dims[2] = {HW, MUX_DEC_HIDDEN};
+	struct sam3_tensor *keys = gh_reshape(g, arena, src, 2, keys_dims);
+	if (!keys) return SAM3_ENOMEM;
+
+	/* --- 3. Build token stream [obj_score | iou | mask_tokens | sparse] --- */
+	struct sam3_tensor *sparse_2d;
+	{
+		int sp2d[2] = {sparse_prompt->dims[1], MUX_DEC_HIDDEN};
+		sparse_2d = gh_reshape(g, arena, sparse_prompt, 2, sp2d);
+		if (!sparse_2d) return SAM3_ENOMEM;
+	}
+	struct sam3_tensor *parts[4] = {
+		md->obj_score_token,   /* [1, 256] */
+		md->iou_token,         /* [1, 256] */
+		md->mask_tokens,       /* [4, 256] */
+		sparse_2d,             /* [N_sparse, 256] */
+	};
+	struct sam3_tensor *tokens = gh_concat(g, arena, parts, 4, 0);
+	if (!tokens) return SAM3_ENOMEM;
+
+	struct sam3_tensor *queries = tokens;
+	struct sam3_tensor *query_pe = tokens;
+	struct sam3_tensor *key_pe = image_pe;
+
+	/* --- 4. Two-way transformer: 2 blocks. Same two_way_block as
+	 * multiplex (layer shapes match). --- */
+	for (int i = 0; i < 2; i++) {
+		queries = two_way_block(g, arena, &md->layers[i],
+					queries, &keys, query_pe, key_pe,
+					/*skip_pe=*/(i == 0));
+		if (!queries) return SAM3_ENOMEM;
+	}
+
+	/* --- 5. Final token→image attention + norm --- */
+	{
+		struct sam3_tensor *q = gh_add(g, arena, queries, query_pe);
+		struct sam3_tensor *k = gh_add(g, arena, keys, key_pe);
+		if (!q || !k) return SAM3_ENOMEM;
+		struct sam3_tensor *fa = mha_sdpa_basic(g, arena, q, k, keys,
+			md->final_q_w, md->final_q_b,
+			md->final_k_w, md->final_k_b,
+			md->final_v_w, md->final_v_b,
+			md->final_out_w, md->final_out_b,
+			MUX_DEC_N_HEADS_XA);
+		if (!fa) return SAM3_ENOMEM;
+		queries = gh_add(g, arena, queries, fa);
+		if (!queries) return SAM3_ENOMEM;
+		queries = gh_layernorm(g, arena, queries,
+				       md->norm_final_w, md->norm_final_b);
+		if (!queries) return SAM3_ENOMEM;
+	}
+
+	/* --- 6. Slice output tokens.
+	 * queries: [N_tokens, 256]. obj_score at index 0, iou at 1, mask
+	 * tokens at 2..6 (4 tokens), sparse at 6..N_tokens. */
+	struct sam3_tensor *obj_score_tok = gh_slice(g, arena, queries, 0, 0, 1);
+	struct sam3_tensor *iou_tok       = gh_slice(g, arena, queries, 0, 1, 2);
+	struct sam3_tensor *mask_tok_out  = gh_slice(g, arena, queries, 0, 2, 6);
+	if (!obj_score_tok || !iou_tok || !mask_tok_out) return SAM3_ENOMEM;
+
+	/* --- 7. Upscaling --- */
+	int src_4d[4] = {1, H, W, MUX_DEC_HIDDEN};
+	struct sam3_tensor *up_in = gh_reshape(g, arena, keys, 4, src_4d);
+	if (!up_in) return SAM3_ENOMEM;
+
+	struct sam3_tensor *s1_proj = gh_conv2d(g, arena, feat_s1,
+			md->conv_s1_w, md->conv_s1_b, 1, 0, 1);
+	struct sam3_tensor *s0_proj = gh_conv2d(g, arena, feat_s0,
+			md->conv_s0_w, md->conv_s0_b, 1, 0, 1);
+	if (!s1_proj || !s0_proj) return SAM3_ENOMEM;
+
+	struct sam3_tensor *up = gh_conv_transpose2d(g, arena, up_in,
+			md->up0_w, md->up0_b, 2, 0);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_add(g, arena, up, s1_proj);
+	if (!up) return SAM3_ENOMEM;
+
+	int H2 = 2 * H, W2 = 2 * W;
+	int up1_flat[2] = {H2 * W2, MUX_DEC_UPSCALE_1C};
+	int up1_nhwc[4] = {1, H2, W2, MUX_DEC_UPSCALE_1C};
+	up = gh_reshape(g, arena, up, 2, up1_flat);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_layernorm(g, arena, up, md->up1_w, md->up1_b);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_reshape(g, arena, up, 4, up1_nhwc);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_gelu(g, arena, up);
+	if (!up) return SAM3_ENOMEM;
+
+	up = gh_conv_transpose2d(g, arena, up, md->up3_w, md->up3_b, 2, 0);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_add(g, arena, up, s0_proj);
+	if (!up) return SAM3_ENOMEM;
+	up = gh_gelu(g, arena, up);
+	if (!up) return SAM3_ENOMEM;
+	/* up: [1, 4H, 4W, 32] */
+
+	/* --- 8. Hypernetworks: 4 MLPs, each 256 -> 256 -> 256 -> 32 --- */
+	struct sam3_tensor *hyper_parts[4];
+	for (int i = 0; i < 4; i++) {
+		struct sam3_tensor *slc = gh_slice(g, arena, mask_tok_out,
+						   0, i, i + 1);
+		if (!slc) return SAM3_ENOMEM;
+		int slc_2d[2] = {1, MUX_DEC_HIDDEN};
+		slc = gh_reshape(g, arena, slc, 2, slc_2d);
+		if (!slc) return SAM3_ENOMEM;
+		struct sam3_tensor *hn_w[3] = {
+			md->hn_w[i][0], md->hn_w[i][1], md->hn_w[i][2]
+		};
+		struct sam3_tensor *hn_b[3] = {
+			md->hn_b[i][0], md->hn_b[i][1], md->hn_b[i][2]
+		};
+		struct sam3_tensor *h = mlp3_relu(g, arena, slc, hn_w, hn_b);
+		if (!h) return SAM3_ENOMEM;
+		/* h: [1, 32] */
+		hyper_parts[i] = h;
+	}
+	struct sam3_tensor *hyper_in = gh_concat(g, arena, hyper_parts, 4, 0);
+	if (!hyper_in) return SAM3_ENOMEM;
+	/* hyper_in: [4, 32] */
+
+	/* --- 9. Mask logits: hyper_in @ upscaled^T --- */
+	int H4 = 4 * H, W4 = 4 * W;
+	int up_2d[2] = {H4 * W4, MUX_DEC_UPSCALE_2C};
+	up = gh_reshape(g, arena, up, 2, up_2d);
+	if (!up) return SAM3_ENOMEM;
+	struct sam3_tensor *up_t = gh_transpose(g, arena, up);
+	if (!up_t) return SAM3_ENOMEM;
+
+	struct sam3_tensor *masks_flat = gh_matmul(g, arena, hyper_in, up_t);
+	if (!masks_flat) return SAM3_ENOMEM;
+	int mask_4d[4] = {1, 4, H4, W4};
+	struct sam3_tensor *masks = gh_reshape(g, arena, masks_flat, 4, mask_4d);
+	if (!masks) return SAM3_ENOMEM;
+
+	/* --- 10. IoU head (256 -> 256 -> 256 -> 4, ReLU between) --- */
+	struct sam3_tensor *iou_w[3] = {md->iou_head_w[0],
+					md->iou_head_w[1], md->iou_head_w[2]};
+	struct sam3_tensor *iou_b[3] = {md->iou_head_b[0],
+					md->iou_head_b[1], md->iou_head_b[2]};
+	struct sam3_tensor *iou = mlp3_relu(g, arena, iou_tok, iou_w, iou_b);
+	if (!iou) return SAM3_ENOMEM;
+
+	/* --- 11. Object score head (256 -> 256 -> 256 -> 1, ReLU between) --- */
+	struct sam3_tensor *score_w[3] = {md->score_head_w[0],
+					  md->score_head_w[1],
+					  md->score_head_w[2]};
+	struct sam3_tensor *score_b[3] = {md->score_head_b[0],
+					  md->score_head_b[1],
+					  md->score_head_b[2]};
+	struct sam3_tensor *obj_logit = mlp3_relu(g, arena, obj_score_tok,
+						  score_w, score_b);
+	if (!obj_logit) return SAM3_ENOMEM;
+
+	*out_masks = masks;
+	*out_iou = iou;
+	*out_obj_score = obj_logit;
+	*out_sam_tokens = mask_tok_out;  /* [4, 256] */
+	return SAM3_OK;
+}
+
+/*
+ * sam3_multiplex_use_mask_as_output - Orchestrator for the seeded frame
+ * path. Mirrors Python's `_use_mask_as_output` in
+ * video_tracking_multiplex.py:925-1020.
+ *
+ * Takes a binary mask (from C's detector output, thresholded at 0) and
+ * produces the obj_ptr that should go into the memory bank on the
+ * seed frame. The mask itself is not regenerated — Python uses the
+ * RAW seed mask scaled `mask * 20 - 10` as mask_logits; C's detector
+ * already produced the mask we use (caller applies the same scaling
+ * separately for mask_for_mem).
+ *
+ * @backbone_features: conditioned pix_feat [1, H, W, 256] — for seed
+ *     frame this is the raw vit output (no memattn since bank is empty,
+ *     plus `interactivity_no_mem_embed` add from the existing path).
+ * @feat_s1:    [1, 2H, 2W, 256] 2x high-res
+ * @feat_s0:    [1, 4H, 4W, 256] 4x high-res
+ * @binary_mask: [mask_h, mask_w] F32 values in {0, 1}. mask_h, mask_w
+ *     should be the detector's output mask size (288 for SAM 3.1).
+ * @is_obj_appearing: 1 if the binary mask has any foreground pixel.
+ * @out_obj_ptr: [16, 256] per-slot obj_ptr for bank commit (slot 0 =
+ *     interactive_obj_ptr_proj output, slots 1..15 = no_obj_ptr_linear
+ *     projection).
+ */
+enum sam3_error sam3_multiplex_use_mask_as_output(
+		const struct sam3_tracker_multiplex *trk,
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		struct sam3_tensor *backbone_features,
+		struct sam3_tensor *feat_s1,
+		struct sam3_tensor *feat_s0,
+		const float *binary_mask,
+		int mask_h, int mask_w,
+		int is_obj_appearing,
+		struct sam3_tensor **out_obj_ptr)
+{
+	if (!trk || !g || !arena || !backbone_features || !feat_s1 ||
+	    !feat_s0 || !binary_mask || !out_obj_ptr)
+		return SAM3_EINVAL;
+	if (backbone_features->n_dims != 4 ||
+	    backbone_features->dims[0] != 1 ||
+	    backbone_features->dims[3] != MUX_DEC_HIDDEN)
+		return SAM3_EINVAL;
+
+	int H = backbone_features->dims[1];
+	int W = backbone_features->dims[2];
+	/* Expected prompt-encoder mask_input_size: 4 × image_embedding_size.
+	 * For SAM 3.1 multiplex with H=W=72, that's 288. */
+	const int mask_in_h = 4 * H;
+	const int mask_in_w = 4 * W;
+
+	/* --- 1. Build mask_input tensor [1, mask_in_h, mask_in_w, 1] NHWC
+	 * from the binary mask. If the detector mask size differs, nearest-
+	 * neighbour upsample/downsample to fit. --- */
+	int mi_dims[4] = {1, mask_in_h, mask_in_w, 1};
+	struct sam3_tensor *mask_input = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+							 4, mi_dims);
+	if (!mask_input) return SAM3_ENOMEM;
+	{
+		float *dst = (float *)mask_input->data;
+		for (int y = 0; y < mask_in_h; y++) {
+			int sy = (y * mask_h) / mask_in_h;
+			if (sy >= mask_h) sy = mask_h - 1;
+			for (int x = 0; x < mask_in_w; x++) {
+				int sx = (x * mask_w) / mask_in_w;
+				if (sx >= mask_w) sx = mask_w - 1;
+				dst[(size_t)y * mask_in_w + x] =
+					binary_mask[sy * mask_w + sx];
+			}
+		}
+	}
+
+	/* --- 2. Prompt encoder forward (mask-only path). --- */
+	struct sam3_tensor *sparse = NULL, *dense = NULL;
+	enum sam3_error err = interactive_prompt_encoder_forward_mask_only(
+		g, arena, &trk->interactive_sam_prompt_encoder,
+		mask_input, &sparse, &dense);
+	if (err != SAM3_OK) return err;
+
+	/* --- 3. Build image_pe from interactive prompt encoder's
+	 * pe_gauss basis. Same helper as multiplex but with different
+	 * basis weights. --- */
+	struct sam3_tensor *image_pe = sam3_multiplex_image_pe_layer(
+		g, arena, trk->interactive_sam_prompt_encoder.pe_gauss, H, W);
+	if (!image_pe) return SAM3_ENOMEM;
+
+	/* --- 4. Run interactive mask decoder. Only sam_tokens is used;
+	 * masks / iou / obj_score are discarded (Python overrides them
+	 * with hardcoded values from mask_inputs). --- */
+	struct sam3_tensor *dec_masks = NULL, *dec_iou = NULL;
+	struct sam3_tensor *dec_score = NULL, *sam_tokens = NULL;
+	err = interactive_mask_decoder_forward(
+		g, arena, &trk->interactive_sam_mask_decoder,
+		backbone_features, image_pe, feat_s1, feat_s0,
+		sparse, dense,
+		&dec_masks, &dec_iou, &dec_score, &sam_tokens);
+	if (err != SAM3_OK) return err;
+	(void)dec_masks; (void)dec_iou; (void)dec_score;
+
+	/* --- 5. Project sam_tokens[0] (single-mask token) through
+	 * interactive_obj_ptr_proj. sam_tokens has shape [4, 256];
+	 * _forward_sam_heads takes `sam_output_tokens[:, 0]`. --- */
+	struct sam3_tensor *sam_tok0 = gh_slice(g, arena, sam_tokens,
+						 0, 0, 1);
+	if (!sam_tok0) return SAM3_ENOMEM;
+	/* sam_tok0: [1, 256]. Apply MLP3. */
+	struct sam3_tensor *iobj_w[3] = {
+		trk->interactive_obj_ptr_proj.fc_w[0],
+		trk->interactive_obj_ptr_proj.fc_w[1],
+		trk->interactive_obj_ptr_proj.fc_w[2],
+	};
+	struct sam3_tensor *iobj_b[3] = {
+		trk->interactive_obj_ptr_proj.fc_b[0],
+		trk->interactive_obj_ptr_proj.fc_b[1],
+		trk->interactive_obj_ptr_proj.fc_b[2],
+	};
+	struct sam3_tensor *obj_ptr_single = mlp3_relu(g, arena, sam_tok0,
+						       iobj_w, iobj_b);
+	if (!obj_ptr_single) return SAM3_ENOMEM;
+	/* obj_ptr_single: [1, 256]. Force readback so we can host-side
+	 * build the per-slot bank tensor. */
+	obj_ptr_single->dbg_force_readback = 1;
+
+	/* --- 6. Build [16, 256] per-slot obj_ptr on the host side after
+	 * graph eval. Since graph eval hasn't run yet, we return the
+	 * graph node and let the caller evaluate + build the host
+	 * tensor.
+	 *
+	 * Simpler approach: allocate the output tensor now and emit a
+	 * post-eval fill helper. But arena tensors allocated before eval
+	 * survive eval, so we allocate the [16, 256] result here and
+	 * emit an "obj_ptr multiplex expansion" op that runs after the
+	 * graph is evaluated.
+	 *
+	 * Pragmatic path: return obj_ptr_single as [1, 256] in *out_obj_ptr.
+	 * Caller evaluates the graph, then host-side expands to [16, 256]
+	 * by copying slot 0 = raw projected, slots 1..15 =
+	 * no_obj_ptr_linear(raw). This keeps the graph-build path clean
+	 * and matches Python's lambda*obj_ptr + (1-lambda)*no_obj_ptr_linear
+	 * semantics with lambda_s = (s == 0 ? is_obj_appearing : 0). */
+	(void)is_obj_appearing;  /* used by caller post-eval */
+	*out_obj_ptr = obj_ptr_single;
+	return SAM3_OK;
+}
+
+/*
+ * sam3_multiplex_expand_obj_ptr - Post-eval host-side helper.
+ *
+ * Takes the interactive decoder's single obj_ptr [1, 256] and expands
+ * it to [16, 256] for bank storage:
+ *   slot 0:    raw (if is_obj_appearing) or no_obj_ptr_linear(raw)
+ *   slot 1..15: always no_obj_ptr_linear(raw) (not-appearing slots)
+ *
+ * Matches Python's per-slot gating in _use_mask_as_output. The input
+ * tensor must have been graph-evaluated (host data populated).
+ */
+void sam3_multiplex_expand_obj_ptr(
+		const struct sam3_tracker_multiplex *trk,
+		const struct sam3_tensor *obj_ptr_single,
+		int is_obj_appearing,
+		float *out_bank_ptr)
+{
+	const int D = MUX_DEC_HIDDEN;
+	const float *raw = (const float *)obj_ptr_single->data;
+	const float *W = (const float *)trk->no_obj_ptr_linear_w->data;
+	const float *b = (const float *)trk->no_obj_ptr_linear_b->data;
+
+	/* Compute no_obj_ptr_linear(raw): y = raw @ W^T + b. */
+	float proj[MUX_DEC_HIDDEN];
+	for (int i = 0; i < D; i++) {
+		float acc = b[i];
+		const float *wrow = W + (size_t)i * D;
+		for (int j = 0; j < D; j++)
+			acc += raw[j] * wrow[j];
+		proj[i] = acc;
+	}
+
+	/* Slot 0: raw if appearing, proj if not. Slots 1..15: always proj
+	 * (only slot 0 is the real object in single-obj seed). */
+	const float *slot0 = is_obj_appearing ? raw : proj;
+	memcpy(out_bank_ptr, slot0, (size_t)D * sizeof(float));
+	for (int s = 1; s < SAM3_MULTIPLEX_COUNT; s++)
+		memcpy(out_bank_ptr + (size_t)s * D, proj,
+		       (size_t)D * sizeof(float));
+}
+
 /*
  * sam3_multiplex_image_pe_layer - Host-side implementation of the Gaussian PE
  *                          basis lookup.
@@ -1791,7 +2524,7 @@ static void multiplex_fill_dense_sine_pe_row(float *row,
 					     int grid_h, int grid_w)
 {
 	const int half = SAM3_MULTIPLEX_HIDDEN_DIM / 2;   /* 128 */
-	const int num_pos_feats = half / 2;               /* 64 per axis */
+	const int num_pairs = half / 2;                   /* 64 (sin,cos) pairs per axis */
 	const float temperature = 10000.0f;
 	const float two_pi = 6.28318530717958647692f;
 	const float eps = 1e-6f;
@@ -1799,11 +2532,15 @@ static void multiplex_fill_dense_sine_pe_row(float *row,
 	float y_embed = ((float)(y + 1)) / ((float)grid_h + eps) * two_pi;
 	float x_embed = ((float)(x + 1)) / ((float)grid_w + eps) * two_pi;
 
-	/* pos_y / pos_x each produce 2*num_pos_feats = 128 values. The
-	 * Python code stacks (sin, cos) in pairs so the layout is
-	 * sin, cos, sin, cos, ... (interleaved) rather than sin-then-cos. */
-	for (int k = 0; k < num_pos_feats; k++) {
-		float exponent = (float)(2 * k) / (float)num_pos_feats;
+	/* pos_y / pos_x each produce 2*num_pairs = 128 values. The Python
+	 * code (PositionEmbeddingSine, num_pos_feats=256 → self.num_pos_feats
+	 * = half = 128) computes
+	 *     dim_t[i] = temperature^(2*(i//2)/half)   for i in [0, half)
+	 * so pairs (2k, 2k+1) share dim_t = temperature^(2k/half) (NOT
+	 * /num_pairs — that was a 2× frequency bug). `stack(sin, cos).flatten`
+	 * yields interleaved sin,cos,sin,cos,... along the half-dim. */
+	for (int k = 0; k < num_pairs; k++) {
+		float exponent = (float)(2 * k) / (float)half;
 		float dim_t = powf(temperature, exponent);
 		float vy = y_embed / dim_t;
 		float vx = x_embed / dim_t;
@@ -2069,6 +2806,39 @@ static int multiplex_build_memory_from_bank(
 	*out_memory_image = memory_image;
 	*out_memory_image_pos = memory_image_pos;
 	*out_Nm = Nm;
+
+#ifdef SAM3_DEBUG_DUMP
+	/*
+	 * Dump-layout parity: Python's hook captures the `memory_image` /
+	 * `memory_image_pos` kwargs BEFORE the encoder pads them with
+	 * obj_ptr tail rows (reference/sam3/sam3/model/decoder.py:1316-1346).
+	 * The C compute pre-materialises the padded Nm-row versions, so a
+	 * raw dump of `memory_image`/`memory_image_pos` (Nm rows) will
+	 * never line up with Python's pre-pad dump (total_spatial rows).
+	 *
+	 * Expose a `total_spatial`-row slice here for byte-diff parity.
+	 * The full padded tensors still drive the attention compute — this
+	 * only changes what the debug extern points at.
+	 */
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_memory_image;
+		extern struct sam3_tensor *sam3_dbg_trk_memory_image_pos;
+		int dbg_dims[3] = {1, total_spatial, D};
+		struct sam3_tensor *dbg_mi = gh_alloc_tensor(
+			arena, SAM3_DTYPE_F32, 3, dbg_dims);
+		struct sam3_tensor *dbg_mip = gh_alloc_tensor(
+			arena, SAM3_DTYPE_F32, 3, dbg_dims);
+		if (dbg_mi && dbg_mip) {
+			memcpy(dbg_mi->data, memory_image->data,
+			       (size_t)total_spatial * D * sizeof(float));
+			memcpy(dbg_mip->data, memory_image_pos->data,
+			       (size_t)total_spatial * D * sizeof(float));
+			sam3_dbg_trk_memory_image = dbg_mi;
+			sam3_dbg_trk_memory_image_pos = dbg_mip;
+		}
+	}
+#endif
+
 	return total_obj_ptrs;
 }
 
@@ -2086,11 +2856,12 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		struct sam3_tensor **out_iou,
 		struct sam3_tensor **out_obj_ptrs,
 		struct sam3_tensor **out_all_iou,
-		struct sam3_tensor **out_score)
+		struct sam3_tensor **out_score,
+		struct sam3_tensor **out_all_score)
 {
 	if (!trk || !g || !image_embed || !feat_s1 || !feat_s0 || !arena
 	    || !out_masks || !out_iou || !out_obj_ptrs || !out_all_iou
-	    || !out_score) {
+	    || !out_score || !out_all_score) {
 		sam3_log_error("tracker_multiplex_track_frame: NULL arg");
 		return SAM3_EINVAL;
 	}
@@ -2225,14 +2996,16 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		} else {
 #ifdef SAM3_DEBUG_DUMP
 			{
+				/* memory is dumped verbatim (matches Python's
+				 * `memory` kwarg: image + obj_ptr tail). The
+				 * image-only slices for memory_image and
+				 * memory_image_pos are set inside
+				 * multiplex_build_memory_from_bank so Python's
+				 * pre-pad hook capture lines up byte-for-byte. */
 				extern struct sam3_tensor *sam3_dbg_trk_memory;
-				extern struct sam3_tensor *sam3_dbg_trk_memory_image;
-				extern struct sam3_tensor *sam3_dbg_trk_memory_image_pos;
 				extern struct sam3_tensor *sam3_dbg_trk_tgt;
-				sam3_dbg_trk_memory           = memory;
-				sam3_dbg_trk_memory_image     = memory_image;
-				sam3_dbg_trk_memory_image_pos = memory_image_pos;
-				sam3_dbg_trk_tgt              = tgt;
+				sam3_dbg_trk_memory = memory;
+				sam3_dbg_trk_tgt    = tgt;
 			}
 #endif
 			struct sam3_tensor *cond_2d =
@@ -2381,10 +3154,20 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 	if (!obj_ptrs)
 		return SAM3_ENOMEM;
 
-	*out_masks    = slot0_masks;
-	*out_iou      = slot0_iou;
-	*out_obj_ptrs = obj_ptrs;
-	*out_all_iou  = all_iou_view;
-	*out_score    = slot0_score;
+	/* Flatten all_score [16, 1] -> [16] for per-slot is_appearing
+	 * consumption by the caller. Python gates obj_ptr per-slot
+	 * via `object_score_logits > 0` (video_tracking_multiplex.py:983-986). */
+	int all_score_dims[1] = {16};
+	struct sam3_tensor *all_score_view = gh_reshape(g, arena, all_score,
+							1, all_score_dims);
+	if (!all_score_view)
+		return SAM3_ENOMEM;
+
+	*out_masks     = slot0_masks;
+	*out_iou       = slot0_iou;
+	*out_obj_ptrs  = obj_ptrs;
+	*out_all_iou   = all_iou_view;
+	*out_score     = slot0_score;
+	*out_all_score = all_score_view;
 	return SAM3_OK;
 }
