@@ -7,12 +7,12 @@ lookup at load time.
 ## File Layout
 
 ```
-Offset 0                          Offset 48
+Offset 0                          Offset 52
  |                                 |
  v                                 v
 +----------+----------------------+-----------+-----------+-----+
 |  Header  |  Tensor Descriptors  |  Padding  | Data Blob |     |
-| 48 bytes |  n_tensors x 176 B   |  (zeros)  | (aligned) | EOF |
+| 52 bytes |  n_tensors x 176 B   |  (zeros)  | (aligned) | EOF |
 +----------+----------------------+-----------+-----------+-----+
                                    ^           ^
                                    |           |
@@ -21,14 +21,14 @@ Offset 0                          Offset 48
 
 All numeric values are little-endian.
 
-## Header (48 bytes)
+## Header (52 bytes, v4 current)
 
-Sits at offset 0. Validated with `_Static_assert(sizeof(...) == 48)`.
+Sits at offset 0. Validated with `_Static_assert(sizeof(...) == 52)`.
 
 | Offset | Field              | Type       | Description                          |
 |--------|--------------------|------------|--------------------------------------|
 | 0      | `magic`            | uint32_t   | `0x334D4153` (ASCII "SAM3", LE)      |
-| 4      | `version`          | uint32_t   | Format version (currently **3**)     |
+| 4      | `version`          | uint32_t   | Format version (currently **4**)     |
 | 8      | `flags`            | uint32_t   | Reserved, set to 0                   |
 | 12     | `n_tensors`        | uint32_t   | Total tensor count                   |
 | 16     | `image_size`       | int32_t    | Input resolution (e.g. 1008)         |
@@ -36,11 +36,19 @@ Sits at offset 0. Validated with `_Static_assert(sizeof(...) == 48)`.
 | 24     | `decoder_dim`      | int32_t    | Mask decoder dim (256)               |
 | 28     | `n_encoder_layers` | int32_t    | Vision encoder depth (e.g. 32)       |
 | 32     | `n_decoder_layers` | int32_t    | Mask decoder depth (e.g. 2)          |
-| 36     | `reserved[3]`      | uint32_t[] | Reserved, zeroed                     |
+| 36     | `reserved[3]`      | uint32_t[] | [0]=backbone_type, [1]=variant, [2]=n_fpn_scales |
+| 48     | `text_backbone`    | uint32_t   | enum sam3_text_backbone (0=CLIP)     |
 
 The config fields (`image_size` through `n_decoder_layers`) let models with
 different architectures coexist. They override any compiled-in defaults at
 load time.
+
+### Header v3
+
+Previous format (2026-04-10). 48 bytes total. Three reserved uint32 slots at
+offset 36. The v3 reader path in `sam3_weight_open()` recognizes files written
+with `version == 3` and treats `text_backbone` as defaulting to
+`SAM3_TEXT_CLIP`, so existing `.sam3` files continue to load.
 
 ## Tensor Descriptor (176 bytes)
 
@@ -94,7 +102,7 @@ undefined for Q8_0.
 The loader (`sam3_weight_open()`) does:
 
 1. `mmap()` the file (read-only, `MAP_PRIVATE`)
-2. Validate magic (`0x334D4153`) and version (`3`)
+2. Validate magic (`0x334D4153`) and version (3 or 4)
 3. Bounds-check the descriptor table and all tensor data ranges
 4. Build an FNV-1a hash table for O(1) tensor lookup by name
    - Table size: next power of 2 >= 2 * `n_tensors`
@@ -107,7 +115,7 @@ Tensor data pointers point directly into the mmap region and are valid until
 
 The writer (`sam3_weight_write()`) iterates a `weight_reader` vtable:
 
-1. Write header (48 bytes)
+1. Write header (52 bytes, v4 format)
 2. Write descriptor array (`n_tensors` x 176 bytes)
 3. Zero-pad to 4096-byte boundary
 4. Write each tensor's data, zero-padding to 64-byte alignment between tensors
@@ -144,6 +152,12 @@ The format does **not** include checksums. Integrity is ensured by:
 | `tools/cli_convert.c`      | `sam3_cli convert` subcommand     |
 
 ## Changelog
+
+### v4 (2026-04-20, current)
+- Extended header from 48 to 52 bytes
+- Added `text_backbone` field (enum sam3_text_backbone) to select text encoder variant
+- Supports CLIP, MobileCLIP-S0, MobileCLIP-S1, MobileCLIP-L
+- Backward compatible: v3 files read with default `text_backbone=SAM3_TEXT_CLIP`
 
 ### v3 (2026-04-10)
 - Conv2d weights stored in OHWI: `[C_out, KH, KW, C_in]`
