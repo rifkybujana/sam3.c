@@ -539,6 +539,21 @@ struct sam3_tensor *sam3_mobileclip_text_build(
 	return out;
 }
 
+/*
+ * sam3_mobileclip_text_build_perblock - Per-block evaluator for MobileCLIP.
+ *
+ * Builds the embedding once, then evaluates each transformer block in its own
+ * graph, copying the result to persist and resetting scratch between blocks.
+ * Mirrors the pattern used by sam3_text_encoder_build_perblock in text_encoder.c.
+ *
+ * @enc:      Encoder with loaded weights
+ * @be:       Backend for graph evaluation
+ * @token_ids: Input token IDs [seq_len] (I32 tensor)
+ * @scratch:  Arena for per-block intermediate tensors (reset between blocks)
+ * @persist:  Arena for output buffer that survives across blocks
+ *
+ * Returns per-token embeddings [seq_len, out_dim], or NULL on error.
+ */
 struct sam3_tensor *sam3_mobileclip_text_build_perblock(
 	struct sam3_mobileclip_text_encoder *enc,
 	struct sam3_backend *be,
@@ -546,7 +561,133 @@ struct sam3_tensor *sam3_mobileclip_text_build_perblock(
 	struct sam3_arena *scratch,
 	struct sam3_arena *persist)
 {
-	(void)enc; (void)be; (void)token_ids; (void)scratch; (void)persist;
-	sam3_log_error("mobileclip_text_build_perblock: not yet implemented");
-	return NULL;
+	const struct sam3_mobileclip_config *cfg = &enc->cfg;
+	struct sam3_graph g;
+	enum sam3_error err;
+	int seq_len, i;
+	int x_dims[2];
+	size_t x_bytes;
+	void *x_buf;
+
+	seq_len = sam3_tensor_nelems(token_ids);
+	x_bytes = (size_t)seq_len * (size_t)cfg->width * sizeof(float);
+
+	/* Allocate persist buffer for block outputs [seq_len, width] */
+	x_buf = sam3_arena_alloc(persist, x_bytes);
+	if (!x_buf)
+		return NULL;
+
+	/* === Group 0: token embed + pos embed === */
+	{
+		struct sam3_tensor *x, *pos;
+		int pos2d_dims[2];
+
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		x = gh_embed(&g, scratch, enc->token_embedding, token_ids);
+		if (!x)
+			return NULL;
+
+		pos2d_dims[0] = cfg->pos_embed_table_len;
+		pos2d_dims[1] = cfg->width;
+		pos = gh_reshape(&g, scratch, enc->pos_embed_full,
+				 2, pos2d_dims);
+		if (!pos)
+			return NULL;
+
+		if (seq_len < cfg->pos_embed_table_len) {
+			pos = gh_slice(&g, scratch, pos, 0, 0, seq_len);
+			if (!pos)
+				return NULL;
+		}
+
+		x = gh_add(&g, scratch, x, pos);
+		if (!x)
+			return NULL;
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+
+		memcpy(x_buf, x->data, x_bytes);
+	}
+
+	/* === Block loop: one block per graph_eval === */
+	x_dims[0] = seq_len;
+	x_dims[1] = cfg->width;
+
+	for (i = 0; i < cfg->n_layers; i++) {
+		const struct sam3_mobileclip_layer *Lslot = &enc->layers[i];
+		struct sam3_tensor *x;
+
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+				   2, x_dims, x_buf);
+		if (!x)
+			return NULL;
+
+		if (Lslot->is_repmixer) {
+			sam3_log_error("mobileclip_perblock: RepMixer block %d "
+				       "reached before Phase 6 wired it", i);
+			return NULL;
+		}
+
+		x = build_std_block(&g, &Lslot->u.std, x,
+				    cfg->n_heads, cfg->width,
+				    seq_len, scratch);
+		if (!x)
+			return NULL;
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+
+		memcpy(x_buf, x->data, x_bytes);
+	}
+
+	/* === Tail: final LN + inner projection + external projector === */
+	{
+		struct sam3_tensor *x, *out;
+		int out_dims[2];
+
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+				   2, x_dims, x_buf);
+		if (!x)
+			return NULL;
+
+		x = gh_layernorm(&g, scratch, x,
+				 enc->ln_final_w, enc->ln_final_b);
+		if (!x)
+			return NULL;
+
+		x = gh_matmul(&g, scratch, x, enc->projection_layer);
+		if (!x)
+			return NULL;
+
+		out = gh_linear(&g, scratch, x,
+				enc->out_proj_w, enc->out_proj_b);
+		if (!out)
+			return NULL;
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+
+		/* Copy result to persist arena */
+		out_dims[0] = seq_len;
+		out_dims[1] = cfg->out_dim;
+		struct sam3_tensor *result;
+		result = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+					 2, out_dims);
+		if (!result)
+			return NULL;
+		memcpy(result->data, out->data, result->nbytes);
+		return result;
+	}
 }
