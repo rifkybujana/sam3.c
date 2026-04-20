@@ -24,81 +24,20 @@ Usage:
 import argparse
 import os
 import sys
-import types
 from pathlib import Path
 
-# sam3's tracker utils import triton (CUDA-only). The SAM 3.1 image path
-# we assemble below doesn't actually execute any triton kernels.
-#
-# Two things must happen before sam3 is imported:
-# 1. Force torch.utils._triton.has_triton_package() to return False, so
-#    torch._inductor (loaded transitively via torchvision) doesn't try
-#    to import triton.backends.compiler.
-# 2. Stub the `triton` module so sam3/model/edt.py's bare `import triton`
-#    succeeds without the kernels ever being called.
-import torch  # isort:skip
-from torch.utils import _triton as _torch_triton
+# Shared CUDA->CPU shims. Must run BEFORE any sam3 import.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cpu_patches import (  # noqa: E402
+    install_triton_stub, install_cuda_redirect, install_addmm_act_fp32,
+)
 
-_torch_triton.has_triton_package = lambda: False
-_torch_triton.has_triton = lambda: False
+install_triton_stub()
+install_cuda_redirect()
 
-# The upstream sam3 package hardcodes device="cuda" in several tensor
-# creation calls (PositionEmbeddingSine, TransformerDecoder._get_coords,
-# etc.). Redirect `device="cuda"` (or torch.device("cuda")) to CPU for
-# every tensor factory when CUDA isn't available.
-if not torch.cuda.is_available():
-    def _cpu_redirect(kwargs):
-        dev = kwargs.get("device")
-        if dev is None:
-            return
-        if isinstance(dev, torch.device) and dev.type == "cuda":
-            kwargs["device"] = torch.device("cpu")
-        elif isinstance(dev, str) and dev.startswith("cuda"):
-            kwargs["device"] = "cpu"
-
-    for _fn in ("zeros", "ones", "empty", "arange", "randn", "rand",
-                "full", "linspace", "eye", "tensor", "as_tensor"):
-        _orig = getattr(torch, _fn)
-
-        def _wrap(orig):
-            def _wrapped(*a, **kw):
-                _cpu_redirect(kw)
-                return orig(*a, **kw)
-            return _wrapped
-
-        setattr(torch, _fn, _wrap(_orig))
-
-    # .cuda() no-ops to self (CPU tensor stays on CPU).
-    torch.Tensor.cuda = lambda self, *a, **kw: self
-    # Module.cuda() likewise returns self without moving.
-    torch.nn.Module.cuda = lambda self, *a, **kw: self
-
-
-if "triton" not in sys.modules:
-    class _TritonStubType:
-        pass
-
-    triton_stub = types.ModuleType("triton")
-    triton_stub.jit = lambda f=None, **kw: (
-        f if callable(f) else (lambda g: g)
-    )
-    triton_stub.heuristics = lambda *a, **kw: (lambda f: f)
-    triton_stub.autotune = lambda *a, **kw: (lambda f: f)
-
-    triton_lang_stub = types.ModuleType("triton.language")
-    for _name in ("dtype", "tensor", "pointer_type", "void", "int1",
-                  "int8", "int16", "int32", "int64",
-                  "uint8", "uint16", "uint32", "uint64",
-                  "float16", "float32", "float64",
-                  "bfloat16", "block_type", "constexpr"):
-        setattr(triton_lang_stub, _name, _TritonStubType)
-
-    triton_stub.language = triton_lang_stub
-    sys.modules["triton"] = triton_stub
-    sys.modules["triton.language"] = triton_lang_stub
-
-from PIL import Image
-from safetensors.torch import save_file
+import torch  # noqa: E402
+from PIL import Image  # noqa: E402
+from safetensors.torch import save_file  # noqa: E402
 
 
 def build_model_sam3(checkpoint: str, bpe_path: str, device: str):
@@ -113,30 +52,8 @@ def build_model_sam3(checkpoint: str, bpe_path: str, device: str):
 
 
 def _install_addmm_act_fp32_patch():
-    """Replace sam3.perflib.fused.addmm_act with an fp32-preserving
-    version that works on CPU. Must be called AFTER importing sam3 (so
-    sam3.perflib.fused exists) but BEFORE vitdet captures it. Since
-    vitdet does `from sam3.perflib.fused import addmm_act` at import
-    time, we also patch vitdet's module-level reference.
-    """
-    import sam3.perflib.fused as _fused
-
-    def _addmm_act_fp32(activation, linear, mat1):
-        if torch.is_grad_enabled():
-            raise ValueError("Expected grad to be disabled.")
-        w = linear.weight.detach()
-        b = linear.bias.detach()
-        y = torch.nn.functional.linear(mat1, w, b)
-        if activation in (torch.nn.functional.relu, torch.nn.ReLU):
-            return torch.nn.functional.relu(y)
-        if activation in (torch.nn.functional.gelu, torch.nn.GELU):
-            return torch.nn.functional.gelu(y)
-        raise ValueError(f"Unexpected activation {activation}")
-
-    _fused.addmm_act = _addmm_act_fp32
-    # vitdet imports the symbol directly; patch its copy too.
-    import sam3.model.vitdet as _vitdet
-    _vitdet.addmm_act = _addmm_act_fp32
+    """Thin wrapper — delegates to _cpu_patches.install_addmm_act_fp32."""
+    install_addmm_act_fp32()
 
 
 def build_model_sam3_1(checkpoint: str, bpe_path: str, device: str):
