@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
-Dump Python-reference intermediate tensors for frames 0-2 of
-kids.mp4 (seeded with a C-produced seed_mask) so we can compare
-layer-by-layer against our C engine's /tmp/dbg_trk_*.bin files.
+Dump Python-reference intermediate tensors for the two propagation
+frames of kids.mp4 (seeded with a C-produced seed_mask) so we can
+compare layer-by-layer against our C engine's /tmp/dbg_trk_*.bin files.
 
-Writes NHWC f32 raw-binary files matching the C dump format:
-  /tmp/py_trk_memattn_out_f1.bin   [1, 5184, 256]
-  /tmp/py_trk_mask_dec_masks_fN.bin
-  /tmp/py_trk_mask_dec_iou_fN.bin
-  /tmp/py_trk_mask_dec_score_fN.bin
-  /tmp/py_trk_mask_dec_sam_fN.bin
+Only `_f1.bin` and `_f2.bin` are produced: the seed frame (frame 0)
+does not invoke forward hooks on memory_attention or mask_decoder
+(its outputs are cached during preflight and re-yielded by
+propagate_in_video without re-running the forward), so there is no
+`_f0.bin`.
+
+Writes f32 raw-binary files matching the C dump format. Image-shaped
+4-D tensors (NCHW) are permuted to NHWC before writing; token-shaped
+tensors (e.g. sam_tokens_out [B, M, K, C]) are written verbatim with
+any leading singleton batch dim squeezed so the byte layout matches
+the C side's 3-D [M, K, C] dump.
+
+  /tmp/py_trk_memattn_out_fN.bin       [5184, 256]
+  /tmp/py_trk_mask_dec_masks_fN.bin    NHWC of [16, 3, 288, 288]
+  /tmp/py_trk_mask_dec_iou_fN.bin      [16, 3]
+  /tmp/py_trk_mask_dec_score_fN.bin    [16]
+  /tmp/py_trk_mask_dec_sam_fN.bin      [16, 3, 256]
 
 Usage:
   SAM3_CKPT=models/sam3.1_multiplex.pt \\
@@ -49,15 +60,24 @@ from PIL import Image  # noqa: E402
 # Dump helpers
 # ---------------------------------------------------------------------
 
-def _dump(path, t):
+def _dump(path, t, nhwc=False):
     """Write a torch.Tensor (any shape) as f32 raw binary.
 
-    4-D tensors in NCHW layout are transposed to NHWC before writing
-    so the C engine's NHWC dumps align pixel-for-pixel.
+    When `nhwc=True`, 4-D tensors are assumed to be in NCHW layout and
+    are permuted to NHWC so the C engine's NHWC dumps align pixel-for-
+    pixel. This is only correct for image-shaped tensors; token-shaped
+    4-D tensors (e.g. sam_tokens_out [B, M, K, C]) must be dumped with
+    `nhwc=False` (the default) to preserve their layout.
+
+    When `nhwc=False`, a leading singleton batch dim is squeezed so
+    e.g. [1, 16, 3, 256] becomes [16, 3, 256] to match the C side's
+    3-D tensor dumps.
     """
     x = t.detach().cpu().float().contiguous()
-    if x.dim() == 4:
+    if nhwc and x.dim() == 4:
         x = x.permute(0, 2, 3, 1).contiguous()
+    elif not nhwc and x.dim() >= 2 and x.size(0) == 1:
+        x = x.squeeze(0).contiguous()
     arr = x.numpy().astype(np.float32)
     arr.tofile(path)
     print(f"dump: {path} shape={tuple(arr.shape)} dtype={arr.dtype}",
@@ -159,35 +179,30 @@ def _dump_mem(raw, frame_idx):
 
 
 def _dump_mask_decoder(raw, frame_idx):
-    """Dump a sam_mask_decoder capture (dict or tuple) for this frame."""
-    # MultiplexMaskDecoder returns a dict:
-    #   masks / iou_pred / sam_tokens_out / object_score_logits
-    if isinstance(raw, dict):
-        named = {
-            "masks": "mask_dec_masks",
-            "iou_pred": "mask_dec_iou",
-            "sam_tokens_out": "mask_dec_sam",
-            "object_score_logits": "mask_dec_score",
-        }
-        for key, slot in named.items():
-            t = raw.get(key)
-            if isinstance(t, torch.Tensor):
-                _dump(f"/tmp/py_trk_{slot}_f{frame_idx}.bin", t)
-        return
+    """Dump a sam_mask_decoder capture for this frame.
 
-    # Older upstreams return a tuple in unspecified order; classify by shape.
-    if isinstance(raw, (tuple, list)):
-        for t in raw:
-            if not isinstance(t, torch.Tensor):
-                continue
-            if t.dim() >= 4:
-                _dump(f"/tmp/py_trk_mask_dec_masks_f{frame_idx}.bin", t)
-            elif t.dim() == 3:
-                _dump(f"/tmp/py_trk_mask_dec_sam_f{frame_idx}.bin", t)
-            elif t.dim() == 2 and t.size(-1) == 1:
-                _dump(f"/tmp/py_trk_mask_dec_score_f{frame_idx}.bin", t)
-            elif t.dim() == 2:
-                _dump(f"/tmp/py_trk_mask_dec_iou_f{frame_idx}.bin", t)
+    MultiplexMaskDecoder returns a dict with keys:
+      masks / iou_pred / sam_tokens_out / object_score_logits
+    Only `masks` is image-shaped (NCHW -> NHWC); the rest are
+    token/score tensors and are written verbatim (with the leading
+    singleton batch dim squeezed) so the byte layout matches the C
+    side's dumps.
+    """
+    if not isinstance(raw, dict):
+        return
+    # image-shaped tensors get NHWC'd; everything else stays as-is.
+    nhwc_keys = {"masks"}
+    named = {
+        "masks": "mask_dec_masks",
+        "iou_pred": "mask_dec_iou",
+        "sam_tokens_out": "mask_dec_sam",
+        "object_score_logits": "mask_dec_score",
+    }
+    for key, slot in named.items():
+        t = raw.get(key)
+        if isinstance(t, torch.Tensor):
+            _dump(f"/tmp/py_trk_{slot}_f{frame_idx}.bin", t,
+                  nhwc=(key in nhwc_keys))
 
 
 def _flush_captures_delta(captures, cursors, frame_idx):
