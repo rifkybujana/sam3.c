@@ -108,6 +108,12 @@ tests/fixtures/*
 !tests/fixtures/nhwc_migration/*.bin
 !tests/fixtures/video_kids/
 !tests/fixtures/video_kids/README.md
+!tests/fixtures/mobileclip_s0/
+!tests/fixtures/mobileclip_s0/*.npy
+!tests/fixtures/mobileclip_s1/
+!tests/fixtures/mobileclip_s1/*.npy
+!tests/fixtures/mobileclip_l/
+!tests/fixtures/mobileclip_l/*.npy
 
 TODO*
 
