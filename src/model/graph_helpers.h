@@ -131,6 +131,16 @@ struct sam3_tensor *gh_softmax(struct sam3_graph *g, struct sam3_arena *a,
 struct sam3_tensor *gh_add(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *x, struct sam3_tensor *b);
 
+/*
+ * gh_sub - Element-wise subtraction: out = x - y.
+ *
+ * Implemented as gh_add(x, gh_mul(y, neg_one)) where neg_one is a
+ * pre-allocated scalar-broadcast constant. Both x and y must have the
+ * same shape. Output shape equals x's shape.
+ */
+struct sam3_tensor *gh_sub(struct sam3_graph *g, struct sam3_arena *a,
+			   struct sam3_tensor *x, struct sam3_tensor *y);
+
 struct sam3_tensor *gh_mul(struct sam3_graph *g, struct sam3_arena *a,
 			   struct sam3_tensor *x, struct sam3_tensor *b);
 
@@ -546,6 +556,27 @@ struct sam3_tensor *gh_conv2d(struct sam3_graph *g, struct sam3_arena *a,
 			      struct sam3_tensor *weight,
 			      struct sam3_tensor *bias,
 			      int stride, int padding, int groups);
+
+/*
+ * gh_conv2d_hw - 2D convolution with separate H and W padding.
+ *
+ * Like gh_conv2d but accepts independent padding for H and W axes.
+ * Required for non-square kernels such as 1×11 depthwise convolutions
+ * where pad_h=0 and pad_w=5 must differ.
+ *
+ * @pad_h: Padding applied to the H axis (top and bottom)
+ * @pad_w: Padding applied to the W axis (left and right)
+ *
+ * Stores pad_h in params[1] and pad_w in params[3]. Backends read
+ * params[3] and use it as W-padding when non-zero; otherwise they
+ * fall back to params[1] (backward compatible with existing callers).
+ */
+struct sam3_tensor *gh_conv2d_hw(struct sam3_graph *g, struct sam3_arena *a,
+				 struct sam3_tensor *input,
+				 struct sam3_tensor *weight,
+				 struct sam3_tensor *bias,
+				 int stride, int pad_h, int pad_w,
+				 int groups);
 
 /*
  * gh_conv_transpose2d - 2D transposed conv with NHWC input and OHWI
