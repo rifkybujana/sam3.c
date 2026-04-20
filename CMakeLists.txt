@@ -217,6 +217,9 @@ target_include_directories(sam3_1_dump_seed PRIVATE
 if(SAM3_TESTS)
 	enable_testing()
 	file(GLOB TEST_SOURCES "tests/test_*.c")
+	# test_helpers_png.c is a helper TU, not a standalone test.
+	list(REMOVE_ITEM TEST_SOURCES
+		${CMAKE_SOURCE_DIR}/tests/test_helpers_png.c)
 	if(NOT SAM3_FIXTURE_TESTS)
 		list(REMOVE_ITEM TEST_SOURCES
 			${CMAKE_SOURCE_DIR}/tests/test_tracker_fixtures.c)
