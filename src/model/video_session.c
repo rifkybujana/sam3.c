@@ -47,11 +47,20 @@ int sam3_session_get_or_add_obj(struct sam3_video_session *session, int obj_id)
 	session->objects[idx].prompted_frames  = NULL;
 	session->objects[idx].prev_mask_logits = NULL;
 	session->objects[idx].prev_mask_frame  = -1;
+	/*
+	 * mf_threshold is SAM3-Long memory selection. The stock SAM 3.1
+	 * multiplex config sets `use_memory_selection=False`
+	 * (reference/sam3/sam3/model_builder.py), so the non-cond filter is
+	 * disabled there for Python parity. SAM 3 keeps the 0.01 threshold
+	 * because its legacy tracker relied on it.
+	 */
+	float mf_threshold = (session->variant == SAM3_VARIANT_SAM3_1)
+		? -1.0f : 0.01f;
 	sam3_memory_bank_init(&session->objects[idx].bank,
 			      /*capacity=*/7,
 			      /*max_cond_in_attn=*/4,
 			      /*temporal_stride=*/1,
-			      /*mf_threshold=*/0.01f);
+			      mf_threshold);
 	session->n_objects++;
 	return idx;
 }

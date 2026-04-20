@@ -1688,12 +1688,13 @@ struct sam3_tensor *sam3_multiplex_image_pe_layer(
 
 /*
  * Cap on the number of most-recent bank entries fed into memory
- * attention. Each entry contributes HW=5184 spatial tokens at the
- * production 72×72 grid, so capping keeps the memory-attention K/V
- * tensors manageable (2 × 5184 = 10368 tokens fit comfortably in a
- * 3 GiB scratch arena).
+ * attention. Python's accumulation is up to 1 cond frame +
+ * (num_maskmem - 1) non-cond frames = 7, so we size to match.
+ * Each entry contributes HW=5184 spatial tokens at the production
+ * 72×72 grid (7 × 5184 = 36288 tokens, still fits in the 3 GiB scratch
+ * arena).
  */
-#define MUX_MAX_MEM_ENTRIES_IN_ATTN 2
+#define MUX_MAX_MEM_ENTRIES_IN_ATTN SAM3_MULTIPLEX_NUM_MASKMEM  /* 7 */
 
 /*
  * multiplex_apply_linear_256 - Host-side y = x @ W^T + b for single-vector linear.
@@ -1766,6 +1767,51 @@ int multiplex_maskmem_tpos_slot(int t_rel)
 	if (t_rel <= 0 || t_rel >= N)
 		return N - 1;
 	return N - t_rel - 1;
+}
+
+/*
+ * multiplex_fill_dense_sine_pe_row - Compute one row of Python's
+ * PositionEmbeddingSine(num_pos_feats=256) output for grid cell (y, x) on a
+ * (grid_h, grid_w) grid.
+ *
+ * Matches reference/sam3/sam3/model/position_encoding.py:
+ *   y_embed = (y + 1) / H * (2*pi)     (normalize=True, scale=2*pi)
+ *   x_embed = (x + 1) / W * (2*pi)
+ *   dim_t[i] = temperature^(2*floor(i/2)/128)   for i in [0, 128)
+ *   pos_y_i = sin(y_embed/dim_t) if i even, cos(...) if i odd
+ *   row = [pos_y (128), pos_x (128)]   (Python permutes channel-last then
+ *                                       concat along channel dim)
+ *
+ * This is the positional encoding used by the tracker backbone / neck, i.e.
+ * `propagation_vision_pos_embeds[-1]` in Python, which Python feeds into
+ * `memory_image_pos` (NOT the mask-decoder's Gaussian PE).
+ */
+static void multiplex_fill_dense_sine_pe_row(float *row,
+					     int y, int x,
+					     int grid_h, int grid_w)
+{
+	const int half = SAM3_MULTIPLEX_HIDDEN_DIM / 2;   /* 128 */
+	const int num_pos_feats = half / 2;               /* 64 per axis */
+	const float temperature = 10000.0f;
+	const float two_pi = 6.28318530717958647692f;
+	const float eps = 1e-6f;
+
+	float y_embed = ((float)(y + 1)) / ((float)grid_h + eps) * two_pi;
+	float x_embed = ((float)(x + 1)) / ((float)grid_w + eps) * two_pi;
+
+	/* pos_y / pos_x each produce 2*num_pos_feats = 128 values. The
+	 * Python code stacks (sin, cos) in pairs so the layout is
+	 * sin, cos, sin, cos, ... (interleaved) rather than sin-then-cos. */
+	for (int k = 0; k < num_pos_feats; k++) {
+		float exponent = (float)(2 * k) / (float)num_pos_feats;
+		float dim_t = powf(temperature, exponent);
+		float vy = y_embed / dim_t;
+		float vx = x_embed / dim_t;
+		row[2 * k]          = sinf(vy);   /* pos_y even */
+		row[2 * k + 1]      = cosf(vy);   /* pos_y odd */
+		row[half + 2 * k]     = sinf(vx); /* pos_x even */
+		row[half + 2 * k + 1] = cosf(vx); /* pos_x odd */
+	}
 }
 
 /*
@@ -1856,10 +1902,39 @@ static int multiplex_build_memory_from_bank(
 	float *mp  = (float *)memory->data;
 	float *mip = (float *)memory_image->data;
 	float *mpp = (float *)memory_image_pos->data;
-	const float *pe = image_pe ? (const float *)image_pe->data : NULL;
 	const float *tpos_base = trk->maskmem_tpos_enc
 		? (const float *)trk->maskmem_tpos_enc->data
 		: NULL;
+
+	/*
+	 * Bug A fix: for memory_image_pos, Python uses the tracker backbone's
+	 * PositionEmbeddingSine (dense sinusoidal PE — NOT the mask-decoder's
+	 * random Gaussian PE captured in `image_pe`). Precompute it once for
+	 * the [HW, 256] grid implied by memory rows. SAM 3.1 uses a square
+	 * grid (H = W), so we derive side length from HW.
+	 */
+	int grid_side = 1;
+	while (grid_side * grid_side < HW && grid_side < 256)
+		grid_side++;
+	if (grid_side * grid_side != HW) {
+		sam3_log_error("multiplex_build_memory_from_bank: HW %d not a "
+			       "perfect square — sine PE assumes H=W",
+			       HW);
+		return -1;
+	}
+	float *dense_sine_pe = (float *)sam3_arena_alloc(
+		arena, (size_t)HW * D * sizeof(float));
+	if (!dense_sine_pe)
+		return -1;
+	for (int y = 0; y < grid_side; y++) {
+		for (int x = 0; x < grid_side; x++) {
+			float *rowp = dense_sine_pe
+				+ (size_t)(y * grid_side + x) * D;
+			multiplex_fill_dense_sine_pe_row(
+				rowp, y, x, grid_side, grid_side);
+		}
+	}
+	(void)image_pe; /* image_pe (Gaussian) is no longer used here. */
 
 	size_t row = 0;
 
@@ -1902,7 +1977,11 @@ static int multiplex_build_memory_from_bank(
 			       (size_t)n_rows * D * sizeof(float));
 		}
 
-		/* memory_image_pos: image_pe + maskmem_tpos_enc[slot]. */
+		/* memory_image_pos: dense_sine_pe + maskmem_tpos_enc[slot]
+		 * (matches Python video_tracking_multiplex.py:
+		 *   image_pos_embed = prev["image_pos_enc"] + tpos_enc
+		 * where image_pos_enc is the tracker backbone's
+		 * PositionEmbeddingSine output). */
 		int t_rel = current_frame_idx - picks[i]->frame_idx;
 		if (t_rel < 0)
 			t_rel = -t_rel;
@@ -1912,11 +1991,10 @@ static int multiplex_build_memory_from_bank(
 			: NULL;
 		for (int r = 0; r < n_rows; r++) {
 			float *dst = mpp + base + (size_t)r * D;
-			const float *pe_row = pe
-				? pe + (size_t)r * D
-				: NULL;
+			const float *pe_row = dense_sine_pe
+				+ (size_t)r * D;
 			for (int c = 0; c < D; c++) {
-				float v = pe_row ? pe_row[c] : 0.0f;
+				float v = pe_row[c];
 				if (tpos) v += tpos[c];
 				dst[c] = v;
 			}

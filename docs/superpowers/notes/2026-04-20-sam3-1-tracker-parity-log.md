@@ -400,3 +400,96 @@ frames. In priority order:
 3. Only once image-features parity holds should we revisit the
    tracker bank / pos-enc findings from iteration 3.
 
+## Iteration 5 — fix (2026-04-20)
+
+### Patches
+
+**Bug A (memory_image_pos):** The C tracker was adding the mask-decoder's
+Gaussian-random PE (`PositionEmbeddingRandom`, loaded from the
+`image_pe_layer.positional_encoding_gaussian_matrix` weight) to the
+spatial rows of `memory_image_pos`. Python uses the tracker backbone's
+sinusoidal PE (`PositionEmbeddingSine`, no learned weights — pure
+sin/cos over normalized (x, y) with temperature=10000), which is what
+`propagation_vision_pos_embeds[-1]` carries. Added a local
+`multiplex_fill_dense_sine_pe_row` helper in
+`src/model/tracker_multiplex.c` (≈1800) that reproduces
+`reference/sam3/sam3/model/position_encoding.py` exactly; swapped the
+spatial-row inner loop in `multiplex_build_memory_from_bank`
+(tracker_multiplex.c:1945) to use it instead of the Gaussian `image_pe`.
+
+**Bug B (bank retention):** Two changes in concert:
+1. `src/model/tracker_multiplex.c:1696` — bumped
+   `MUX_MAX_MEM_ENTRIES_IN_ATTN` from 2 to `SAM3_MULTIPLEX_NUM_MASKMEM`
+   (= 7), matching Python's `1 cond + (num_maskmem - 1) non-cond`
+   fanout.
+2. `src/model/video_session.c:50` — the SAM 3.1 multiplex variant now
+   initialises the bank with `mf_threshold = -1.0f` (filter disabled),
+   matching Python's default `use_memory_selection=False`. Without this
+   change, every propagation frame was rejected by the SAM3-Long
+   obj_score filter (because the image_embed root bug produces
+   obj_score=0), so `n_non_cond` stayed 0 and the cap bump alone was a
+   no-op. SAM 3 legacy still uses `mf_threshold=0.01f`.
+
+### Post-fix comparator output (from /tmp/compare_post_fix.log)
+
+```
+memory_image_pos_f1  cos=0.94750 abs_max=1.331 abs_mean=0.1051  rel=17.807%  [py_rows=5184, c_rows=5185]
+memory_f1            cos=0.49205 abs_max=10.24 abs_mean=0.4854  rel=108.052% [py_rows=5200, c_rows=5185]
+memory_image_pos_f2  cos=0.88266 abs_max=2.154 abs_mean=0.2353  rel=39.821%  [py_rows=10368, c_rows=10370]
+memory_f2            cos=0.12510 abs_max=10.65 abs_mean=0.5623  rel=127.150% [py_rows=10400, c_rows=10370]
+memory_image_f2      cos=0.48093 abs_max=6.285 abs_mean=0.5347  rel=121.565% [py_rows=10368, c_rows=10370]
+memattn_out_f2       cos=0.00012 abs_max=1.418e+17 abs_mean=1.069e+11  (numerical blow-up on f2 — see below)
+image_embed_f1       cos=0.57287 (unchanged — fix is out of scope for this path)
+image_embed_f2       cos=0.57369 (unchanged — same reason)
+```
+
+### Analysis
+
+- `memory_image_pos_f1`: before cos=0.088, **after cos=0.9475** — Bug A
+  confirmed. The slot is now dominated by the sine-PE grid (matching
+  Python). Residual 0.05 cosine gap comes from the remaining f1 shape
+  mismatch (C has 1 obj_ptr tail row vs Python's 16; see below).
+- `memory_image_pos_f2`: before cos=0.043, **after cos=0.883** — same
+  Bug A fix, same residual (+ 2 obj_ptr tails vs Python's 32 from two
+  frames × multiplex_count=16).
+- `memory_f2` row count: C 5185 → **10370**, Python 10400 — Bug B
+  retention fix now pulls in both the cond frame (frame 0) and the
+  non-cond propagation result from frame 1. Row count still trails
+  Python by 30 = 2 × (16 − 1), which is exactly the `multiplex_count`
+  obj_ptr expansion the C bank does not yet do (the C bank stores one
+  "best" 256-D obj_pointer per frame; Python stores the full
+  `[multiplex_count=16, 256]` and cats them as 16 tokens per frame).
+  Left as a known follow-up — this is the `obj_pointer [n_obj, 256]`
+  noted in `memory_bank.h:25`.
+- `memattn_layer0_f{1,2}`, `memattn_out_f{1,2}`: still near-zero
+  cosines. As expected — these are downstream of the image_embed
+  divergence (cos=0.573) which this task did not address.
+- **Regression note — numerical blow-up at `memattn_out_f2`**
+  (abs_max=1.4e17). This was introduced by the Bug B retention bump:
+  adding a second spatial K/V block when the image_embed input is
+  already wrong seems to cause a softmax / RoPE interaction that
+  explodes through the 4-layer stack. The divergence is downstream of
+  the image_embed bug (memattn_layer1_f2 already shows abs_max=229),
+  so we expect this to clear once image_embed parity is restored. No
+  change in regression tests (`ctest -E test_fixture_compare|
+  test_video_parity_kids` → 74/74 passing).
+- `image_embed_f1` still at cos=0.573 — confirmed unchanged. The fix
+  targets the memory bank construction, not the per-frame image
+  encoder pipeline, which is a separate bug.
+
+### Next step
+
+`image_embed` is now the sole pre-memattn divergence on propagation
+frames. The next session should:
+
+1. Dump `feat_s1` at frame 1 on both sides.
+2. If `feat_s1` disagrees: bisect the backbone / neck path for
+   propagation frames (frame-load, preprocess, ViT state).
+3. Once `image_embed` clears cos≥0.99, re-run this comparator — the
+   memattn blow-up on f2 should collapse back to matched-magnitude
+   outputs.
+4. Then address the outstanding obj_ptr multiplex expansion (store
+   full [16, 256] in the bank, emit 16 rows per entry in
+   `multiplex_build_memory_from_bank`) to close the remaining ~30-row
+   shape gap at frame 2.
+
