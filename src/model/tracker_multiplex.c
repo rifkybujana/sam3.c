@@ -1880,8 +1880,15 @@ static int multiplex_build_memory_from_bank(
 		if (HW > 0 && picks[i]->spatial_features->dims[0] != HW)
 			return -1;
 		total_spatial += picks[i]->spatial_features->dims[0];
-		if (picks[i]->obj_pointer)
-			total_obj_ptrs++;
+		if (picks[i]->obj_pointer) {
+			/* obj_pointer layout: SAM 3 stores [1, 256]; SAM 3.1
+			 * multiplex stores [16, 256] (one row per multiplex
+			 * slot). Total rows contributed = dims[0] when n_dims>=2
+			 * else 1 for legacy scalar tensors. */
+			int rows = (picks[i]->obj_pointer->n_dims >= 2)
+				? picks[i]->obj_pointer->dims[0] : 1;
+			total_obj_ptrs += rows;
+		}
 	}
 	int Nm = total_spatial + total_obj_ptrs;
 
@@ -2020,18 +2027,42 @@ static int multiplex_build_memory_from_bank(
 		int n_elems = sam3_tensor_nelems(op);
 		if (n_elems < D)
 			continue;
-		size_t base = row * D;
-		memcpy(mp + base, op->data, D * sizeof(float));
-		/* memory_image row already zero from memset. */
+		/* SAM 3: op is [1, 256] -> 1 row; SAM 3.1 multiplex: op is
+		 * [16, 256] -> 16 rows per entry. All rows for the same
+		 * frame share the same temporal sine position (they are
+		 * multiplex slots, not temporal steps). */
+		int n_rows = (op->n_dims >= 2) ? op->dims[0] : 1;
+		const float *op_data = (const float *)op->data;
 
+		/* Precompute the per-entry tpos row once; reuse across
+		 * all n_rows. */
+		float tpos_row[SAM3_MULTIPLEX_HIDDEN_DIM];
+		int have_tpos = 0;
 		if (W && B) {
 			int t_rel = current_frame_idx - picks[i]->frame_idx;
-			float norm_pos = (t_rel < 0 ? -(float)t_rel : (float)t_rel)
+			float norm_pos = (t_rel < 0 ? -(float)t_rel
+						    : (float)t_rel)
 				/ t_diff_max;
 			multiplex_sine_tpos_256(sine_row, norm_pos);
-			multiplex_apply_linear_256(mpp + base, sine_row, 1, W, B);
+			/* Apply the linear projection once per entry into
+			 * a reusable buffer. */
+			memset(tpos_row, 0, sizeof(tpos_row));
+			multiplex_apply_linear_256(tpos_row, sine_row,
+						   1, W, B);
+			have_tpos = 1;
 		}
-		row++;
+
+		for (int r = 0; r < n_rows; r++) {
+			size_t base = row * D;
+			memcpy(mp + base, op_data + (size_t)r * D,
+			       D * sizeof(float));
+			/* memory_image row already zero from memset. */
+			if (have_tpos) {
+				memcpy(mpp + base, tpos_row,
+				       D * sizeof(float));
+			}
+			row++;
+		}
 	}
 
 	*out_memory = memory;
@@ -2054,10 +2085,12 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		struct sam3_tensor **out_masks,
 		struct sam3_tensor **out_iou,
 		struct sam3_tensor **out_obj_ptrs,
+		struct sam3_tensor **out_all_iou,
 		struct sam3_tensor **out_score)
 {
 	if (!trk || !g || !image_embed || !feat_s1 || !feat_s0 || !arena
-	    || !out_masks || !out_iou || !out_obj_ptrs || !out_score) {
+	    || !out_masks || !out_iou || !out_obj_ptrs || !out_all_iou
+	    || !out_score) {
 		sam3_log_error("tracker_multiplex_track_frame: NULL arg");
 		return SAM3_EINVAL;
 	}
@@ -2298,6 +2331,15 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 	if (!slot0_iou)
 		return SAM3_ENOMEM;
 
+	/* Keep a [16, 3] view of all per-slot IoUs for the caller's
+	 * per-slot best-mask pick. Shape may already be [16, 3]; reshape
+	 * explicitly to normalize. */
+	int all_iou_dims[2] = {16, 3};
+	struct sam3_tensor *all_iou_view = gh_reshape(g, arena, all_iou,
+						      2, all_iou_dims);
+	if (!all_iou_view)
+		return SAM3_ENOMEM;
+
 	struct sam3_tensor *s_score = gh_slice(g, arena, all_score, 0, 0, 1);
 	if (!s_score)
 		return SAM3_ENOMEM;
@@ -2307,17 +2349,18 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 	if (!slot0_score)
 		return SAM3_ENOMEM;
 
-	struct sam3_tensor *s_sam = gh_slice(g, arena, all_sam, 0, 0, 1);
-	if (!s_sam)
+	/* Project ALL 16 × 3 sam_tokens through obj_ptr_proj
+	 * (256→256→256→256). Reshape all_sam [16, 3, 256] to [48, 256]
+	 * so the MLP operates per-token, then reshape back to [16, 3, 256].
+	 * The caller argmaxes @out_all_iou per slot and extracts
+	 * obj_ptrs[slot, best_per_slot, :] into a [16, 256] tensor for
+	 * memory-bank storage (Python's per-slot obj_ptr with
+	 * multiplex_count=16). */
+	int all_sam_flat_dims[2] = {16 * 3, D};
+	struct sam3_tensor *all_sam_flat = gh_reshape(g, arena, all_sam,
+						      2, all_sam_flat_dims);
+	if (!all_sam_flat)
 		return SAM3_ENOMEM;
-	int sam2_dims[2] = {3, D};
-	struct sam3_tensor *slot0_sam = gh_reshape(g, arena, s_sam,
-						   2, sam2_dims);
-	if (!slot0_sam)
-		return SAM3_ENOMEM;
-
-	/* Project all 3 sam_tokens through obj_ptr_proj (256→256→256→256).
-	 * Caller picks the row matching the best-IoU mask after eval. */
 	struct sam3_tensor *obj_w[3] = {
 		trk->obj_ptr_proj.fc_w[0],
 		trk->obj_ptr_proj.fc_w[1],
@@ -2328,14 +2371,20 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		trk->obj_ptr_proj.fc_b[1],
 		trk->obj_ptr_proj.fc_b[2],
 	};
-	struct sam3_tensor *obj_ptrs = mlp3_relu(g, arena, slot0_sam,
-						 obj_w, obj_b);
+	struct sam3_tensor *obj_ptrs_flat =
+		mlp3_relu(g, arena, all_sam_flat, obj_w, obj_b);
+	if (!obj_ptrs_flat)
+		return SAM3_ENOMEM;
+	int obj_ptrs_dims[3] = {16, 3, D};
+	struct sam3_tensor *obj_ptrs =
+		gh_reshape(g, arena, obj_ptrs_flat, 3, obj_ptrs_dims);
 	if (!obj_ptrs)
 		return SAM3_ENOMEM;
 
 	*out_masks    = slot0_masks;
 	*out_iou      = slot0_iou;
 	*out_obj_ptrs = obj_ptrs;
+	*out_all_iou  = all_iou_view;
 	*out_score    = slot0_score;
 	return SAM3_OK;
 }

@@ -590,9 +590,16 @@ enum sam3_error sam3_multiplex_mask_decoder_forward(
  * @is_cond:      1 for conditioning frames, 0 for propagation.
  * @arena:        Scratch arena for graph intermediates.
  * @out_masks:    [3, 4H, 4W] slot-0 multimask mask logits.
- * @out_iou:      [3] IoU predictions per multimask.
- * @out_obj_ptrs: [3, 256] obj_ptr projection of each multimask sam_token.
- *                The caller picks the row matching the best-IoU mask.
+ * @out_iou:      [3] IoU predictions per multimask for slot 0 (used for
+ *                the final mask pick).
+ * @out_obj_ptrs: [16, 3, 256] obj_ptr projection of all multimask
+ *                sam_tokens across all 16 multiplex slots. The caller
+ *                argmaxes IoU per slot (via @out_all_iou) and extracts
+ *                obj_ptrs[slot, best_per_slot, :] into a [16, 256]
+ *                tensor for memory-bank storage. Matches Python's
+ *                per-slot obj_ptr with multiplex_count=16.
+ * @out_all_iou:  [16, 3] per-slot IoU predictions. Caller argmaxes the
+ *                inner dim to pick the best mask head for each slot.
  * @out_score:    [1] slot-0 obj_score logit.
  *
  * Returns SAM3_OK on success; SAM3_EINVAL on bad args; SAM3_ENOMEM on
@@ -611,6 +618,7 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		struct sam3_tensor **out_masks,
 		struct sam3_tensor **out_iou,
 		struct sam3_tensor **out_obj_ptrs,
+		struct sam3_tensor **out_all_iou,
 		struct sam3_tensor **out_score);
 
 #endif /* SAM3_MODEL_TRACKER_MULTIPLEX_H */

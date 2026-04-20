@@ -763,8 +763,12 @@ video_track_one_obj(struct sam3_video_session *session,
 
 	/* --- 4. Variant-dispatched tracker call ------------------------- */
 	struct sam3_tensor *track_masks   = NULL; /* [N_mask, H, W]            */
-	struct sam3_tensor *track_iou     = NULL; /* [N_mask]                  */
-	struct sam3_tensor *track_obj_ptr = NULL; /* sam3:[1,256] mux:[N_mask,256] */
+	struct sam3_tensor *track_iou     = NULL; /* [N_mask] slot-0 (mux)     */
+	/* sam3:[1,256]; mux:[16, 3, 256] per-slot per-mask obj_ptr proj */
+	struct sam3_tensor *track_obj_ptr = NULL;
+	/* Multiplex only: [16, 3] per-slot IoU for the per-slot best-mask
+	 * pick in step 8. NULL on SAM 3. */
+	struct sam3_tensor *track_all_iou = NULL;
 	struct sam3_tensor *track_score   = NULL; /* [1]                        */
 
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_build");
@@ -776,7 +780,7 @@ video_track_one_obj(struct sam3_video_session *session,
 			cf.feat_4x,   /* 4x skip, 288x288       */
 			frame_idx, is_cond, gfx,
 			&track_masks, &track_iou,
-			&track_obj_ptr, &track_score);
+			&track_obj_ptr, &track_all_iou, &track_score);
 	} else {
 		/*
 		 * SAM 3 takes sparse prompt tokens only on conditioning
@@ -985,44 +989,79 @@ video_track_one_obj(struct sam3_video_session *session,
 
 	/* --- 8. Persist the best obj_ptr -------------------------------
 	 *
-	 * SAM 3.1 multiplex: when the object isn't appearing, Python runs the
-	 * raw obj_ptr through `no_obj_ptr_linear` (use_linear_no_obj_ptr=True)
-	 * rather than zeroing it. See video_tracking_multiplex.py:893-895.
+	 * SAM 3 path: track_obj_ptr is already [1, 256]; clone verbatim.
+	 *
+	 * SAM 3.1 multiplex: track_obj_ptr is [16, 3, 256] (16 slots, 3
+	 * multimask heads each, projected through obj_ptr_proj).
+	 * track_all_iou is [16, 3]. For each slot, argmax IoU over the 3
+	 * masks, extract obj_ptrs[slot, best_mask, :], and stack into a
+	 * [16, 256] tensor. This matches Python's per-frame obj_ptr
+	 * shape (`[num_buckets=1, multiplex_count=16, C=256]`, flattened
+	 * to [16, 256]).
+	 *
+	 * When the object isn't appearing (slot-0 obj_score_logit <= 0)
+	 * the selected obj_ptr goes through no_obj_ptr_linear per
+	 * Python's use_linear_no_obj_ptr path
+	 * (video_tracking_multiplex.py:893-895).
 	 */
 	struct sam3_tensor *best_obj_ptr_scratch = NULL;
 	{
-		int op_dims[2] = {1, SAM3_MULTIPLEX_HIDDEN_DIM};
+		const int D = SAM3_MULTIPLEX_HIDDEN_DIM;
+		const size_t Dbytes = (size_t)D * sizeof(float);
+		int n_obj_rows = is_multiplex ? SAM3_MULTIPLEX_COUNT : 1;
+		int op_dims[2] = {n_obj_rows, D};
 		best_obj_ptr_scratch = gh_alloc_tensor(gfx, SAM3_DTYPE_F32,
 						      2, op_dims);
 		if (!best_obj_ptr_scratch) {
 			err = SAM3_ENOMEM;
 			goto cleanup;
 		}
-		const size_t D = (size_t)SAM3_MULTIPLEX_HIDDEN_DIM * sizeof(float);
 		if (!is_multiplex) {
 			/* Already pre-selected by sam3_tracker_track_frame
 			 * and gated in-place by apply_occlusion_gating. */
 			memcpy(best_obj_ptr_scratch->data,
-			       track_obj_ptr->data, D);
+			       track_obj_ptr->data, Dbytes);
 		} else {
-			const float *src_row = (const float *)track_obj_ptr->data
-			  + (size_t)best_idx * SAM3_MULTIPLEX_HIDDEN_DIM;
-			if (is_appearing) {
-				memcpy(best_obj_ptr_scratch->data, src_row, D);
-			} else {
-				/* y = x @ W^T + b with W [256,256], b [256]. */
-				const float *W = (const float *)
-					trk_mux->no_obj_ptr_linear_w->data;
-				const float *b = (const float *)
-					trk_mux->no_obj_ptr_linear_b->data;
-				float *dst = (float *)best_obj_ptr_scratch->data;
-				for (int i = 0; i < SAM3_MULTIPLEX_HIDDEN_DIM; i++) {
-					float acc = b[i];
-					const float *wrow =
-						W + (size_t)i * SAM3_MULTIPLEX_HIDDEN_DIM;
-					for (int j = 0; j < SAM3_MULTIPLEX_HIDDEN_DIM; j++)
-						acc += src_row[j] * wrow[j];
-					dst[i] = acc;
+			const float *ptrs = (const float *)track_obj_ptr->data;
+			const float *all_iou = track_all_iou
+				? (const float *)track_all_iou->data : NULL;
+			float *dst = (float *)best_obj_ptr_scratch->data;
+			const float *W = (const float *)
+				trk_mux->no_obj_ptr_linear_w->data;
+			const float *b = (const float *)
+				trk_mux->no_obj_ptr_linear_b->data;
+			for (int s = 0; s < SAM3_MULTIPLEX_COUNT; s++) {
+				/* Per-slot argmax over 3 mask heads. Falls
+				 * back to head 0 if all_iou is unavailable. */
+				int best = 0;
+				if (all_iou) {
+					float bs = all_iou[s * 3 + 0];
+					for (int k = 1; k < 3; k++) {
+						float v = all_iou[s * 3 + k];
+						if (v > bs) {
+							bs = v;
+							best = k;
+						}
+					}
+				}
+				const float *src_row = ptrs +
+					((size_t)s * 3 + best) * D;
+				float *out_row = dst + (size_t)s * D;
+				if (is_appearing) {
+					memcpy(out_row, src_row, Dbytes);
+				} else {
+					/* y = src_row @ W^T + b with
+					 * W [256,256], b [256]. Same Python
+					 * no_obj_ptr_linear applied per slot. */
+					for (int i = 0; i < D; i++) {
+						float acc = b[i];
+						const float *wrow = W +
+							(size_t)i * D;
+						for (int j = 0; j < D; j++)
+							acc += src_row[j]
+								* wrow[j];
+						out_row[i] = acc;
+					}
 				}
 			}
 		}

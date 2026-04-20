@@ -597,3 +597,83 @@ memattn_layer0_f1 cos=0.00383 (still near-orthogonal; K/V still missing 15 obj_p
 3. If IoU still trails 0.75, drill the residual 3 % feat_s1 gap:
    dump ViT block outputs or sam2 neck intermediates side by side.
 
+## Iteration 7 — obj_pointer multiplex expansion to [16, 256] (2026-04-20)
+
+### Scope
+
+Previously `sam3_memory_entry.obj_pointer` stored a single [1, 256]
+tensor per frame — the best mask of slot 0 after argmax. Python stores
+`[num_buckets=1, multiplex_count=16, C=256]` flattened to [16, 256]:
+per-slot argmax over 3 multimask heads, then `obj_ptr_proj` applied.
+
+### Patches
+
+- **`src/model/tracker_multiplex.h`:** add `out_all_iou` output param
+  (shape [16, 3], per-slot IoU). `out_obj_ptrs` reshaped to
+  [16, 3, 256] (all slots × 3 multimask heads × projected dim).
+- **`src/model/tracker_multiplex.c`:** reshape all_sam from [16, 3,
+  256] to [48, 256], apply `obj_ptr_proj` mlp3_relu on the flat
+  tensor, reshape result to [16, 3, 256]. Add the all_iou reshape to
+  [16, 3]. `multiplex_build_memory_from_bank` now emits `op->dims[0]`
+  rows per entry (16 for SAM 3.1, 1 for SAM 3 legacy) with the same
+  tpos encoding shared across slots of the same frame.
+- **`src/model/sam3_video.c`:** at step-8 best-obj_ptr persistence,
+  allocate `[multiplex_count, 256]` (16 rows for SAM 3.1) and for
+  each slot `s` in 0..15 argmax iou over 3 multimask heads to pick
+  the best row of `obj_ptrs[s, *, :]`. Apply `no_obj_ptr_linear`
+  per-slot when the object isn't appearing. SAM 3 path unchanged
+  ([1, 256] copied verbatim).
+- **`src/model/memory_bank.h`:** updated the `obj_pointer` comment
+  to document the per-variant dims[0] convention.
+
+### Post-fix comparator (key rows)
+
+```
+memory_f1        cos=0.69349 abs_max=9.887 abs_mean=0.3442  [py_rows=5200, c_rows=5200]  (row counts match now)
+memory_image_f1  cos=0.96899 [py_rows=5184, c_rows=5200]    (C pads Nm rows, Py is pre-concat)
+memory_f2        cos=0.29024 abs_max=11.21 abs_mean=0.4713  [py_rows=10400, c_rows=10400]
+memory_image_f2  cos=0.80133 abs_max=5.31  abs_mean=0.2406  [py_rows=10368, c_rows=10400]
+```
+
+Row counts now match Python's exactly (5200, 10400). The cosine on
+`memory_f1` / `memory_f2` content is dominated by the obj_ptr rows'
+absolute magnitude (~2.0 in Python; C's per-slot values still differ
+slightly after argmax+no_obj_ptr_linear mismatches between the
+per-slot is_appearing logic).
+
+### Parity test result (test_video_parity_kids SAM 3.1 variant)
+
+| Frame | Baseline | After propagation_convs | After propagation_convs + obj_ptr [16, 256] |
+|-------|----------|-------------------------|---------------------------------------------|
+| 1     | 0.0000   | 0.4449                  | **0.4430**                                  |
+| 2     | 0.0000   | 0.4853                  | **0.4863**                                  |
+| 3     | 0.0000   | 0.0000                  | **0.4135**                                  |
+
+Frame 3 **jumped from 0.0000 to 0.4135** after the obj_ptr expansion
+unblocked its downstream path (previously compounded the f2 numerical
+blow-up in memattn_out). All three propagation frames now produce
+meaningful IoU but still trail the 0.75 threshold by ~0.25-0.30.
+
+### Remaining divergence
+
+- **feat_s1 residual ~3 % cosine gap** — unchanged from iteration 6.
+  Likely amplified through the memattn stack (queries and keys
+  inherit this error). Separate sub-drill would need to bisect ViT
+  block outputs.
+- **memattn_layer0 still near cos≈0** despite correct bank shape.
+  Implies the cosine is dominated by the Q-K alignment: even small
+  feat_s1 errors on attention-relevant tokens produce large output
+  divergences.
+
+### Next step
+
+1. Drill the residual feat_s1 cosine gap. Options:
+   - Dump C's ViT output vs Python's, confirm the backbone alone.
+   - Dump `cached_feat_s1_nhwc` (sam3 neck) vs Python's
+     `sam3_backbone_out["backbone_fpn"][-1]` to see if the error
+     is in the neck specifically (we already confirmed the tracker
+     uses the sam2 side, but both necks take the same ViT input).
+   - Check whether frame_rgb abs_max=0.1176 (stbir-linear vs decord
+     bilinear) can be narrowed by switching C to a cubic / stb-rb
+     resize kernel matching decord's defaults.
+

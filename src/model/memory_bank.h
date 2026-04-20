@@ -22,7 +22,13 @@
 
 struct sam3_memory_entry {
 	struct sam3_tensor *spatial_features; /* [HW, mem_dim] maskmem output */
-	struct sam3_tensor *obj_pointer;      /* [hidden_dim=256] (was obj_pointers [n_obj,256]) */
+	/*
+	 * obj_pointer: SAM 3 stores [1, 256]; SAM 3.1 multiplex stores
+	 * [multiplex_count=16, 256] (one row per multiplex slot, per-slot
+	 * argmax over 3 multimask heads and then obj_ptr_proj applied).
+	 * Consumers read dims[0] as the row count.
+	 */
+	struct sam3_tensor *obj_pointer;
 	/*
 	 * image_features: raw 1x backbone features for this frame, flattened
 	 * to [HW, 256] NHWC. Only populated in SAM 3.1 multiplex paths (the
