@@ -20,7 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 
+#include "sam3/sam3.h"
 #include "sam3/sam3_types.h"
 #include "core/alloc.h"
 #include "core/weight.h"
@@ -368,6 +370,72 @@ test_perblock_parity_s0(void)
 				    SAM3_SOURCE_DIR "/tests/fixtures/mobileclip_s0");
 }
 
+/* --- test_e2e_set_text --- */
+
+/*
+ * test_e2e_set_text - Load a MobileCLIP .sam3 through the public sam3_init /
+ * sam3_load_model path and call sam3_set_text. Verifies iface dispatch
+ * end-to-end: the public API reaches the MobileCLIP iface arm and the
+ * text worker runs without error.
+ *
+ * If the .sam3 is missing (gitignored fixture not yet generated), the test
+ * skips with a clear log and returns 0.
+ *
+ * @text_backbone: enum sam3_text_backbone value for this variant
+ * @sam3_path:     Path to the .sam3 weight file to load
+ */
+static int
+test_e2e_set_text(int text_backbone, const char *sam3_path)
+{
+	sam3_ctx *ctx;
+	enum sam3_error err;
+
+	(void)text_backbone;
+
+	if (access(sam3_path, R_OK) != 0) {
+		fprintf(stderr,
+			"skip e2e (%s): %s missing — run "
+			"`sam3_convert ... --text-backbone <variant>` first\n",
+			sam3_path, sam3_path);
+		return 0;
+	}
+
+	ctx = sam3_init();
+	if (!ctx) {
+		fprintf(stderr, "e2e: sam3_init() returned NULL\n");
+		return 1;
+	}
+
+	err = sam3_load_model(ctx, sam3_path);
+	if (err != SAM3_OK) {
+		fprintf(stderr, "e2e (%s): load failed (%d)\n",
+			sam3_path, err);
+		sam3_free(ctx);
+		return 1;
+	}
+
+	err = sam3_set_text(ctx, "a person riding a bike");
+	ASSERT(err == SAM3_OK);
+
+	sam3_free(ctx);
+	return 0;
+}
+
+/* --- test_e2e_s1 --- */
+
+/*
+ * Smoke: end-to-end public API path for MobileCLIP-S1. One e2e variant is
+ * sufficient — iface dispatch is identical for S0/S1/L; math is exercised
+ * by the parity tests.
+ */
+static int
+test_e2e_s1(void)
+{
+	return test_e2e_set_text(SAM3_TEXT_MOBILECLIP_S1,
+				 SAM3_SOURCE_DIR
+				 "/tests/fixtures/mobileclip_s1/encoder.sam3");
+}
+
 int
 main(void)
 {
@@ -378,6 +446,7 @@ main(void)
 	test_perblock_parity_s1();
 	test_perblock_parity_l();
 	test_perblock_parity_s0();
+	test_e2e_s1();
 
 	if (tests_failed == 0)
 		printf("test_mobileclip_text: PASS (%d tests)\n", tests_run);
