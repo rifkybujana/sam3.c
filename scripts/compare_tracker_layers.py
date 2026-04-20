@@ -49,6 +49,23 @@ def _reshape_memattn(arr, side):
     return arr.reshape(5184, 256).reshape(-1)
 
 
+def _reshape_tgt(arr, side):
+    # Both sides are batch-first [1, HW=5184, 256] at encoder entry
+    # (Py's encoder has batch_first=True so the forward-hook kwargs see
+    # the pre-transpose layout). Identical reshape on both.
+    return arr.reshape(5184, 256).reshape(-1)
+
+
+def _reshape_bank(arr, side):
+    # Bank tensors: C emits [1, Nm, 256]; Py emits [1, Nm, 256] too
+    # (encoder has batch_first=True, so hook kwargs see pre-transpose).
+    # Nm can differ between memory (includes obj_ptrs) and memory_image
+    # (pre-pad) on the Py side — _report handles size-mismatch truncation.
+    assert arr.size % 256 == 0, f"bank size {arr.size} not divisible by 256"
+    Nm = arr.size // 256
+    return arr.reshape(Nm, 256).reshape(-1)
+
+
 def _reshape_iou(arr, side):
     return arr.reshape(16, 3).reshape(-1)
 
@@ -66,6 +83,27 @@ LEVEL0_FRAMES = [1, 2]  # overlap of C and Python dumps
 PAIRS = []
 for f in LEVEL0_FRAMES:
     PAIRS.extend([
+        # Task 5γ bank-input slots: inputs to memory-attn layer 0.
+        # `tgt` (= encoder's `src` kwarg) has fixed HW=5184 rows;
+        # `memory` / `memory_image` / `memory_image_pos` have a
+        # per-frame Nm — the reshape is size-agnostic and _report
+        # truncates mismatched sides to their common row prefix.
+        (f"tgt_f{f}",
+         f"/tmp/dbg_trk_tgt_f{f}.bin",
+         f"/tmp/py_trk_tgt_f{f}.bin",
+         _reshape_tgt),
+        (f"memory_f{f}",
+         f"/tmp/dbg_trk_memory_f{f}.bin",
+         f"/tmp/py_trk_memory_f{f}.bin",
+         _reshape_bank),
+        (f"memory_image_f{f}",
+         f"/tmp/dbg_trk_memory_image_f{f}.bin",
+         f"/tmp/py_trk_memory_image_f{f}.bin",
+         _reshape_bank),
+        (f"memory_image_pos_f{f}",
+         f"/tmp/dbg_trk_memory_image_pos_f{f}.bin",
+         f"/tmp/py_trk_memory_image_pos_f{f}.bin",
+         _reshape_bank),
         (f"memattn_layer0_f{f}",
          f"/tmp/dbg_trk_memattn_layer0_f{f}.bin",
          f"/tmp/py_trk_memattn_layer0_f{f}.bin",
@@ -121,9 +159,25 @@ def _report(name, py, c, reshape_fn):
     if py is None or c is None:
         print(f"{name:40s} MISSING (py={py is not None}, c={c is not None})")
         return None  # treat as no signal
+    size_note = ""
     if py.size != c.size:
-        print(f"{name:40s} size mismatch py={py.size} c={c.size}")
-        return False
+        # Bank tensors (memory_image, memory_image_pos) differ in row
+        # count: C pre-pads with obj_ptr rows; Py pre-pads inside the
+        # encoder forward, so the hook sees the shorter pre-concat
+        # tensor. Truncate both to the common row prefix (assumed
+        # row-major with last dim = 256) so we still compare content.
+        if reshape_fn is _reshape_bank and py.size % 256 == 0 and c.size % 256 == 0:
+            py_rows = py.size // 256
+            c_rows = c.size // 256
+            common_rows = min(py_rows, c_rows)
+            py = py[: common_rows * 256]
+            c = c[: common_rows * 256]
+            size_note = (f" [truncated to {common_rows} rows "
+                         f"(py_rows={py_rows}, "
+                         f"c_rows={c_rows})]")
+        else:
+            print(f"{name:40s} size mismatch py={py.size} c={c.size}")
+            return False
     try:
         py_flat = reshape_fn(py, 'py')
         c_flat  = reshape_fn(c, 'c')
@@ -139,7 +193,7 @@ def _report(name, py, c, reshape_fn):
           f"abs_max={abs_diff.max():.4g} "
           f"abs_mean={abs_diff.mean():.4g} "
           f"rel={abs_diff.mean()/(py_abs.mean()+1e-9):.3%}"
-          f"{marker}")
+          f"{marker}{size_note}")
     return cos >= COS_THRESHOLD
 
 

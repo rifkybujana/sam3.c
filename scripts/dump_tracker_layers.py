@@ -161,8 +161,16 @@ def _register_hooks(model, captures):
             captures.setdefault(name, []).append(out)
         return _h
 
+    # Encoder hook captures BOTH the output (for memattn_out) and the
+    # inputs (for tgt / memory / memory_image / memory_image_pos bank
+    # comparisons in Task 5γ). Upstream call-site at
+    # video_tracking_multiplex.py:1590 uses kwargs, so we register with
+    # with_kwargs=True to receive them in the kwargs dict.
+    def _cap_encoder(_m, _inp, kwargs, out):
+        captures.setdefault("memattn_out", []).append(out)
+        captures.setdefault("memattn_inputs", []).append(dict(kwargs))
     hooks.append(model.transformer.encoder.register_forward_hook(
-        _cap("memattn_out")))
+        _cap_encoder, with_kwargs=True))
     hooks.append(model.sam_mask_decoder.register_forward_hook(
         _cap("mask_decoder_tuple")))
 
@@ -225,6 +233,33 @@ def _flush_captures_delta(captures, cursors, frame_idx):
     if end > start:
         # Multiple calls in one frame is unusual; dump the last one.
         _dump_mem(captures[slot][end - 1], frame_idx)
+    cursors[slot] = end
+
+    # Task 5γ: dump memory-attn encoder INPUTS (tgt / memory /
+    # memory_image / memory_image_pos) for bank parity. Upstream
+    # forward(image, src, memory_image, memory, image_pos=None,
+    # src_pos=None, memory_image_pos=None, memory_pos=None, ...).
+    # `src` is the object-query stream (= C's `tgt`).
+    slot = "memattn_inputs"
+    start = cursors.get(slot, 0)
+    end = len(captures.get(slot, []))
+    if end > start:
+        kw = captures[slot][end - 1]
+        tgt_t = kw.get("src")
+        memory_t = kw.get("memory")
+        memory_image_t = kw.get("memory_image")
+        memory_image_pos_t = kw.get("memory_image_pos")
+        import torch as _torch  # local alias to avoid top-level churn
+        if isinstance(tgt_t, _torch.Tensor):
+            _dump(f"/tmp/py_trk_tgt_f{frame_idx}.bin", tgt_t)
+        if isinstance(memory_t, _torch.Tensor):
+            _dump(f"/tmp/py_trk_memory_f{frame_idx}.bin", memory_t)
+        if isinstance(memory_image_t, _torch.Tensor):
+            _dump(f"/tmp/py_trk_memory_image_f{frame_idx}.bin",
+                  memory_image_t)
+        if isinstance(memory_image_pos_t, _torch.Tensor):
+            _dump(f"/tmp/py_trk_memory_image_pos_f{frame_idx}.bin",
+                  memory_image_pos_t)
     cursors[slot] = end
 
     slot = "mask_decoder_tuple"

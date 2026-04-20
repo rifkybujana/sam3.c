@@ -2110,9 +2110,11 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 				extern struct sam3_tensor *sam3_dbg_trk_memory;
 				extern struct sam3_tensor *sam3_dbg_trk_memory_image;
 				extern struct sam3_tensor *sam3_dbg_trk_memory_image_pos;
+				extern struct sam3_tensor *sam3_dbg_trk_tgt;
 				sam3_dbg_trk_memory           = memory;
 				sam3_dbg_trk_memory_image     = memory_image;
 				sam3_dbg_trk_memory_image_pos = memory_image_pos;
+				sam3_dbg_trk_tgt              = tgt;
 			}
 #endif
 			struct sam3_tensor *cond_2d =
