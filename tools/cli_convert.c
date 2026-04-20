@@ -58,6 +58,8 @@ static void print_usage(const char *prog)
 	       "\"tinyvit\"\n");
 	printf("  --variant <type>     Model variant: "
 	       "\"sam3\" (default), \"sam3.1\"\n");
+	printf("  --text-backbone <t>  Text encoder: \"clip\" (default), "
+	       "\"mobileclip_s0\", \"mobileclip_s1\", \"mobileclip_l\"\n");
 	printf("  --quantize <type>    Quantize weights: "
 	       "\"q8_0\" (default: none)\n");
 	printf("  -v                   Verbose output "
@@ -82,6 +84,8 @@ struct convert_args {
 	int         decoder_layers;
 	int         backbone_type;
 	int         variant_type;     /* enum sam3_variant */
+	const char *text_backbone;        /* CLI string */
+	int         text_backbone_type;   /* enum sam3_text_backbone */
 	int         n_fpn_scales;
 	int         verbose;
 	int         quiet;
@@ -106,8 +110,10 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 	args->decoder_dim    = 256;
 	args->encoder_layers = -1; /* -1 = use backbone default */
 	args->decoder_layers = 2;
-	args->backbone_type  = SAM3_BACKBONE_HIERA;
-	args->variant_type   = SAM3_VARIANT_SAM3;
+	args->backbone_type      = SAM3_BACKBONE_HIERA;
+	args->variant_type       = SAM3_VARIANT_SAM3;
+	args->text_backbone      = "clip";
+	args->text_backbone_type = SAM3_TEXT_CLIP;
 	args->n_fpn_scales   = 4;
 	args->verbose        = 0;
 	args->quiet          = 0;
@@ -188,6 +194,13 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 				return 1;
 			}
 			args->variant = argv[i];
+		} else if (strcmp(argv[i], "--text-backbone") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr,
+					"error: --text-backbone requires a type\n");
+				return 1;
+			}
+			args->text_backbone = argv[i];
 		} else if (strcmp(argv[i], "--quantize") == 0) {
 			if (++i >= argc) {
 				fprintf(stderr,
@@ -259,6 +272,24 @@ static int parse_args(int argc, char **argv, struct convert_args *args)
 			"error: unsupported variant '%s' "
 			"(use \"sam3\" or \"sam3.1\")\n",
 			args->variant);
+		return 1;
+	}
+
+	/* Resolve text backbone type */
+	if (strcmp(args->text_backbone, "clip") == 0) {
+		args->text_backbone_type = SAM3_TEXT_CLIP;
+	} else if (strcmp(args->text_backbone, "mobileclip_s0") == 0) {
+		args->text_backbone_type = SAM3_TEXT_MOBILECLIP_S0;
+	} else if (strcmp(args->text_backbone, "mobileclip_s1") == 0) {
+		args->text_backbone_type = SAM3_TEXT_MOBILECLIP_S1;
+	} else if (strcmp(args->text_backbone, "mobileclip_l") == 0) {
+		args->text_backbone_type = SAM3_TEXT_MOBILECLIP_L;
+	} else {
+		fprintf(stderr,
+			"error: unsupported text-backbone '%s' "
+			"(use \"clip\", \"mobileclip_s0\", "
+			"\"mobileclip_s1\", or \"mobileclip_l\")\n",
+			args->text_backbone);
 		return 1;
 	}
 
@@ -531,6 +562,7 @@ int cli_convert(int argc, char **argv)
 		cli_progress("  decoder_dim:    %d\n", args.decoder_dim);
 		cli_progress("  encoder_layers: %d\n", args.encoder_layers);
 		cli_progress("  decoder_layers: %d\n", args.decoder_layers);
+		cli_progress("  text_backbone:  %s\n", args.text_backbone);
 	}
 
 	/* Build model config */
@@ -542,6 +574,7 @@ int cli_convert(int argc, char **argv)
 	config.backbone_type    = args.backbone_type;
 	config.variant          = args.variant_type;
 	config.n_fpn_scales     = args.n_fpn_scales;
+	config.text_backbone    = args.text_backbone_type;
 
 	/* Set up quantizing wrapper if requested */
 	struct weight_reader *write_reader = &conv_perm_reader;

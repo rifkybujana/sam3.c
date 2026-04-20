@@ -112,8 +112,10 @@ tests/fixtures/*
 !tests/fixtures/mobileclip_s0/*.npy
 !tests/fixtures/mobileclip_s1/
 !tests/fixtures/mobileclip_s1/*.npy
+tests/fixtures/mobileclip_s1/*.sam3
 !tests/fixtures/mobileclip_l/
 !tests/fixtures/mobileclip_l/*.npy
+tests/fixtures/mobileclip_l/*.sam3
 
 TODO*
 
