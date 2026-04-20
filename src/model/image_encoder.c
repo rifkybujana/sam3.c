@@ -280,9 +280,16 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 	if (!vit->patch_embed_w)
 		return SAM3_ENOMEM;
 
-	/* Patch embedding bias [embed_dim] — optional; absent when the
-	 * upstream ViT was built with bias_patch_embed=False (silent
-	 * zero-fill rather than a noisy warning). */
+	/*
+	 * Patch embedding bias [embed_dim] — optional; absent when the
+	 * upstream ViT was built with bias_patch_embed=False (SAM 3.1
+	 * default). The fallback path explicitly zeroes t->data because
+	 * gh_alloc_tensor leaves arena bytes uninitialised; without the
+	 * memset we'd feed stale arena contents as a spurious conv bias,
+	 * producing a ~-0.36 ± 0.065 per-channel offset at the ViT input
+	 * that propagates as a feat_s1 cosine drop to ~0.97 and dragged
+	 * propagation-frame IoU from ~0.9 to ~0.45.
+	 */
 	int pe_b_dims[] = {e};
 	vit->patch_embed_b = gh_load_mmap_optional(wf,
 		VIT_P "embeddings.patch_embeddings.projection.bias",
@@ -292,6 +299,8 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
 						     1, pe_b_dims);
 		if (!vit->patch_embed_b)
 			return SAM3_ENOMEM;
+		memset(vit->patch_embed_b->data, 0,
+		       vit->patch_embed_b->nbytes);
 	}
 
 	/*
@@ -586,6 +595,59 @@ struct sam3_tensor *sam3_vit_build(struct sam3_vit *vit,
 	x = gh_add(&g, scratch, x, vit->patch_embed_b);
 	if (!x)
 		return NULL;
+
+#ifdef SAM3_DEBUG_DUMP
+	/* Log patch_embed_b stats so we can spot a non-zero bias when
+	 * Python ran with bias_patch_embed=False (SAM 3.1 default). */
+	if (vit->patch_embed_b && vit->patch_embed_b->data) {
+		const float *bd = (const float *)vit->patch_embed_b->data;
+		int bn = sam3_tensor_nelems(vit->patch_embed_b);
+		float bmin = bd[0], bmax = bd[0], bsum = 0.f, bsumsq = 0.f;
+		for (int i = 0; i < bn; i++) {
+			if (bd[i] < bmin) bmin = bd[i];
+			if (bd[i] > bmax) bmax = bd[i];
+			bsum += bd[i];
+			bsumsq += bd[i] * bd[i];
+		}
+		float bmean = bsum / (float)bn;
+		float bvar  = bsumsq / (float)bn - bmean * bmean;
+		sam3_log_info("vit: patch_embed_b stats n=%d min=%.4f "
+			      "max=%.4f mean=%.4f std=%.4f",
+			      bn, bmin, bmax, bmean,
+			      bvar > 0 ? sqrtf(bvar) : 0.f);
+	}
+	/* Bisection split (iteration 8.5): evaluate the sub-graph up to
+	 * patch_embed + bias so we can dump it, then continue building
+	 * the rest (pos_embed + ln_pre) in the same function call. This
+	 * lets the comparator localise the pre_blocks divergence into
+	 * patch_embed-alone vs pos_embed/ln_pre. */
+	{
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK)
+			return NULL;
+		FILE *fp = fopen("/tmp/dbg_vit_patch_only.bin", "wb");
+		if (fp) {
+			int n_elt = 1;
+			for (int i = 0; i < x->n_dims; i++)
+				n_elt *= x->dims[i];
+			fwrite(x->data, sizeof(float), (size_t)n_elt, fp);
+			fclose(fp);
+			sam3_log_info("dump: wrote /tmp/dbg_vit_patch_only.bin "
+				      "(%d floats, shape [%d, %d])",
+				      n_elt, x->dims[0], x->dims[1]);
+		}
+		/* Rewire into a fresh graph wrapping the materialised x, so
+		 * the subsequent pos_embed/ln_pre ops don't reference nodes
+		 * from the already-evaluated graph. */
+		void *x_data_after_patch = x->data;
+		sam3_graph_init(&g);
+		int flat_dims2[] = {np, e};
+		x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, 2, flat_dims2,
+				   x_data_after_patch);
+		if (!x)
+			return NULL;
+	}
+#endif
 
 	x = gh_add(&g, scratch, x, vit->pos_embed);
 	if (!x)
