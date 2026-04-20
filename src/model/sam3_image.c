@@ -24,7 +24,7 @@
 #include "util/log.h"
 #include "util/profile.h"
 
-/* ── CPU helpers for decoder box refinement ──────────────────────── */
+/* --- CPU helpers for decoder box refinement --- */
 
 /*
  * cpu_layernorm_f32 - Apply LayerNorm on CPU.

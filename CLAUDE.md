@@ -83,6 +83,25 @@ static int compute_offset(int row, int col, int stride)
 }
 ```
 
+### Section Comments
+
+For dividing a file into labeled sections, use a single-line comment with
+short dash runs around the label. No multi-line dashed blocks.
+
+Good:
+
+```c
+/* --- sam3_frame_cache_init --- */
+```
+
+Bad (do not use):
+
+```c
+/* ------------------------------------------------------------------ */
+/* sam3_frame_cache_init                                               */
+/* ------------------------------------------------------------------ */
+```
+
 ### Naming
 
 - **`snake_case` for everything:** functions, variables, types, enum values, macros.

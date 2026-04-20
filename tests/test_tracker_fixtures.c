@@ -36,7 +36,7 @@
 
 #define FIXTURE_DIR SAM3_SOURCE_DIR "/tests/fixtures/tracker"
 
-/* ── Helpers ───────────────────────────────────────────────────────── */
+/* --- Helpers ─────── --- */
 
 /*
  * load_fixture_tensor - Load a named tensor from a SafeTensors file.
@@ -130,7 +130,7 @@ static void print_shape(const char *label, int n_dims, const int *dims)
 	printf("]\n");
 }
 
-/* ── Test: memory attention fixture ────────────────────────────────── */
+/* --- Test: memory attention fixture ───── --- */
 
 static void test_tracker_memory_attn_fixture(void)
 {
@@ -151,7 +151,7 @@ static void test_tracker_memory_attn_fixture(void)
 	free(data);
 }
 
-/* ── Test: mask decoder fixture ────────────────────────────────────── */
+/* --- Test: mask decoder fixture ───────── --- */
 
 static void test_tracker_mask_decoder_fixture(void)
 {
@@ -183,7 +183,7 @@ static void test_tracker_mask_decoder_fixture(void)
 	free(iou_scores);
 }
 
-/* ── Test: memory encoder fixture ──────────────────────────────────── */
+/* --- Test: memory encoder fixture ─────── --- */
 
 static void test_tracker_memory_encoder_fixture(void)
 {
@@ -204,7 +204,7 @@ static void test_tracker_memory_encoder_fixture(void)
 	free(data);
 }
 
-/* ── Test: integration fixture (frame 0) ───────────────────────────── */
+/* --- Test: integration fixture (frame 0) --- */
 
 static void test_tracker_integration_fixture(void)
 {
@@ -225,7 +225,7 @@ static void test_tracker_integration_fixture(void)
 	free(data);
 }
 
-/* ── Test: propagation fixture (frame 1) ───────────────────────────── */
+/* --- Test: propagation fixture (frame 1) --- */
 
 static void test_tracker_propagation_fixture(void)
 {
@@ -246,7 +246,7 @@ static void test_tracker_propagation_fixture(void)
 	free(data);
 }
 
-/* ── Main ──────────────────────────────────────────────────────────── */
+/* --- Main ────────── --- */
 
 int main(void)
 {

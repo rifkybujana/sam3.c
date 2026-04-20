@@ -23,7 +23,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/* ── Helpers ──────────────────────────────────────────────────────── */
+/* --- Helpers ────── --- */
 
 static void make_f32_tensor(struct sam3_tensor *t, float *data, int n)
 {
@@ -87,7 +87,7 @@ static struct sam3_node make_cast_node(struct sam3_tensor *in,
 	return node;
 }
 
-/* ── Tests ────────────────────────────────────────────────────────── */
+/* --- Tests ──────── --- */
 
 static void test_cast_f32_to_f16(void)
 {

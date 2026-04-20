@@ -21,9 +21,7 @@
 #include <string.h>
 #include <math.h>
 
-/* ------------------------------------------------------------------ */
-/* fp16 round-trip tests                                               */
-/* ------------------------------------------------------------------ */
+/* --- fp16 round-trip tests --- */
 
 static void
 test_fp16_round_trip(void)
@@ -51,9 +49,7 @@ test_fp16_round_trip(void)
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* fp16 special-value tests                                            */
-/* ------------------------------------------------------------------ */
+/* --- fp16 special-value tests --- */
 
 static void
 test_fp16_special_values(void)
@@ -104,9 +100,7 @@ test_fp16_special_values(void)
 	ASSERT(neginf_r < 0.0f);
 }
 
-/* ------------------------------------------------------------------ */
-/* bf16 round-trip tests                                               */
-/* ------------------------------------------------------------------ */
+/* --- bf16 round-trip tests --- */
 
 static void
 test_bf16_round_trip(void)
@@ -134,9 +128,7 @@ test_bf16_round_trip(void)
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* bf16 special-value tests                                            */
-/* ------------------------------------------------------------------ */
+/* --- bf16 special-value tests --- */
 
 static void
 test_bf16_special_values(void)
@@ -180,9 +172,7 @@ test_bf16_special_values(void)
 	ASSERT_EQ(neg_zero, (uint16_t)0x8000u);
 }
 
-/* ------------------------------------------------------------------ */
-/* bf16 round-to-nearest-even                                         */
-/* ------------------------------------------------------------------ */
+/* --- bf16 round-to-nearest-even --- */
 
 static void
 test_bf16_round_to_nearest_even(void)
@@ -239,9 +229,7 @@ test_bf16_round_to_nearest_even(void)
 	ASSERT_EQ(b_even, (uint16_t)0x3F80u);
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
+/* --- main --- */
 
 int main(void)
 {

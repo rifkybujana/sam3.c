@@ -37,7 +37,7 @@ static int model_available(void)
 	return access(VIDEO_TEST_MODEL_PATH, F_OK) == 0;
 }
 
-/* ── Null-safety tests ───────────────────────────────────────────── */
+/* --- Null-safety tests ──────────────── --- */
 
 static void test_video_frame_count_null(void)
 {
@@ -165,7 +165,7 @@ static void test_video_start_no_model(void)
 	sam3_free(ctx);
 }
 
-/* ── End-to-end: eager feature cache ──────────────────────────────── */
+/* --- End-to-end: eager feature cache ─── --- */
 
 static void test_video_start_caches_features(void)
 {
@@ -203,7 +203,7 @@ static void test_video_start_caches_features(void)
 	sam3_free(ctx);
 }
 
-/* ── End-to-end: add_points produces non-empty mask ───────────────── */
+/* --- End-to-end: add_points produces non-empty mask --- */
 
 static void test_video_add_points_produces_nonempty_mask(void)
 {
@@ -293,7 +293,7 @@ static void test_video_add_points_produces_nonempty_mask(void)
 	sam3_free(ctx);
 }
 
-/* ── End-to-end: reset clears all state ──────────────────────────── */
+/* --- End-to-end: reset clears all state --- */
 
 static void test_video_reset_clears_all_state(void)
 {
@@ -353,7 +353,7 @@ static void test_video_reset_clears_all_state(void)
 	sam3_free(ctx);
 }
 
-/* ── End-to-end: add_box produces non-empty mask ──────────────────── */
+/* --- End-to-end: add_box produces non-empty mask --- */
 
 static void test_video_add_box_produces_nonempty_mask(void)
 {
@@ -440,7 +440,7 @@ static void test_video_add_box_produces_nonempty_mask(void)
 	sam3_free(ctx);
 }
 
-/* ── End-to-end: propagate tracks across frames ───────────────────── */
+/* --- End-to-end: propagate tracks across frames --- */
 
 struct propagate_counts {
 	int n_masks[8];

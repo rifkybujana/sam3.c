@@ -28,7 +28,7 @@
 
 #define EVIT_PREFIX "detector_model.vision_encoder.backbone."
 
-/* ── Initialization ──────────────────────────────────────────────── */
+/* --- Initialization ─ --- */
 
 enum sam3_error sam3_efficientvit_init(struct sam3_efficientvit *evit,
 				       const int *width_list,
@@ -93,7 +93,7 @@ enum sam3_error sam3_efficientvit_init(struct sam3_efficientvit *evit,
 	return SAM3_OK;
 }
 
-/* ── Weight loading helpers ──────────────────────────────────────── */
+/* --- Weight loading helpers ─────────── --- */
 
 /*
  * load_conv_weights - Load weights for one ConvLayer.
@@ -301,7 +301,7 @@ static enum sam3_error load_litemla_weights(
 	return SAM3_OK;
 }
 
-/* ── Main weight loading ─────────────────────────────────────────── */
+/* --- Main weight loading ────────────── --- */
 
 enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 					const struct sam3_weight_file *wf,
@@ -311,7 +311,7 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 	enum sam3_error err;
 	int w0 = evit->width_list[0];
 
-	/* ── Input stem ──────────────────────────────────────────── */
+	/* --- Input stem ─────────────── --- */
 
 	/* stem_conv: Conv2d(3 -> w0, kernel=3, stride=2, pad=1) + BN */
 	snprintf(prefix, sizeof(prefix), EVIT_PREFIX "input_stem.0.");
@@ -347,7 +347,7 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 			return err;
 	}
 
-	/* ── Stages 1-4 ──────────────────────────────────────────── */
+	/* --- Stages 1-4 ─────────────── --- */
 
 	for (int s = 0; s < 4; s++) {
 		struct sam3_evit_stage *stage = &evit->stages[s];
@@ -413,7 +413,7 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 		}
 	}
 
-	/* ── Projection head ─────────────────────────────────────── */
+	/* --- Projection head ────────── --- */
 
 	/*
 	 * Projection: conv1(1x1, final_ch -> embed_dim) -> BN(embed_dim)
@@ -503,7 +503,7 @@ enum sam3_error sam3_efficientvit_load(struct sam3_efficientvit *evit,
 	return SAM3_OK;
 }
 
-/* ── Graph construction helpers ──────────────────────────────────── */
+/* --- Graph construction helpers ─────── --- */
 
 /*
  * evit_conv_bn - Apply conv2d + optional BN (no activation).
@@ -803,7 +803,7 @@ static struct sam3_tensor *evit_litemla_forward(
 	return attn_out;
 }
 
-/* ── Main graph construction ─────────────────────────────────────── */
+/* --- Main graph construction ────────── --- */
 
 /*
  * sam3_efficientvit_build - Build and evaluate the EfficientViT encoder.
@@ -844,7 +844,7 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 	if (!x_buf)
 		return NULL;
 
-	/* ── Phase 0: Preprocess + Stem ─────────────────────────── */
+	/* --- Phase 0: Preprocess + Stem --- */
 
 	sam3_graph_init(&g);
 
@@ -912,7 +912,7 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 		       cur_h, cur_w, cur_ch, g.n_nodes,
 		       scratch->offset, scratch->size);
 
-	/* ── Phases 1-4: Stages ─────────────────────────────────── */
+	/* --- Phases 1-4: Stages ────── --- */
 
 	for (int s = 0; s < 4; s++) {
 		struct sam3_evit_stage *stage = &evit->stages[s];
@@ -1004,7 +1004,7 @@ struct sam3_tensor *sam3_efficientvit_build(struct sam3_efficientvit *evit,
 	}
 	/* x_buf: [1, gs, gs, final_ch] */
 
-	/* ── Phase 5: Projection head ───────────────────────────── */
+	/* --- Phase 5: Projection head --- */
 
 	sam3_arena_reset(scratch);
 	sam3_graph_init(&g);

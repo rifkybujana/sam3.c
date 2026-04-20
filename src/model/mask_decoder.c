@@ -28,7 +28,7 @@
 #define P "tracker_model.mask_decoder."
 #define TP "tracker_model.mask_decoder.transformer."
 
-/* ── Initialization ──────────────────────────────────────────────── */
+/* --- Initialization ─ --- */
 
 enum sam3_error sam3_mask_decoder_init(struct sam3_mask_decoder *dec)
 {
@@ -41,7 +41,7 @@ enum sam3_error sam3_mask_decoder_init(struct sam3_mask_decoder *dec)
 	return SAM3_OK;
 }
 
-/* ── Weight loading helpers ──────────────────────────────────────── */
+/* --- Weight loading helpers ─────────── --- */
 
 /*
  * fuse_3 - Load 3 separate [d, d_in] weights and fuse into [3*d, d_in].
@@ -141,7 +141,7 @@ static int load_ca_128(const struct sam3_weight_file *wf,
 	return 0;
 }
 
-/* ── Weight loading ──────────────────────────────────────────────── */
+/* --- Weight loading ─ --- */
 
 enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 				       const struct sam3_weight_file *wf,
@@ -152,7 +152,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	char name[128], q_name[128], k_name[128], v_name[128];
 	char ca_prefix[128];
 
-	/* ── Learned tokens ─────────────────────────────────────── */
+	/* --- Learned tokens ────────── --- */
 	int mt_dims[] = {dec->n_masks, d};
 	dec->mask_tokens = gh_load_mmap(wf, P "mask_tokens.weight",
 					     arena, SAM3_DTYPE_F32,
@@ -174,7 +174,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	if (!dec->obj_score_token)
 		return SAM3_ENOMEM;
 
-	/* ── Transformer layers ─────────────────────────────────── */
+	/* --- Transformer layers ────── --- */
 	int d_dims[] = {d};
 	int proj_dims[] = {d, d};
 	int fc1_dims[] = {ff, d};
@@ -334,7 +334,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 			return SAM3_ENOMEM;
 	}
 
-	/* ── Final cross-attention ──────────────────────────────── */
+	/* --- Final cross-attention ─── --- */
 	if (load_ca_128(wf, arena,
 			TP "final_attn_token_to_image.",
 			&dec->final_q_w, &dec->final_q_b,
@@ -354,7 +354,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	if (!dec->final_ln_b)
 		return SAM3_ENOMEM;
 
-	/* ── Pixel decoder ──────────────────────────────────────── */
+	/* --- Pixel decoder ─────────── --- */
 	/*
 	 * Pixel decoder conv weights ship in OHWI [OC, KH, KW, IC]
 	 * after Task 12's permute in sam3_convert. Source checkpoint
@@ -403,7 +403,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	if (!dec->up_conv2_b)
 		return SAM3_ENOMEM;
 
-	/* ── Hypernetwork MLPs ──────────────────────────────────── */
+	/* --- Hypernetwork MLPs ─────── --- */
 	for (int i = 0; i < dec->n_masks; i++) {
 		int hd_dims[] = {d, d};
 		int ho_w_dims[] = {dec->d_pixel, d};
@@ -457,7 +457,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 			return SAM3_ENOMEM;
 	}
 
-	/* ── IoU prediction MLP ─────────────────────────────────── */
+	/* --- IoU prediction MLP ────── --- */
 	int iou_d_dims[] = {d, d};
 	int iou_out_w_dims[] = {dec->n_masks, d};
 	int iou_out_b_dims[] = {dec->n_masks};
@@ -495,7 +495,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	if (!dec->iou_proj_out_b)
 		return SAM3_ENOMEM;
 
-	/* ── pred_obj_score_head: 3-layer MLP [256->256->256->1] ─── */
+	/* --- pred_obj_score_head: 3-layer MLP [256->256->256->1] --- */
 	{
 		int fc0_w_dims[] = {d, d};
 		int fc0_b_dims[] = {d};
@@ -532,7 +532,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		if (!dec->obj_score_fc2_b) return SAM3_ENOMEM;
 	}
 
-	/* ── Multi-scale skip connection convolutions ──────────── */
+	/* --- Multi-scale skip connection convolutions --- */
 	{
 		/* Conv2d weights ship in OHWI after Task 12's permute:
 		 * conv_s0: OIHW [32, 256, 1, 1] -> OHWI [32, 1, 1, 256]
@@ -560,7 +560,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 		if (!dec->conv_s1_b) return SAM3_ENOMEM;
 	}
 
-	/* ── no_mask_embed & PE gaussian ──────────────────────── */
+	/* --- no_mask_embed & PE gaussian --- */
 	{
 		int nm_dims[] = {1, d};
 		int pe_dims[] = {2, 128};
@@ -615,7 +615,7 @@ enum sam3_error sam3_mask_decoder_load(struct sam3_mask_decoder *dec,
 	return SAM3_OK;
 }
 
-/* ── Graph building helpers ──────────────────────────────────────── */
+/* --- Graph building helpers ─────────── --- */
 
 /*
  * cross_attn_128 - Cross-attention with 128-dim internal projections.
@@ -781,7 +781,7 @@ static struct sam3_tensor *broadcast_add_1d(struct sam3_arena *arena,
 	return out;
 }
 
-/* ── Main graph build ────────────────────────────────────────────── */
+/* --- Main graph build ───────────────── --- */
 
 enum sam3_error sam3_mask_decoder_build(
 	struct sam3_mask_decoder *dec,

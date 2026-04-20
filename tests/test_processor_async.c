@@ -174,7 +174,7 @@ static void test_set_text_parallel_with_set_image(void)
 	prompts[0].type = SAM3_PROMPT_TEXT;
 	prompts[0].text = "cat";
 
-	/* ── Run 1: legacy inline path ──────────────────────────── */
+	/* --- Run 1: legacy inline path --- */
 	float *masks_legacy = NULL;
 	float *iou_legacy   = NULL;
 	int    n_masks_legacy = 0, mh = 0, mw = 0;
@@ -214,7 +214,7 @@ static void test_set_text_parallel_with_set_image(void)
 		sam3_weight_close(&wf);
 	}
 
-	/* ── Run 2: async (set_text BEFORE set_image) ──────────── */
+	/* --- Run 2: async (set_text BEFORE set_image) --- */
 	float *masks_async = NULL;
 	float *iou_async   = NULL;
 	int    n_masks_async = 0;
@@ -255,7 +255,7 @@ static void test_set_text_parallel_with_set_image(void)
 		sam3_weight_close(&wf);
 	}
 
-	/* ── Compare ────────────────────────────────────────────── */
+	/* --- Compare ───────────────── --- */
 	ASSERT_EQ(n_masks_async, n_masks_legacy);
 
 	/* Mask-logit drift (informational). */

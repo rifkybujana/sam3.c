@@ -34,7 +34,7 @@
  * Block index = linear_index / 32, offset within block = linear_index % 32.
  */
 
-/* ── Kernel core: single-threaded row range ────────────────────────── */
+/* --- Kernel core: single-threaded row range --- */
 
 static void matmul_q8_rows(const float *a,
 			    const struct sam3_q8_block *b_blocks,
@@ -133,7 +133,7 @@ static void matmul_q8_rows(const float *a,
 	}
 }
 
-/* ── Thread-parallel dispatch ──────────────────────────────────────── */
+/* --- Thread-parallel dispatch ─────────── --- */
 
 struct matmul_q8_ctx {
 	const float                *a;

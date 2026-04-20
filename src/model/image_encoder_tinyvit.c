@@ -31,7 +31,7 @@
 
 #define TVIT_PREFIX "detector_model.vision_encoder.backbone."
 
-/* ── Initialization ──────────────────────────────────────────────── */
+/* --- Initialization ─ --- */
 
 enum sam3_error sam3_tinyvit_init(struct sam3_tinyvit *tvit,
 				  const int *embed_dims,
@@ -112,7 +112,7 @@ enum sam3_error sam3_tinyvit_init(struct sam3_tinyvit *tvit,
 	return SAM3_OK;
 }
 
-/* ── Weight loading helpers ──────────────────────────────────────── */
+/* --- Weight loading helpers ─────────── --- */
 
 /*
  * load_tvit_conv - Load Conv2d_BN weights (TinyViT naming: .c. and .bn.).
@@ -422,7 +422,7 @@ static enum sam3_error load_attention(
 	return SAM3_OK;
 }
 
-/* ── Main weight loading ─────────────────────────────────────────── */
+/* --- Main weight loading ────────────── --- */
 
 enum sam3_error sam3_tinyvit_load(struct sam3_tinyvit *tvit,
 				  const struct sam3_weight_file *wf,
@@ -431,7 +431,7 @@ enum sam3_error sam3_tinyvit_load(struct sam3_tinyvit *tvit,
 	char prefix[256];
 	enum sam3_error err;
 
-	/* ── Patch embedding ────────────────────────────────────── */
+	/* --- Patch embedding ───────── --- */
 
 	int half_ch = tvit->embed_dims[0] / 2;
 
@@ -451,7 +451,7 @@ enum sam3_error sam3_tinyvit_load(struct sam3_tinyvit *tvit,
 	if (err != SAM3_OK)
 		return err;
 
-	/* ── Layers 0-3 ─────────────────────────────────────────── */
+	/* --- Layers 0-3 ────────────── --- */
 
 	for (int l = 0; l < tvit->n_layers; l++) {
 		struct sam3_tvit_layer *layer = &tvit->layers[l];
@@ -563,7 +563,7 @@ enum sam3_error sam3_tinyvit_load(struct sam3_tinyvit *tvit,
 		}
 	}
 
-	/* ── Projection head ────────────────────────────────────── */
+	/* --- Projection head ───────── --- */
 
 	int final_ch = tvit->embed_dims[tvit->n_layers - 1];
 	int ed = tvit->embed_dim;
@@ -647,7 +647,7 @@ enum sam3_error sam3_tinyvit_load(struct sam3_tinyvit *tvit,
 	return SAM3_OK;
 }
 
-/* ── Graph construction helpers ──────────────────────────────────── */
+/* --- Graph construction helpers ─────── --- */
 
 /*
  * tvit_conv_bn - Apply conv2d + optional BN (no activation).
@@ -906,7 +906,7 @@ static struct sam3_tensor *tvit_block_forward(
 	if (!residual)
 		return NULL;
 
-	/* ── Window Attention ────────────────────────────────── */
+	/* --- Window Attention ───── --- */
 
 	int pad_h = (ws - H % ws) % ws;
 	int pad_w = (ws - W % ws) % ws;
@@ -1001,7 +1001,7 @@ static struct sam3_tensor *tvit_block_forward(
 	if (!x)
 		return NULL;
 
-	/* ── Local Conv ──────────────────────────────────────── */
+	/* --- Local Conv ─────────── --- */
 
 	/* Reshape to [1, H, W, C] for conv2d */
 	{
@@ -1021,7 +1021,7 @@ static struct sam3_tensor *tvit_block_forward(
 	if (!x)
 		return NULL;
 
-	/* ── MLP ─────────────────────────────────────────────── */
+	/* --- MLP --- */
 
 	/* Save residual */
 	residual = x;
@@ -1053,7 +1053,7 @@ static struct sam3_tensor *tvit_block_forward(
 	return x;
 }
 
-/* ── Main graph construction ─────────────────────────────────────── */
+/* --- Main graph construction ────────── --- */
 
 struct sam3_tensor *sam3_tinyvit_build(struct sam3_tinyvit *tvit,
 				       struct sam3_backend *be,
@@ -1086,7 +1086,7 @@ struct sam3_tensor *sam3_tinyvit_build(struct sam3_tinyvit *tvit,
 
 	int cur_h = h0, cur_w = h0, cur_ch = tvit->embed_dims[0];
 
-	/* ── Phase 0: Preprocess + Patch Embed ──────────────── */
+	/* --- Phase 0: Preprocess + Patch Embed --- */
 
 	sam3_graph_init(&g);
 
@@ -1130,7 +1130,7 @@ struct sam3_tensor *sam3_tinyvit_build(struct sam3_tinyvit *tvit,
 	sam3_log_debug("tvit_build: patch_embed done [1,%d,%d,%d] "
 		       "(%d nodes)", cur_h, cur_w, cur_ch, g.n_nodes);
 
-	/* ── Phases 1-4: Layers (per-block evaluation) ──────── */
+	/* --- Phases 1-4: Layers (per-block evaluation) --- */
 
 	for (int l = 0; l < tvit->n_layers; l++) {
 		struct sam3_tvit_layer *layer = &tvit->layers[l];
@@ -1222,7 +1222,7 @@ struct sam3_tensor *sam3_tinyvit_build(struct sam3_tinyvit *tvit,
 	}
 	/* x_buf: [1, gs, gs, final_ch] */
 
-	/* ── Phase 5: Projection head ───────────────────────── */
+	/* --- Phase 5: Projection head --- */
 
 	sam3_arena_reset(scratch);
 	sam3_graph_init(&g);

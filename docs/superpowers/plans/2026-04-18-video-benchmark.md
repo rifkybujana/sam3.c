@@ -479,7 +479,7 @@ in one place.
 Append this static helper to `src/bench/bench_video_frame.c` after `sam3_bench_rmtree`, before the per-frame benchmark section:
 
 ```c
-/* ── Multi-object seeding helper ──────────────────────────────────── */
+/* --- Multi-object seeding helper ─────── --- */
 
 /*
  * seed_n_objects - Place @n distinct obj_id points inside the frame-@seed
@@ -556,7 +556,7 @@ without per-case boilerplate.
 Replace the existing `struct video_frame_ctx`, `video_frame_fn`, and `sam3_bench_run_video_frame` with:
 
 ```c
-/* ── Per-frame case-table driver ──────────────────────────────────── */
+/* --- Per-frame case-table driver ─────── --- */
 
 /*
  * Case table — each row is one benchmark emitted by this function.

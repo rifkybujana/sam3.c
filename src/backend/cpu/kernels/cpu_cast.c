@@ -22,7 +22,7 @@
 
 #include <string.h>
 
-/* ── Static conversion functions ───────────────────────────────────── */
+/* --- Static conversion functions ──────── --- */
 
 static void cast_f32_to_f16(const void *in, void *out, int n)
 {
@@ -144,7 +144,7 @@ static void cast_bf16_to_f16(const void *in, void *out, int n)
 #endif
 }
 
-/* ── Public kernel ─────────────────────────────────────────────────── */
+/* --- Public kernel ─ --- */
 
 /*
  * cpu_kernel_cast - Convert tensor data between dtypes.

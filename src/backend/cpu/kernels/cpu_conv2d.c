@@ -131,7 +131,7 @@ static void conv2d_nhwc_matmul_fn(void *arg, int task_id, int n_tasks)
 	}
 }
 
-/* ── NHWC transpose helpers (dtype-generic, file-scope linkage) ──── */
+/* --- NHWC transpose helpers (dtype-generic, file-scope linkage) --- */
 
 /*
  * These helpers are used by cpu_kernel_conv2d_f16 / _bf16 /

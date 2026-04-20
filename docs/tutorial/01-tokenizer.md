@@ -2156,7 +2156,7 @@ int sam3_tokenizer_encode(const struct sam3_tokenizer *tok,
 	tokens[pos++] = tok->sot_token;
 
 	if (tok->bpe_loaded) {
-		/* ---------- CLIP BPE path ---------- */
+		/* --- CLIP BPE path --- */
 		char lower[1024];
 		int tlen = 0;
 		const int lim = sizeof(lower) - 1;

@@ -94,7 +94,7 @@ static void transpose_u16(const uint16_t *src, uint16_t *dst,
 				src[(size_t)i * cols + j];
 }
 
-/* ── NEON fp16 path ─────────────────────────────────────────────────── */
+/* --- NEON fp16 path ─ --- */
 
 #if SAM3_HAS_NEON_FP16
 
@@ -195,7 +195,7 @@ static void conv2d_nhwc_matmul_f16_fn(void *arg, int task_id,
 
 #else /* !SAM3_HAS_NEON_FP16 */
 
-/* ── Scalar fallback path (f32 accumulation) ───────────────────────── */
+/* --- Scalar fallback path (f32 accumulation) --- */
 
 struct conv2d_nhwc_matmul_ctx_f16 {
 	const uint16_t *col;       /* [M, K] im2col output */

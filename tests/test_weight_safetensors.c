@@ -21,7 +21,7 @@
 #define TEST_ST_FILE  "/tmp/test_sam3.safetensors"
 #define TEST_SAM3_FILE "/tmp/test_sam3_from_st.sam3"
 
-/* ── Helper: write a raw SafeTensors file ──────────────────────────── */
+/* --- Helper: write a raw SafeTensors file --- */
 
 static int write_safetensors(const char *path, const char *json,
 			     const void *data, size_t data_size)
@@ -48,7 +48,7 @@ fail:
 	return -1;
 }
 
-/* ── Test 1: single tensor read ────────────────────────────────────── */
+/* --- Test 1: single tensor read ───────── --- */
 
 static void test_safetensors_read(void)
 {
@@ -90,7 +90,7 @@ static void test_safetensors_read(void)
 	reader.ops->close(&reader);
 }
 
-/* ── Test 2: multi-tensor ──────────────────────────────────────────── */
+/* --- Test 2: multi-tensor ─────────────── --- */
 
 static void test_safetensors_multi_tensor(void)
 {
@@ -152,7 +152,7 @@ static void test_safetensors_multi_tensor(void)
 	reader.ops->close(&reader);
 }
 
-/* ── Test 3: bad file ──────────────────────────────────────────────── */
+/* --- Test 3: bad file ─ --- */
 
 static void test_safetensors_bad_file(void)
 {
@@ -164,7 +164,7 @@ static void test_safetensors_bad_file(void)
 	ASSERT_EQ(err, SAM3_EIO);
 }
 
-/* ── Test 4: end-to-end SafeTensors -> .sam3 -> load ───────────────── */
+/* --- Test 4: end-to-end SafeTensors -> .sam3 -> load --- */
 
 static void test_safetensors_end_to_end(void)
 {
@@ -224,7 +224,7 @@ static void test_safetensors_end_to_end(void)
 	sam3_weight_close(&wf);
 }
 
-/* ── Main ──────────────────────────────────────────────────────────── */
+/* --- Main ────────── --- */
 
 int main(void)
 {

@@ -25,7 +25,7 @@
 #include "core/tensor.h"
 #include "core/half.h"
 
-/* ── Configuration ─────────────────────────────────────────────────── */
+/* --- Configuration ─ --- */
 
 #define WARMUP_ITERS   5
 #define TIMED_ITERS   50
@@ -34,7 +34,7 @@
 #define PEAK_F32_GFLOPS  3400.0
 #define PEAK_F16_GFLOPS  6800.0
 
-/* ── Timing helper ─────────────────────────────────────────────────── */
+/* --- Timing helper ─ --- */
 
 static double get_time_ms(void)
 {
@@ -43,7 +43,7 @@ static double get_time_ms(void)
 	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-/* ── Random fill ───────────────────────────────────────────────────── */
+/* --- Random fill ─── --- */
 
 static void fill_random_f32(float *buf, int n)
 {
@@ -59,7 +59,7 @@ static void fill_random_f16(uint16_t *buf, int n)
 	}
 }
 
-/* ── Tensor setup ──────────────────────────────────────────────────── */
+/* --- Tensor setup ── --- */
 
 static struct sam3_tensor make_tensor_2d(enum sam3_dtype dtype,
 					 int rows, int cols)
@@ -80,7 +80,7 @@ static struct sam3_tensor make_tensor_2d(enum sam3_dtype dtype,
 	return t;
 }
 
-/* ── Benchmark: matmul F32 ─────────────────────────────────────────── */
+/* --- Benchmark: matmul F32 ────────────── --- */
 
 static double bench_matmul(struct sam3_backend *be, int m, int k, int n)
 {
@@ -120,7 +120,7 @@ static double bench_matmul(struct sam3_backend *be, int m, int k, int n)
 	return elapsed;
 }
 
-/* ── Benchmark: matmul F16 ─────────────────────────────────────────── */
+/* --- Benchmark: matmul F16 ────────────── --- */
 
 static double bench_matmul_f16(struct sam3_backend *be, int m, int k, int n)
 {
@@ -160,7 +160,7 @@ static double bench_matmul_f16(struct sam3_backend *be, int m, int k, int n)
 	return elapsed;
 }
 
-/* ── Benchmark: elementwise add ────────────────────────────────────── */
+/* --- Benchmark: elementwise add ───────── --- */
 
 static double bench_add(struct sam3_backend *be, int rows, int cols)
 {
@@ -200,7 +200,7 @@ static double bench_add(struct sam3_backend *be, int rows, int cols)
 	return elapsed;
 }
 
-/* ── Benchmark: softmax ────────────────────────────────────────────── */
+/* --- Benchmark: softmax ───────────────── --- */
 
 static double bench_softmax(struct sam3_backend *be, int rows, int cols)
 {
@@ -236,7 +236,7 @@ static double bench_softmax(struct sam3_backend *be, int rows, int cols)
 	return elapsed;
 }
 
-/* ── Benchmark: matmul + add + softmax pipeline ───────────────────── */
+/* --- Benchmark: matmul + add + softmax pipeline --- */
 
 static double bench_pipeline(struct sam3_backend *be,
 			     int m, int k, int n)
@@ -297,7 +297,7 @@ static double bench_pipeline(struct sam3_backend *be,
 	return elapsed;
 }
 
-/* ── Reporting ─────────────────────────────────────────────────────── */
+/* --- Reporting ───── --- */
 
 static void print_row(const char *label, double cpu_ms, double metal_ms)
 {
@@ -325,7 +325,7 @@ static void print_header(void)
 	       "-------------", "-------------", "---------");
 }
 
-/* ── Main ──────────────────────────────────────────────────────────── */
+/* --- Main ────────── --- */
 
 int main(void)
 {
@@ -353,7 +353,7 @@ int main(void)
 	printf("========================================"
 	       "========================================\n\n");
 
-	/* ── Matmul F32 ────────────────────────────────────── */
+	/* --- Matmul F32 ───────── --- */
 	printf("  MATMUL F32 (M x K x N)\n");
 	print_header();
 
@@ -397,7 +397,7 @@ int main(void)
 		}
 	}
 
-	/* ── Matmul F16 ────────────────────────────────────── */
+	/* --- Matmul F16 ───────── --- */
 	printf("\n  MATMUL F16 (M x K x N)\n");
 	print_header();
 
@@ -431,7 +431,7 @@ int main(void)
 		}
 	}
 
-	/* ── Add ────────────────────────────────────────────── */
+	/* --- Add ───────────────── --- */
 	printf("\n  ELEMENTWISE ADD (rows x cols)\n");
 	print_header();
 
@@ -453,7 +453,7 @@ int main(void)
 		print_row(label, tc, tm);
 	}
 
-	/* ── Softmax ────────────────────────────────────────── */
+	/* --- Softmax ───────────── --- */
 	printf("\n  SOFTMAX (rows x cols)\n");
 	print_header();
 
@@ -475,7 +475,7 @@ int main(void)
 		print_row(label, tc, tm);
 	}
 
-	/* ── Pipeline ───────────────────────────────────────── */
+	/* --- Pipeline ──────────── --- */
 	printf("\n  PIPELINE: matmul + add + softmax (M x K x N)\n");
 	print_header();
 
@@ -498,7 +498,7 @@ int main(void)
 		print_row(label, tc, tm);
 	}
 
-	/* ── Peak summary ──────────────────────────────────── */
+	/* --- Peak summary ─────── --- */
 	printf("\n  ---- Peak Throughput ----\n");
 	printf("  Peak F32: %.1f GFLOPS (%.1f%% of 3.4 TFLOPS)\n",
 	       peak_f32, peak_f32 / PEAK_F32_GFLOPS * 100.0);

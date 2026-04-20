@@ -32,7 +32,7 @@ typedef enum sam3_error (*sam3_kernel_fn)(const struct sam3_node *,
 					  struct sam3_arena *,
 					  struct sam3_threadpool *);
 
-/* ── Wrapper functions ─────────────────────────────────────────────── */
+/* --- Wrapper functions --- */
 
 static enum sam3_error
 wrap_matmul(const struct sam3_node *node, struct sam3_arena *scratch,
@@ -443,7 +443,7 @@ wrap_bias_add_bf16(const struct sam3_node *node, struct sam3_arena *scratch,
 	return cpu_kernel_bias_add_bf16(node, pool);
 }
 
-/* ── Dispatch table ────────────────────────────────────────────────── */
+/* --- Dispatch table --- */
 
 /*
  * cpu_dispatch_table[op][dtype] — NULL means not implemented.
@@ -575,7 +575,7 @@ cpu_dispatch_table[SAM3_OP_COUNT][SAM3_DTYPE_COUNT] = {
 	},
 };
 
-/* ── Dispatch function ─────────────────────────────────────────────── */
+/* --- Dispatch function --- */
 
 /*
  * cpu_dispatch_node - Dispatch a graph node to the correct dtype-specific kernel.

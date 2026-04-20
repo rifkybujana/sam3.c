@@ -21,7 +21,7 @@
 #include "util/log.h"
 #include "util/threadpool.h"
 
-/* ── F32 bias add ──────────────────────────────────────────────────── */
+/* --- F32 bias add ── --- */
 
 struct bias_add_par_ctx {
 	const float *x;
@@ -100,7 +100,7 @@ enum sam3_error cpu_kernel_bias_add(const struct sam3_node *node,
 	return SAM3_OK;
 }
 
-/* ── BF16 bias add ─────────────────────────────────────────────────── */
+/* --- BF16 bias add ─ --- */
 
 struct bias_add_par_ctx_bf16 {
 	const uint16_t *x;

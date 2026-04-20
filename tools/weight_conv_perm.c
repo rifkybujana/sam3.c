@@ -31,7 +31,7 @@
 #include "core/tensor.h"
 #include "util/log.h"
 
-/* ── Implementation state ──────────────────────────────────────────── */
+/* --- Implementation state ─────────────── --- */
 
 struct conv_perm_impl {
 	struct weight_reader *inner;
@@ -41,7 +41,7 @@ struct conv_perm_impl {
  * converter, matching the pattern used by weight_rename.c. */
 static struct conv_perm_impl cp_state;
 
-/* ── Name classification ───────────────────────────────────────────── */
+/* --- Name classification ──────────────── --- */
 
 static int str_ends_with(const char *s, const char *suffix)
 {
@@ -185,7 +185,7 @@ static int is_conv_transpose_weight(const char *name)
 	return 0;
 }
 
-/* ── Permute kernel ────────────────────────────────────────────────── */
+/* --- Permute kernel --- */
 
 /*
  * permute_ohwi - Copy-permute a 4-D conv weight into OHWI.
@@ -232,7 +232,7 @@ static void permute_ohwi(const void *src, void *dst,
 	}
 }
 
-/* ── Vtable callbacks ──────────────────────────────────────────────── */
+/* --- Vtable callbacks ─ --- */
 
 static enum sam3_error cp_open(struct weight_reader *r, const char *path)
 {
@@ -380,7 +380,7 @@ static const struct weight_reader_ops conv_perm_reader_ops = {
 	.close            = cp_close,
 };
 
-/* ── Public init ───────────────────────────────────────────────────── */
+/* --- Public init ─── --- */
 
 enum sam3_error weight_reader_conv_perm_init(struct weight_reader *r,
 					      struct weight_reader *inner)

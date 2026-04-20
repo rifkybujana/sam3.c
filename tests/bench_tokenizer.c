@@ -21,7 +21,7 @@
 
 #include "model/tokenizer.h"
 
-/* ── Configuration ─────────────────────────────────────────────────── */
+/* --- Configuration ─ --- */
 
 #define WARMUP_ITERS	1000
 #define TIMED_ITERS	100000
@@ -47,7 +47,7 @@ static const struct {
 };
 #define N_INPUTS (int)(sizeof(test_inputs) / sizeof(test_inputs[0]))
 
-/* ── Timing helper ─────────────────────────────────────────────────── */
+/* --- Timing helper ─ --- */
 
 static double get_time_ms(void)
 {
@@ -56,7 +56,7 @@ static double get_time_ms(void)
 	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-/* ── Benchmark runner ──────────────────────────────────────────────── */
+/* --- Benchmark runner ─ --- */
 
 static void bench_encode(const struct sam3_tokenizer *tok,
 			 const char *label, const char *text,
@@ -91,7 +91,7 @@ static void bench_encode(const struct sam3_tokenizer *tok,
 	(void)mode_label;
 }
 
-/* ── Corpus loader ─────────────────────────────────────────────────── */
+/* --- Corpus loader ─ --- */
 
 /*
  * load_corpus - Read a text file into a single buffer and index lines.
@@ -181,7 +181,7 @@ static int load_corpus(const char *path, char **out_buf, char ***out_lines,
 	return 0;
 }
 
-/* ── Main ──────────────────────────────────────────────────────────── */
+/* --- Main ────────── --- */
 
 int main(int argc, char **argv)
 {
@@ -189,7 +189,7 @@ int main(int argc, char **argv)
 	printf("========================\n");
 	printf("Warmup: %d | Timed: %d\n\n", WARMUP_ITERS, TIMED_ITERS);
 
-	/* ── Byte-level mode ──────────────────────────────────────── */
+	/* --- Byte-level mode ─────────── --- */
 	struct sam3_tokenizer tok;
 	enum sam3_error err = sam3_tokenizer_init(&tok);
 	if (err != SAM3_OK) {
@@ -211,7 +211,7 @@ int main(int argc, char **argv)
 
 	sam3_tokenizer_free(&tok);
 
-	/* ── BPE mode ─────────────────────────────────────────────── */
+	/* --- BPE mode --- */
 	printf("\nBPE mode:\n");
 
 	err = sam3_tokenizer_init(&tok);
@@ -245,7 +245,7 @@ int main(int argc, char **argv)
 
 	sam3_tokenizer_free(&tok);
 
-	/* ── Corpus throughput ────────────────────────────────────── */
+	/* --- Corpus throughput ───────── --- */
 	const char *corpus_path = (argc > 1)
 		? argv[1]
 		: "tests/data/bench_corpus.txt";

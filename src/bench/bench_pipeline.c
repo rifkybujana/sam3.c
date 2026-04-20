@@ -21,7 +21,7 @@
 #include "bench/bench_pipeline.h"
 #include "util/log.h"
 
-/* ── Context structs for each benchmark case ──────────────────────────── */
+/* --- Context structs for each benchmark case --- */
 
 struct image_encode_ctx {
 	sam3_ctx      *ctx;
@@ -35,7 +35,7 @@ struct segment_ctx {
 	struct sam3_prompt prompt;
 };
 
-/* ── Benchmark callbacks ──────────────────────────────────────────────── */
+/* --- Benchmark callbacks ─ --- */
 
 static void image_encode_fn(void *arg)
 {
@@ -53,7 +53,7 @@ static void segment_fn(void *arg)
 	sam3_result_free(&result);
 }
 
-/* ── Synthetic test image generation ──────────────────────────────────── */
+/* --- Synthetic test image generation ─────── --- */
 
 /*
  * generate_gradient_image - Create an RGB gradient test pattern.
@@ -75,7 +75,7 @@ static void generate_gradient_image(uint8_t *pixels, int size)
 	}
 }
 
-/* ── Public entry point ───────────────────────────────────────────────── */
+/* --- Public entry point ── --- */
 
 int sam3_bench_run_pipeline(const struct sam3_bench_config *cfg,
 			    sam3_ctx *ctx,
@@ -106,7 +106,7 @@ int sam3_bench_run_pipeline(const struct sam3_bench_config *cfg,
 
 	int count = 0;
 
-	/* ── image_encode ─────────────────────────────────────────────── */
+	/* --- image_encode --- */
 	if (count < max_results &&
 	    sam3_bench_filter_match("image_encode", cfg->filter)) {
 		struct image_encode_ctx ec;
@@ -152,7 +152,7 @@ int sam3_bench_run_pipeline(const struct sam3_bench_config *cfg,
 		sam3_set_prompt_space(ctx, img_size, img_size);
 	}
 
-	/* ── full_pipeline_point ──────────────────────────────────────── */
+	/* --- full_pipeline_point ─────────── --- */
 	if (count < max_results &&
 	    sam3_bench_filter_match("full_pipeline_point", cfg->filter)) {
 		struct segment_ctx sc;
@@ -173,7 +173,7 @@ int sam3_bench_run_pipeline(const struct sam3_bench_config *cfg,
 		count++;
 	}
 
-	/* ── full_pipeline_box ────────────────────────────────────────── */
+	/* --- full_pipeline_box ───────────── --- */
 	if (count < max_results &&
 	    sam3_bench_filter_match("full_pipeline_box", cfg->filter)) {
 		struct segment_ctx sc;
@@ -195,7 +195,7 @@ int sam3_bench_run_pipeline(const struct sam3_bench_config *cfg,
 		count++;
 	}
 
-	/* ── full_pipeline_text ───────────────────────────────────────── */
+	/* --- full_pipeline_text ──────────── --- */
 	if (count < max_results &&
 	    sam3_bench_filter_match("full_pipeline_text", cfg->filter)) {
 		struct segment_ctx sc;

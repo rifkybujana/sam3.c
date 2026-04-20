@@ -1278,7 +1278,7 @@ EOF
 After `test_bus_person_text_only` in `tests/test_fixture_compare.c`, add:
 
 ```c
-/* ── Test: SAM 3.1 bus/person text-only fixture ─────────────────────── */
+/* --- Test: SAM 3.1 bus/person text-only fixture --- */
 
 #define SAM3_1_BUS_FIXTURE_DIR \
 	SAM3_SOURCE_DIR "/tests/fixtures/sam3_1_bus_person"

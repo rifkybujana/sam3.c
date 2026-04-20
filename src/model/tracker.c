@@ -31,7 +31,7 @@
 
 #define WP "tracker_model."
 
-/* ── Initialization ──────────────────────────────────────────────── */
+/* --- Initialization ─ --- */
 
 enum sam3_error sam3_tracker_init(struct sam3_tracker *trk)
 {
@@ -69,7 +69,7 @@ enum sam3_error sam3_tracker_init(struct sam3_tracker *trk)
 	return SAM3_OK;
 }
 
-/* ── Weight loading ──────────────────────────────────────────────── */
+/* --- Weight loading ─ --- */
 
 enum sam3_error sam3_tracker_load(struct sam3_tracker *trk,
 				  const struct sam3_weight_file *wf,
@@ -280,7 +280,7 @@ enum sam3_error sam3_tracker_load(struct sam3_tracker *trk,
 	return SAM3_OK;
 }
 
-/* ── SAM prompt encoder (point projection for tracker path) ─────── */
+/* --- SAM prompt encoder (point projection for tracker path) --- */
 
 /*
  * Apply Gaussian positional encoding to a normalized coord pair
@@ -416,7 +416,7 @@ struct sam3_tensor *sam3_tracker_sam_project_prompts(
 	return out;
 }
 
-/* ── Per-frame tracking ──────────────────────────────────────────── */
+/* --- Per-frame tracking ─────────────── --- */
 
 enum sam3_error sam3_tracker_track_frame(
 	struct sam3_tracker *trk,
@@ -666,7 +666,7 @@ enum sam3_error sam3_tracker_track_frame(
 	return SAM3_OK;
 }
 
-/* ── Reset ───────────────────────────────────────────────────────── */
+/* --- Reset ─────── --- */
 
 enum sam3_error sam3_tracker_reset(struct sam3_tracker *trk)
 {

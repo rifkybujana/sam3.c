@@ -111,11 +111,7 @@ static void check_finite(struct sam3_tensor *t, const char *label)
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* test_encoder_decoder_pipeline                                      */
-/*                                                                    */
-/* Tests encoder fusion + decoder wired together end-to-end.          */
-/* ------------------------------------------------------------------ */
+/* --- test_encoder_decoder_pipeline --- */
 static void test_encoder_decoder_pipeline(void)
 {
 	enum sam3_error err;
@@ -210,12 +206,7 @@ static void test_encoder_decoder_pipeline(void)
 	check_finite(boxes, "decoder_boxes");
 }
 
-/* ------------------------------------------------------------------ */
-/* test_geom_enc_pipeline                                             */
-/*                                                                    */
-/* Tests the geometry encoder: prompt_tokens + image_features ->      */
-/* [N+1, d_model] output.                                             */
-/* ------------------------------------------------------------------ */
+/* --- test_geom_enc_pipeline --- */
 static void test_geom_enc_pipeline(void)
 {
 	enum sam3_error err;
@@ -273,13 +264,7 @@ static void test_geom_enc_pipeline(void)
 	check_finite(geom_out, "geom_encoder_out");
 }
 
-/* ------------------------------------------------------------------ */
-/* test_seg_head_pipeline                                             */
-/*                                                                    */
-/* Tests the segmentation head: query_embed + pixel_features ->       */
-/* mask logits [n_queries, grid_h*8 * grid_w*8].                      */
-/* Use grid 2x2 so output is [4, 256] = manageable size.             */
-/* ------------------------------------------------------------------ */
+/* --- test_seg_head_pipeline --- */
 static void test_seg_head_pipeline(void)
 {
 	enum sam3_error err;
@@ -363,12 +348,7 @@ static void test_seg_head_pipeline(void)
 	check_finite(masks, "seg_head_masks");
 }
 
-/* ------------------------------------------------------------------ */
-/* test_full_pipeline                                                 */
-/*                                                                    */
-/* Wires geometry_encoder + encoder_fusion + decoder + seg_head       */
-/* together into a single graph and evaluates it end-to-end.          */
-/* ------------------------------------------------------------------ */
+/* --- test_full_pipeline --- */
 static void test_full_pipeline(void)
 {
 	enum sam3_error err;

@@ -30,7 +30,7 @@
 #include "weight_rename.h"
 #include "util/log.h"
 
-/* ── Data structures ───────────────────────────────────────────────── */
+/* --- Data structures ── --- */
 
 struct rename_entry {
 	int  inner_idx;
@@ -46,7 +46,7 @@ struct rename_reader_state {
 	int                   n_entries;
 };
 
-/* ── String helpers ────────────────────────────────────────────────── */
+/* --- String helpers --- */
 
 /*
  * strip_prefix - Check if str starts with prefix.
@@ -61,7 +61,7 @@ static const char *strip_prefix(const char *str, const char *prefix)
 	return NULL;
 }
 
-/* ── Entry helpers ─────────────────────────────────────────────────── */
+/* --- Entry helpers ─ --- */
 
 static int add_entry(struct rename_entry *out, int inner_idx,
 		     const char *name)
@@ -114,7 +114,7 @@ static int add_q_kv_split(struct rename_entry *out, int inner_idx,
 }
 
 
-/* ── Per-subsystem handlers (PyTorch .pt format) ──────────────────── */
+/* --- Per-subsystem handlers (PyTorch .pt format) --- */
 
 /*
  * Each handler takes the remainder after prefix stripping and
@@ -1442,7 +1442,7 @@ static int handle_tracker_multiplex(struct rename_entry *out, int inner_idx,
 	return add_entry(out, inner_idx, buf);
 }
 
-/* ── Prefix table (longest-match-wins) ─────────────────────────────── */
+/* --- Prefix table (longest-match-wins) ── --- */
 
 struct prefix_rule {
 	const char *py_prefix;
@@ -1493,7 +1493,7 @@ static const struct prefix_rule prefix_table[] = {
 #define N_PREFIX_RULES \
 	(int)(sizeof(prefix_table) / sizeof(prefix_table[0]))
 
-/* ── Core rename logic ─────────────────────────────────────────────── */
+/* --- Core rename logic --- */
 
 /*
  * rename_tensor - Apply prefix + attribute renaming to a single tensor.
@@ -1546,7 +1546,7 @@ static enum sam3_error build_rename_table(struct rename_reader_state *s)
 	return SAM3_OK;
 }
 
-/* ── Vtable callbacks ──────────────────────────────────────────────── */
+/* --- Vtable callbacks ─ --- */
 
 static enum sam3_error rr_open(struct weight_reader *r, const char *path)
 {
@@ -1655,7 +1655,7 @@ static const struct weight_reader_ops rename_reader_ops = {
 	.close            = rr_close,
 };
 
-/* ── Public init ───────────────────────────────────────────────────── */
+/* --- Public init ─── --- */
 
 /*
  * Persistent state — only one rename reader exists at a time in

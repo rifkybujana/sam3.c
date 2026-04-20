@@ -60,7 +60,7 @@
 #pragma GCC diagnostic pop
 #endif
 
-/* ── Deterministic noise generator ─────────────────────────────────── */
+/* --- Deterministic noise generator ────── --- */
 
 int sam3_bench_bounce_pos(int i)
 {
@@ -92,7 +92,7 @@ static uint32_t bench_lcg_next(void)
 	return bench_lcg_state;
 }
 
-/* ── Shared clip helpers (declared in bench_video.h) ───────────────── */
+/* --- Shared clip helpers (declared in bench_video.h) --- */
 
 int sam3_bench_generate_clip(const char *dir, int n)
 {
@@ -200,7 +200,7 @@ void sam3_bench_rmtree(const char *dir)
 		sam3_log_warn("bench rmtree: cannot rmdir '%s'", dir);
 }
 
-/* ── Multi-object seeding helper ──────────────────────────────────── */
+/* --- Multi-object seeding helper ─────── --- */
 
 /*
  * seed_n_objects - Place @n distinct obj_id points inside the frame-@seed
@@ -243,7 +243,7 @@ static enum sam3_error seed_n_objects(sam3_video_session *s, int n,
 	return SAM3_OK;
 }
 
-/* ── Per-frame case-table driver ──────────────────────────────────── */
+/* --- Per-frame case-table driver ─────── --- */
 
 /*
  * Case table — each row is one benchmark emitted by this function.

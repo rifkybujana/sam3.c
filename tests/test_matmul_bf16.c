@@ -23,7 +23,7 @@
 #include <string.h>
 #include <stdint.h>
 
-/* ── Helpers ──────────────────────────────────────────────────────── */
+/* --- Helpers ────── --- */
 
 static void make_bf16_tensor_2d(struct sam3_tensor *t, uint16_t *data,
 				int rows, int cols)
@@ -42,7 +42,7 @@ static void make_bf16_tensor_2d(struct sam3_tensor *t, uint16_t *data,
 	t->nbytes     = (size_t)rows * cols * sizeof(uint16_t);
 }
 
-/* ── Tests ────────────────────────────────────────────────────────── */
+/* --- Tests ──────── --- */
 
 /*
  * test_matmul_bf16_small - 4x3 @ 3x4 = 4x4 matmul.

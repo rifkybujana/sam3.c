@@ -20,7 +20,7 @@
 
 #define TEST_FILE "/tmp/test_sam3_weights.sam3"
 
-/* ── Minimal in-memory reader for testing ──────────────────────────── */
+/* --- Minimal in-memory reader for testing --- */
 
 struct mem_tensor {
 	const char     *name;
@@ -90,7 +90,7 @@ static const struct weight_reader_ops mem_reader_ops = {
 	.close            = mem_close,
 };
 
-/* ── Helper: create a test reader with known data ──────────────────── */
+/* --- Helper: create a test reader with known data --- */
 
 static float test_data_a[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
 static float test_data_b[] = {7.0f, 8.0f, 9.0f, 10.0f};
@@ -135,7 +135,7 @@ static enum sam3_error write_test_file(void)
 	return sam3_weight_write(TEST_FILE, &test_config, &reader);
 }
 
-/* ── Tests ─────────────────────────────────────────────────────────── */
+/* --- Tests ───────── --- */
 
 static void test_weight_roundtrip(void)
 {
