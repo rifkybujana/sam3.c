@@ -354,6 +354,12 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
+	# test_mobileclip_text needs source dir for fixture paths
+	if(TARGET test_mobileclip_text)
+		target_compile_definitions(test_mobileclip_text PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
 	# test_video_e2e needs the model path at build time
 	if(TARGET test_video_e2e)
 		target_compile_definitions(test_video_e2e PRIVATE

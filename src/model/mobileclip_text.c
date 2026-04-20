@@ -24,9 +24,9 @@
 #include "text_encoder_iface.h"
 #include "util/log.h"
 
-/* Weight key prefixes */
-#define ENC_PFX      "detector.backbone.language_backbone.encoder."
-#define BACKBONE_PFX "detector.backbone.language_backbone."
+/* Weight key prefixes (match the key namespace written by cli_convert). */
+#define ENC_PFX      "detector_model.text_encoder.encoder."
+#define BACKBONE_PFX "detector_model.text_encoder."
 
 /* --- Variant configs (post-Phase-0 audit values) --- */
 
@@ -505,15 +505,12 @@ struct sam3_tensor *sam3_mobileclip_text_build(
 	if (!x)
 		return NULL;
 
-	/* 5. Inner projection (width -> width). projection_layer is a raw
-	 *    [width, width] tensor used as a right-hand matmul factor.
-	 *    x is [seq_len, width]; result is [seq_len, width]. */
-	x = gh_matmul(g, arena, x, enc->projection_layer);
-	if (!x)
-		return NULL;
-
-	/* 6. External 256-dim projector: out = x @ out_proj_w^T + out_proj_b
-	 *    gh_linear computes input @ weight^T + bias. */
+	/* 5. External 256-dim projector: out = x @ out_proj_w^T + out_proj_b
+	 *    gh_linear computes input @ weight^T + bias.
+	 *    Note: projection_layer (width->width inner matmul) is intentionally
+	 *    skipped here. It is only applied in the pooled single-token path
+	 *    and is all-zeros in the MobileCLIP checkpoints when return_all_tokens
+	 *    is True. */
 	out = gh_linear(g, arena, x, enc->out_proj_w, enc->out_proj_b);
 	if (!out)
 		return NULL;
@@ -666,10 +663,10 @@ struct sam3_tensor *sam3_mobileclip_text_build_perblock(
 		if (!x)
 			return NULL;
 
-		x = gh_matmul(&g, scratch, x, enc->projection_layer);
-		if (!x)
-			return NULL;
-
+		/* External 256-dim projector: out = x @ out_proj_w^T + out_proj_b.
+		 * projection_layer (inner width->width matmul) is intentionally
+		 * skipped — it is all-zeros in MobileCLIP checkpoints and is only
+		 * applied in the pooled single-token path (return_all_tokens=False). */
 		out = gh_linear(&g, scratch, x,
 				enc->out_proj_w, enc->out_proj_b);
 		if (!out)
