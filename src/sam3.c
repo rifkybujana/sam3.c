@@ -177,6 +177,22 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->proc.profiler = ctx->profiler;
 #endif
 
+	/* Reinitialize text iface to match the text_backbone from the
+	 * .sam3 v4 header (default CLIP was set in vl_backbone_init). */
+	err = sam3_vl_backbone_set_text_backbone(
+		&ctx->proc.model.backbone,
+		ctx->config.text_backbone,
+		&ctx->proc.model_arena);
+	if (err != SAM3_OK) {
+		sam3_log_error("sam3_load: text_backbone init failed (%d)",
+			       err);
+		sam3_processor_free(&ctx->proc);
+#ifdef SAM3_HAS_PROFILE
+		SAM3_PROF_END(ctx->profiler, "model_load");
+#endif
+		return err;
+	}
+
 	err = sam3_processor_load(&ctx->proc, &ctx->weights, vocab);
 	if (err != SAM3_OK) {
 		sam3_processor_free(&ctx->proc);
