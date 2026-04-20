@@ -1,25 +1,32 @@
 /*
  * src/model/mobileclip_text.c - MobileCLIP text encoder implementation
  *
- * Skeleton file: variant config table + iface vtable ops + stubs for
- * load/build that are filled in over Phases 4-6. Each variant maps to
- * a static const sam3_mobileclip_config; the iface init allocates a
- * fresh sam3_mobileclip_text_encoder, copies the config, and hands
- * back via the iface vtable.
+ * Variant config table, iface vtable ops, and weight loader for the
+ * MobileCLIP text encoder (S0/S1/L). The loader fills all embedding,
+ * final-norm, projection, and per-block standard-attention tensors.
+ * RepMixer blocks (S0 indices 0 and 5) are marked is_repmixer=1 and
+ * skipped here; Task 6.1 fills them.
  *
  * Key types:  sam3_mobileclip_text_encoder
- * Depends on: mobileclip_text.h, text_encoder_iface.h, util/log.h
+ * Depends on: mobileclip_text.h, graph_helpers.h, text_encoder_iface.h,
+ *             util/log.h
  * Used by:    src/model/text_encoder_iface.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "mobileclip_text.h"
+#include "graph_helpers.h"
 #include "text_encoder_iface.h"
 #include "util/log.h"
+
+/* Weight key prefixes */
+#define ENC_PFX      "detector.backbone.language_backbone.encoder."
+#define BACKBONE_PFX "detector.backbone.language_backbone."
 
 /* --- Variant configs (post-Phase-0 audit values) --- */
 
@@ -148,16 +155,215 @@ enum sam3_error sam3_mobileclip_text_iface_init_impl(
 	return SAM3_OK;
 }
 
-/* --- Stubs for load/build (filled in by Tasks 4.3-4.5, 6.x) --- */
+/* --- Helpers for weight loading --- */
+
+/*
+ * load_required - Lookup tensor by name; log error and return NULL on miss.
+ *
+ * Used by Task 6.1 for RepMixer keys that must be present. Kept here so
+ * the symbol is defined before sam3_mobileclip_text_load.
+ */
+static struct sam3_tensor *load_required(
+	const struct sam3_weight_file *wf, struct sam3_arena *arena,
+	const char *name, enum sam3_dtype dtype, int n_dims, const int *dims)
+{
+	struct sam3_tensor *t = gh_load_mmap_optional(
+		wf, name, arena, dtype, n_dims, dims);
+	if (!t)
+		sam3_log_error("mobileclip: required tensor %s not found", name);
+	return t;
+}
+
+/* --- sam3_mobileclip_text_load --- */
 
 enum sam3_error sam3_mobileclip_text_load(
 	struct sam3_mobileclip_text_encoder *enc,
 	const struct sam3_weight_file *wf,
 	struct sam3_arena *arena)
 {
-	(void)enc; (void)wf; (void)arena;
-	sam3_log_error("mobileclip_text_load: not yet implemented");
-	return SAM3_EINVAL;
+	char name[256];
+	int dims[4];
+	const struct sam3_mobileclip_config *cfg;
+
+	if (!enc || !arena)
+		return SAM3_EINVAL;
+	cfg = &enc->cfg;
+
+	/* Token embedding: [vocab_size, width] */
+	dims[0] = cfg->vocab_size; dims[1] = cfg->width;
+	enc->token_embedding = gh_load_mmap(
+		wf, ENC_PFX "embedding_layer.weight",
+		arena, SAM3_DTYPE_F32, 2, dims);
+	if (!enc->token_embedding)
+		return SAM3_ENOMEM;
+
+	/* Positional embedding: stored as [1, 1, 77, width] in checkpoint.
+	 * Build code will slice [ctx_len, width] from this at inference. */
+	dims[0] = 1; dims[1] = 1;
+	dims[2] = cfg->pos_embed_table_len; dims[3] = cfg->width;
+	enc->pos_embed_full = gh_load_mmap(
+		wf, ENC_PFX "positional_embedding.pos_embed.pos_embed",
+		arena, SAM3_DTYPE_F32, 4, dims);
+	if (!enc->pos_embed_full)
+		return SAM3_ENOMEM;
+
+	/* Final layer norm: [width] */
+	dims[0] = cfg->width;
+	enc->ln_final_w = gh_load_mmap(
+		wf, ENC_PFX "final_layer_norm.weight",
+		arena, SAM3_DTYPE_F32, 1, dims);
+	if (!enc->ln_final_w)
+		return SAM3_ENOMEM;
+	enc->ln_final_b = gh_load_mmap(
+		wf, ENC_PFX "final_layer_norm.bias",
+		arena, SAM3_DTYPE_F32, 1, dims);
+	if (!enc->ln_final_b)
+		return SAM3_ENOMEM;
+
+	/* Inner projection (width -> width). Raw tensor, NO .weight suffix. */
+	dims[0] = cfg->width; dims[1] = cfg->width;
+	enc->projection_layer = gh_load_mmap(
+		wf, ENC_PFX "projection_layer",
+		arena, SAM3_DTYPE_F32, 2, dims);
+	if (!enc->projection_layer)
+		return SAM3_ENOMEM;
+
+	/* External 256-dim projector weight: [out_dim, width] */
+	dims[0] = cfg->out_dim; dims[1] = cfg->width;
+	enc->out_proj_w = gh_load_mmap(
+		wf, BACKBONE_PFX "projector.weight",
+		arena, SAM3_DTYPE_F32, 2, dims);
+	if (!enc->out_proj_w)
+		return SAM3_ENOMEM;
+
+	/* Projector bias: [out_dim]. May be absent; build code checks NULL. */
+	dims[0] = cfg->out_dim;
+	enc->out_proj_b = gh_load_mmap_optional(
+		wf, BACKBONE_PFX "projector.bias",
+		arena, SAM3_DTYPE_F32, 1, dims);
+
+	/* Per-block tensors.
+	 * RepMixer indices (S0: {0, 5}) are marked and skipped here;
+	 * Task 6.1 fills them. Standard blocks load pre_norm_mha.*
+	 * and pre_norm_ffn.{0,1,4} keys. */
+	for (int i = 0; i < cfg->n_layers; i++) {
+		int is_rep = 0;
+		for (int k = 0; k < cfg->n_repmixer_blocks; k++) {
+			if (cfg->repmixer_block_indices[k] == i) {
+				is_rep = 1;
+				break;
+			}
+		}
+		if (is_rep) {
+			enc->layers[i].is_repmixer = 1;
+			continue;
+		}
+		enc->layers[i].is_repmixer = 0;
+
+		struct sam3_mobileclip_layer_std *L = &enc->layers[i].u.std;
+
+		/* LN1 (pre-norm MHA): [width] */
+		dims[0] = cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_mha.0.weight", i);
+		L->ln1_w = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->ln1_w) return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_mha.0.bias", i);
+		L->ln1_b = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->ln1_b) return SAM3_ENOMEM;
+
+		/* QKV projection: [3*width, width] (already fused in ckpt) */
+		dims[0] = 3 * cfg->width; dims[1] = cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d"
+			 ".pre_norm_mha.1.qkv_proj.weight", i);
+		L->qkv_w = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 2, dims);
+		if (!L->qkv_w) return SAM3_ENOMEM;
+
+		dims[0] = 3 * cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d"
+			 ".pre_norm_mha.1.qkv_proj.bias", i);
+		L->qkv_b = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->qkv_b) return SAM3_ENOMEM;
+
+		/* Out projection: [width, width] */
+		dims[0] = cfg->width; dims[1] = cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d"
+			 ".pre_norm_mha.1.out_proj.weight", i);
+		L->out_w = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 2, dims);
+		if (!L->out_w) return SAM3_ENOMEM;
+
+		dims[0] = cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d"
+			 ".pre_norm_mha.1.out_proj.bias", i);
+		L->out_b = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->out_b) return SAM3_ENOMEM;
+
+		/* LN2 (pre-norm FFN): sequential index 0 */
+		dims[0] = cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_ffn.0.weight", i);
+		L->ln2_w = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->ln2_w) return SAM3_ENOMEM;
+
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_ffn.0.bias", i);
+		L->ln2_b = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->ln2_b) return SAM3_ENOMEM;
+
+		/* FC1 (sequential index 1): [mlp_dim, width] */
+		dims[0] = cfg->mlp_dim; dims[1] = cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_ffn.1.weight", i);
+		L->fc1_w = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 2, dims);
+		if (!L->fc1_w) return SAM3_ENOMEM;
+
+		dims[0] = cfg->mlp_dim;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_ffn.1.bias", i);
+		L->fc1_b = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->fc1_b) return SAM3_ENOMEM;
+
+		/* FC2 (sequential index 4; indices 2-3 are GELU+Dropout):
+		 * [width, mlp_dim] */
+		dims[0] = cfg->width; dims[1] = cfg->mlp_dim;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_ffn.4.weight", i);
+		L->fc2_w = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 2, dims);
+		if (!L->fc2_w) return SAM3_ENOMEM;
+
+		dims[0] = cfg->width;
+		snprintf(name, sizeof(name),
+			 ENC_PFX "transformer.%d.pre_norm_ffn.4.bias", i);
+		L->fc2_b = gh_load_mmap(wf, name, arena,
+					SAM3_DTYPE_F32, 1, dims);
+		if (!L->fc2_b) return SAM3_ENOMEM;
+	}
+
+	sam3_log_info(
+		"mobileclip: loaded %d-layer %s text encoder "
+		"(%d RepMixer blocks)",
+		cfg->n_layers,
+		cfg->text_backbone == SAM3_TEXT_MOBILECLIP_S0 ? "S0" :
+		cfg->text_backbone == SAM3_TEXT_MOBILECLIP_S1 ? "S1" : "L",
+		cfg->n_repmixer_blocks);
+	return SAM3_OK;
 }
 
 struct sam3_tensor *sam3_mobileclip_text_build(
