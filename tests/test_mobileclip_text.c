@@ -300,6 +300,19 @@ test_perblock_parity_s1(void)
 				    SAM3_SOURCE_DIR "/tests/fixtures/mobileclip_s1");
 }
 
+/* --- test_perblock_parity_l --- */
+
+/*
+ * Correctness check: per-block evaluator for MobileCLIP-L (12 standard
+ * blocks, ctx_len=16, d_model=768) against the PyTorch reference fixtures.
+ */
+static int
+test_perblock_parity_l(void)
+{
+	return test_perblock_parity(SAM3_TEXT_MOBILECLIP_L, 16,
+				    SAM3_SOURCE_DIR "/tests/fixtures/mobileclip_l");
+}
+
 int
 main(void)
 {
@@ -308,6 +321,7 @@ main(void)
 	test_iface_factory_l();
 	test_mobileclip_config_for();
 	test_perblock_parity_s1();
+	test_perblock_parity_l();
 
 	if (tests_failed == 0)
 		printf("test_mobileclip_text: PASS (%d tests)\n", tests_run);
