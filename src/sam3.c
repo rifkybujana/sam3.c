@@ -131,6 +131,7 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->config.backbone_type    = (int)h->reserved[0];
 	ctx->config.variant          = (int)h->reserved[1];
 	ctx->config.n_fpn_scales     = (int)h->reserved[2];
+	ctx->config.text_backbone    = (int)ctx->weights.text_backbone;
 
 	/* Legacy (pre-SAM3.1) .sam3 files have reserved[1..2] == 0.
 	 * Treat that as SAM 3 with 4 FPN scales. */
