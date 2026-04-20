@@ -84,6 +84,15 @@ struct sam3_tensor *sam3_dbg_trk_memattn_layer0    = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_layer1    = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_layer2    = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_layer3    = NULL;
+/* Layer-0 sub-drill (iteration 9). Intermediates captured inside
+ * memory_attn_layer() when layer_idx==0 so we can bisect the
+ * 0.98→0.004 cosine collapse across self-attn / cross-attn Q,K /
+ * cross-attn attention body. */
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_sa_out   = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_q     = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k     = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_v     = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_attn  = NULL;
 /* Image-pipeline slots (populated per-frame inside
  * session_encode_frame; flushed directly there to cover both cond
  * frame 0 and propagation frames). */
@@ -791,6 +800,9 @@ video_track_one_obj(struct sam3_video_session *session,
 	 * pick in step 8. NULL on SAM 3. */
 	struct sam3_tensor *track_all_iou = NULL;
 	struct sam3_tensor *track_score   = NULL; /* [1]                        */
+	/* Multiplex only: [16] per-slot obj_score_logits for per-slot
+	 * is_appearing gating in step 8. NULL on SAM 3. */
+	struct sam3_tensor *track_all_score = NULL;
 
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "tracker_build");
 	if (is_multiplex) {
@@ -801,7 +813,8 @@ video_track_one_obj(struct sam3_video_session *session,
 			cf.feat_4x,   /* 4x skip, 288x288       */
 			frame_idx, is_cond, gfx,
 			&track_masks, &track_iou,
-			&track_obj_ptr, &track_all_iou, &track_score);
+			&track_obj_ptr, &track_all_iou, &track_score,
+			&track_all_score);
 	} else {
 		/*
 		 * SAM 3 takes sparse prompt tokens only on conditioning
@@ -914,6 +927,11 @@ video_track_one_obj(struct sam3_video_session *session,
 		DUMP_TRK(memattn_layer1);
 		DUMP_TRK(memattn_layer2);
 		DUMP_TRK(memattn_layer3);
+		DUMP_TRK(memattn_l0_sa_out);
+		DUMP_TRK(memattn_l0_ca_q);
+		DUMP_TRK(memattn_l0_ca_k);
+		DUMP_TRK(memattn_l0_ca_v);
+		DUMP_TRK(memattn_l0_ca_attn);
 		#undef DUMP_TRK
 	}
 #endif
@@ -1046,6 +1064,21 @@ video_track_one_obj(struct sam3_video_session *session,
 			const float *ptrs = (const float *)track_obj_ptr->data;
 			const float *all_iou = track_all_iou
 				? (const float *)track_all_iou->data : NULL;
+			/* TODO(sub-project 3 / mask-decoder parity): per-slot
+			 * obj_score_logits are available via @track_all_score
+			 * but cannot yet drive gating safely. C's current
+			 * pipeline is self-consistent (not Python-consistent).
+			 * Any partial Python-ward fix here — runtime per-slot
+			 * gate OR seed-only slot-0 hardcode — regresses
+			 * frames 1-3 IoU to 0.000 (iteration 10 + 11 findings).
+			 * The 0.44/0.52/0.41 baseline relies on all 16 slots
+			 * getting raw obj_ptrs on seed and the current detector
+			 * behaviour. Fixing requires simultaneous fix of
+			 * feat_s1 / maskmem / obj_ptr paths — i.e. sub-project 3
+			 * (interactive decoder). See
+			 * docs/superpowers/notes/2026-04-20-sam3-1-tracker-parity-log.md
+			 * for the full trail. */
+			(void)track_all_score;
 			float *dst = (float *)best_obj_ptr_scratch->data;
 			const float *W = (const float *)
 				trk_mux->no_obj_ptr_linear_w->data;
@@ -1221,12 +1254,61 @@ video_track_one_obj(struct sam3_video_session *session,
 	/*
 	 * SAM 3 post-encoder gating: add no_obj_embed_spatial when the
 	 * object isn't appearing so the stored memory reflects occlusion.
-	 * The multiplex no_obj_embed_spatial has a different shape (16, 256) and
-	 * is applied via a different mechanism; skipped here.
+	 *
+	 * SAM 3:      scalar score gates the whole mem_feat uniformly
+	 *             (apply_occlusion_gating).
+	 * SAM 3.1:    per-slot gate over the 16 multiplex slots. Matches
+	 *             reference/sam3/sam3/model/video_tracking_multiplex.py
+	 *             :1707-1737 (_encode_new_memory):
+	 *                 is_obj_appearing[s] = score[s] > threshold
+	 *                 no_obj_embed[c] = Σ_s (1 - is_obj_appearing[s])
+	 *                                       * no_obj_embed_spatial[s, c]
+	 *                 maskmem_features += no_obj_embed[None, None, :]
+	 *             threshold is `object_score_logit_threshold` (= 0.0
+	 *             in the SAM 3.1 model_builder default).
+	 *
+	 *             Before this fix the C path skipped the addition
+	 *             entirely, leaving the stored maskmem ~30 % cosine off
+	 *             from Python at frame 1 (and cascading through
+	 *             memattn / mask decoder to ±1e17 explosions).
 	 */
 	if (!is_multiplex) {
 		apply_occlusion_gating(NULL, NULL, mem_feat,
 				       track_score, no_obj_ptr, no_obj_embed);
+	} else if (mem_feat && mem_feat->data && track_all_score
+		   && track_all_score->data
+		   && trk_mux && trk_mux->no_obj_embed_spatial
+		   && trk_mux->no_obj_embed_spatial->data) {
+		const int D = SAM3_MULTIPLEX_HIDDEN_DIM;   /* 256 */
+		const int N_SLOTS = SAM3_MULTIPLEX_COUNT;  /* 16 */
+		if (mem_feat->n_dims == 4 && mem_feat->dims[3] == D &&
+		    trk_mux->no_obj_embed_spatial->n_dims == 2 &&
+		    trk_mux->no_obj_embed_spatial->dims[0] == N_SLOTS &&
+		    trk_mux->no_obj_embed_spatial->dims[1] == D) {
+			const float *scores =
+				(const float *)track_all_score->data;
+			const float *nobs = (const float *)
+				trk_mux->no_obj_embed_spatial->data;
+			float no_obj_embed_v[SAM3_MULTIPLEX_HIDDEN_DIM];
+			memset(no_obj_embed_v, 0, sizeof(no_obj_embed_v));
+			for (int s = 0; s < N_SLOTS; s++) {
+				if (scores[s] > 0.0f)
+					continue;
+				const float *row =
+					nobs + (size_t)s * D;
+				for (int c = 0; c < D; c++)
+					no_obj_embed_v[c] += row[c];
+			}
+			const int mH = mem_feat->dims[1];
+			const int mW = mem_feat->dims[2];
+			const int HW = mH * mW;
+			float *mf = (float *)mem_feat->data;
+			for (int i = 0; i < HW; i++) {
+				float *pos = mf + (size_t)i * D;
+				for (int c = 0; c < D; c++)
+					pos[c] += no_obj_embed_v[c];
+			}
+		}
 	}
 
 	/* --- 11. Flatten + clone to persist ---------------------------- */
