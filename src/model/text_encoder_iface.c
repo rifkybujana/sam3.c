@@ -73,21 +73,6 @@ extern enum sam3_error sam3_mobileclip_text_iface_init_impl(
 	struct sam3_text_encoder_iface *iface,
 	int text_backbone, struct sam3_arena *arena);
 
-/*
- * Temporary stub: removed in Phase 4 once mobileclip_text.c lands.
- * The CLIP path doesn't reach this; MobileCLIP variants will fail
- * until Phase 4.
- */
-__attribute__((weak))
-enum sam3_error sam3_mobileclip_text_iface_init_impl(
-	struct sam3_text_encoder_iface *iface,
-	int text_backbone, struct sam3_arena *arena)
-{
-	(void)iface; (void)text_backbone; (void)arena;
-	sam3_log_error("text_iface: MobileCLIP not yet implemented");
-	return SAM3_EINVAL;
-}
-
 /* --- Factory --- */
 
 enum sam3_error sam3_text_encoder_iface_init(
