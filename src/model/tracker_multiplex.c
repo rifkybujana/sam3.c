@@ -704,11 +704,6 @@ struct sam3_tensor *sam3_multiplex_maskmem_forward(
 #define MUX_ATTN_HALF            (MUX_ATTN_HEAD_DIM / 2)                /* 16 */
 #define MUX_ATTN_QUARTER         (MUX_ATTN_HEAD_DIM / 4)                /* 8 */
 #define MUX_ROPE_THETA           10000.0f
-/* pos_enc_at_input=True scales src_pos by 0.1 before the residual add.
- * Matches TransformerEncoderDecoupledCrossAttention.forward in
- * reference/sam3/sam3/model/decoder.py. */
-#define MUX_POS_ENC_INPUT_SCALE  0.1f
-
 /*
  * build_rope_2d_axial - Fill [n_pos, head_dim/2] cos/sin tables for a
  * grid_w × grid_w 2D axial RoPE basis.
@@ -1011,7 +1006,6 @@ struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 		struct sam3_arena *arena,
 		const struct sam3_multiplex_memory_attn *ma,
 		struct sam3_tensor *tgt,
-		struct sam3_tensor *tgt_pos,
 		struct sam3_tensor *image,
 		struct sam3_tensor *memory,
 		struct sam3_tensor *memory_image,
@@ -1082,22 +1076,13 @@ struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 			return NULL;
 	}
 
-	/* --- pos_enc_at_input=True: output = tgt + 0.1 * tgt_pos --- */
+	/*
+	 * pos_enc_at_input=True but the single-object call path always
+	 * passes tgt_pos=NULL; the tgt + 0.1 * tgt_pos add is a no-op
+	 * for our use. If a future refactor needs this path, pull it
+	 * back from commit history.
+	 */
 	struct sam3_tensor *output = tgt;
-	if (tgt_pos) {
-		int one[] = {1};
-		struct sam3_tensor *scale = gh_alloc_tensor(arena,
-			SAM3_DTYPE_F32, 1, one);
-		if (!scale)
-			return NULL;
-		((float *)scale->data)[0] = MUX_POS_ENC_INPUT_SCALE;
-		struct sam3_tensor *scaled = gh_mul(g, arena, tgt_pos, scale);
-		if (!scaled)
-			return NULL;
-		output = gh_add(g, arena, tgt, scaled);
-		if (!output)
-			return NULL;
-	}
 
 	/* --- 4 layers --- */
 	for (int i = 0; i < 4; i++) {
@@ -2108,7 +2093,7 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 			struct sam3_tensor *cond_2d =
 				sam3_multiplex_memory_attn_forward(
 					g, arena, &trk->transformer,
-					tgt, NULL, tgt,
+					tgt, tgt,
 					memory, memory_image,
 					memory_image_pos,
 					W, num_k_exclude);

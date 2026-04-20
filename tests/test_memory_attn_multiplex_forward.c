@@ -94,8 +94,6 @@ int main(void)
 
 	struct sam3_tensor *tgt          = gh_alloc_tensor(&cpu.arena,
 			SAM3_DTYPE_F32, 3, nq_dims);
-	struct sam3_tensor *tgt_pos      = gh_alloc_tensor(&cpu.arena,
-			SAM3_DTYPE_F32, 3, nq_dims);
 	struct sam3_tensor *image        = gh_alloc_tensor(&cpu.arena,
 			SAM3_DTYPE_F32, 3, nq_dims);
 	struct sam3_tensor *memory       = gh_alloc_tensor(&cpu.arena,
@@ -104,13 +102,11 @@ int main(void)
 			SAM3_DTYPE_F32, 3, nm_dims);
 	struct sam3_tensor *memory_image_pos = gh_alloc_tensor(&cpu.arena,
 			SAM3_DTYPE_F32, 3, nm_dims);
-	ASSERT(tgt && tgt_pos && image && memory
+	ASSERT(tgt && image && memory
 	       && memory_image && memory_image_pos);
 
 	fill_pattern((float *)tgt->data, TEST_NQ * TEST_HIDDEN,
 		     0.03f, 23);
-	fill_pattern((float *)tgt_pos->data, TEST_NQ * TEST_HIDDEN,
-		     0.02f, 19);
 	fill_pattern((float *)image->data, TEST_NQ * TEST_HIDDEN,
 		     0.025f, 29);
 	fill_pattern((float *)memory->data, TEST_NM * TEST_HIDDEN,
@@ -120,10 +116,9 @@ int main(void)
 	fill_pattern((float *)memory_image_pos->data,
 		     TEST_NM * TEST_HIDDEN, 0.01f, 41);
 
-	/* --- 4. Two-pass forward: both pos-enc inputs set, then both NULL --- */
-	struct sam3_tensor *pass_tgt_pos[2]  = {tgt_pos, NULL};
+	/* --- 4. Two-pass forward: memory_image_pos populated, then NULL --- */
 	struct sam3_tensor *pass_mem_ip[2]   = {memory_image_pos, NULL};
-	const char *labels[2] = {"full_pos", "no_pos"};
+	const char *labels[2] = {"with_mem_pos", "no_mem_pos"};
 
 	for (int pass = 0; pass < 2; pass++) {
 		struct sam3_graph graph;
@@ -131,7 +126,7 @@ int main(void)
 
 		struct sam3_tensor *out = sam3_multiplex_memory_attn_forward(
 				&graph, &cpu.arena, &trk.transformer,
-				tgt, pass_tgt_pos[pass], image,
+				tgt, image,
 				memory, memory_image, pass_mem_ip[pass],
 				TEST_GRID_W, TEST_N_OBJ);
 		ASSERT(out != NULL);

@@ -395,12 +395,6 @@ struct sam3_tensor *sam3_multiplex_maskmem_forward(
  *                    tracker this is the current frame's vision
  *                    features (flattened row-major from the grid_w ×
  *                    grid_w grid).
- * @tgt_pos:          Positional encoding for object queries
- *                    [B, Nq, 256] or NULL. When non-NULL the layer
- *                    applies `tgt = tgt + 0.1 * tgt_pos` before the
- *                    first encoder layer (pos_enc_at_input=True). The
- *                    layer-level self/cross-attn projections ignore
- *                    this tensor afterwards.
  * @image:            Current-frame image features [B, Nq, 256], fed
  *                    to the image_cross_attn_q_proj side of the
  *                    decoupled cross-attention. In the tracker this
@@ -457,7 +451,6 @@ struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 		struct sam3_arena *arena,
 		const struct sam3_multiplex_memory_attn *ma,
 		struct sam3_tensor *tgt,
-		struct sam3_tensor *tgt_pos,
 		struct sam3_tensor *image,
 		struct sam3_tensor *memory,
 		struct sam3_tensor *memory_image,
