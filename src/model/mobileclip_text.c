@@ -366,6 +366,83 @@ enum sam3_error sam3_mobileclip_text_load(
 	return SAM3_OK;
 }
 
+/*
+ * build_std_block - One pre-norm transformer block, non-causal, no RoPE.
+ *
+ * Mirrors the reference pre_norm_mha + pre_norm_ffn layout.
+ * QKV is pre-fused in the checkpoint (single weight [3*width, width]).
+ * x must be [seq_len, width] on entry and exit (2D).
+ */
+static struct sam3_tensor *build_std_block(
+	struct sam3_graph *g,
+	const struct sam3_mobileclip_layer_std *L,
+	struct sam3_tensor *x,
+	int n_heads,
+	int width,
+	int seq_len,
+	struct sam3_arena *arena)
+{
+	struct sam3_tensor *t, *x3d;
+	int attn_dims[3];
+
+	/* --- Attention sub-block --- */
+	t = gh_layernorm(g, arena, x, L->ln1_w, L->ln1_b);
+	if (!t)
+		return NULL;
+
+	/* gh_multihead_attention_rope expects [batch, seq, d_model] */
+	attn_dims[0] = 1; attn_dims[1] = seq_len; attn_dims[2] = width;
+	x3d = gh_reshape(g, arena, t, 3, attn_dims);
+	if (!x3d)
+		return NULL;
+
+	/* Non-causal: attn_mask=NULL, no RoPE: rope_cos=rope_sin=NULL */
+	t = gh_multihead_attention_rope(
+		g, arena,
+		x3d, NULL, NULL,
+		L->qkv_w, L->qkv_b,
+		L->out_w, L->out_b,
+		n_heads,
+		NULL, NULL,
+		NULL, 0, 0.0f);
+	if (!t)
+		return NULL;
+
+	/* attn output is [batch*seq, width] = [seq_len, width]; add residual */
+	x = gh_add(g, arena, x, t);
+	if (!x)
+		return NULL;
+
+	/* --- FFN sub-block --- */
+	t = gh_layernorm(g, arena, x, L->ln2_w, L->ln2_b);
+	if (!t)
+		return NULL;
+
+	t = gh_mlp(g, arena, t,
+		   L->fc1_w, L->fc1_b,
+		   L->fc2_w, L->fc2_b,
+		   SAM3_OP_GELU);
+	if (!t)
+		return NULL;
+
+	x = gh_add(g, arena, x, t);
+	return x;
+}
+
+/*
+ * sam3_mobileclip_text_build - Single-shot graph build for MobileCLIP S1/L.
+ *
+ * Builds the full compute graph: embedding + pos embed + transformer blocks
+ * (std only; RepMixer errors until Phase 6) + final LN + projection.
+ *
+ * @enc:        Encoder with loaded weights
+ * @g:          Graph to add nodes to
+ * @token_ids:  [ctx_len] integer token indices
+ * @pooled_out: If non-NULL, receives pooled [out_dim] EOT embedding
+ * @arena:      Arena for intermediate tensors
+ *
+ * Returns per-token output [ctx_len, out_dim], or NULL on error.
+ */
 struct sam3_tensor *sam3_mobileclip_text_build(
 	struct sam3_mobileclip_text_encoder *enc,
 	struct sam3_graph *g,
@@ -373,9 +450,93 @@ struct sam3_tensor *sam3_mobileclip_text_build(
 	struct sam3_tensor **pooled_out,
 	struct sam3_arena *arena)
 {
-	(void)enc; (void)g; (void)token_ids; (void)pooled_out; (void)arena;
-	sam3_log_error("mobileclip_text_build: not yet implemented");
-	return NULL;
+	const struct sam3_mobileclip_config *cfg = &enc->cfg;
+	struct sam3_tensor *x, *pos, *out;
+	int seq_len, i;
+
+	seq_len = sam3_tensor_nelems(token_ids);
+
+	/* 1. Token embedding lookup: [seq_len, width] */
+	x = gh_embed(g, arena, enc->token_embedding, token_ids);
+	if (!x)
+		return NULL;
+
+	/* 2. Positional embedding.
+	 * pos_embed_full is [1, 1, 77, width] (4D). Reshape to [77, width]
+	 * to make it 2D, then slice [0, seq_len) along axis 0.
+	 */
+	{
+		int pos2d_dims[2];
+		pos2d_dims[0] = cfg->pos_embed_table_len;
+		pos2d_dims[1] = cfg->width;
+		pos = gh_reshape(g, arena, enc->pos_embed_full,
+				 2, pos2d_dims);
+		if (!pos)
+			return NULL;
+	}
+	if (seq_len < cfg->pos_embed_table_len) {
+		pos = gh_slice(g, arena, pos, 0, 0, seq_len);
+		if (!pos)
+			return NULL;
+	}
+	x = gh_add(g, arena, x, pos);
+	if (!x)
+		return NULL;
+
+	/* 3. Transformer blocks (no causal mask). RepMixer errors until
+	 *    Phase 6 wires it. */
+	for (i = 0; i < cfg->n_layers; i++) {
+		const struct sam3_mobileclip_layer *Lslot = &enc->layers[i];
+		if (Lslot->is_repmixer) {
+			sam3_log_error(
+				"mobileclip_build: RepMixer block %d "
+				"reached before Phase 6 wired it", i);
+			return NULL;
+		}
+		x = build_std_block(g, &Lslot->u.std, x,
+				    cfg->n_heads, cfg->width,
+				    seq_len, arena);
+		if (!x)
+			return NULL;
+	}
+
+	/* 4. Final layer norm */
+	x = gh_layernorm(g, arena, x, enc->ln_final_w, enc->ln_final_b);
+	if (!x)
+		return NULL;
+
+	/* 5. Inner projection (width -> width). projection_layer is a raw
+	 *    [width, width] tensor used as a right-hand matmul factor.
+	 *    x is [seq_len, width]; result is [seq_len, width]. */
+	x = gh_matmul(g, arena, x, enc->projection_layer);
+	if (!x)
+		return NULL;
+
+	/* 6. External 256-dim projector: out = x @ out_proj_w^T + out_proj_b
+	 *    gh_linear computes input @ weight^T + bias. */
+	out = gh_linear(g, arena, x, enc->out_proj_w, enc->out_proj_b);
+	if (!out)
+		return NULL;
+
+	/* 7. Pooled output: last token (EOT slot = seq_len - 1).
+	 *    Slice [seq_len-1, seq_len) -> [1, out_dim], reshape to [out_dim]. */
+	if (pooled_out) {
+		struct sam3_tensor *last_tok;
+		int p_dims[1];
+
+		last_tok = gh_slice(g, arena, out, 0,
+				    seq_len - 1, seq_len);
+		if (!last_tok)
+			return NULL;
+
+		p_dims[0] = cfg->out_dim;
+		*pooled_out = gh_reshape(g, arena, last_tok,
+					 1, p_dims);
+		if (!*pooled_out)
+			return NULL;
+	}
+
+	return out;
 }
 
 struct sam3_tensor *sam3_mobileclip_text_build_perblock(
