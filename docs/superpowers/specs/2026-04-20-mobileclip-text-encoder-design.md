@@ -75,11 +75,11 @@ by a config struct loaded from a `static const` table at module init:
 
 | Variant            | n_layers | width | n_heads | mlp_dim | ctx_len | out_dim | RepMixer blocks |
 |--------------------|----------|-------|---------|---------|---------|---------|-----------------|
-| `MOBILECLIP_S0`    | **12**   | 512   | 8       | 2048    | 16      | 256     | **{0, 5}**      |
+| `MOBILECLIP_S0`    | 6        | 512   | 8       | 2048    | 16      | 256     | **{0, 5}**      |
 | `MOBILECLIP_S1`    | 12       | 512   | 8       | 2048    | 16      | 256     | (none)          |
 | `MOBILECLIP_L`     | 12       | 768   | 12      | 3072    | 16      | 256     | (none)          |
 
-(The earlier draft of this spec listed S0 as a 6-layer model with RepMixer at block 0; both numbers came from a guess. The audit confirms S0 has **12 transformer blocks** total, with RepMixer at indices 0 and 5 and standard pre-norm transformer blocks at the other ten indices.)
+(The earlier draft of this spec listed S0 as a 6-layer model with RepMixer at block 0 only. The audit + reference Python confirm S0 has **6 transformer blocks** total; RepMixer blocks live at indices 0 and 5 (the bookends), and indices 1–4 are standard pre-norm transformer blocks.)
 
 Vocab size = 49408 (shared CLIP BPE). Output contract is `[ctx_len, 256]`
 per-token plus `[256]` pooled, matching the existing CLIP encoder so
