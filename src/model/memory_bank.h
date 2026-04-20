@@ -21,8 +21,19 @@
 #include "sam3/sam3_types.h"
 
 struct sam3_memory_entry {
-	struct sam3_tensor *spatial_features; /* [HW, mem_dim] */
+	struct sam3_tensor *spatial_features; /* [HW, mem_dim] maskmem output */
 	struct sam3_tensor *obj_pointer;      /* [hidden_dim=256] (was obj_pointers [n_obj,256]) */
+	/*
+	 * image_features: raw 1x backbone features for this frame, flattened
+	 * to [HW, 256] NHWC. Only populated in SAM 3.1 multiplex paths (the
+	 * decoupled memory attention consumes image-side memory separately
+	 * from maskmem). NULL on SAM 3 (SAM 3 memory attention is single-
+	 * source, doesn't need this).
+	 *
+	 * Python analog: the `image_features` entry saved per frame when
+	 * `save_image_features=True` (SAM 3.1 config).
+	 */
+	struct sam3_tensor *image_features;
 	int    frame_idx;
 	int    is_conditioning;
 	float  obj_score; /* max object score for SAM3-Long selection */

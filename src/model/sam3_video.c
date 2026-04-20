@@ -676,6 +676,7 @@ video_track_one_obj(struct sam3_video_session *session,
 	struct sam3_frame_features cf;
 	struct sam3_tensor *spatial_persist = NULL;
 	struct sam3_tensor *obj_ptr_persist = NULL;
+	struct sam3_tensor *image_feat_persist = NULL;
 
 	/* --- 1. Features ------------------------------------------------- */
 	if (shared) {
@@ -917,7 +918,12 @@ video_track_one_obj(struct sam3_video_session *session,
 		is_multiplex ? NULL : track_obj_ptr,
 		NULL, track_score, no_obj_ptr, no_obj_embed);
 
-	/* --- 8. Persist the best obj_ptr ------------------------------- */
+	/* --- 8. Persist the best obj_ptr -------------------------------
+	 *
+	 * SAM 3.1 multiplex: when the object isn't appearing, Python runs the
+	 * raw obj_ptr through `no_obj_ptr_linear` (use_linear_no_obj_ptr=True)
+	 * rather than zeroing it. See video_tracking_multiplex.py:893-895.
+	 */
 	struct sam3_tensor *best_obj_ptr_scratch = NULL;
 	{
 		int op_dims[2] = {1, SAM3_MULTIPLEX_HIDDEN_DIM};
@@ -933,13 +939,27 @@ video_track_one_obj(struct sam3_video_session *session,
 			 * and gated in-place by apply_occlusion_gating. */
 			memcpy(best_obj_ptr_scratch->data,
 			       track_obj_ptr->data, D);
-		} else if (is_appearing) {
-			memcpy(best_obj_ptr_scratch->data,
-			       (const float *)track_obj_ptr->data
-			         + (size_t)best_idx * SAM3_MULTIPLEX_HIDDEN_DIM,
-			       D);
 		} else {
-			memset(best_obj_ptr_scratch->data, 0, D);
+			const float *src_row = (const float *)track_obj_ptr->data
+			  + (size_t)best_idx * SAM3_MULTIPLEX_HIDDEN_DIM;
+			if (is_appearing) {
+				memcpy(best_obj_ptr_scratch->data, src_row, D);
+			} else {
+				/* y = x @ W^T + b with W [256,256], b [256]. */
+				const float *W = (const float *)
+					trk_mux->no_obj_ptr_linear_w->data;
+				const float *b = (const float *)
+					trk_mux->no_obj_ptr_linear_b->data;
+				float *dst = (float *)best_obj_ptr_scratch->data;
+				for (int i = 0; i < SAM3_MULTIPLEX_HIDDEN_DIM; i++) {
+					float acc = b[i];
+					const float *wrow =
+						W + (size_t)i * SAM3_MULTIPLEX_HIDDEN_DIM;
+					for (int j = 0; j < SAM3_MULTIPLEX_HIDDEN_DIM; j++)
+						acc += src_row[j] * wrow[j];
+					dst[i] = acc;
+				}
+			}
 		}
 	}
 
@@ -968,10 +988,17 @@ video_track_one_obj(struct sam3_video_session *session,
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_build");
 	if (is_multiplex) {
 		/*
-		 * Multiplex packing: put the best mask into slot-0 channel 0
-		 * and zero the remaining 31 channels. Proper multiplex
-		 * layout (channels 0..15 active, 16..31 no-obj complements)
-		 * is sub-project 4's concern.
+		 * Multiplex packing for single-object slot 0:
+		 *   channel 0      = sigmoid(mask_logits) * 2 - 1  (mask signal)
+		 *   channel 16     = 1.0 on cond frames, 0.0 otherwise
+		 *                    (condition_as_mask_input_fg/bg = 1.0/0.0)
+		 *   all other channels zero
+		 *
+		 * Python reference: video_tracking_multiplex._encode_new_memory
+		 *   mask_for_mem = sigmoid(logits) * sigmoid_scale_for_mem_enc
+		 *                + sigmoid_bias_for_mem_enc   (2.0, -1.0)
+		 *   maskmem_backbone(..., skip_mask_sigmoid=True)
+		 *   concat([mux_mask_for_mem, cond_value_broadcast], dim=1)
 		 */
 		int pf_H  = cf.feat_s1->dims[1];
 		int pf_W  = cf.feat_s1->dims[2];
@@ -993,21 +1020,33 @@ video_track_one_obj(struct sam3_video_session *session,
 				(const float *)track_masks->data
 				  + (size_t)best_idx * final_h * final_w;
 			float *dst = (float *)multi_mask->data;
+			/*
+			 * SAM 3.1 multiplex mem-enc config (model_builder.py
+			 * build_sam3_multiplex_tracker): scale=2, bias=-1.
+			 * Hard-coded because no other SAM 3.1 variant ships.
+			 */
+			const float mem_scale = 2.0f;
+			const float mem_bias  = -1.0f;
+			const float cond_fg   = is_cond ? 1.0f : 0.0f;
+			const int   cond_ch   = SAM3_MULTIPLEX_COUNT;  /* 16 */
 			for (int y = 0; y < big_H; y++) {
 				int sy = y / up_h;
 				if (sy >= final_h) sy = final_h - 1;
 				for (int x = 0; x < big_W; x++) {
 					int sx = x / up_w;
 					if (sx >= final_w) sx = final_w - 1;
-					dst[((size_t)y * big_W + x)
-					    * mm_C + 0] =
-						src[sy * final_w + sx];
+					float v = src[sy * final_w + sx];
+					float s = 1.0f / (1.0f + expf(-v));
+					size_t base = ((size_t)y * big_W + x)
+						* mm_C;
+					dst[base + 0] = s * mem_scale + mem_bias;
+					dst[base + cond_ch] = cond_fg;
 				}
 			}
 			mem_feat = sam3_multiplex_maskmem_forward(
 				&g, gfx, &trk_mux->maskmem,
 				cf.feat_s1, multi_mask,
-				/*skip_mask_sigmoid=*/0);
+				/*skip_mask_sigmoid=*/1);
 			if (!mem_feat)
 				err = SAM3_ENOMEM;
 		}
@@ -1094,12 +1133,40 @@ video_track_one_obj(struct sam3_video_session *session,
 		goto cleanup;
 	}
 
+	/*
+	 * SAM 3.1 multiplex memory attention consumes raw image features
+	 * per past frame (decoupled cross-attention image side). Clone the
+	 * 1x backbone features (cf.feat_s1) flattened to [HW, 256] into
+	 * session->persist so they survive frame_cache eviction.
+	 */
+	if (is_multiplex && cf.feat_s1) {
+		int iH = cf.feat_s1->dims[1];
+		int iW = cf.feat_s1->dims[2];
+		int iC = cf.feat_s1->dims[3];
+		struct sam3_tensor flat_view = *cf.feat_s1;
+		flat_view.n_dims  = 2;
+		flat_view.dims[0] = iH * iW;
+		flat_view.dims[1] = iC;
+		flat_view.dims[2] = 0;
+		flat_view.dims[3] = 0;
+		sam3_tensor_compute_strides(&flat_view);
+		flat_view.ephemeral = 0;
+		image_feat_persist = sam3_tensor_clone_persist(
+			&session->persist, &flat_view);
+		if (!image_feat_persist) {
+			sam3_log_error("video_track: image_features clone failed");
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
+	}
+
 	/* --- 12. Commit bank entry ------------------------------------- */
 	{
 		struct sam3_memory_entry entry;
 		memset(&entry, 0, sizeof(entry));
 		entry.spatial_features = spatial_persist;
 		entry.obj_pointer      = obj_ptr_persist;
+		entry.image_features   = image_feat_persist;
 		entry.frame_idx        = frame_idx;
 		entry.is_conditioning  = is_cond;
 		entry.obj_score        = compute_eff_iou_score(

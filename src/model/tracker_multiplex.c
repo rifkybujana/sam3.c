@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "tracker_multiplex.h"
+#include "tracker_multiplex_internal.h"
 #include "graph_helpers.h"
 #include "memory_bank.h"
 #include "util/log.h"
@@ -1695,23 +1696,110 @@ struct sam3_tensor *sam3_multiplex_image_pe_layer(
 #define MUX_MAX_MEM_ENTRIES_IN_ATTN 2
 
 /*
- * v2_build_memory_from_bank - Materialise a [1, Nm, 256] memory tensor
- * from the N most-recent entries of a per-object bank.
+ * multiplex_apply_linear_256 - Host-side y = x @ W^T + b for single-vector linear.
  *
- * Lays out all spatial_features rows first, then one obj_ptr row per
- * entry. Also fills @memory_image with the same spatial rows (zeros on
- * the obj_ptr tail) — the image-side K side of the decoupled cross-
- * attention uses these as additive keys.
- *
- * Returns the number of obj_ptr rows appended (i.e. num_k_exclude_rope
- * for memory_attn_forward). Returns -1 on failure; 0 and a valid
- * allocation when there are zero usable entries.
+ * Broadcasts over N contiguous 256-D rows of @src → @dst. Used for the
+ * obj_ptr temporal positional projection where we want to write the
+ * result straight into a specific row of memory_image_pos without a
+ * graph round-trip.
  */
-static int v2_build_memory_from_bank(
+void multiplex_apply_linear_256(float *dst, const float *src, int n_rows,
+			 const float *W, const float *b)
+{
+	const int D = SAM3_MULTIPLEX_HIDDEN_DIM;
+	for (int r = 0; r < n_rows; r++) {
+		const float *x = src + (size_t)r * D;
+		float *y = dst + (size_t)r * D;
+		for (int i = 0; i < D; i++) {
+			float acc = b ? b[i] : 0.0f;
+			const float *wrow = W + (size_t)i * D;
+			for (int j = 0; j < D; j++)
+				acc += x[j] * wrow[j];
+			y[i] = acc;
+		}
+	}
+}
+
+/*
+ * multiplex_sine_tpos_256 - Build a 1D sine/cos temporal positional encoding
+ * at `norm_pos` into a 256-D row.
+ *
+ * Matches get_1d_sine_pe (reference/sam3/sam3/model/sam3_tracker_utils.py):
+ *   first half: sin(norm_pos / temperature^(2*(j/2)/128))
+ *   second half: cos(norm_pos / temperature^(2*(j/2)/128))
+ */
+void multiplex_sine_tpos_256(float *row, float norm_pos)
+{
+	const int pe_dim = SAM3_MULTIPLEX_HIDDEN_DIM / 2;  /* 128 */
+	const float temperature = 10000.0f;
+	for (int j = 0; j < pe_dim; j++) {
+		float exponent = (float)(2 * (j / 2)) / (float)pe_dim;
+		float dim_t = powf(temperature, exponent);
+		float v = norm_pos / dim_t;
+		row[j]          = sinf(v);
+		row[pe_dim + j] = cosf(v);
+	}
+}
+
+/*
+ * multiplex_maskmem_tpos_slot - Python's use_maskmem_tpos_v2 rule:
+ *   idx = num_maskmem - t_rel - 1                    if 0 < t_rel < num_maskmem
+ *   idx = num_maskmem - 1                            otherwise (out of range)
+ *
+ * `t_rel` is the absolute frame distance |current - entry.frame_idx|.
+ * This is a simplification of Python's sign-aware t_pos but matches the
+ * v2 formula whenever current > entry (the common tracking-forward case)
+ * and degrades gracefully to the out-of-range slot otherwise.
+ *
+ * TODO(sub-project 4 / reverse tracking): Python uses
+ *   t_pos = (frame_idx - prev_frame_idx) * tpos_sign_mul
+ * where tpos_sign_mul = -1 when track_in_reverse=True. With SAM3_PROPAGATE_
+ * REVERSE or SAM3_PROPAGATE_BOTH and prev_frame_idx > current_frame_idx,
+ * our abs() collapses what Python would keep signed, so we degrade to the
+ * out-of-range slot (num_maskmem - 1) for all backward entries instead of
+ * using maskmem_tpos_enc[num_maskmem - t_pos - 1] with negative t_pos. Fix
+ * when reverse-direction parity becomes load-bearing.
+ */
+int multiplex_maskmem_tpos_slot(int t_rel)
+{
+	const int N = SAM3_MULTIPLEX_NUM_MASKMEM;  /* 7 */
+	if (t_rel <= 0 || t_rel >= N)
+		return N - 1;
+	return N - t_rel - 1;
+}
+
+/*
+ * multiplex_build_memory_from_bank - Materialise [1, Nm, 256] memory, memory_image
+ * and memory_image_pos tensors from the N most-recent entries of a per-
+ * object bank.
+ *
+ * Layout:
+ *   rows [0 .. total_spatial):
+ *     memory[r]           = entry.spatial_features (maskmem output)
+ *     memory_image[r]     = entry.image_features   (raw backbone 1x feats)
+ *     memory_image_pos[r] = image_pe[r_in_frame] + maskmem_tpos_enc[slot]
+ *   rows [total_spatial .. Nm):
+ *     memory[r]           = entry.obj_pointer
+ *     memory_image[r]     = 0   (image K side gets zero contribution here)
+ *     memory_image_pos[r] = obj_ptr_tpos_proj(sine_pe(t_diff))
+ *
+ * Mirrors Python video_tracking_multiplex._prepare_memory_conditioned_features
+ * + decoder.TransformerEncoderDecoupledCrossAttention.forward: memory_image_pos
+ * is padded to match memory by copying the obj_ptr tail from memory_pos so a
+ * single K = k_img + k_mem + memory_image_pos is correct.
+ *
+ * Returns num_k_exclude_rope (= number of obj_ptr rows) on success, or
+ * -1 on failure.
+ */
+static int multiplex_build_memory_from_bank(
 		struct sam3_arena *arena,
+		const struct sam3_tracker_multiplex *trk,
 		const struct sam3_memory_bank *bank,
+		int current_frame_idx,
+		const struct sam3_tensor *image_pe,
 		struct sam3_tensor **out_memory,
 		struct sam3_tensor **out_memory_image,
+		struct sam3_tensor **out_memory_image_pos,
 		int *out_Nm)
 {
 	const struct sam3_memory_entry *picks[MUX_MAX_MEM_ENTRIES_IN_ATTN];
@@ -1731,14 +1819,19 @@ static int v2_build_memory_from_bank(
 	if (n_pick == 0) {
 		*out_memory = NULL;
 		*out_memory_image = NULL;
+		*out_memory_image_pos = NULL;
 		*out_Nm = 0;
 		return 0;
 	}
 
+	const int D  = SAM3_MULTIPLEX_HIDDEN_DIM;
+	const int HW = image_pe ? image_pe->dims[0] : -1;
 	int total_spatial = 0;
 	int total_obj_ptrs = 0;
 	for (int i = 0; i < n_pick; i++) {
-		if (picks[i]->spatial_features->dims[1] != SAM3_MULTIPLEX_HIDDEN_DIM)
+		if (picks[i]->spatial_features->dims[1] != D)
+			return -1;
+		if (HW > 0 && picks[i]->spatial_features->dims[0] != HW)
 			return -1;
 		total_spatial += picks[i]->spatial_features->dims[0];
 		if (picks[i]->obj_pointer)
@@ -1746,46 +1839,126 @@ static int v2_build_memory_from_bank(
 	}
 	int Nm = total_spatial + total_obj_ptrs;
 
-	int dims[3] = {1, Nm, SAM3_MULTIPLEX_HIDDEN_DIM};
+	int dims[3] = {1, Nm, D};
 	struct sam3_tensor *memory = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
 						     3, dims);
 	struct sam3_tensor *memory_image = gh_alloc_tensor(arena,
 							   SAM3_DTYPE_F32,
 							   3, dims);
-	if (!memory || !memory_image)
+	struct sam3_tensor *memory_image_pos = gh_alloc_tensor(
+		arena, SAM3_DTYPE_F32, 3, dims);
+	if (!memory || !memory_image || !memory_image_pos)
 		return -1;
 	memset(memory->data, 0, memory->nbytes);
 	memset(memory_image->data, 0, memory_image->nbytes);
+	memset(memory_image_pos->data, 0, memory_image_pos->nbytes);
 
-	float *mp = (float *)memory->data;
+	float *mp  = (float *)memory->data;
 	float *mip = (float *)memory_image->data;
+	float *mpp = (float *)memory_image_pos->data;
+	const float *pe = image_pe ? (const float *)image_pe->data : NULL;
+	const float *tpos_base = trk->maskmem_tpos_enc
+		? (const float *)trk->maskmem_tpos_enc->data
+		: NULL;
+
 	size_t row = 0;
 
-	/* Pass 1: all spatial rows. */
+	/* One-shot warn across the whole function call when the fallback
+	 * fires. The fallback is reachable in principle (a SAM 3 memory
+	 * entry reused by a SAM 3.1 session) but shouldn't hit in
+	 * production — sam3_video.c clones cf.feat_s1 into every SAM 3.1
+	 * bank entry at commit time. If this warning prints, a stale
+	 * entry leaked in. */
+	int warned_missing_image_feat = 0;
+
+	/* Pass 1: spatial rows for each picked frame. */
 	for (int i = 0; i < n_pick; i++) {
 		const struct sam3_tensor *sf = picks[i]->spatial_features;
-		size_t n = (size_t)sf->dims[0] * SAM3_MULTIPLEX_HIDDEN_DIM;
-		memcpy(mp  + row * SAM3_MULTIPLEX_HIDDEN_DIM, sf->data,
-		       n * sizeof(float));
-		memcpy(mip + row * SAM3_MULTIPLEX_HIDDEN_DIM, sf->data,
-		       n * sizeof(float));
-		row += sf->dims[0];
+		const struct sam3_tensor *ife = picks[i]->image_features;
+		int n_rows = sf->dims[0];
+		size_t base = row * D;
+		memcpy(mp + base, sf->data,
+		       (size_t)n_rows * D * sizeof(float));
+		if (ife && ife->data && ife->dims[0] == n_rows
+		    && ife->dims[1] == D) {
+			memcpy(mip + base, ife->data,
+			       (size_t)n_rows * D * sizeof(float));
+		} else {
+			/* Older SAM 3 entries may lack image_features; fall
+			 * back to spatial_features so the K-side addition is
+			 * at least coherent. This should not hit on SAM 3.1
+			 * in practice because sam3_video clones feat_s1 at
+			 * commit time. */
+			if (!warned_missing_image_feat) {
+				sam3_log_warn("multiplex_build_memory_from_bank: "
+					      "entry frame %d missing "
+					      "image_features; falling back "
+					      "to maskmem spatial features "
+					      "(stale SAM 3 entry?)",
+					      picks[i]->frame_idx);
+				warned_missing_image_feat = 1;
+			}
+			memcpy(mip + base, sf->data,
+			       (size_t)n_rows * D * sizeof(float));
+		}
+
+		/* memory_image_pos: image_pe + maskmem_tpos_enc[slot]. */
+		int t_rel = current_frame_idx - picks[i]->frame_idx;
+		if (t_rel < 0)
+			t_rel = -t_rel;
+		int slot = multiplex_maskmem_tpos_slot(t_rel);
+		const float *tpos = tpos_base
+			? tpos_base + (size_t)slot * D
+			: NULL;
+		for (int r = 0; r < n_rows; r++) {
+			float *dst = mpp + base + (size_t)r * D;
+			const float *pe_row = pe
+				? pe + (size_t)r * D
+				: NULL;
+			for (int c = 0; c < D; c++) {
+				float v = pe_row ? pe_row[c] : 0.0f;
+				if (tpos) v += tpos[c];
+				dst[c] = v;
+			}
+		}
+		row += n_rows;
 	}
-	/* Pass 2: obj_ptr rows (no image-side contribution). */
+
+	/* Pass 2: obj_ptr rows — memory gets pointer, image zeros,
+	 * memory_image_pos gets obj_ptr_tpos_proj(sine_pe(t_diff)). */
+	const float *W = trk->obj_ptr_tpos_proj_w
+		? (const float *)trk->obj_ptr_tpos_proj_w->data : NULL;
+	const float *B = trk->obj_ptr_tpos_proj_b
+		? (const float *)trk->obj_ptr_tpos_proj_b->data : NULL;
+	/* Normalization denominator from Python: max_obj_ptrs_in_encoder - 1.
+	 * SAM 3.1 uses 16 obj_ptrs in encoder (model_builder default). */
+	const float max_obj_ptrs_in_enc = 16.0f;
+	const float t_diff_max = max_obj_ptrs_in_enc - 1.0f;
+	float sine_row[SAM3_MULTIPLEX_HIDDEN_DIM];
 	for (int i = 0; i < n_pick; i++) {
 		if (!picks[i]->obj_pointer)
 			continue;
 		const struct sam3_tensor *op = picks[i]->obj_pointer;
 		int n_elems = sam3_tensor_nelems(op);
-		if (n_elems < SAM3_MULTIPLEX_HIDDEN_DIM)
-			continue;  /* malformed; skip */
-		memcpy(mp + row * SAM3_MULTIPLEX_HIDDEN_DIM, op->data,
-		       SAM3_MULTIPLEX_HIDDEN_DIM * sizeof(float));
+		if (n_elems < D)
+			continue;
+		size_t base = row * D;
+		memcpy(mp + base, op->data, D * sizeof(float));
+		/* memory_image row already zero from memset. */
+
+		if (W && B) {
+			int t_rel = current_frame_idx - picks[i]->frame_idx;
+			float norm_pos = (t_rel < 0 ? -(float)t_rel : (float)t_rel)
+				/ t_diff_max;
+			multiplex_sine_tpos_256(sine_row, norm_pos);
+			multiplex_apply_linear_256(mpp + base, sine_row, 1, W, B);
+		}
 		row++;
 	}
 
 	*out_memory = memory;
 	*out_memory_image = memory_image;
+	*out_memory_image_pos = memory_image_pos;
 	*out_Nm = Nm;
 	return total_obj_ptrs;
 }
@@ -1858,6 +2031,17 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 
 	struct sam3_tensor *pix_feat_with_mem = NULL;
 
+	/*
+	 * Dense positional encoding is deterministic in (H, W, basis) and
+	 * is consumed by both the memory attention (as K-side memory_image_pos
+	 * spatial rows) and the mask decoder. Compute it once up front and
+	 * share.
+	 */
+	struct sam3_tensor *image_pe = sam3_multiplex_image_pe_layer(
+		g, arena, trk->image_pe_gauss, H, W);
+	if (!image_pe)
+		return SAM3_ENOMEM;
+
 	int total_entries = bank ? sam3_memory_bank_total(bank) : 0;
 	int use_memory_attn = (bank != NULL) && (total_entries > 0);
 
@@ -1883,15 +2067,11 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 	} else {
 		/*
 		 * Memory path: flatten image_embed to [1, HW, 256], build
-		 * memory inputs from the bank, run the 4-layer decoupled
-		 * transformer, reshape back to [1, H, W, 256].
-		 *
-		 * NOTE: the image-side K projection of the decoupled cross-
-		 * attention consumes `memory_image` — we fill it with the
-		 * same spatial rows as `memory` (zero tail for obj_ptrs).
-		 * Not physically the "current-frame image features broadcast
-		 * across the memory axis" that Python uses, but good enough
-		 * for the phase-2.5 plumbing test.
+		 * memory inputs from the bank (with per-entry maskmem_tpos_enc
+		 * and obj_ptr_tpos_proj position encodings on memory_image_pos),
+		 * run the 4-layer decoupled transformer, reshape back to
+		 * [1, H, W, 256]. Mirrors Python:
+		 *   video_tracking_multiplex._prepare_memory_conditioned_features
 		 */
 		int tgt_dims[3] = {1, HW, D};
 		struct sam3_tensor *tgt = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
@@ -1903,9 +2083,11 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 
 		struct sam3_tensor *memory = NULL;
 		struct sam3_tensor *memory_image = NULL;
+		struct sam3_tensor *memory_image_pos = NULL;
 		int Nm = 0;
-		int num_k_exclude = v2_build_memory_from_bank(
-			arena, bank, &memory, &memory_image, &Nm);
+		int num_k_exclude = multiplex_build_memory_from_bank(
+			arena, trk, bank, frame_idx, image_pe,
+			&memory, &memory_image, &memory_image_pos, &Nm);
 		if (num_k_exclude < 0 || !memory || !memory_image || Nm == 0) {
 			sam3_log_warn("tracker_multiplex_track_frame: memory build "
 				      "failed, falling back to no_mem path");
@@ -1927,7 +2109,8 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 				sam3_multiplex_memory_attn_forward(
 					g, arena, &trk->transformer,
 					tgt, NULL, tgt,
-					memory, memory_image, NULL,
+					memory, memory_image,
+					memory_image_pos,
 					W, num_k_exclude);
 			if (!cond_2d)
 				return SAM3_ENOMEM;
@@ -1939,21 +2122,36 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		}
 	}
 
-	/* Dense positional encoding for the multiplex mask decoder. */
-	struct sam3_tensor *image_pe = sam3_multiplex_image_pe_layer(
-		g, arena, trk->image_pe_gauss, H, W);
-	if (!image_pe)
-		return SAM3_ENOMEM;
+	/* Build extra_per_object [16, 256] from output_valid/invalid_embed
+	 * (add_output_suppression_embeddings=True). For this single-object
+	 * path slot 0 is the only active slot; slots 1..15 use the invalid
+	 * embed. Python: video_tracking_multiplex.py:795-801. */
+	struct sam3_tensor *extra_per_object = NULL;
+	if (trk->output_valid_embed && trk->output_invalid_embed) {
+		int ex_dims[2] = {SAM3_MULTIPLEX_COUNT, SAM3_MULTIPLEX_HIDDEN_DIM};
+		extra_per_object = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						   2, ex_dims);
+		if (!extra_per_object)
+			return SAM3_ENOMEM;
+		const float *valid = (const float *)trk->output_valid_embed->data;
+		const float *invalid = (const float *)trk->output_invalid_embed->data;
+		float *dst = (float *)extra_per_object->data;
+		for (int slot = 0; slot < SAM3_MULTIPLEX_COUNT; slot++) {
+			const float *src = (slot == 0) ? valid : invalid;
+			memcpy(dst + slot * SAM3_MULTIPLEX_HIDDEN_DIM,
+			       src + slot * SAM3_MULTIPLEX_HIDDEN_DIM,
+			       SAM3_MULTIPLEX_HIDDEN_DIM * sizeof(float));
+		}
+	}
 
-	/* Multiplex mask decoder. extra_per_object = NULL (single-object
-	 * plumbing; multiplex joint forward is sub-project 4). */
 	struct sam3_tensor *all_masks = NULL;
 	struct sam3_tensor *all_iou   = NULL;
 	struct sam3_tensor *all_score = NULL;
 	struct sam3_tensor *all_sam   = NULL;
 	enum sam3_error err = sam3_multiplex_mask_decoder_forward(
 		g, arena, &trk->sam_mask_decoder,
-		pix_feat_with_mem, image_pe, feat_s1, feat_s0, NULL,
+		pix_feat_with_mem, image_pe, feat_s1, feat_s0,
+		extra_per_object,
 		&all_masks, &all_iou, &all_score, &all_sam);
 	if (err != SAM3_OK)
 		return err;
