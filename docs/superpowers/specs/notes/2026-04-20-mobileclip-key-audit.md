@@ -3,7 +3,7 @@
 Resolutions of TBD items from the design spec, derived from inspecting
 the three .pt checkpoints in `models/`.
 
-## Standard-block keys (S1/L, S0 blocks 1-4 and 6-11 [note: see RepMixer section])
+## Standard-block keys (S1/L, S0 blocks 1-4)
 
 Verified prefix: `detector.backbone.language_backbone.encoder.transformer.<N>`
 
@@ -56,7 +56,10 @@ not `language_backbone.encoder.*`).
 
 **Correction from design spec**: the design spec anticipated RepMixer only
 in block 0. In the S0 checkpoint, blocks **0 and 5** are RepMixer blocks;
-blocks 1–4 and 6–11 are standard transformer blocks.
+blocks 1–4 are standard transformer blocks. S0 has **6 transformer blocks
+total** (indices 0–5), confirmed by `inspect_mobileclip_pt.py` and by the
+reference Python (`_create_student_text_encoder` instantiates a 6-layer
+RepMixer-augmented MobileCLIP for S0).
 
 Verbatim inspector output for block 0 and block 5 (lines 7–34 and 83–110
 of /tmp/s0_keys.txt):

@@ -11,20 +11,23 @@
 **Spec:** `docs/superpowers/specs/2026-04-20-mobileclip-text-encoder-design.md`
 **Audit:** `docs/superpowers/specs/notes/2026-04-20-mobileclip-key-audit.md` (Phase 0 .pt key inventory)
 
-> **Revision note (2026-04-20, post-Phase-0):** The Phase 0 audit changed the
-> RepMixer design: S0 has **12** transformer blocks total with RepMixer at
-> indices **{0, 5}** (not just block 0), and MobileOne reparameterization is
-> NOT collapsed at export — both RepMixer blocks ship parallel BN/conv
-> branches that must be summed at inference. Variant config now carries
-> `n_repmixer_blocks` + `repmixer_block_indices[]` instead of a boolean,
-> and the per-layer struct is a tagged union (std vs repmixer). The
-> verified RepMixer arithmetic lives in the **spec** under "RepMixer
-> block (S0 blocks 0 and 5) — verified from reference"; treat that as
-> the authoritative source if any code snippet below contradicts it.
-> Tasks 4.3, 4.5, 6.1, and 6.2 were drafted before the audit and contain
-> stale `has_repmixer_block_0` / `repmixer_block_0` references — the
-> implementer for those tasks must adapt to the tagged-union layer
-> layout shown in Task 4.1.
+> **Revision note (2026-04-20, post-Phase-0):** The Phase 0 audit + reference
+> Python check changed the RepMixer design:
+> - **S0 has 6 transformer blocks total** (indices 0–5; not 12 as the audit
+>   doc initially extrapolated). RepMixer at indices **{0, 5}** (the
+>   bookends), standard pre-norm transformer blocks at {1, 2, 3, 4}.
+> - **MobileOne reparameterization is NOT collapsed** at export — both
+>   RepMixer blocks ship parallel BN/conv branches that must be summed at
+>   inference (see spec section "RepMixer block (S0 blocks 0 and 5) —
+>   verified from reference" for exact arithmetic).
+>
+> Variant config now carries `n_repmixer_blocks` + `repmixer_block_indices[]`
+> instead of a boolean, and the per-layer struct is a tagged union (std vs
+> repmixer). Tasks 4.3, 4.5, 6.1, and 6.2 were drafted before the audit and
+> contain stale `has_repmixer_block_0` / `repmixer_block_0` references — the
+> implementer for those tasks must adapt to the tagged-union layer layout
+> shown in Task 4.1. **Treat the spec as authoritative** if any code snippet
+> below contradicts it.
 
 ---
 
@@ -1411,7 +1414,7 @@ Create `src/model/mobileclip_text.c`:
 
 static const struct sam3_mobileclip_config mobileclip_s0 = {
 	.text_backbone           = SAM3_TEXT_MOBILECLIP_S0,
-	.n_layers                = 12,
+	.n_layers                = 6,
 	.width                   = 512,
 	.n_heads                 = 8,
 	.mlp_dim                 = 2048,
