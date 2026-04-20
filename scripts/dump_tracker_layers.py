@@ -179,6 +179,30 @@ def _register_hooks(model, captures):
     for i, layer in enumerate(model.transformer.encoder.layers):
         hooks.append(layer.register_forward_hook(
             _cap(f"memattn_layer{i}")))
+
+    # Sub-drill (iteration 4): capture image features pre-flatten by
+    # monkey-patching `_prepare_memory_conditioned_features` on the
+    # model instance. `current_vision_feats[-1]` is [HW, 1, C] (the
+    # top-level feature map after backbone+neck, already in (HW)BC
+    # layout but BEFORE the expand(-1, B, -1) broadcast to 16 buckets).
+    # Byte-layout matches C's [1, H, W, C] NHWC image_embed since HW
+    # is contiguous and C is innermost.
+    _orig = model._prepare_memory_conditioned_features
+
+    def _patched_prepare(*args, **kwargs):
+        cvf = kwargs.get("current_vision_feats")
+        if isinstance(cvf, (list, tuple)) and len(cvf) > 0 \
+                and isinstance(cvf[-1], torch.Tensor):
+            captures.setdefault("image_embed", []).append(cvf[-1])
+        return _orig(*args, **kwargs)
+
+    model._prepare_memory_conditioned_features = _patched_prepare
+
+    class _UnpatchHandle:
+        def remove(self_inner):
+            model._prepare_memory_conditioned_features = _orig
+    hooks.append(_UnpatchHandle())
+
     return hooks
 
 
@@ -227,6 +251,19 @@ def _flush_captures_delta(captures, cursors, frame_idx):
     preserves frame-index numbering regardless of which path each
     frame took inside the upstream forward.
     """
+    # Sub-drill (iteration 4): image_embed = current_vision_feats[-1]
+    # (HW, 1, C), captured pre-expand by the monkey-patch on
+    # _prepare_memory_conditioned_features. Same byte layout as C's
+    # [1, H, W, C] NHWC image_embed.
+    slot = "image_embed"
+    start = cursors.get(slot, 0)
+    end = len(captures.get(slot, []))
+    if end > start:
+        t = captures[slot][end - 1]
+        if isinstance(t, torch.Tensor):
+            _dump(f"/tmp/py_trk_image_embed_f{frame_idx}.bin", t)
+    cursors[slot] = end
+
     slot = "memattn_out"
     start = cursors.get(slot, 0)
     end = len(captures.get(slot, []))

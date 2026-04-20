@@ -70,6 +70,7 @@ struct sam3_tensor *sam3_dbg_xformer_layer0_q = NULL;
 /* Tracker-path dump slots (level 0). Populated by tracker_multiplex.c
  * during each frame; flushed to /tmp/dbg_trk_<slot>_f<frame>.bin after
  * graph_eval. All tensors are F32 NHWC or flat 2-D / 3-D. */
+struct sam3_tensor *sam3_dbg_trk_image_embed       = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_out       = NULL;
 struct sam3_tensor *sam3_dbg_trk_mask_dec_masks    = NULL;
 struct sam3_tensor *sam3_dbg_trk_mask_dec_iou      = NULL;
@@ -858,6 +859,7 @@ video_track_one_obj(struct sam3_video_session *session,
 				sam3_dbg_trk_##slot = NULL; \
 			} \
 		} while (0)
+		DUMP_TRK(image_embed);
 		DUMP_TRK(memattn_out);
 		DUMP_TRK(mask_dec_masks);
 		DUMP_TRK(mask_dec_iou);

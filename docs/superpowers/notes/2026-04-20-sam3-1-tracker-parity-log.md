@@ -300,3 +300,103 @@ state. Concrete actions:
    maskmem_tpos_enc` is a separate bug in the pos-enc builder in
    `multiplex_build_memory_from_bank` (tracker_multiplex.c:1905).
 
+## Iteration 4 — sub-drill: image_embed vs tgt (2026-04-20)
+
+### Setup
+
+- Goal: isolate whether the frame-1 `tgt` divergence (cos=0.573)
+  originates in the reshape from `image_embed` → `tgt`, or upstream
+  at the image-features source itself.
+- C side: added `sam3_dbg_trk_image_embed` slot, assigned at the top
+  of `sam3_tracker_multiplex_track_frame` (the 4-D NHWC
+  `[1, 72, 72, 256]` feature map passed in as the first tensor
+  argument, before any processing).
+- Python side: monkey-patched
+  `model._prepare_memory_conditioned_features` to capture
+  `current_vision_feats[-1]` — the top-level backbone/neck output in
+  `(HW, 1, C) = (5184, 1, 256)` layout, pre-`expand(-1, B, -1)`.
+  Byte layout matches C's NHWC `[1, H, W, C]` (HW contiguous, C
+  innermost).
+- Both sides produce exactly 1,327,104 F32 values per frame (=
+  5184 × 256). Same commands as iteration 1/3.
+
+### Results
+
+```
+# Tracker layer parity diff (cosine threshold: 0.99)
+# Frames compared: [1, 2]
+
+image_embed_f1   cos=0.57287 abs_max=4.686 abs_mean=0.4881 rel=111.642% <--- FIRST DIVERGENCE
+tgt_f1           cos=0.57287 abs_max=4.686 abs_mean=0.4881 rel=111.642% <--- FIRST DIVERGENCE
+memory_f1        cos=0.49205 abs_max=10.24 abs_mean=0.4854 rel=108.052% [trunc 5185 rows]
+memory_image_f1  cos=0.57695 abs_max=3.619 abs_mean=0.4942 rel=111.702% [trunc 5184 rows]
+memory_image_pos_f1 cos=0.08799 abs_max=2    abs_mean=0.7937 rel=134.469% [trunc 5184 rows]
+memattn_layer0_f1   cos=0.01169 ...
+...
+image_embed_f2   cos=0.57369 abs_max=4.615 abs_mean=0.489  rel=111.695% <--- FIRST DIVERGENCE
+tgt_f2           cos=0.57369 abs_max=4.615 abs_mean=0.489  rel=111.695% <--- FIRST DIVERGENCE
+```
+
+### Analysis
+
+- **`image_embed_f1` and `tgt_f1` have BYTE-IDENTICAL parity metrics**
+  on both frames: cos=0.57287 (f1) and cos=0.57369 (f2), with the same
+  abs_max, abs_mean, and relative error to five significant figures.
+  This confirms that C's memcpy from `image_embed` → `tgt` is lossless
+  (as expected — it's a literal `memcpy` of the same byte-layout
+  tensor), and Python's `vision_feat = current_vision_feats[-1]
+  .expand(-1, B, -1)` followed by slicing the B=1 plane is likewise
+  byte-equal to the pre-expand source.
+- **The divergence originates UPSTREAM of the tracker**: the feature
+  tensor handed to the tracker already disagrees at cos=0.573 before
+  any memory-attention or reshape work begins. The tracker is NOT the
+  source of the bug; it is a downstream victim.
+- cos ≈ 0.57 at the top-of-memory-attn input with abs_mean ≈ 0.49 and
+  rel ≈ 111 % is consistent with the image-encoder output genuinely
+  differing in both magnitude AND direction — not a simple off-by-one,
+  scale, or transpose. It rules out (a) NHWC↔NCHW confusion (that
+  would keep the values but permute the order, leaving cos high if we
+  flatten identically on both sides), (b) an obj-ptr pre-pad mis-count
+  (image_embed has no obj-ptr rows), and (c) the memory-bank pos-enc
+  bug flagged in iteration 3 (that feeds only into `memory_image_pos`,
+  not `image_embed`).
+- The divergence is symmetric across frame 1 and frame 2 (0.57287 vs
+  0.57369) but _frame 0_'s C dump matches upstream — that is, the
+  seed frame's mask-decoder output agreed in earlier iterations. The
+  difference therefore appears specifically on propagation frames
+  where the C engine's image-features pipeline is re-invoked against
+  a new frame load, suggesting:
+  1. Frame-loading divergence (C uses libffmpeg; Python uses cv2) —
+     uint8 RGB bytes may differ at frame 1+ due to codec / colour-
+     space / chroma-subsampling handling.
+  2. Image-encoder / neck output divergence on non-seed frames,
+     possibly from a frame-cache or state-mutation artefact.
+  3. Preprocessing (mean/std / resize / letterbox) misalignment on
+     propagation frames that does not manifest on frame 0 because
+     frame 0 takes a different code path in both engines.
+
+### Interpretation
+
+**Upstream feature disagreement.** The tracker reshape is not the
+bug. The image features that feed the tracker already diverge at
+cos=0.573 on frame 1 and frame 2.
+
+### Next step
+
+The next drill must target the image-features pipeline on propagation
+frames. In priority order:
+
+1. **Frame-bytes comparison.** Dump `feat_s1` on both sides (the
+   direct output of neck) for frame 1 and frame 2, AND the raw
+   pre-preprocess uint8 RGB frame fed into the image encoder. If the
+   uint8 bytes already disagree, the decoder is the culprit (ffmpeg
+   vs cv2). If uint8 bytes match but `feat_s1` disagrees, the image
+   encoder or neck is running with a different state on propagation
+   frames.
+2. **Verify `feat_s1` at frame 0 still matches.** If the C seed-mask
+   at frame 0 is produced from the _same_ `feat_s1` layout and it
+   agrees with Python, then whatever breaks on frames 1/2 is
+   frame-load / pipeline specific — not a static mis-wiring.
+3. Only once image-features parity holds should we revisit the
+   tracker bank / pos-enc findings from iteration 3.
+

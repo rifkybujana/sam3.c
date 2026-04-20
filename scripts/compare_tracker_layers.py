@@ -49,6 +49,13 @@ def _reshape_memattn(arr, side):
     return arr.reshape(5184, 256).reshape(-1)
 
 
+def _reshape_image_embed(arr, side):
+    # C: [1, 72, 72, 256] NHWC; Py: [5184, 1, 256]. Both are the same
+    # 1,327,104 floats with matching byte layout (HW contiguous, C
+    # innermost). Flatten either way for bytewise cosine.
+    return arr.reshape(-1)
+
+
 def _reshape_tgt(arr, side):
     # Both sides are batch-first [1, HW=5184, 256] at encoder entry
     # (Py's encoder has batch_first=True so the forward-hook kwargs see
@@ -83,6 +90,18 @@ LEVEL0_FRAMES = [1, 2]  # overlap of C and Python dumps
 PAIRS = []
 for f in LEVEL0_FRAMES:
     PAIRS.extend([
+        # Sub-drill (iteration 4): image features pre-flatten on both
+        # sides. C dumps image_embed from tracker_multiplex_track_frame's
+        # parameter (the 4-D NHWC feature map from the neck). Python
+        # dumps current_vision_feats[-1] (HW,1,C) captured by the
+        # monkey-patch on _prepare_memory_conditioned_features. If
+        # image_embed matches but tgt diverges, the reshape/permute
+        # from image_embed to tgt is the bug; if both diverge at
+        # similar magnitude, the source feature already disagrees.
+        (f"image_embed_f{f}",
+         f"/tmp/dbg_trk_image_embed_f{f}.bin",
+         f"/tmp/py_trk_image_embed_f{f}.bin",
+         _reshape_image_embed),
         # Task 5γ bank-input slots: inputs to memory-attn layer 0.
         # `tgt` (= encoder's `src` kwarg) has fixed HW=5184 rows;
         # `memory` / `memory_image` / `memory_image_pos` have a

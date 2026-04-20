@@ -1996,6 +1996,13 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		return SAM3_EINVAL;
 	}
 
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_image_embed;
+		sam3_dbg_trk_image_embed = image_embed;
+	}
+#endif
+
 	const int H = image_embed->dims[1];
 	const int W = image_embed->dims[2];
 	const int HW = H * W;
