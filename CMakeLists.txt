@@ -22,6 +22,9 @@ option(SAM3_E2E_TESTS
 	"Build end-to-end video integration tests" OFF)
 option(SAM3_BUILD_PARITY_TESTS
 	"Build end-to-end Python-parity tests (requires fixtures)" OFF)
+set(SAM3_PARITY_VARIANT "sam3_1" CACHE STRING
+	"Variant for test_video_parity_kids {sam3, sam3_1}")
+set_property(CACHE SAM3_PARITY_VARIANT PROPERTY STRINGS sam3 sam3_1)
 set(SAM3_TEST_MODEL "" CACHE STRING
 	"Path to a .sam3 model file used by E2E tests")
 
@@ -354,11 +357,17 @@ if(SAM3_TESTS)
 			SAM3_TEST_MODEL="${SAM3_TEST_MODEL}")
 	endif()
 
-	# test_video_parity_kids needs source dir and model path at build time
+	# test_video_parity_kids needs source dir, model path, and variant
 	if(TARGET test_video_parity_kids)
 		target_compile_definitions(test_video_parity_kids PRIVATE
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-			SAM3_TEST_MODEL="${SAM3_TEST_MODEL}")
+			SAM3_TEST_MODEL="${SAM3_TEST_MODEL}"
+			SAM3_PARITY_VARIANT_${SAM3_PARITY_VARIANT}=1)
+		target_sources(test_video_parity_kids PRIVATE
+			${CMAKE_SOURCE_DIR}/tests/test_helpers_png.c)
+		target_include_directories(test_video_parity_kids PRIVATE
+			${CMAKE_SOURCE_DIR}/src
+			${CMAKE_SOURCE_DIR}/tests)
 	endif()
 
 	# test_bench needs the bench harness library
