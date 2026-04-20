@@ -120,6 +120,15 @@ enum sam3_variant {
 	SAM3_VARIANT_SAM3_1 = 1,
 };
 
+/* Text encoder backbone variant. Stored in the .sam3 v4 header.
+ * v3 files (no field) load as SAM3_TEXT_CLIP for backward compat. */
+enum sam3_text_backbone {
+	SAM3_TEXT_CLIP            = 0,
+	SAM3_TEXT_MOBILECLIP_S0   = 1,
+	SAM3_TEXT_MOBILECLIP_S1   = 2,
+	SAM3_TEXT_MOBILECLIP_L    = 3,
+};
+
 /* Model configuration loaded from weights file. */
 struct sam3_model_config {
 	int image_size;       /* Input image size (e.g., 1024) */
@@ -130,6 +139,7 @@ struct sam3_model_config {
 	int backbone_type;    /* enum sam3_backbone_type */
 	int n_fpn_scales;     /* 3 (SAM 3.1) or 4 (SAM 3) */
 	int variant;          /* enum sam3_variant */
+	int text_backbone;    /* enum sam3_text_backbone */
 };
 
 /* Propagation direction for video tracking. */
