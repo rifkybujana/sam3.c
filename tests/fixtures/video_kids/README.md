@@ -27,3 +27,14 @@ checked in as binary blobs when the reference behavior is blessed.
 The C parity test (`tests/test_video_parity_kids.c`) is built only
 when `cmake -DSAM3_BUILD_PARITY_TESTS=ON`. Without that flag, the
 test source is excluded from the build.
+
+## Variants
+
+- **SAM 3** (this directory's `frames/`): see regen steps above. Still
+  scaffolded — the C parity test is a stub pending a PNG loader and
+  blessed reference outputs.
+- **SAM 3.1**: see [`sam3_1/README.md`](sam3_1/README.md). C-seeded,
+  Python-propagated; C side fully wired, committed `seed_mask.png` +
+  `frames/frame_000{1,2,3}_obj_1.png` are needed for the parity test
+  to run (otherwise it SKIPs). Select via
+  `cmake -DSAM3_PARITY_VARIANT=sam3_1`.

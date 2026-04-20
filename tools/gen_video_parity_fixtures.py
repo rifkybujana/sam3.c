@@ -121,6 +121,27 @@ def _build_sam3_1_demo_model(checkpoint):
     return model
 
 
+def _patch_load_video_frames():
+    """Upstream VideoTrackingMultiplexDemo.init_state passes
+    use_torchcodec / use_cv2 kwargs to load_video_frames, but the
+    packaged load_video_frames doesn't accept them. Wrap it to swallow
+    those kwargs."""
+    from sam3.model.utils import sam2_utils as _u
+    orig = _u.load_video_frames
+
+    def _wrapped(*a, **kw):
+        kw.pop("use_torchcodec", None)
+        kw.pop("use_cv2", None)
+        return orig(*a, **kw)
+
+    _u.load_video_frames = _wrapped
+    # init_state may already have captured the symbol at import time;
+    # also patch the demo module's namespace.
+    import sam3.model.video_tracking_multiplex_demo as _demo
+    if hasattr(_demo, "load_video_frames"):
+        _demo.load_video_frames = _wrapped
+
+
 def _init_state_sam3_1(model, video_path, offload_video_to_cpu=True):
     """Invoke the VideoTrackingMultiplexDemo base-class init_state that
     accepts a video_path. The Sam3VideoTrackingMultiplexDemo subclass
@@ -128,6 +149,7 @@ def _init_state_sam3_1(model, video_path, offload_video_to_cpu=True):
     (video_height/video_width/num_frames, pre-loaded); we bypass that
     override by calling the base unbound method.
     """
+    _patch_load_video_frames()
     from sam3.model.video_tracking_multiplex_demo import (
         VideoTrackingMultiplexDemo,
     )

@@ -82,10 +82,11 @@ int main(void)
 
 /* --- SAM 3.1 variant: C-seeded parity run --- */
 
-#define MODEL_PATH   SAM3_SOURCE_DIR "/models/sam3.1.sam3"
-#define VIDEO_PATH   SAM3_SOURCE_DIR "/assets/kids.mp4"
-#define FIXTURE_DIR  SAM3_SOURCE_DIR "/tests/fixtures/video_kids/sam3_1"
-#define SEED_PATH    FIXTURE_DIR "/seed_mask.png"
+#define MODEL_PATH    SAM3_SOURCE_DIR "/models/sam3.1.sam3"
+#define VIDEO_PATH    SAM3_SOURCE_DIR "/assets/kids.mp4"
+#define FIXTURE_DIR   SAM3_SOURCE_DIR "/tests/fixtures/video_kids/sam3_1"
+#define SEED_PATH     FIXTURE_DIR "/seed_mask.png"
+#define FRAME_1_PATH  FIXTURE_DIR "/frames/frame_0001_obj_1.png"
 
 #define N_PROP_FRAMES 3
 #define IOU_FRAME_THRESH 0.75f
@@ -170,10 +171,11 @@ int main(void)
 {
 	if (access(MODEL_PATH, F_OK) != 0 ||
 	    access(VIDEO_PATH, F_OK) != 0 ||
-	    access(SEED_PATH,  F_OK) != 0) {
+	    access(SEED_PATH,  F_OK) != 0 ||
+	    access(FRAME_1_PATH, F_OK) != 0) {
 		fprintf(stderr,
-			"SKIP: model/video/seed missing. See %s/README.md\n",
-			FIXTURE_DIR);
+			"SKIP: model/video/seed/frame-fixtures missing. "
+			"See %s/README.md\n", FIXTURE_DIR);
 		return 0;
 	}
 
