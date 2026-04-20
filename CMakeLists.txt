@@ -204,6 +204,12 @@ endif()
 add_executable(gen_nhwc_fixtures tools/gen_nhwc_fixtures.c)
 target_link_libraries(gen_nhwc_fixtures sam3)
 
+# SAM 3.1 parity fixture seed dumper (manual regen tool, not CI).
+add_executable(sam3_1_dump_seed tools/sam3_1_dump_seed.c)
+target_link_libraries(sam3_1_dump_seed sam3)
+target_include_directories(sam3_1_dump_seed PRIVATE
+	${CMAKE_SOURCE_DIR}/src)
+
 # Tests
 if(SAM3_TESTS)
 	enable_testing()
