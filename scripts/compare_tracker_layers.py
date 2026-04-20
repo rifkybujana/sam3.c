@@ -70,6 +70,21 @@ def _reshape_feat_s1(arr, side):
     return arr.reshape(-1)
 
 
+def _reshape_vit_out(arr, side):
+    # C: gh_tensor_wrap around vit_out->data with dims [1, gs, gs, C]
+    # (ViT output is row-major [HW, C], which is the NHWC byte layout
+    # for a 1-batch 4-D tensor). Python dumps after NCHW -> NHWC, so
+    # the byte layouts match.
+    return arr.reshape(-1)
+
+
+def _reshape_sam3_feat_s1(arr, side):
+    # C: cached_feat_s1_nhwc (sam3-side neck 1x output) [1, 72, 72, 256]
+    # NHWC. Python: sam3_features[-1] from the tri-neck forward, dumped
+    # NHWC. Same byte layout on both sides.
+    return arr.reshape(-1)
+
+
 def _reshape_tgt(arr, side):
     # Both sides are batch-first [1, HW=5184, 256] at encoder entry
     # (Py's encoder has batch_first=True so the forward-hook kwargs see
@@ -114,6 +129,21 @@ for f in IMAGE_PIPELINE_FRAMES:
          f"/tmp/dbg_trk_frame_rgb_f{f}.bin",
          f"/tmp/py_trk_frame_rgb_f{f}.bin",
          _reshape_frame_rgb),
+        # Iteration 8: ViT trunk output (pre-neck). Shared input to
+        # convs / interactive_convs / propagation_convs. If this
+        # matches but feat_s1 doesn't, the bug is downstream in the
+        # sam2-side neck (propagation_convs) compute.
+        (f"vit_out_f{f}",
+         f"/tmp/dbg_trk_vit_out_f{f}.bin",
+         f"/tmp/py_trk_vit_out_f{f}.bin",
+         _reshape_vit_out),
+        # Iteration 8: sam3-side 1x neck output. Same ViT input,
+        # different conv stack. If sam3_feat_s1 matches but feat_s1
+        # doesn't, the propagation_convs weights/compute are wrong.
+        (f"sam3_feat_s1_f{f}",
+         f"/tmp/dbg_trk_sam3_feat_s1_f{f}.bin",
+         f"/tmp/py_trk_sam3_feat_s1_f{f}.bin",
+         _reshape_sam3_feat_s1),
         (f"feat_s1_f{f}",
          f"/tmp/dbg_trk_feat_s1_f{f}.bin",
          f"/tmp/py_trk_feat_s1_f{f}.bin",

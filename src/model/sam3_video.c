@@ -89,6 +89,16 @@ struct sam3_tensor *sam3_dbg_trk_memattn_layer3    = NULL;
  * frame 0 and propagation frames). */
 struct sam3_tensor *sam3_dbg_trk_frame_rgb         = NULL;
 struct sam3_tensor *sam3_dbg_trk_feat_s1           = NULL;
+/* ViT-vs-neck sub-drill (iteration 8). Populated inside
+ * sam3_image_model_encode with persist-arena wraps of vit_out (NHWC
+ * view) and the sam3-side neck 1x output (pfn[2]). These let the
+ * video encode tail bisect the feat_s1 residual: if vit_out matches
+ * Py but sam3_feat_s1 and feat_s1 both diverge, the bug is in the
+ * shared ViT-to-neck boundary. If vit_out matches and sam3_feat_s1
+ * matches but feat_s1 (sam2 side) doesn't, the propagation_convs
+ * compute itself is the bug. */
+struct sam3_tensor *sam3_dbg_trk_vit_out           = NULL;
+struct sam3_tensor *sam3_dbg_trk_sam3_feat_s1      = NULL;
 
 /* Video-path tensor dumper. Used for layer-by-layer parity diffs
  * against the Python reference via scripts/dump_reference_layers.py
@@ -412,6 +422,17 @@ session_encode_frame(struct sam3_video_session *session,
 		snprintf(pbuf, sizeof(pbuf),
 			 "/tmp/dbg_trk_feat_s1_f%d.bin", frame_idx);
 		auto_dump_tensor(pbuf, out->feat_s1);
+		if (sam3_dbg_trk_vit_out) {
+			snprintf(pbuf, sizeof(pbuf),
+				 "/tmp/dbg_trk_vit_out_f%d.bin", frame_idx);
+			auto_dump_tensor(pbuf, sam3_dbg_trk_vit_out);
+		}
+		if (sam3_dbg_trk_sam3_feat_s1) {
+			snprintf(pbuf, sizeof(pbuf),
+				 "/tmp/dbg_trk_sam3_feat_s1_f%d.bin",
+				 frame_idx);
+			auto_dump_tensor(pbuf, sam3_dbg_trk_sam3_feat_s1);
+		}
 	}
 #endif
 	SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");

@@ -757,6 +757,27 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 			dump_tensor("/tmp/dbg_sam2_05x.bin", spfn[3]);
 		}
 
+#ifdef SAM3_DEBUG_DUMP
+		/*
+		 * ViT-vs-neck sub-drill (iteration 8). Publish persist-arena
+		 * wraps of the ViT output and the sam3-side 1x neck output
+		 * for the video-path dump tail to pick up per-frame.
+		 */
+		{
+			extern struct sam3_tensor *sam3_dbg_trk_vit_out;
+			extern struct sam3_tensor *sam3_dbg_trk_sam3_feat_s1;
+
+			int C  = model->backbone.neck.backbone_dim;
+			int gs = model->backbone.neck.grid_size;
+			int vit_dims[] = {1, gs, gs, C};
+			struct sam3_tensor *vit_wrap = gh_tensor_wrap(
+				persist, SAM3_DTYPE_F32, 4, vit_dims,
+				vit_out->data);
+			sam3_dbg_trk_vit_out      = vit_wrap;
+			sam3_dbg_trk_sam3_feat_s1 = pfn[2];
+		}
+#endif
+
 		if (pfn[3]) {
 			sam3_log_debug("encode: cached features (NHWC): "
 				       "main [%d,%d,%d,%d] "

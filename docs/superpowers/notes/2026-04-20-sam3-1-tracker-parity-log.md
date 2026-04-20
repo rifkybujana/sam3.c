@@ -677,3 +677,138 @@ meaningful IoU but still trail the 0.75 threshold by ~0.25-0.30.
      bilinear) can be narrowed by switching C to a cubic / stb-rb
      resize kernel matching decord's defaults.
 
+## Iteration 8 — ViT sub-drill: uninitialised patch_embed_b bias (2026-04-20)
+
+### Scope
+
+Bisect the ViT residual 3 % cosine gap. Added three C-side dump
+slots and matching Python hooks, then split the gap location-by-
+location to find the first divergence.
+
+New slots (all gated on `SAM3_DEBUG_DUMP`):
+- `/tmp/dbg_trk_vit_out_f{N}.bin` — ViT trunk output (pre-neck),
+  NHWC [1, 72, 72, 1024]. C populates via `sam3_dbg_trk_vit_out` in
+  sam3_image.c; sam3_video.c dumps per-frame.
+- `/tmp/dbg_trk_sam3_feat_s1_f{N}.bin` — sam3-side neck 1x output
+  (pfn[2]). Same input ViT, different conv weights than the
+  propagation side.
+- `/tmp/dbg_vit_patch_only.bin` — patch_embed + patch_embed_b
+  output (pre-pos_embed, pre-ln_pre). image_encoder.c splits the
+  pre-blocks graph eval to dump this intermediate.
+
+Matching Python captures in `scripts/dump_tracker_layers.py`:
+`vit_out`, `sam3_feat_s1`, `vit_patch_only`, `vit_pre_blocks`,
+and `vit_block{00,03,07,11,13,14,15,16,17,19,23,27,31}` (all hook
+`model.backbone.vision_backbone.trunk.*`).
+
+### Bisection results (baseline — before fix)
+
+```
+frame_rgb_f0        cos=0.99983 abs_max=0.1176
+patch_only          cos=0.61457 abs_max=0.5535 p_std=0.23  <--- DIVERGES
+pre_blocks          cos=0.82000 abs_max=21.49  p_std=1.12
+block00             cos=0.91798
+block07             cos=0.99008  (best intermediate)
+block16             cos=0.95433
+block31             cos=0.93454  abs_max=181.3
+vit_out_f0          cos=0.93742 (= block31)
+sam3_feat_s1_f0     cos=0.96634
+feat_s1_f0          cos=0.96899
+```
+
+The first divergence is `patch_only` (cos=0.61) — the conv output
+alone is already wildly different. Block-level dumps show the
+cosine *recovers* to 0.99 by block 7 (LN normalisation absorbs
+the DC offset) then degrades again through blocks 14-31 as
+attention sinks grow at slightly different spatial positions.
+
+### Root cause
+
+Per-channel mean of the diff `C - Py` at `patch_only` was
+`-0.3609 ± 0.0648`. Adding back the per-channel mean as a
+correction raised the cosine to **0.9997** — so C's conv output
+has a spurious per-channel DC offset.
+
+Logging `patch_embed_b` stats on the C side: `min=-0.3725
+max=0.0000 mean=-0.3609 std=0.0648` — identical distribution to
+the diff. Python's checkpoint has **no** `patch_embed.proj.bias`
+(SAM 3.1 builds with `bias_patch_embed=False`), so
+`gh_load_mmap_optional` correctly returns NULL and the fallback
+path calls `gh_alloc_tensor`. But `gh_alloc_tensor` only zeroes
+the tensor struct, not its `data` buffer — the raw arena bytes
+that became the "bias" were stale weight data left in the arena
+from prior loads.
+
+So on SAM 3.1 (bias_patch_embed=False) the ViT was adding a
+non-zero channel-dependent bias after every patch conv, producing
+a shifted pre-blocks state that the blocks then amplified into
+the 7 % residual.
+
+### Patch
+
+`src/model/image_encoder.c`:
+
+- When `gh_load_mmap_optional` returns NULL for
+  `projection.bias`, explicitly `memset(t->data, 0, nbytes)`
+  after allocation. Comment documents the amplification chain so
+  the next reader doesn't "simplify" the memset away.
+
+### Post-fix comparator
+
+```
+vit_out_f0         cos=0.96177  abs_max=171.1  (was 0.93742 / 186.1)
+sam3_feat_s1_f0    cos=0.98176  abs_max=3.201  (was 0.96634 / 3.58)
+feat_s1_f0         cos=0.98374  abs_max=3.115  (was 0.96899 / 3.474)
+```
+
+feat_s1 residual halved (3.1 % → 1.6 %). `patch_embed_b stats`
+now logs `min=0.0000 max=0.0000 mean=0.0000 std=0.0000`.
+
+### Parity test result
+
+`test_video_parity_kids` SAM 3.1 variant: IoUs on frames 1/2/3
+stay at 0.44/0.49/0.41 against the *committed* fixture PNGs.
+That's expected: the committed `seed_mask.png` was produced by
+the **buggy** sam3_1_dump_seed; with the fix, C's new frame-0
+mask diverges from the old seed (frame-0-vs-seed IoU drops to
+0.13). Regenerating the fixture via
+`tools/gen_video_parity_fixtures.py` is required to get a
+fair IoU number on the fix. The comparator cosines directly
+confirm the ViT improved.
+
+74/76 tests still pass (same 2 pre-existing failures:
+`test_fixture_compare` NaN, `test_video_parity_kids` target).
+
+### Remaining divergence
+
+- **vit_out abs_max still ~170.** The per-channel DC offset was
+  one component of the ViT divergence; the remaining ~4 % cosine
+  gap is distributed across many channels and positions. Clamping
+  outliers only recovers ~1 % cosine, so the residual is not
+  outlier-dominated. Likely candidates: RoPE precomputation
+  differences (SAM 3.1 uses `use_interp_rope=True`; C's
+  `precompute_rope_table` doesn't interpolate), accumulated f32
+  rounding through 32 blocks, or small op mismatches in
+  gh_multihead_attention_rope.
+- **memattn amplifies 2 % feat_s1 error to near-orthogonal
+  memattn_layer0 output** (cos=0.004). This is the dominant IoU
+  killer. The C memattn must have a structural difference that
+  magnifies Q/K misalignment.
+
+### Next step
+
+1. Regenerate the SAM 3.1 parity fixtures against the fixed C
+   seed: `./build/sam3_1_dump_seed ...` → `seed_mask.png`, then
+   `python gen_video_parity_fixtures.py --variant sam3.1 ...` →
+   new `frame_000{1,2,3}_obj_1.png`. Re-run the parity test to
+   get a fixture-honest IoU.
+2. Drill the memattn amplification. Compare `tgt` (matches 0.98)
+   vs `memattn_layer0` (cos=0.004). Likely sub-steps: Q projection,
+   K projection, attention softmax, V projection. Hook each inside
+   `DecoupledTransformerDecoderLayer.forward` on the Python side
+   and add matching C-side dumps in tracker_multiplex.c.
+3. If the memattn structural bug is fixed and IoU still trails
+   0.75, return to the vit_out outlier positions and drill
+   further ViT blocks (block 8-15 is where the outlier positions
+   start diverging — see abs_max trend).
+

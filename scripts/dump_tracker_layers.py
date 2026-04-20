@@ -234,6 +234,20 @@ def _register_hooks(model, captures):
                 if hasattr(fpn[-1], "tensors"):
                     captures.setdefault("feat_s1", []).append(
                         fpn[-1].tensors.detach().cpu().float().contiguous())
+        # Sub-drill (iteration 8): capture the sam3-side 1x neck
+        # output. `out["backbone_fpn"]` is `sam3_features` in the
+        # tri-neck (see vl_combiner.py:243-252) — the detector-side
+        # neck that shares the ViT input with propagation_convs but
+        # uses a different conv stack. If vit_out matches and
+        # sam3_feat_s1 matches but feat_s1 (sam2/propagation side)
+        # doesn't, the propagation_convs compute itself is the bug.
+        if isinstance(out, dict):
+            sam3_fpn = out.get("backbone_fpn")
+            if isinstance(sam3_fpn, list) and len(sam3_fpn) > 0 and \
+                    hasattr(sam3_fpn[-1], "tensors"):
+                captures.setdefault("sam3_feat_s1", []).append(
+                    sam3_fpn[-1].tensors.detach().cpu().float()
+                    .contiguous())
         return out
 
     model.forward_image = _patched_forward_image
@@ -242,6 +256,61 @@ def _register_hooks(model, captures):
         def remove(self_inner):
             model.forward_image = _orig_fwd_image
     hooks.append(_UnpatchFwdImage())
+
+    # Sub-drill (iteration 8): capture ViT trunk output pre-neck.
+    # `Sam3TriViTDetNeck.forward` calls `xs = self.trunk(tensor_list)`
+    # and then applies convs/interactive_convs/propagation_convs to
+    # `xs[-1]`. Registering a forward_hook on the trunk gives us
+    # direct access to that shared input — so we can bisect whether
+    # the feat_s1 divergence originates in the backbone or in the
+    # sam2-side neck's propagation_convs compute.
+    def _cap_trunk(_m, _inp, out):
+        # `out` is a list/tuple of feature maps at the FPN scales,
+        # possibly wrapped as NestedTensors. Grab the last one — it's
+        # what the neck convs consume in Sam3TriViTDetNeck.forward.
+        if not isinstance(out, (list, tuple)) or len(out) == 0:
+            return
+        last = out[-1]
+        t = getattr(last, "tensors", last)
+        if isinstance(t, torch.Tensor):
+            captures.setdefault("vit_out", []).append(
+                t.detach().cpu().float().contiguous())
+
+    trunk = model.backbone.vision_backbone.trunk
+    hooks.append(trunk.register_forward_hook(_cap_trunk))
+
+    # Sub-drill (iteration 8.5): capture ViT pre-blocks state (after
+    # patch embed + pos_embed + ln_pre) and selected block outputs so
+    # we can bisect where in the backbone the ~3% cosine gap starts.
+    # The pre-blocks tensor matches C's /tmp/dbg_vit_patch.bin; each
+    # block matches C's /tmp/dbg_vit_block{NN}.bin. Both sides dump
+    # the same flat [np, e] byte layout — Python's block output is
+    # [B, H, W, C] NHWC which is already byte-equivalent to [HW, e].
+    def _cap_ln_pre(_m, _inp, out):
+        if isinstance(out, torch.Tensor):
+            captures.setdefault("vit_pre_blocks", []).append(
+                out.detach().cpu().float().contiguous())
+    hooks.append(trunk.ln_pre.register_forward_hook(_cap_ln_pre))
+
+    # Sub-drill (iteration 8.5+): capture patch_embed output alone
+    # (pre-pos_embed, pre-ln_pre) to further bisect the ~18% cosine
+    # gap at pre_blocks into patch_embed vs pos_embed/ln_pre. Matches
+    # C's /tmp/dbg_vit_patch_only.bin.
+    def _cap_patch(_m, _inp, out):
+        if isinstance(out, torch.Tensor):
+            captures.setdefault("vit_patch_only", []).append(
+                out.detach().cpu().float().contiguous())
+    hooks.append(trunk.patch_embed.register_forward_hook(_cap_patch))
+
+    _BLOCK_DUMP_IDS = (0, 3, 7, 11, 13, 14, 15, 16, 17, 19, 23, 27, 31)
+    for bi in _BLOCK_DUMP_IDS:
+        def _cap_block(_m, _inp, out, _bi=bi):
+            if isinstance(out, torch.Tensor):
+                captures.setdefault(
+                    f"vit_block{_bi:02d}", []).append(
+                    out.detach().cpu().float().contiguous())
+        hooks.append(
+            trunk.blocks[bi].register_forward_hook(_cap_block))
 
     return hooks
 
@@ -304,11 +373,34 @@ def _flush_captures_delta(captures, cursors, frame_idx):
             _dump(f"/tmp/py_trk_image_embed_f{frame_idx}.bin", t)
     cursors[slot] = end
 
+    # ViT sub-drill (iteration 8.5): pre-blocks state + per-block
+    # outputs. Only dump for the last propagation frame (frame 2)
+    # to match the C side's fixed-path dumps that get overwritten
+    # each encode. Dumped as raw [np, e] F32 with no permute.
+    if frame_idx == 2:
+        for slot in (["vit_patch_only", "vit_pre_blocks"] +
+                     [f"vit_block{bi:02d}"
+                      for bi in (0, 3, 7, 11, 13, 14, 15, 16, 17,
+                                 19, 23, 27, 31)]):
+            entries = captures.get(slot, [])
+            if len(entries) > 0:
+                t = entries[-1]
+                if isinstance(t, torch.Tensor):
+                    arr = t.contiguous().numpy().astype(np.float32)
+                    path = f"/tmp/py_{slot}.bin"
+                    arr.tofile(path)
+                    print(f"dump: {path} shape={tuple(arr.shape)}",
+                          file=sys.stderr)
+
     # Image-pipeline drill: frame_rgb (NCHW img_batch input) and
     # feat_s1 (NCHW sam2 1x post-neck). Captured once per frame via
     # forward_image forward-hook, in frame-index order. Dump the
     # latest unconsumed one — if >1 new entries, prefer the last.
-    for slot in ("frame_rgb", "feat_s1"):
+    # Iteration 8 adds two more NCHW-captured slots: vit_out (ViT
+    # trunk output, shared input to all three neck heads) and
+    # sam3_feat_s1 (sam3-side 1x neck output — same ViT, different
+    # conv weights). Both are dumped NHWC to match the C side.
+    for slot in ("frame_rgb", "feat_s1", "vit_out", "sam3_feat_s1"):
         start = cursors.get(slot, 0)
         end = len(captures.get(slot, []))
         if end > start:
@@ -316,10 +408,11 @@ def _flush_captures_delta(captures, cursors, frame_idx):
             if isinstance(t, torch.Tensor):
                 # Drop the batch dim and permute NCHW -> CHW for
                 # frame_rgb to match C's make_frame_tensor layout;
-                # NCHW -> NHWC for feat_s1 to match cached_sam2_1x_nhwc.
+                # NCHW -> NHWC for feat_s1 / sam3_feat_s1 / vit_out
+                # to match the C-side NHWC wraps.
                 if slot == "frame_rgb" and t.dim() == 4:
                     out = t.squeeze(0).contiguous()
-                elif slot == "feat_s1" and t.dim() == 4:
+                elif t.dim() == 4:
                     out = t.permute(0, 2, 3, 1).contiguous()
                 else:
                     out = t
