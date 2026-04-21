@@ -160,20 +160,31 @@ enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
 		goto cleanup_model_arena;
 
 	/*
-	 * Async text encoder arenas (#11). Sized for the CLIP text
-	 * encoder operating on a 77-token sequence with 4-block
-	 * batching: per-block scratch peaks well under 256 MiB and the
-	 * persistent output is a few hundred KiB.
+	 * Async text encoder scratch arena (#11). Sized for the CLIP
+	 * text encoder operating on a 77-token sequence with 4-block
+	 * batching: per-block scratch peaks well under 256 MiB. The
+	 * worker's persistent output now lives in the txt_cache slot
+	 * arena (created below), not in a dedicated arena.
 	 */
 	err = sam3_arena_init(&proc->text_scratch_arena,
 			      256UL * 1024 * 1024);
 	if (err != SAM3_OK)
 		goto cleanup_scratch_arena;
 
-	err = sam3_arena_init(&proc->text_persist_arena,
-			      16UL * 1024 * 1024);
-	if (err != SAM3_OK)
+	/*
+	 * Text feature cache. Each slot holds one [n_tokens, d_model]
+	 * f32 tensor; max sized for 77 tokens × 1024 d_model = 308 KiB.
+	 * Bundle a 1 MiB cell to leave room for tensor headers and
+	 * worker-local scratch. Default 16 slots → 16 MiB total.
+	 */
+	proc->txt_cache = sam3_text_cache_create(n_text_slots,
+						 16UL * 1024 * 1024);
+	if (!proc->txt_cache) {
+		err = SAM3_ENOMEM;
 		goto cleanup_text_scratch_arena;
+	}
+	proc->text_cached_bundle = NULL;
+	proc->text_worker_slot = -1;
 
 	/*
 	 * Async text encoder backend (#11). The text worker runs against
@@ -228,7 +239,6 @@ enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
 		goto cleanup_video_arena;
 	}
 	proc->current_img_slot = -1;
-	(void)n_text_slots; /* wired in Task 6 */
 
 	return SAM3_OK;
 
@@ -242,7 +252,8 @@ cleanup_text_backend:
 		free(proc->text_backend);
 		proc->text_backend = NULL;
 	}
-	sam3_arena_free(&proc->text_persist_arena);
+	sam3_text_cache_destroy(proc->txt_cache);
+	proc->txt_cache = NULL;
 cleanup_text_scratch_arena:
 	sam3_arena_free(&proc->text_scratch_arena);
 cleanup_scratch_arena:
@@ -295,7 +306,8 @@ void sam3_processor_free(struct sam3_processor *proc)
 		proc->backend = NULL;
 	}
 
-	sam3_arena_free(&proc->text_persist_arena);
+	sam3_text_cache_destroy(proc->txt_cache);
+	proc->txt_cache = NULL;
 	sam3_arena_free(&proc->text_scratch_arena);
 	sam3_arena_free(&proc->model_arena);
 	sam3_arena_free(&proc->video_scratch_arena);
@@ -768,10 +780,10 @@ static void join_text_worker(struct sam3_processor *proc)
  * text_worker_main - pthread entry point for async text encoding.
  *
  * Reads pre-tokenized state from proc, runs the text encoder, writes
- * the result tensor pointer (or NULL on error) and the error code into
- * proc->text_features_async / proc->text_thread_err. Owns the text
- * arenas exclusively for the duration of this call — the main thread
- * must not touch them until pthread_join returns.
+ * the result tensor into the pre-claimed text cache slot's arena, and
+ * registers the bundle with the cache. The main thread must not touch
+ * the slot arena or the cache's mutable tables until pthread_join
+ * returns.
  */
 static void *text_worker_main(void *arg)
 {
@@ -779,33 +791,24 @@ static void *text_worker_main(void *arg)
 	struct sam3_text_encoder_iface *te_iface =
 		&proc->model.backbone.text_iface;
 	int ctx = te_iface->ctx_len;
-	struct sam3_tensor *tok_tensor;
-	int tok_dims[1];
+	int slot = proc->text_worker_slot;
+	struct sam3_arena *arena =
+		sam3_text_cache_slot_arena(proc->txt_cache, slot);
 
-	tok_dims[0] = ctx;
-
-	/*
-	 * Wrap the pre-tokenized buffer (lives in proc->text_tokens,
-	 * a stable processor field) into a tensor allocated from
-	 * text_persist_arena.
-	 */
-	tok_tensor = gh_alloc_tensor(&proc->text_persist_arena,
-				     SAM3_DTYPE_I32, 1, tok_dims);
-	if (!tok_tensor) {
-		proc->text_features_async = NULL;
+	int tok_dims[1] = {ctx};
+	struct sam3_tensor *tok = gh_alloc_tensor(arena, SAM3_DTYPE_I32,
+						  1, tok_dims);
+	if (!tok) {
 		proc->text_thread_err = SAM3_ENOMEM;
 		return NULL;
 	}
-	memcpy(tok_tensor->data, proc->text_tokens,
+	memcpy(tok->data, proc->text_tokens,
 	       (size_t)ctx * sizeof(int32_t));
 
-	struct sam3_tensor *features;
-	features = te_iface->ops->build_perblock(
-		te_iface, proc->text_backend, tok_tensor,
-		&proc->text_scratch_arena,
-		&proc->text_persist_arena);
+	struct sam3_tensor *features = te_iface->ops->build_perblock(
+		te_iface, proc->text_backend, tok,
+		&proc->text_scratch_arena, arena);
 	if (!features) {
-		proc->text_features_async = NULL;
 		proc->text_thread_err = SAM3_ENOMEM;
 		return NULL;
 	}
@@ -813,13 +816,10 @@ static void *text_worker_main(void *arg)
 	/* Truncate to real tokens (mirrors the inline path). */
 	if (features->dims[0] > proc->text_n_tokens) {
 		int d = features->dims[1];
-		int trunc_dims[] = {proc->text_n_tokens, d};
-		struct sam3_tensor *trunc;
-
-		trunc = gh_alloc_tensor(&proc->text_persist_arena,
-					SAM3_DTYPE_F32, 2, trunc_dims);
+		int trunc_dims[2] = {proc->text_n_tokens, d};
+		struct sam3_tensor *trunc = gh_alloc_tensor(arena,
+				SAM3_DTYPE_F32, 2, trunc_dims);
 		if (!trunc) {
-			proc->text_features_async = NULL;
 			proc->text_thread_err = SAM3_ENOMEM;
 			return NULL;
 		}
@@ -829,7 +829,17 @@ static void *text_worker_main(void *arg)
 		features = trunc;
 	}
 
-	proc->text_features_async = features;
+	struct sam3_text_bundle b = {.features = features,
+				     .n_tokens = proc->text_n_tokens};
+	uint64_t key = SAM3_FNV1A_64_OFFSET_BASIS;
+	key = sam3_fnv1a_64((const uint8_t *)proc->text_tokens,
+			    (size_t)proc->text_n_tokens * sizeof(int32_t),
+			    key);
+	if (key == 0)
+		key = 1;
+
+	sam3_text_cache_register(proc->txt_cache, slot, key,
+				 proc->text_tokens, proc->text_n_tokens, &b);
 	proc->text_thread_err = SAM3_OK;
 	return NULL;
 }
@@ -838,38 +848,52 @@ enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
 					const char *text)
 {
 	struct sam3_text_encoder_iface *te_iface;
-	int ctx;
-	int n_tokens;
-	int rc;
+	int ctx, n_tokens, rc;
 
 	if (!proc || !text)
 		return SAM3_EINVAL;
-
 	if (!proc->text_backend) {
 		sam3_log_error("set_text: text_backend unavailable");
 		return SAM3_EBACKEND;
 	}
 
-	/* Join any prior worker before stomping on the text arenas. */
+	/* Join any prior worker before stomping on shared state. */
 	join_text_worker(proc);
-
 	sam3_arena_reset(&proc->text_scratch_arena);
-	sam3_arena_reset(&proc->text_persist_arena);
-	proc->text_features_async = NULL;
+	proc->text_cached_bundle = NULL;
+	proc->text_worker_slot = -1;
 	proc->text_thread_err = SAM3_OK;
 
 	te_iface = &proc->model.backbone.text_iface;
 	ctx = te_iface->ctx_len;
 
 	/* Tokenize on the caller thread (cheap, < 1ms). */
-	n_tokens = sam3_tokenizer_encode(
-		&proc->model.backbone.tokenizer, text,
-		proc->text_tokens, ctx);
+	n_tokens = sam3_tokenizer_encode(&proc->model.backbone.tokenizer,
+					 text, proc->text_tokens, ctx);
 	if (n_tokens <= 0) {
 		sam3_log_error("set_text: tokenize failed");
 		return SAM3_EINVAL;
 	}
 	proc->text_n_tokens = n_tokens;
+
+	uint64_t key = SAM3_FNV1A_64_OFFSET_BASIS;
+	key = sam3_fnv1a_64((const uint8_t *)proc->text_tokens,
+			    (size_t)n_tokens * sizeof(int32_t), key);
+	if (key == 0)
+		key = 1;
+
+	int hit = sam3_text_cache_lookup(proc->txt_cache, key,
+					 proc->text_tokens, n_tokens);
+	if (hit >= 0) {
+		proc->text_cached_bundle =
+			&proc->txt_cache->slots[hit].bundle;
+		return SAM3_OK;
+	}
+
+	int slot = sam3_text_cache_claim_slot(proc->txt_cache);
+	if (slot < 0)
+		return SAM3_ENOMEM;
+	proc->text_worker_slot = slot;
 
 	/*
 	 * Spawn the worker. Request an 8 MiB stack — MLX-C plus ASan
@@ -883,9 +907,8 @@ enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
 		pthread_attr_destroy(&attr);
 		return SAM3_EBACKEND;
 	}
-
-	rc = pthread_create(&proc->text_thread, &attr,
-			    text_worker_main, proc);
+	rc = pthread_create(&proc->text_thread, &attr, text_worker_main,
+			    proc);
 	pthread_attr_destroy(&attr);
 	if (rc != 0) {
 		sam3_log_error("set_text: pthread_create failed (%d)", rc);
@@ -950,54 +973,39 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	if (text) {
 		SAM3_PROF_BEGIN(proc->profiler, "text_encode");
 
-		/*
-		 * If a worker thread is in flight, wait for it to finish.
-		 * After this returns, proc->text_features_async is either
-		 * set (worker succeeded) or NULL (worker failed — see
-		 * text_thread_err).
-		 */
-		join_text_worker(proc);
-		if (proc->text_thread_err != SAM3_OK) {
-			sam3_log_error("segment: text worker failed: %d",
-				       proc->text_thread_err);
-			err = proc->text_thread_err;
-			proc->text_thread_err = SAM3_OK;
-			goto fail;
-		}
-
-		/*
-		 * If sam3_processor_set_text() was called earlier, the
-		 * worker has produced text_features_async in
-		 * proc->text_persist_arena. Copy it into model_arena so
-		 * it survives scratch resets and lives alongside other
-		 * persistent tensors used by the segmentation stages.
-		 */
-		if (proc->text_features_async) {
-			struct sam3_tensor *src = proc->text_features_async;
-			int copy_dims[2] = {src->dims[0], src->dims[1]};
-
-			text_features = gh_alloc_tensor(&proc->model_arena,
-							SAM3_DTYPE_F32,
-							2, copy_dims);
-			if (!text_features) {
-				err = SAM3_ENOMEM;
+		if (proc->text_cached_bundle) {
+			/*
+			 * Hit path: set_text found the bundle already in
+			 * txt_cache. Read features directly from the cache
+			 * slot — no copy into model_arena, no worker.
+			 */
+			text_features = proc->text_cached_bundle->features;
+			proc->text_cached_bundle = NULL;
+			SAM3_PROF_END(proc->profiler, "text_encode");
+		} else if (proc->text_thread_active) {
+			/*
+			 * Miss path: set_text spawned a worker. Join it,
+			 * then pick up the features from the slot it wrote
+			 * into. Features live in the cache slot's arena —
+			 * no copy into model_arena.
+			 */
+			join_text_worker(proc);
+			if (proc->text_thread_err != SAM3_OK) {
+				sam3_log_error("segment: text worker "
+					       "failed: %d",
+					       proc->text_thread_err);
+				err = proc->text_thread_err;
+				proc->text_thread_err = SAM3_OK;
 				goto fail;
 			}
-			memcpy(text_features->data, src->data,
-			       (size_t)src->dims[0] * (size_t)src->dims[1] *
-			       sizeof(float));
-
-			/*
-			 * One-shot consumption: clear the async slot so a
-			 * subsequent segment() without a fresh set_text()
-			 * falls back to inline encoding.
-			 */
-			proc->text_features_async = NULL;
-
-			sam3_log_debug("segment: consumed async text "
-				       "features [%d,%d]",
-				       text_features->dims[0],
-				       text_features->dims[1]);
+			int s = proc->text_worker_slot;
+			if (s < 0) {
+				err = SAM3_EBACKEND;
+				goto fail;
+			}
+			text_features =
+				proc->txt_cache->slots[s].bundle.features;
+			proc->text_worker_slot = -1;
 			SAM3_PROF_END(proc->profiler, "text_encode");
 		} else {
 			/*
@@ -1292,7 +1300,12 @@ void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which)
 		return;
 	if (which == 0 || (which & 1u))
 		sam3_image_cache_clear(proc->img_cache);
-	/* text cache cleared in Task 6 once it exists */
+	if (which == 0 || (which & 2u)) {
+		join_text_worker(proc);
+		sam3_text_cache_clear(proc->txt_cache);
+		proc->text_cached_bundle = NULL;
+		proc->text_worker_slot = -1;
+	}
 }
 
 void sam3_processor_cache_stats(const struct sam3_processor *proc,
@@ -1303,5 +1316,13 @@ void sam3_processor_cache_stats(const struct sam3_processor *proc,
 	memset(out, 0, sizeof(*out));
 	if (!proc)
 		return;
-	sam3_image_cache_stats(proc->img_cache, out);
+	struct sam3_cache_stats img = {0}, txt = {0};
+	sam3_image_cache_stats(proc->img_cache, &img);
+	sam3_text_cache_stats(proc->txt_cache, &txt);
+	out->image_hits = img.image_hits;
+	out->image_misses = img.image_misses;
+	out->image_evictions = img.image_evictions;
+	out->text_hits = txt.text_hits;
+	out->text_misses = txt.text_misses;
+	out->text_evictions = txt.text_evictions;
 }

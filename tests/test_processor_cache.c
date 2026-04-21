@@ -80,8 +80,63 @@ static void test_image_cache_hit_skips_encoder(void)
 	sam3_weight_close(&wf);
 }
 
+static void test_text_cache_hit_skips_worker(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+
+	struct sam3_processor proc;
+	enum sam3_error err;
+	err = sam3_processor_init(&proc, SAM3_BACKBONE_HIERA, 4);
+	ASSERT_EQ(err, SAM3_OK);
+
+	struct sam3_weight_file wf;
+	err = sam3_weight_open(&wf, MODEL_PATH);
+	ASSERT_EQ(err, SAM3_OK);
+	err = sam3_processor_load(&proc, &wf, VOCAB_PATH);
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* First call → miss + worker spawned. */
+	err = sam3_processor_set_text(&proc, "cat");
+	ASSERT_EQ(err, SAM3_OK);
+
+	/* Drive the segment path so the worker output gets registered. */
+	int sz = sam3_processor_img_size(&proc);
+	uint8_t *pixels = calloc((size_t)sz * sz * 3, 1);
+	err = sam3_processor_set_image(&proc, pixels, sz, sz);
+	ASSERT_EQ(err, SAM3_OK);
+
+	struct sam3_prompt p = {.type = SAM3_PROMPT_TEXT,
+				.text = "cat"};
+	struct sam3_result r = {0};
+	err = sam3_processor_segment(&proc, &p, 1, &r);
+	ASSERT_EQ(err, SAM3_OK);
+	sam3_result_free(&r);
+
+	struct sam3_cache_stats s0 = {0};
+	sam3_text_cache_stats(proc.txt_cache, &s0);
+	ASSERT_EQ(s0.text_misses, 1u);
+	ASSERT_EQ(s0.text_hits, 0u);
+
+	/* Second set_text("cat") → hit, no worker. */
+	err = sam3_processor_set_text(&proc, "cat");
+	ASSERT_EQ(err, SAM3_OK);
+	ASSERT_EQ(proc.text_thread_active, 0);
+
+	struct sam3_cache_stats s1 = {0};
+	sam3_text_cache_stats(proc.txt_cache, &s1);
+	ASSERT_EQ(s1.text_hits, 1u);
+
+	free(pixels);
+	sam3_processor_free(&proc);
+	sam3_weight_close(&wf);
+}
+
 int main(void)
 {
 	test_image_cache_hit_skips_encoder();
+	test_text_cache_hit_skips_worker();
 	TEST_REPORT();
 }
