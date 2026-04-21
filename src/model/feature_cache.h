@@ -2,13 +2,13 @@
  * src/model/feature_cache.h - LRU caches in front of the image and text
  * encoders.
  *
- * Two independent LRU caches keyed by FNV-1a 64-bit content hash. The
- * image cache holds bundles of 8 cached_* tensor pointers (one per
- * scale) inside per-slot arenas. The text cache holds [n_tokens, d]
- * feature tensors inside fixed-size cells of a shared arena. Both are
- * thread-safe-by-construction: only the main thread mutates the cache
- * tables; the text encoder worker writes into a pre-claimed slot region
- * and is joined before the main thread inspects it.
+ * Two independent LRU caches keyed by FNV-1a 64-bit content hash. Each
+ * cache owns one sam3_arena per slot — the image cache stores bundles
+ * of 8 cached_* tensor pointers per scale, the text cache stores a
+ * single [n_tokens, d_model] feature tensor. Thread-safe-by-
+ * construction: only the main thread mutates the cache tables; the
+ * text encoder worker writes into its pre-claimed slot's arena and is
+ * joined before the main thread inspects it.
  *
  * Key types:  sam3_image_feature_cache, sam3_text_feature_cache,
  *             sam3_image_bundle, sam3_text_bundle

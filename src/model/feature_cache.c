@@ -1,12 +1,11 @@
 /*
  * src/model/feature_cache.c - Image and text feature LRU caches.
  *
- * Implements the cache module declared in feature_cache.h. Image cache
- * uses one arena per slot (sized for worst-case encoder output); text
- * cache uses a single shared arena partitioned into fixed-size cells.
- * All allocation outside the per-slot arenas (slots[] table, the cache
- * struct itself) goes through calloc/free since cache lifetime tracks
- * the processor, not an arena.
+ * Implements the cache module declared in feature_cache.h. Both image
+ * and text caches use one sam3_arena per slot, sized for the encoder's
+ * worst-case output. Allocation outside the per-slot arenas (the
+ * slots[] table and the cache struct itself) goes through calloc/free
+ * since cache lifetime tracks the processor, not an arena.
  *
  * Key types:  sam3_image_feature_cache, sam3_text_feature_cache
  * Depends on: feature_cache.h, util/log.h
