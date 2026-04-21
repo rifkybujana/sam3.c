@@ -209,11 +209,45 @@ static void test_segment_does_not_grow_model_arena(void)
 	sam3_weight_close(&wf);
 }
 
+/*
+ * test_image_cache_clear_drops_cached_pointers - Locks down the
+ * invariant that sam3_cache_clear(SAM3_CACHE_IMAGE) must null the
+ * model's cached_* pointers so a subsequent segment() without a fresh
+ * set_image fails predictably with SAM3_EINVAL (rather than reading
+ * poisoned arena memory).
+ */
+static void test_image_cache_clear_drops_cached_pointers(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+
+	sam3_ctx *ctx = sam3_init();
+	ASSERT_NOT_NULL(ctx);
+	ASSERT_EQ(sam3_load_model(ctx, MODEL_PATH), SAM3_OK);
+
+	int sz = sam3_get_image_size(ctx);
+	uint8_t *pixels = calloc((size_t)sz * sz * 3, 1);
+	ASSERT_EQ(sam3_set_image(ctx, pixels, sz, sz), SAM3_OK);
+
+	sam3_cache_clear(ctx, SAM3_CACHE_IMAGE);
+
+	struct sam3_prompt p = {.type = SAM3_PROMPT_TEXT, .text = "cat"};
+	struct sam3_result r = {0};
+	enum sam3_error err = sam3_segment(ctx, &p, 1, &r);
+	ASSERT_EQ(err, SAM3_EINVAL);
+
+	free(pixels);
+	sam3_free(ctx);
+}
+
 int main(void)
 {
 	test_image_cache_hit_skips_encoder();
 	test_text_cache_hit_skips_worker();
 	test_top_level_cache_clear_and_stats();
 	test_segment_does_not_grow_model_arena();
+	test_image_cache_clear_drops_cached_pointers();
 	TEST_REPORT();
 }
