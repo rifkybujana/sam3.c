@@ -953,23 +953,27 @@ video_track_one_obj(struct sam3_video_session *session,
 		goto cleanup;
 	}
 
-#ifdef SAM3_DEBUG_DUMP
 	/*
-	 * Sub-project 3 validation: on the seed frame, also run the SAM-style
-	 * interactive forward in a second graph using the multiplex decoder's
-	 * first multimask (head 0, slot 0) binarised at 0 as the seed mask.
-	 * Result (obj_ptr) is discarded — this is a dump-only side-effect
-	 * call used to diff C's interactive path against Python's.
+	 * SAM 3.1 seeded-frame interactive obj_ptr path (sub-project 3).
 	 *
-	 * Does nothing in release builds (guarded by SAM3_DEBUG_DUMP).
+	 * On cond multiplex frames, mirror Python's `_use_mask_as_output`
+	 * (video_tracking_multiplex.py:925-1020): run the interactive prompt
+	 * encoder + interactive mask decoder + interactive_obj_ptr_proj in a
+	 * second graph, using the multiplex decoder's best-IoU mask binarised
+	 * at 0 as the seed mask. The result (`iact_obj_ptr_single`, shape
+	 * [1, 256]) replaces the multiplex decoder's per-slot obj_ptrs at
+	 * step 8. Mask/iou/score still come from the multiplex decoder.
+	 *
+	 * Gated on feature availability: interactive_feat_{s1,s0,4x} are
+	 * only populated on SAM 3.1 checkpoints (where eval_neck_to_persist
+	 * built the interactive neck). SAM 3 checkpoints silently skip.
+	 *
+	 * Runs in both release and debug builds. The DUMP_TRK block below
+	 * reads dbg globals that this call populates when SAM3_DEBUG_DUMP is
+	 * on; keep it after this block.
 	 */
-	/*
-	 * Inputs for the interactive forward come from the interactive neck
-	 * (Python native: `interactive_convs[i](x)` -> interactive mask
-	 * decoder's conv_s0/s1 skip path). SAM 3 checkpoints have no
-	 * interactive neck — the dump call is skipped in that case.
-	 */
-	if (is_multiplex && trk_mux && is_cond && frame_idx == 0 &&
+	struct sam3_tensor *iact_obj_ptr_single = NULL;
+	if (is_multiplex && trk_mux && is_cond &&
 	    track_masks && track_masks->n_dims == 3 &&
 	    cf.interactive_feat_s1 && cf.interactive_feat_s0 &&
 	    cf.interactive_feat_4x &&
@@ -1048,14 +1052,24 @@ video_track_one_obj(struct sam3_video_session *session,
 							binary, mh, mw, 1,
 							&iact_op);
 						if (ierr == SAM3_OK) {
-							(void)ctx->proc.backend->ops
+							enum sam3_error eerr =
+							    ctx->proc.backend->ops
 							     ->graph_eval(
 								ctx->proc.backend,
 								g2);
+							if (eerr == SAM3_OK)
+								iact_obj_ptr_single =
+									iact_op;
+							else
+								sam3_log_warn(
+									"iact graph "
+									"eval failed "
+									"(err=%d)",
+									(int)eerr);
 						} else {
 							sam3_log_warn(
-								"iact dump "
-								"build failed "
+								"iact build "
+								"failed "
 								"(err=%d)",
 								(int)ierr);
 						}
@@ -1066,7 +1080,6 @@ video_track_one_obj(struct sam3_video_session *session,
 			}
 		}
 	}
-#endif
 
 #ifdef SAM3_DEBUG_DUMP
 	if (is_multiplex) {
@@ -1257,24 +1270,27 @@ video_track_one_obj(struct sam3_video_session *session,
 			 * and gated in-place by apply_occlusion_gating. */
 			memcpy(best_obj_ptr_scratch->data,
 			       track_obj_ptr->data, Dbytes);
+		} else if (iact_obj_ptr_single) {
+			/* SAM 3.1 cond frame: Python's `_use_mask_as_output`
+			 * produced a single obj_ptr via interactive_obj_ptr_proj.
+			 * Expand to [16, 256]:
+			 *   slot 0:      raw if appearing, else no_obj_ptr_linear(raw)
+			 *   slot 1..15:  always no_obj_ptr_linear(raw)
+			 * This replaces the multiplex decoder's per-slot best-IoU
+			 * obj_ptrs on seeded frames and matches Python's per-slot
+			 * lambda-gated obj_ptr commit. */
+			(void)track_all_score;
+			sam3_multiplex_expand_obj_ptr(
+				trk_mux, iact_obj_ptr_single, is_appearing,
+				(float *)best_obj_ptr_scratch->data);
 		} else {
+			/* SAM 3.1 propagation frames: multiplex decoder's
+			 * per-slot [16, 3, 256] obj_ptrs. Per-slot argmax IoU
+			 * selects one mask head; gated by scalar is_appearing
+			 * (not per-slot score yet — see sub-project 3 notes). */
 			const float *ptrs = (const float *)track_obj_ptr->data;
 			const float *all_iou = track_all_iou
 				? (const float *)track_all_iou->data : NULL;
-			/* TODO(sub-project 3 / mask-decoder parity): per-slot
-			 * obj_score_logits are available via @track_all_score
-			 * but cannot yet drive gating safely. C's current
-			 * pipeline is self-consistent (not Python-consistent).
-			 * Any partial Python-ward fix here — runtime per-slot
-			 * gate OR seed-only slot-0 hardcode — regresses
-			 * frames 1-3 IoU to 0.000 (iteration 10 + 11 findings).
-			 * The 0.44/0.52/0.41 baseline relies on all 16 slots
-			 * getting raw obj_ptrs on seed and the current detector
-			 * behaviour. Fixing requires simultaneous fix of
-			 * feat_s1 / maskmem / obj_ptr paths — i.e. sub-project 3
-			 * (interactive decoder). See
-			 * docs/superpowers/notes/2026-04-20-sam3-1-tracker-parity-log.md
-			 * for the full trail. */
 			(void)track_all_score;
 			float *dst = (float *)best_obj_ptr_scratch->data;
 			const float *W = (const float *)
@@ -1367,10 +1383,6 @@ video_track_one_obj(struct sam3_video_session *session,
 			err = SAM3_ENOMEM;
 		} else {
 			memset(multi_mask->data, 0, multi_mask->nbytes);
-			int up_h = big_H / final_h;
-			int up_w = big_W / final_w;
-			if (up_h < 1) up_h = 1;
-			if (up_w < 1) up_w = 1;
 			const float *src =
 				(const float *)track_masks->data
 				  + (size_t)best_idx * final_h * final_w;
@@ -1378,7 +1390,6 @@ video_track_one_obj(struct sam3_video_session *session,
 			/*
 			 * SAM 3.1 multiplex mem-enc config (model_builder.py
 			 * build_sam3_multiplex_tracker): scale=2, bias=-1.
-			 * Hard-coded because no other SAM 3.1 variant ships.
 			 */
 			const float mem_scale = 2.0f;
 			const float mem_bias  = -1.0f;
@@ -1395,29 +1406,96 @@ video_track_one_obj(struct sam3_video_session *session,
 			 */
 			const float near_pos =  0.99991f;
 			const float near_neg = -0.99991f;
+
+#define BILINEAR_UPSAMPLE(out_buf, out_h, out_w, in_buf, in_h, in_w) do { \
+	const float _syscale = (float)(in_h) / (float)(out_h); \
+	const float _sxscale = (float)(in_w) / (float)(out_w); \
+	for (int _y = 0; _y < (out_h); _y++) { \
+		float _fy = ((float)_y + 0.5f) * _syscale - 0.5f; \
+		int _sylo = (int)floorf(_fy); \
+		int _syhi = _sylo + 1; \
+		float _wy = _fy - (float)_sylo; \
+		if (_sylo < 0)         _sylo = 0; \
+		if (_sylo >= (in_h))   _sylo = (in_h) - 1; \
+		if (_syhi < 0)         _syhi = 0; \
+		if (_syhi >= (in_h))   _syhi = (in_h) - 1; \
+		for (int _x = 0; _x < (out_w); _x++) { \
+			float _fx = ((float)_x + 0.5f) * _sxscale - 0.5f; \
+			int _sxlo = (int)floorf(_fx); \
+			int _sxhi = _sxlo + 1; \
+			float _wx = _fx - (float)_sxlo; \
+			if (_sxlo < 0)         _sxlo = 0; \
+			if (_sxlo >= (in_w))   _sxlo = (in_w) - 1; \
+			if (_sxhi < 0)         _sxhi = 0; \
+			if (_sxhi >= (in_w))   _sxhi = (in_w) - 1; \
+			float _v00 = (in_buf)[_sylo * (in_w) + _sxlo]; \
+			float _v01 = (in_buf)[_sylo * (in_w) + _sxhi]; \
+			float _v10 = (in_buf)[_syhi * (in_w) + _sxlo]; \
+			float _v11 = (in_buf)[_syhi * (in_w) + _sxhi]; \
+			(out_buf)[_y * (out_w) + _x] = \
+				(1.0f - _wy) * (1.0f - _wx) * _v00 \
+				+ (1.0f - _wy) * _wx         * _v01 \
+				+ _wy         * (1.0f - _wx) * _v10 \
+				+ _wy         * _wx          * _v11; \
+		} \
+	} \
+} while (0)
+
+			/*
+			 * Stage A: apply sigmoid*scale+bias (or hard-binarize
+			 * on cond) at the native track_masks resolution
+			 * (final_h × final_w, e.g. 288 × 288). Python's
+			 * _encode_new_memory does the same transform at this
+			 * resolution before handing mask_for_mem to the
+			 * mask_downsampler.
+			 */
+			float *mask_lr = (float *)malloc(
+				(size_t)final_h * final_w * sizeof(float));
+			if (!mask_lr) {
+				err = SAM3_ENOMEM;
+				goto cleanup;
+			}
+			for (int i = 0; i < final_h * final_w; i++) {
+				float v = src[i];
+				if (is_cond) {
+					mask_lr[i] = (v > 0.0f)
+						? near_pos : near_neg;
+				} else {
+					float s = 1.0f / (1.0f + expf(-v));
+					mask_lr[i] = s * mem_scale + mem_bias;
+				}
+			}
+
+			/* Stage B: bilinear upsample to (big_H, big_W).
+			 * Matches the bilinear inside Python's
+			 * SimpleMaskDownSampler.forward (memory.py:78-86)
+			 * driven by interpol_size = [1152, 1152]. Prior code
+			 * did nearest-neighbour + binarize here, producing
+			 * hard ±1 steps at mask boundaries instead of
+			 * smooth transitions. */
+			float *mask_upsampled = (float *)malloc(
+				(size_t)big_H * big_W * sizeof(float));
+			if (!mask_upsampled) {
+				free(mask_lr);
+				err = SAM3_ENOMEM;
+				goto cleanup;
+			}
+			BILINEAR_UPSAMPLE(mask_upsampled, big_H, big_W,
+					  mask_lr, final_h, final_w);
+			free(mask_lr);
+
 			for (int y = 0; y < big_H; y++) {
-				int sy = y / up_h;
-				if (sy >= final_h) sy = final_h - 1;
 				for (int x = 0; x < big_W; x++) {
-					int sx = x / up_w;
-					if (sx >= final_w) sx = final_w - 1;
-					float v = src[sy * final_w + sx];
-					float mem_v;
-					if (is_cond) {
-						mem_v = (v > 0.0f)
-							? near_pos : near_neg;
-					} else {
-						float s = 1.0f /
-							(1.0f + expf(-v));
-						mem_v = s * mem_scale
-							+ mem_bias;
-					}
 					size_t base = ((size_t)y * big_W + x)
 						* mm_C;
-					dst[base + 0] = mem_v;
+					dst[base + 0] =
+						mask_upsampled[y * big_W + x];
 					dst[base + cond_ch] = cond_fg;
 				}
 			}
+			free(mask_upsampled);
+#undef BILINEAR_UPSAMPLE
+
 			mem_feat = sam3_multiplex_maskmem_forward(
 				&g, gfx, &trk_mux->maskmem,
 				cf.feat_s1, multi_mask,

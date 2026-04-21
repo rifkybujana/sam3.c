@@ -2500,10 +2500,12 @@ enum sam3_error sam3_multiplex_use_mask_as_output(
  * Takes the interactive decoder's single obj_ptr [1, 256] and expands
  * it to [16, 256] for bank storage:
  *   slot 0:    raw (if is_obj_appearing) or no_obj_ptr_linear(raw)
- *   slot 1..15: always no_obj_ptr_linear(raw) (not-appearing slots)
+ *   slot 1..15: literal zeros (Python's `multiplex_state.mux`
+ *               padding for unassigned slots).
  *
- * Matches Python's per-slot gating in _use_mask_as_output. The input
- * tensor must have been graph-evaluated (host data populated).
+ * Matches Python's `multiplex_state.mux(obj_ptr)` at
+ * video_tracking_multiplex.py:2401. The input tensor must have been
+ * graph-evaluated (host data populated).
  */
 void sam3_multiplex_expand_obj_ptr(
 		const struct sam3_tracker_multiplex *trk,
@@ -2513,26 +2515,37 @@ void sam3_multiplex_expand_obj_ptr(
 {
 	const int D = MUX_DEC_HIDDEN;
 	const float *raw = (const float *)obj_ptr_single->data;
-	const float *W = (const float *)trk->no_obj_ptr_linear_w->data;
-	const float *b = (const float *)trk->no_obj_ptr_linear_b->data;
 
-	/* Compute no_obj_ptr_linear(raw): y = raw @ W^T + b. */
-	float proj[MUX_DEC_HIDDEN];
-	for (int i = 0; i < D; i++) {
-		float acc = b[i];
-		const float *wrow = W + (size_t)i * D;
-		for (int j = 0; j < D; j++)
-			acc += raw[j] * wrow[j];
-		proj[i] = acc;
+	/* Python's `_use_mask_as_output` stores `multiplex_state.mux(obj_ptr)`
+	 * in the bank (video_tracking_multiplex.py:2401). For a single-object
+	 * seed, `mux` is a sparse [16, 1] matrix with 1.0 at (slot_0, obj_0)
+	 * and zeros elsewhere, so the result is:
+	 *   slot 0:      one obj_ptr — already gated by the per-object
+	 *                `lambda * raw + (1 - lambda) * no_obj_ptr_linear(raw)`
+	 *                in `_use_mask_as_output`. For a single-object seed
+	 *                with `is_obj_appearing` = 1 this is just `raw`; with
+	 *                `is_obj_appearing` = 0 it's `no_obj_ptr_linear(raw)`.
+	 *   slots 1..15: literal zeros (mux padding for unassigned slots).
+	 *
+	 * Earlier versions filled slots 1..15 with `no_obj_ptr_linear(raw)`.
+	 * That byte-diverges from Python at the bank entry: the cross-attn
+	 * keys/values derived from slots 1..15 come out non-zero in C vs
+	 * zero in Python, corrupting memattn on propagation frames. */
+	if (is_obj_appearing) {
+		memcpy(out_bank_ptr, raw, (size_t)D * sizeof(float));
+	} else {
+		const float *W = (const float *)trk->no_obj_ptr_linear_w->data;
+		const float *b = (const float *)trk->no_obj_ptr_linear_b->data;
+		for (int i = 0; i < D; i++) {
+			float acc = b[i];
+			const float *wrow = W + (size_t)i * D;
+			for (int j = 0; j < D; j++)
+				acc += raw[j] * wrow[j];
+			out_bank_ptr[i] = acc;
+		}
 	}
-
-	/* Slot 0: raw if appearing, proj if not. Slots 1..15: always proj
-	 * (only slot 0 is the real object in single-obj seed). */
-	const float *slot0 = is_obj_appearing ? raw : proj;
-	memcpy(out_bank_ptr, slot0, (size_t)D * sizeof(float));
-	for (int s = 1; s < SAM3_MULTIPLEX_COUNT; s++)
-		memcpy(out_bank_ptr + (size_t)s * D, proj,
-		       (size_t)D * sizeof(float));
+	memset(out_bank_ptr + D, 0,
+	       (size_t)(SAM3_MULTIPLEX_COUNT - 1) * D * sizeof(float));
 }
 
 /*

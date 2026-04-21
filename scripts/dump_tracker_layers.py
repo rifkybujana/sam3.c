@@ -171,6 +171,81 @@ def _register_hooks(model, captures):
         captures.setdefault("memattn_inputs", []).append(dict(kwargs))
     hooks.append(model.transformer.encoder.register_forward_hook(
         _cap_encoder, with_kwargs=True))
+
+    # Capture the input mask_inputs arriving at _use_mask_as_output
+    # (or equivalently _encode_new_memory's pred_masks_high_res) to
+    # verify C's resolution-matching vs Python's video_res-hop on cond
+    # frames.
+    _orig_use_mask = model._use_mask_as_output
+    def _patched_use_mask(backbone_features, high_res_features,
+                          mask_inputs, multiplex_state, objects_in_mask=None):
+        captures.setdefault("use_mask_mask_inputs", []).append(
+            mask_inputs.detach().cpu().float().contiguous())
+        return _orig_use_mask(backbone_features, high_res_features,
+                              mask_inputs, multiplex_state, objects_in_mask)
+    model._use_mask_as_output = _patched_use_mask
+
+    class _UnpatchUseMask:
+        def remove(self_inner):
+            model._use_mask_as_output = _orig_use_mask
+    hooks.append(_UnpatchUseMask())
+
+    # Iteration 15: Maskmem bisection. Capture:
+    #   - maskmem_out: final maskmem_backbone output (pre no_obj_embed)
+    #   - maskmem_proj: post-downsampler (pre pix_proj add)
+    #   - maskmem_pix_proj: pix_feat_proj output (for add bisection)
+    #   - maskmem_stage{0..3}_conv/act: per-stage Conv and post-GELU out
+    # These let us pinpoint which sub-op of maskmem amplifies the ~2%
+    # feat_s1 input gap into the observed 10% cos drop at memory[:5184].
+    def _cap_maskmem_out(_m, _inp, out):
+        # SimpleMaskEncoder returns dict {"vision_features", "vision_pos_enc"}
+        if isinstance(out, dict) and "vision_features" in out:
+            captures.setdefault("maskmem_out", []).append(
+                out["vision_features"].detach().cpu().float().contiguous())
+    hooks.append(model.maskmem_backbone.register_forward_hook(_cap_maskmem_out))
+
+    # Downsampler output: feeds `x + masks` add in SimpleMaskEncoder.forward.
+    def _cap_maskmem_proj(_m, _inp, out):
+        if isinstance(out, torch.Tensor):
+            captures.setdefault("maskmem_proj", []).append(
+                out.detach().cpu().float().contiguous())
+    hooks.append(model.maskmem_backbone.mask_downsampler.register_forward_hook(
+        _cap_maskmem_proj))
+
+    # pix_feat_proj (1x1 conv on feat_s1) output.
+    def _cap_maskmem_pix(_m, _inp, out):
+        if isinstance(out, torch.Tensor):
+            captures.setdefault("maskmem_pix_proj", []).append(
+                out.detach().cpu().float().contiguous())
+    hooks.append(model.maskmem_backbone.pix_feat_proj.register_forward_hook(
+        _cap_maskmem_pix))
+
+    # Per-stage intermediates inside mask_downsampler.encoder (Sequential).
+    # Layout: [Conv, LN, GELU] × 4, then final 1x1 Conv.
+    # Indices: 0,3,6,9 = Conv per stage; 2,5,8,11 = GELU per stage; 12 = final proj.
+    _enc = model.maskmem_backbone.mask_downsampler.encoder
+    # Capture post-bilinear input to encoder[0] (the Conv)
+    def _cap_downsampler_in(_m, inp, out):
+        if isinstance(inp, tuple) and len(inp) > 0 and isinstance(inp[0], torch.Tensor):
+            captures.setdefault("maskmem_downsampler_in", []).append(
+                inp[0].detach().cpu().float().contiguous())
+    hooks.append(_enc[0].register_forward_pre_hook(
+        lambda _m, inp: captures.setdefault(
+            "maskmem_downsampler_in", []).append(
+                inp[0].detach().cpu().float().contiguous())))
+    for si in range(4):
+        conv_idx = si * 3
+        act_idx = si * 3 + 2
+        def _cap_conv(_m, _inp, out, _si=si):
+            if isinstance(out, torch.Tensor):
+                captures.setdefault(f"maskmem_stage{_si}_conv", []).append(
+                    out.detach().cpu().float().contiguous())
+        def _cap_act(_m, _inp, out, _si=si):
+            if isinstance(out, torch.Tensor):
+                captures.setdefault(f"maskmem_stage{_si}_act", []).append(
+                    out.detach().cpu().float().contiguous())
+        hooks.append(_enc[conv_idx].register_forward_hook(_cap_conv))
+        hooks.append(_enc[act_idx].register_forward_hook(_cap_act))
     hooks.append(model.sam_mask_decoder.register_forward_hook(
         _cap("mask_decoder_tuple")))
 
@@ -490,6 +565,32 @@ def _flush_captures_delta(captures, cursors, frame_idx):
         # Multiple calls in one frame is unusual; dump the last one.
         _dump_mem(captures[slot][end - 1], frame_idx)
     cursors[slot] = end
+
+    # Iteration 15: Maskmem bisection dumps. `maskmem_backbone` runs once
+    # per frame (cond + prop) to compute that frame's bank entry. Dump
+    # the final output + internal intermediates so compare_tracker_layers
+    # can localize maskmem internal divergence vs input gap amplification.
+    for slot in ("maskmem_out", "maskmem_proj", "maskmem_pix_proj",
+                 "maskmem_downsampler_in", "use_mask_mask_inputs",
+                 "maskmem_stage0_conv", "maskmem_stage0_act",
+                 "maskmem_stage1_conv", "maskmem_stage1_act",
+                 "maskmem_stage2_conv", "maskmem_stage2_act",
+                 "maskmem_stage3_conv", "maskmem_stage3_act"):
+        start = cursors.get(slot, 0)
+        end = len(captures.get(slot, []))
+        if end > start:
+            t = captures[slot][end - 1]
+            if isinstance(t, torch.Tensor):
+                # All are NCHW image-shaped ([1, C, H, W]). Permute to
+                # NHWC to match the C-side dump byte layout.
+                if t.dim() == 4:
+                    t = t.permute(0, 2, 3, 1).contiguous()
+                arr = t.numpy().astype(np.float32)
+                path = f"/tmp/py_trk_{slot}_f{frame_idx}.bin"
+                arr.tofile(path)
+                print(f"dump: {path} shape={tuple(arr.shape)}",
+                      file=sys.stderr)
+        cursors[slot] = end
 
     # Task 5γ: dump memory-attn encoder INPUTS (tgt / memory /
     # memory_image / memory_image_pos) for bank parity. Upstream
