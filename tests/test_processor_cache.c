@@ -165,10 +165,55 @@ static void test_top_level_cache_clear_and_stats(void)
 	sam3_free(ctx);
 }
 
+/*
+ * test_segment_does_not_grow_model_arena - Repeated segment() calls
+ * must not grow model_arena.offset after weights are loaded. Since the
+ * image-cache redesign, encoder outputs live in per-slot arenas and
+ * text features live in the text cache arena; model_arena should hold
+ * weights only. Per-segment tensors go into scratch and are rolled back.
+ */
+static void test_segment_does_not_grow_model_arena(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+
+	struct sam3_processor proc;
+	enum sam3_error err = sam3_processor_init(&proc,
+						  SAM3_BACKBONE_HIERA, 4);
+	ASSERT_EQ(err, SAM3_OK);
+	struct sam3_weight_file wf;
+	ASSERT_EQ(sam3_weight_open(&wf, MODEL_PATH), SAM3_OK);
+	ASSERT_EQ(sam3_processor_load(&proc, &wf, VOCAB_PATH), SAM3_OK);
+
+	int sz = sam3_processor_img_size(&proc);
+	uint8_t *pixels = calloc((size_t)sz * sz * 3, 1);
+	ASSERT_EQ(sam3_processor_set_image(&proc, pixels, sz, sz), SAM3_OK);
+
+	size_t arena_after_load = proc.model_arena.offset;
+
+	struct sam3_prompt p = {.type = SAM3_PROMPT_TEXT, .text = "cat"};
+	struct sam3_result r = {0};
+
+	for (int i = 0; i < 4; i++) {
+		ASSERT_EQ(sam3_processor_segment(&proc, &p, 1, &r), SAM3_OK);
+		sam3_result_free(&r);
+		memset(&r, 0, sizeof(r));
+	}
+
+	ASSERT_EQ(proc.model_arena.offset, arena_after_load);
+
+	free(pixels);
+	sam3_processor_free(&proc);
+	sam3_weight_close(&wf);
+}
+
 int main(void)
 {
 	test_image_cache_hit_skips_encoder();
 	test_text_cache_hit_skips_worker();
 	test_top_level_cache_clear_and_stats();
+	test_segment_does_not_grow_model_arena();
 	TEST_REPORT();
 }
