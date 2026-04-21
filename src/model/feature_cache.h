@@ -86,10 +86,10 @@ struct sam3_text_bundle {
 struct sam3_text_cache_slot {
 	uint64_t hash;
 	uint64_t lru_tick;
+	struct sam3_arena arena;
 	struct sam3_text_bundle bundle;
 	int32_t prefix_tokens[SAM3_CACHE_PREFIX_BYTES / 4];
 	int     prefix_len;
-	size_t  arena_offset;
 };
 
 struct sam3_text_feature_cache {
@@ -98,8 +98,6 @@ struct sam3_text_feature_cache {
 	uint64_t hits;
 	uint64_t misses;
 	uint64_t evictions;
-	struct sam3_arena arena;
-	size_t slot_bytes;
 	struct sam3_text_cache_slot *slots;
 };
 

@@ -87,6 +87,9 @@ void sam3_image_cache_clear(struct sam3_image_feature_cache *c)
 		memset(&c->slots[i].bundle, 0, sizeof(c->slots[i].bundle));
 	}
 	c->next_tick = 0;
+	c->hits = 0;
+	c->misses = 0;
+	c->evictions = 0;
 }
 
 void sam3_image_cache_stats(const struct sam3_image_feature_cache *c,
@@ -195,20 +198,21 @@ sam3_text_cache_create(int n_slots, size_t slot_bytes)
 	if (!c)
 		return NULL;
 	c->n_slots = n_slots;
-	c->slot_bytes = slot_bytes;
 	c->slots = calloc((size_t)n_slots, sizeof(*c->slots));
 	if (!c->slots) {
 		free(c);
 		return NULL;
 	}
-	if (sam3_arena_init(&c->arena,
-			    (size_t)n_slots * slot_bytes) != SAM3_OK) {
-		free(c->slots);
-		free(c);
-		return NULL;
+	for (int i = 0; i < n_slots; i++) {
+		if (sam3_arena_init(&c->slots[i].arena, slot_bytes)
+		    != SAM3_OK) {
+			for (int j = 0; j < i; j++)
+				sam3_arena_free(&c->slots[j].arena);
+			free(c->slots);
+			free(c);
+			return NULL;
+		}
 	}
-	for (int i = 0; i < n_slots; i++)
-		c->slots[i].arena_offset = (size_t)i * slot_bytes;
 	return c;
 }
 
@@ -216,7 +220,8 @@ void sam3_text_cache_destroy(struct sam3_text_feature_cache *c)
 {
 	if (!c)
 		return;
-	sam3_arena_free(&c->arena);
+	for (int i = 0; i < c->n_slots; i++)
+		sam3_arena_free(&c->slots[i].arena);
 	free(c->slots);
 	free(c);
 }
@@ -231,6 +236,7 @@ void sam3_text_cache_clear(struct sam3_text_feature_cache *c)
 	if (!c)
 		return;
 	for (int i = 0; i < c->n_slots; i++) {
+		sam3_arena_reset(&c->slots[i].arena);
 		c->slots[i].hash = 0;
 		c->slots[i].lru_tick = 0;
 		c->slots[i].prefix_len = 0;
@@ -238,6 +244,9 @@ void sam3_text_cache_clear(struct sam3_text_feature_cache *c)
 		c->slots[i].bundle.n_tokens = 0;
 	}
 	c->next_tick = 0;
+	c->hits = 0;
+	c->misses = 0;
+	c->evictions = 0;
 }
 
 void sam3_text_cache_stats(const struct sam3_text_feature_cache *c,
@@ -304,6 +313,7 @@ int sam3_text_cache_claim_slot(struct sam3_text_feature_cache *c)
 	struct sam3_text_cache_slot *s = &c->slots[idx];
 	if (s->hash != 0)
 		c->evictions++;
+	sam3_arena_reset(&s->arena);
 	s->hash = 0;
 	s->prefix_len = 0;
 	s->bundle.features = NULL;
@@ -335,8 +345,7 @@ void sam3_text_cache_register(struct sam3_text_feature_cache *c, int idx,
 struct sam3_arena *
 sam3_text_cache_slot_arena(struct sam3_text_feature_cache *c, int idx)
 {
-	(void)idx;
-	if (!c)
+	if (!c || idx < 0 || idx >= c->n_slots)
 		return NULL;
-	return &c->arena;
+	return &c->slots[idx].arena;
 }
