@@ -137,6 +137,36 @@ def _install_video_patches():
     _gvp._patch_forward_image_clone_loop()
 
 
+def _install_interactive_neck_parity_patch(model):
+    """
+    Compute-parity shim: alias the "interactive" backbone feature stream
+    to "sam2_backbone_out" (the propagation stream) inside
+    `_prepare_backbone_features`. This lets us compare Python's
+    interactive forward against C's on IDENTICAL `backbone_features` —
+    C currently only has a `propagation_convs`-equivalent neck loaded,
+    not the separate `interactive_convs` neck Python uses by default.
+
+    Enabled when SAM3_DUMP_INTERACTIVE_USE_PROPAGATION_NECK=1 in env.
+    Without this, `iact_backbone` diverges at cos~0.38 because the two
+    sides literally run different neck weights — masking compute parity.
+    """
+    if os.environ.get(
+            "SAM3_DUMP_INTERACTIVE_USE_PROPAGATION_NECK", "0") != "1":
+        return
+    _orig = model._prepare_backbone_features
+
+    def _patched(backbone_out):
+        out = _orig(backbone_out)
+        if isinstance(out, dict) and "interactive" in out \
+                and "sam2_backbone_out" in out:
+            out["interactive"] = out["sam2_backbone_out"]
+        return out
+    model._prepare_backbone_features = _patched
+    print("[patch] interactive backbone aliased to sam2_backbone_out "
+          "(SAM3_DUMP_INTERACTIVE_USE_PROPAGATION_NECK=1)",
+          file=sys.stderr)
+
+
 def _init_state(model, video_path):
     from sam3.model.video_tracking_multiplex_demo import (
         VideoTrackingMultiplexDemo,
@@ -450,6 +480,135 @@ def _register_hooks(model, cap):
                                v.detach().cpu().float().contiguous())
     hooks.append(md.register_forward_hook(_cap_md_top))
 
+    # --- interactive (SAM-style) path: prompt encoder + mask decoder ---
+    # Fires once on the seed frame via
+    #   add_new_masks → _use_mask_as_output → _forward_sam_heads(is_interactive=True)
+    # so all dumps land in frame_0000/.
+    if hasattr(model, "interactive_sam_prompt_encoder"):
+        ipe = model.interactive_sam_prompt_encoder
+
+        def _cap_iact_pe(_m, _inp, out):
+            # Returns (sparse_embeddings, dense_embeddings).
+            if isinstance(out, tuple) and len(out) >= 2:
+                s, d = out[0], out[1]
+                if isinstance(s, torch.Tensor):
+                    cap.append("iact_prompt_sparse",
+                               s.detach().cpu().float().contiguous())
+                if isinstance(d, torch.Tensor):
+                    cap.append("iact_prompt_dense",
+                               d.detach().cpu().float().contiguous())
+        hooks.append(ipe.register_forward_hook(_cap_iact_pe))
+
+    if hasattr(model, "interactive_sam_mask_decoder"):
+        imd = model.interactive_sam_mask_decoder
+
+        # Per-layer two-way block queries/keys.
+        for i, layer in enumerate(imd.transformer.layers):
+            def _cap_iactlayer(_m, _inp, out, _i=i):
+                if isinstance(out, tuple) and len(out) >= 2:
+                    q, k = out[0], out[1]
+                    if isinstance(q, torch.Tensor):
+                        cap.append(f"iact_twt_{_i}_queries",
+                                   q.detach().cpu().float().contiguous())
+                    if isinstance(k, torch.Tensor):
+                        cap.append(f"iact_twt_{_i}_keys",
+                                   k.detach().cpu().float().contiguous())
+            hooks.append(layer.register_forward_hook(_cap_iactlayer))
+
+        if hasattr(imd.transformer, "final_attn_token_to_image"):
+            hooks.append(
+                imd.transformer.final_attn_token_to_image
+                   .register_forward_hook(_cap_plain("iact_final_attn")))
+        if hasattr(imd.transformer, "norm_final_attn"):
+            hooks.append(
+                imd.transformer.norm_final_attn.register_forward_hook(
+                    _cap_plain("iact_final_norm")))
+
+        # Top-level decoder returns
+        # (masks, iou_pred, sam_tokens_out, object_score_logits).
+        # NB these are POST-slice values (single-mask or 3-multimask),
+        # so they don't correspond directly to C's raw 4-mask outputs.
+        # Keep them for reference; the raw outputs are captured via the
+        # predict_masks monkey-patch below.
+        def _cap_iact_top(_m, _inp, out):
+            if isinstance(out, tuple) and len(out) >= 4:
+                names = ("iact_out_masks_sliced", "iact_out_iou_sliced",
+                         "iact_out_sam_tokens_sliced",
+                         "iact_out_obj_score")
+                for v, name in zip(out, names):
+                    if isinstance(v, torch.Tensor):
+                        cap.append(name,
+                                   v.detach().cpu().float().contiguous())
+        hooks.append(imd.register_forward_hook(_cap_iact_top))
+
+        # predict_masks returns the RAW outputs
+        # (masks, iou_pred, mask_tokens_out, object_score_logits)
+        # before the forward() slice. This is what C's
+        # interactive_mask_decoder_forward produces directly. Monkey-
+        # patch so we can diff C vs Python at the same point.
+        _orig_predict = imd.predict_masks
+
+        def _wrap_predict(*args, _orig=_orig_predict, **kwargs):
+            # Capture the two inputs image_embeddings and
+            # dense_prompt_embeddings before predict_masks does its
+            # repeat_interleave + add. This gives us `iact_backbone`
+            # (Python's post-no_mem_embed conditioned pix_feat) and
+            # `iact_src_pre_attn` (backbone + dense, first internal
+            # step of predict_masks). Mirror predict_masks' signature
+            # to sniff the args.
+            if "image_embeddings" in kwargs:
+                ie = kwargs["image_embeddings"]
+            elif len(args) >= 1:
+                ie = args[0]
+            else:
+                ie = None
+            if "dense_prompt_embeddings" in kwargs:
+                de = kwargs["dense_prompt_embeddings"]
+            elif len(args) >= 4:
+                de = args[3]
+            else:
+                de = None
+            if isinstance(ie, torch.Tensor):
+                cap.append("iact_backbone",
+                           ie.detach().cpu().float().contiguous())
+            if isinstance(ie, torch.Tensor) and isinstance(de, torch.Tensor):
+                try:
+                    src = ie + de
+                    cap.append("iact_src_pre_attn",
+                               src.detach().cpu().float().contiguous())
+                except Exception:
+                    pass
+
+            masks, iou, tokens, obj_score = _orig(*args, **kwargs)
+            if isinstance(masks, torch.Tensor):
+                cap.append("iact_out_masks",
+                           masks.detach().cpu().float().contiguous())
+            if isinstance(iou, torch.Tensor):
+                cap.append("iact_out_iou",
+                           iou.detach().cpu().float().contiguous())
+            if isinstance(tokens, torch.Tensor):
+                cap.append("iact_out_sam_tokens",
+                           tokens.detach().cpu().float().contiguous())
+            return masks, iou, tokens, obj_score
+        imd.predict_masks = _wrap_predict
+
+        class _UnpatchPredict:
+            def remove(self_inner, _o=_orig_predict, _imd=imd):
+                _imd.predict_masks = _o
+        hooks.append(_UnpatchPredict())
+
+    # interactive_obj_ptr_proj: raw projection of sam_output_token before
+    # no_obj_ptr_linear mixing. Fires once on the seed frame.
+    if hasattr(model, "interactive_obj_ptr_proj"):
+        hooks.append(model.interactive_obj_ptr_proj.register_forward_hook(
+            _cap_plain("iact_obj_ptr_raw")))
+
+    # interactive_mask_downsample: Conv2d(1→1, k=4, s=4) applied to the
+    # raw binary mask_inputs before the prompt encoder sees it.
+    if hasattr(model, "interactive_mask_downsample"):
+        hooks.append(model.interactive_mask_downsample.register_forward_hook(
+            _cap_plain("iact_mask_downsample")))
+
     return hooks
 
 
@@ -469,6 +628,10 @@ _NHWC_SLOTS = {
     "mdec_conv_s0", "mdec_conv_s1", "mdec_out_masks",
     "maskmem_downsampled", "maskmem_pix_proj",
     "maskmem_fuser_out", "maskmem_out",
+    # Interactive path slots with channel-first NCHW layout that needs
+    # NHWC for C parity:
+    "iact_prompt_dense", "iact_out_masks", "iact_out_masks_sliced",
+    "iact_mask_downsample", "iact_backbone", "iact_src_pre_attn",
 }
 
 
@@ -509,6 +672,24 @@ def _ordered_slot_names(trunk_nblocks, memattn_nlayers,
               "mdec_iou_head", "mdec_obj_score_head",
               "mdec_out_masks", "mdec_out_iou",
               "mdec_out_sam_tokens", "mdec_out_obj_score"]
+    # Interactive (SAM-style) seed-frame path. Only fires on frame_0000
+    # via add_new_masks → _use_mask_as_output → _forward_sam_heads.
+    # Raw outputs (iact_out_*) are pre-slice to match C's
+    # interactive_mask_decoder_forward output shapes ([1,4,H4,W4] etc.);
+    # iact_out_*_sliced are the post-slice values returned by
+    # MaskDecoder.forward() (single-mask [1,1,H4,W4]).
+    names += ["iact_backbone",
+              "iact_mask_downsample",
+              "iact_prompt_sparse", "iact_prompt_dense",
+              "iact_src_pre_attn",
+              "iact_twt_0_queries", "iact_twt_0_keys",
+              "iact_twt_1_queries", "iact_twt_1_keys",
+              "iact_final_attn", "iact_final_norm",
+              "iact_out_masks", "iact_out_iou",
+              "iact_out_sam_tokens", "iact_out_obj_score",
+              "iact_out_masks_sliced", "iact_out_iou_sliced",
+              "iact_out_sam_tokens_sliced",
+              "iact_obj_ptr_raw"]
     return names
 
 
@@ -627,6 +808,7 @@ def main():
     print(f"[build] loading checkpoint {args.checkpoint}",
           file=sys.stderr)
     model = _build_model(args.checkpoint)
+    _install_interactive_neck_parity_patch(model)
     print(f"[init] init_state video={args.video}", file=sys.stderr)
     state = _init_state(model, args.video)
 

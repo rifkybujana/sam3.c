@@ -1982,6 +1982,18 @@ static enum sam3_error interactive_prompt_encoder_forward_mask_only(
 			       MUX_DEC_HIDDEN * sizeof(float));
 	}
 	*out_sparse = sparse;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_prompt_sparse;
+		sparse->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_prompt_sparse = sparse;
+	}
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_mask_downsample;
+		mask_input->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_mask_downsample = mask_input;
+	}
+#endif
 
 	/* --- dense: mask_downscaling stack --- */
 	struct sam3_tensor *x = mask_input;
@@ -2005,6 +2017,13 @@ static enum sam3_error interactive_prompt_encoder_forward_mask_only(
 	if (!x) return SAM3_ENOMEM;
 	/* x: [1, Hp/4, Wp/4, 256] */
 	*out_dense = x;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_prompt_dense;
+		x->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_prompt_dense = x;
+	}
+#endif
 	return SAM3_OK;
 }
 
@@ -2050,6 +2069,13 @@ static enum sam3_error interactive_mask_decoder_forward(
 	/* --- 1. image_embeddings + dense_prompt_embeddings --- */
 	struct sam3_tensor *src = gh_add(g, arena, image_embeddings, dense_prompt);
 	if (!src) return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_src_pre_attn;
+		src->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_src_pre_attn = src;
+	}
+#endif
 
 	/* --- 2. Flatten to [HW, 256] for two-way transformer --- */
 	int keys_dims[2] = {HW, MUX_DEC_HIDDEN};
@@ -2083,6 +2109,23 @@ static enum sam3_error interactive_mask_decoder_forward(
 					queries, &keys, query_pe, key_pe,
 					/*skip_pe=*/(i == 0));
 		if (!queries) return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+		if (i == 0) {
+			extern struct sam3_tensor *sam3_dbg_trk_iact_twt_0_queries;
+			extern struct sam3_tensor *sam3_dbg_trk_iact_twt_0_keys;
+			queries->dbg_force_readback = 1;
+			sam3_dbg_trk_iact_twt_0_queries = queries;
+			keys->dbg_force_readback = 1;
+			sam3_dbg_trk_iact_twt_0_keys = keys;
+		} else if (i == 1) {
+			extern struct sam3_tensor *sam3_dbg_trk_iact_twt_1_queries;
+			extern struct sam3_tensor *sam3_dbg_trk_iact_twt_1_keys;
+			queries->dbg_force_readback = 1;
+			sam3_dbg_trk_iact_twt_1_queries = queries;
+			keys->dbg_force_readback = 1;
+			sam3_dbg_trk_iact_twt_1_keys = keys;
+		}
+#endif
 	}
 
 	/* --- 5. Final token→image attention + norm --- */
@@ -2097,11 +2140,25 @@ static enum sam3_error interactive_mask_decoder_forward(
 			md->final_out_w, md->final_out_b,
 			MUX_DEC_N_HEADS_XA);
 		if (!fa) return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+		{
+			extern struct sam3_tensor *sam3_dbg_trk_iact_final_attn;
+			fa->dbg_force_readback = 1;
+			sam3_dbg_trk_iact_final_attn = fa;
+		}
+#endif
 		queries = gh_add(g, arena, queries, fa);
 		if (!queries) return SAM3_ENOMEM;
 		queries = gh_layernorm(g, arena, queries,
 				       md->norm_final_w, md->norm_final_b);
 		if (!queries) return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+		{
+			extern struct sam3_tensor *sam3_dbg_trk_iact_final_norm;
+			queries->dbg_force_readback = 1;
+			sam3_dbg_trk_iact_final_norm = queries;
+		}
+#endif
 	}
 
 	/* --- 6. Slice output tokens.
@@ -2210,6 +2267,22 @@ static enum sam3_error interactive_mask_decoder_forward(
 	*out_iou = iou;
 	*out_obj_score = obj_logit;
 	*out_sam_tokens = mask_tok_out;  /* [4, 256] */
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_out_masks;
+		extern struct sam3_tensor *sam3_dbg_trk_iact_out_iou;
+		extern struct sam3_tensor *sam3_dbg_trk_iact_out_obj_score;
+		extern struct sam3_tensor *sam3_dbg_trk_iact_out_sam_tokens;
+		masks->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_out_masks = masks;
+		iou->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_out_iou = iou;
+		obj_logit->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_out_obj_score = obj_logit;
+		mask_tok_out->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_out_sam_tokens = mask_tok_out;
+	}
+#endif
 	return SAM3_OK;
 }
 
@@ -2256,36 +2329,76 @@ enum sam3_error sam3_multiplex_use_mask_as_output(
 	    backbone_features->dims[0] != 1 ||
 	    backbone_features->dims[3] != MUX_DEC_HIDDEN)
 		return SAM3_EINVAL;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_backbone;
+		backbone_features->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_backbone = backbone_features;
+	}
+#endif
 
 	int H = backbone_features->dims[1];
 	int W = backbone_features->dims[2];
-	/* Expected prompt-encoder mask_input_size: 4 × image_embedding_size.
-	 * For SAM 3.1 multiplex with H=W=72, that's 288. */
+	/*
+	 * Python's `_use_mask_as_output` applies `interactive_mask_downsample`
+	 * (a learned Conv2d(1→1, k=4, s=4)) to the raw [1, 1, 16H, 16W]
+	 * binary mask before feeding it into `_forward_sam_heads`. The
+	 * prompt encoder itself then consumes a [1, 1, 4H, 4W] probability
+	 * map — NOT the raw binary — via its own `mask_downscaling` stack.
+	 *
+	 * Previously the C path skipped the interactive_mask_downsample Conv
+	 * and went straight from raw binary to the prompt encoder, which
+	 * changes the input statistics entirely (binary {0,1} instead of a
+	 * learned probability). Reintroducing the Conv is a pre-requisite
+	 * for sub-project 3 parity (see sub-project 3 bisection results
+	 * vs Python's `iact_mask_downsample` dump).
+	 */
+	const int raw_in_h = 16 * H;
+	const int raw_in_w = 16 * W;
 	const int mask_in_h = 4 * H;
 	const int mask_in_w = 4 * W;
 
-	/* --- 1. Build mask_input tensor [1, mask_in_h, mask_in_w, 1] NHWC
-	 * from the binary mask. If the detector mask size differs, nearest-
-	 * neighbour upsample/downsample to fit. --- */
-	int mi_dims[4] = {1, mask_in_h, mask_in_w, 1};
-	struct sam3_tensor *mask_input = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
-							 4, mi_dims);
-	if (!mask_input) return SAM3_ENOMEM;
+	/* --- 1. Build raw binary mask at [1, 16H, 16W, 1] via nearest-
+	 * neighbour resize (matches Python's `add_new_masks` bilinear on a
+	 * binary input — bilinear on {0,1} + threshold=0 gives nearest-
+	 * neighbour for almost all pixels). --- */
+	int raw_dims[4] = {1, raw_in_h, raw_in_w, 1};
+	struct sam3_tensor *mask_raw = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						       4, raw_dims);
+	if (!mask_raw) return SAM3_ENOMEM;
 	{
-		float *dst = (float *)mask_input->data;
-		for (int y = 0; y < mask_in_h; y++) {
-			int sy = (y * mask_h) / mask_in_h;
+		float *dst = (float *)mask_raw->data;
+		for (int y = 0; y < raw_in_h; y++) {
+			int sy = (y * mask_h) / raw_in_h;
 			if (sy >= mask_h) sy = mask_h - 1;
-			for (int x = 0; x < mask_in_w; x++) {
-				int sx = (x * mask_w) / mask_in_w;
+			for (int x = 0; x < raw_in_w; x++) {
+				int sx = (x * mask_w) / raw_in_w;
 				if (sx >= mask_w) sx = mask_w - 1;
-				dst[(size_t)y * mask_in_w + x] =
+				dst[(size_t)y * raw_in_w + x] =
 					binary_mask[sy * mask_w + sx];
 			}
 		}
 	}
 
-	/* --- 2. Prompt encoder forward (mask-only path). --- */
+	/* --- 2. Apply interactive_mask_downsample: Conv(1→1, k=4, s=4)
+	 * turning [1, 16H, 16W, 1] binary → [1, 4H, 4W, 1] probability. --- */
+	struct sam3_tensor *mask_input = gh_conv2d(g, arena, mask_raw,
+		trk->interactive_mask_downsample_w,
+		trk->interactive_mask_downsample_b,
+		/*stride=*/4, /*pad=*/0, /*dilation=*/1);
+	if (!mask_input) return SAM3_ENOMEM;
+	if (mask_input->n_dims != 4 ||
+	    mask_input->dims[1] != mask_in_h ||
+	    mask_input->dims[2] != mask_in_w) {
+		sam3_log_error("iact: mask_downsample shape %d x %d x %d x %d, "
+			       "expected 1 x %d x %d x 1",
+			       mask_input->dims[0], mask_input->dims[1],
+			       mask_input->dims[2], mask_input->dims[3],
+			       mask_in_h, mask_in_w);
+		return SAM3_EINVAL;
+	}
+
+	/* --- 3. Prompt encoder forward (mask-only path). --- */
 	struct sam3_tensor *sparse = NULL, *dense = NULL;
 	enum sam3_error err = interactive_prompt_encoder_forward_mask_only(
 		g, arena, &trk->interactive_sam_prompt_encoder,
@@ -2335,6 +2448,12 @@ enum sam3_error sam3_multiplex_use_mask_as_output(
 	/* obj_ptr_single: [1, 256]. Force readback so we can host-side
 	 * build the per-slot bank tensor. */
 	obj_ptr_single->dbg_force_readback = 1;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_obj_ptr_raw;
+		sam3_dbg_trk_iact_obj_ptr_raw = obj_ptr_single;
+	}
+#endif
 
 	/* --- 6. Build [16, 256] per-slot obj_ptr on the host side after
 	 * graph eval. Since graph eval hasn't run yet, we return the

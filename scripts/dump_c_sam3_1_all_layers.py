@@ -85,6 +85,25 @@ _PER_FRAME = {
     "mask_dec_score":        "mdec_out_obj_score",
     "mask_dec_sam":          "mdec_out_sam_tokens",
     "maskmem_out":           "maskmem_out",
+    # Interactive SAM-style seed-frame path (sub-project 3). Fire on
+    # frame 0 only (the cond frame where sam3_video.c dispatches the
+    # dump-only sam3_multiplex_use_mask_as_output call).
+    "iact_backbone":         "iact_backbone",
+    "iact_mask_downsample":  "iact_mask_downsample",
+    "iact_prompt_sparse":    "iact_prompt_sparse",
+    "iact_prompt_dense":     "iact_prompt_dense",
+    "iact_src_pre_attn":     "iact_src_pre_attn",
+    "iact_twt_0_queries":    "iact_twt_0_queries",
+    "iact_twt_0_keys":       "iact_twt_0_keys",
+    "iact_twt_1_queries":    "iact_twt_1_queries",
+    "iact_twt_1_keys":       "iact_twt_1_keys",
+    "iact_final_attn":       "iact_final_attn",
+    "iact_final_norm":       "iact_final_norm",
+    "iact_out_masks":        "iact_out_masks",
+    "iact_out_iou":          "iact_out_iou",
+    "iact_out_obj_score":    "iact_out_obj_score",
+    "iact_out_sam_tokens":   "iact_out_sam_tokens",
+    "iact_obj_ptr_raw":      "iact_obj_ptr_raw",
 }
 
 # Non-frame-indexed C dumps (image pipeline runs per forward_image,
@@ -207,6 +226,21 @@ def _write_ordered_slot_list():
               "mdec_iou_head", "mdec_obj_score_head",
               "mdec_out_masks", "mdec_out_iou",
               "mdec_out_sam_tokens", "mdec_out_obj_score"]
+    # Interactive SAM-style seed-frame slots (sub-project 3). Order
+    # and names match scripts/dump_sam3_1_all_layers.py so NN_ prefixes
+    # line up byte-for-byte.
+    names += ["iact_backbone",
+              "iact_mask_downsample",
+              "iact_prompt_sparse", "iact_prompt_dense",
+              "iact_src_pre_attn",
+              "iact_twt_0_queries", "iact_twt_0_keys",
+              "iact_twt_1_queries", "iact_twt_1_keys",
+              "iact_final_attn", "iact_final_norm",
+              "iact_out_masks", "iact_out_iou",
+              "iact_out_sam_tokens", "iact_out_obj_score",
+              "iact_out_masks_sliced", "iact_out_iou_sliced",
+              "iact_out_sam_tokens_sliced",
+              "iact_obj_ptr_raw"]
     return names
 
 

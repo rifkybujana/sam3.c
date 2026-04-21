@@ -120,6 +120,30 @@ struct sam3_tensor *sam3_dbg_trk_feat_s1           = NULL;
  * compute itself is the bug. */
 struct sam3_tensor *sam3_dbg_trk_vit_out           = NULL;
 struct sam3_tensor *sam3_dbg_trk_sam3_feat_s1      = NULL;
+/*
+ * Interactive (SAM-style) seed-frame path dumps. Populated by the
+ * interactive_prompt_encoder / interactive_mask_decoder / obj_ptr_proj
+ * helpers inside tracker_multiplex.c when video_track_one_obj calls
+ * sam3_multiplex_use_mask_as_output on the seed frame (is_cond=1,
+ * is_multiplex=1). Bisection slots for validating the SAM-style decoder
+ * against the Python reference's interactive path (sub-project 3).
+ */
+struct sam3_tensor *sam3_dbg_trk_iact_backbone       = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_mask_downsample = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_prompt_sparse   = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_prompt_dense    = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_src_pre_attn    = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_twt_0_queries   = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_twt_0_keys      = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_twt_1_queries   = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_twt_1_keys      = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_final_attn      = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_final_norm      = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_out_masks       = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_out_iou         = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_out_obj_score   = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_out_sam_tokens  = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_obj_ptr_raw     = NULL;
 
 /* Video-path tensor dumper. Used for layer-by-layer parity diffs
  * against the Python reference via scripts/dump_reference_layers.py
@@ -913,6 +937,113 @@ video_track_one_obj(struct sam3_video_session *session,
 	}
 
 #ifdef SAM3_DEBUG_DUMP
+	/*
+	 * Sub-project 3 validation: on the seed frame, also run the SAM-style
+	 * interactive forward in a second graph using the multiplex decoder's
+	 * first multimask (head 0, slot 0) binarised at 0 as the seed mask.
+	 * Result (obj_ptr) is discarded — this is a dump-only side-effect
+	 * call used to diff C's interactive path against Python's.
+	 *
+	 * Does nothing in release builds (guarded by SAM3_DEBUG_DUMP).
+	 */
+	if (is_multiplex && trk_mux && is_cond && frame_idx == 0 &&
+	    track_masks && track_masks->n_dims == 3 && cf.feat_s1 &&
+	    cf.feat_s0 && cf.feat_4x &&
+	    trk_mux->interactivity_no_mem_embed &&
+	    trk_mux->interactivity_no_mem_embed->data &&
+	    cf.feat_s1->data && track_masks->data) {
+		const int H_ = cf.feat_s1->dims[1];
+		const int W_ = cf.feat_s1->dims[2];
+		const int D_ = SAM3_MULTIPLEX_HIDDEN_DIM;
+		if (cf.feat_s1->n_dims == 4 &&
+		    cf.feat_s1->dims[0] == 1 &&
+		    cf.feat_s1->dims[3] == D_) {
+			int bd[4] = {1, H_, W_, D_};
+			struct sam3_tensor *backbone = gh_alloc_tensor(
+				gfx, SAM3_DTYPE_F32, 4, bd);
+			if (backbone) {
+				const float *sf =
+					(const float *)cf.feat_s1->data;
+				const float *ad = (const float *)
+					trk_mux->interactivity_no_mem_embed->data;
+				float *df = (float *)backbone->data;
+				const int HW_ = H_ * W_;
+				for (int i = 0; i < HW_; i++) {
+					for (int c = 0; c < D_; c++)
+						df[(size_t)i * D_ + c] =
+							sf[(size_t)i * D_ + c]
+							  + ad[c];
+				}
+
+				const int mh = track_masks->dims[1];
+				const int mw = track_masks->dims[2];
+				/* Select the best-IoU multimask head so C's
+				 * interactive input matches the committed
+				 * seed_mask.png fixture (which was saved from
+				 * r.objects[0].mask = best-IoU). */
+				int iact_best_idx = 0;
+				if (track_iou && track_iou->n_dims >= 1 &&
+				    track_iou->data &&
+				    track_iou->dims[0] == track_masks->dims[0]) {
+					const float *io =
+						(const float *)track_iou->data;
+					float best = io[0];
+					for (int i = 1; i < track_masks->dims[0];
+					     i++) {
+						if (io[i] > best) {
+							best = io[i];
+							iact_best_idx = i;
+						}
+					}
+				}
+				float *binary = (float *)malloc(
+					(size_t)mh * mw * sizeof(float));
+				if (binary) {
+					const float *sm = (const float *)
+						track_masks->data
+					        + (size_t)iact_best_idx * mh * mw;
+					for (int i = 0; i < mh * mw; i++)
+						binary[i] = (sm[i] > 0.0f)
+							? 1.0f : 0.0f;
+
+					/* sam3_graph is ~1 MB; allocate on
+					 * the heap, not the stack, to avoid
+					 * overflowing video_track_one_obj's
+					 * already-deep frame. */
+					struct sam3_graph *g2 = (struct sam3_graph *)
+						malloc(sizeof(*g2));
+					if (g2) {
+						sam3_graph_init(g2);
+						struct sam3_tensor *iact_op = NULL;
+						enum sam3_error ierr =
+						    sam3_multiplex_use_mask_as_output(
+							trk_mux, g2, gfx,
+							backbone, cf.feat_s0,
+							cf.feat_4x,
+							binary, mh, mw, 1,
+							&iact_op);
+						if (ierr == SAM3_OK) {
+							(void)ctx->proc.backend->ops
+							     ->graph_eval(
+								ctx->proc.backend,
+								g2);
+						} else {
+							sam3_log_warn(
+								"iact dump "
+								"build failed "
+								"(err=%d)",
+								(int)ierr);
+						}
+						free(g2);
+					}
+					free(binary);
+				}
+			}
+		}
+	}
+#endif
+
+#ifdef SAM3_DEBUG_DUMP
 	if (is_multiplex) {
 		char pbuf[256];
 		#define DUMP_TRK(slot) do { \
@@ -950,6 +1081,26 @@ video_track_one_obj(struct sam3_video_session *session,
 		DUMP_TRK(memattn_l0_gelu_out);
 		DUMP_TRK(memattn_l0_lin2_out);
 		DUMP_TRK(memattn_l0_layer_out);
+		/* Interactive SAM-style seed-frame slots. Populated only when
+		 * video_track_one_obj explicitly calls
+		 * sam3_multiplex_use_mask_as_output below (cond frame 0, with
+		 * SAM3_DEBUG_DUMP on). */
+		DUMP_TRK(iact_backbone);
+		DUMP_TRK(iact_mask_downsample);
+		DUMP_TRK(iact_prompt_sparse);
+		DUMP_TRK(iact_prompt_dense);
+		DUMP_TRK(iact_src_pre_attn);
+		DUMP_TRK(iact_twt_0_queries);
+		DUMP_TRK(iact_twt_0_keys);
+		DUMP_TRK(iact_twt_1_queries);
+		DUMP_TRK(iact_twt_1_keys);
+		DUMP_TRK(iact_final_attn);
+		DUMP_TRK(iact_final_norm);
+		DUMP_TRK(iact_out_masks);
+		DUMP_TRK(iact_out_iou);
+		DUMP_TRK(iact_out_obj_score);
+		DUMP_TRK(iact_out_sam_tokens);
+		DUMP_TRK(iact_obj_ptr_raw);
 		#undef DUMP_TRK
 	}
 #endif
