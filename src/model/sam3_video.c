@@ -1285,8 +1285,37 @@ video_track_one_obj(struct sam3_video_session *session,
 		    trk_mux->no_obj_embed_spatial->n_dims == 2 &&
 		    trk_mux->no_obj_embed_spatial->dims[0] == N_SLOTS &&
 		    trk_mux->no_obj_embed_spatial->dims[1] == D) {
-			const float *scores =
-				(const float *)track_all_score->data;
+			/*
+			 * Cond-frame score synthesis (matches Python's seed
+			 * path). Python `add_new_masks` routes frame 0
+			 * through `_use_mask_as_output` which synthesises
+			 *     object_score_logits = +10 if mask nonzero else -10
+			 * (reference/sam3/sam3/model/video_tracking_multiplex.py
+			 *  :941-977). The subsequent
+			 *  `multiplex_state.mux(object_score_logits)` in
+			 *  `_encode_new_memory` broadcasts that to 16 slots
+			 *  with the assigned slot carrying +10 and the 15
+			 *  padded slots carrying 0.
+			 *
+			 * C's cond path uses add_points → real decoder, which
+			 * yields all-positive per-slot scores — wrong for the
+			 * no_obj_embed gate (Python would add the 15-padded-
+			 * slot correction here). Per tracker_multiplex.c:3036,
+			 * C's single-object multiplex treats slot 0 as active
+			 * and slots 1..15 as padded, so we synthesise the
+			 * post-mux score vector directly.
+			 */
+			float synth_scores[SAM3_MULTIPLEX_COUNT];
+			const float *scores;
+			if (is_cond) {
+				memset(synth_scores, 0,
+				       sizeof(synth_scores));
+				synth_scores[0] = 10.0f;
+				scores = synth_scores;
+			} else {
+				scores =
+					(const float *)track_all_score->data;
+			}
 			const float *nobs = (const float *)
 				trk_mux->no_obj_embed_spatial->data;
 			float no_obj_embed_v[SAM3_MULTIPLEX_HIDDEN_DIM];

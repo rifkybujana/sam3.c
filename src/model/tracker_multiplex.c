@@ -2588,16 +2588,23 @@ static int multiplex_build_memory_from_bank(
 	const struct sam3_memory_entry *picks[MUX_MAX_MEM_ENTRIES_IN_ATTN];
 	int n_pick = 0;
 
-	/* Walk newest-first across non_cond (end of ring) then cond. */
-	for (int i = bank->n_non_cond - 1;
-	     i >= 0 && n_pick < MUX_MAX_MEM_ENTRIES_IN_ATTN; i--) {
-		if (bank->non_cond[i].spatial_features)
-			picks[n_pick++] = &bank->non_cond[i];
-	}
+	/*
+	 * Python memory concatenation order is [cond frames | non-cond
+	 * frames | obj_ptrs] (video_tracking_multiplex.py:1345-1394 builds
+	 * `t_pos_and_prevs` as cond frames first, then non-cond frames
+	 * via the t_pos loop, then iterates in that order appending to
+	 * `to_cat_prompt`). Match that order here so the memattn
+	 * `memory` kwarg lines up byte-for-byte with Python's.
+	 */
 	for (int i = bank->n_cond - 1;
 	     i >= 0 && n_pick < MUX_MAX_MEM_ENTRIES_IN_ATTN; i--) {
 		if (bank->cond[i].spatial_features)
 			picks[n_pick++] = &bank->cond[i];
+	}
+	for (int i = bank->n_non_cond - 1;
+	     i >= 0 && n_pick < MUX_MAX_MEM_ENTRIES_IN_ATTN; i--) {
+		if (bank->non_cond[i].spatial_features)
+			picks[n_pick++] = &bank->non_cond[i];
 	}
 	if (n_pick == 0) {
 		*out_memory = NULL;
