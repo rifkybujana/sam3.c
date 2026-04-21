@@ -50,6 +50,26 @@ v4 header and instantiates the right encoder. `sam3_set_text(ctx, "...")`
 runs at the variant's native context length (16 tokens for MobileCLIP);
 longer prompts are truncated.
 
+### BPE vocab requirement
+
+`sam3_load_model` auto-discovers `bpe_simple_vocab_16e6.txt.gz` in the
+same directory as the `.sam3` file. Without it, the tokenizer falls back
+to byte-level encoding, which produces nonsense tokens for real text
+prompts and degenerate masks (true for both CLIP and MobileCLIP variants —
+MobileCLIP is more sensitive because its smaller capacity is less robust
+to out-of-distribution token IDs).
+
+**Co-locate the vocab with the model:**
+
+```bash
+cp /path/to/bpe_simple_vocab_16e6.txt.gz \
+   "$(dirname /path/to/your_model.sam3)/"
+```
+
+If the vocab is missing, the loader emits a `[WARN]` to stderr. To use
+a custom path, call `sam3_load_bpe(ctx, path)` explicitly after
+`sam3_load_model`.
+
 ## Implementation notes
 
 - Variant configs live in `src/model/mobileclip_text.c`; the iface

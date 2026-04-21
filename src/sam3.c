@@ -154,12 +154,23 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 
 	ctx->loaded = 1;
 
-	/* Auto-discover BPE vocab file next to model */
+	/* Auto-discover BPE vocab file next to model. Without it the
+	 * tokenizer falls back to byte-level encoding, which produces
+	 * garbage text features for any real prompt. The fallback masks
+	 * the failure silently otherwise — emit a loud warning. */
 	char bpe_path[1024];
 	const char *vocab = NULL;
 	if (find_bpe_next_to_model(path, bpe_path, sizeof(bpe_path))) {
 		vocab = bpe_path;
 		sam3_log_info("auto-discovered BPE vocab: %s", bpe_path);
+	} else {
+		sam3_log_warn("BPE vocab not found next to model %s "
+			      "(expected bpe_simple_vocab_16e6.txt.gz "
+			      "in same directory). Tokenizer will use "
+			      "byte-level fallback — text prompts will "
+			      "produce poor masks. Call sam3_load_bpe() "
+			      "explicitly or place the vocab file next "
+			      "to the .sam3 model.", path);
 	}
 
 	/* Initialize processor and load model weights */
