@@ -1298,8 +1298,17 @@ void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which)
 {
 	if (!proc)
 		return;
-	if (which == 0 || (which & 1u))
+	if (which == 0 || (which & 1u)) {
 		sam3_image_cache_clear(proc->img_cache);
+		/*
+		 * The slot arenas were just reset — any live
+		 * model.cached_* pointers now reference freed storage.
+		 * Zero them (and image_loaded / current_img_slot) so a
+		 * subsequent segment() before the next set_image fails
+		 * predictably rather than reading poisoned memory.
+		 */
+		reset_image_cached_state(proc);
+	}
 	if (which == 0 || (which & 2u)) {
 		join_text_worker(proc);
 		sam3_text_cache_clear(proc->txt_cache);
