@@ -24,6 +24,7 @@
 #include "sam3_image.h"
 #include "backend/backend.h"
 #include "sam3/sam3_types.h"
+#include "feature_cache.h"
 
 /* Forward declaration — only used as an opaque pointer here. */
 struct sam3_profiler;
@@ -40,8 +41,9 @@ struct sam3_processor {
 	struct sam3_backend *backend;
 	struct sam3_arena model_arena;    /* weights + cached features */
 	struct sam3_arena scratch_arena;  /* per-inference temp */
-	size_t weights_end;              /* model_arena offset after load */
-	int image_loaded;
+	struct sam3_image_feature_cache *img_cache;
+	int current_img_slot;            /* -1 == none */
+	int image_loaded;                /* 1 iff cached_* pointers are live */
 	int prompt_w;			 /* user-space image width for coord norm */
 	int prompt_h;			 /* user-space image height for coord norm */
 	struct sam3_profiler *profiler;   /* NULL when profiling disabled */
@@ -89,6 +91,21 @@ struct sam3_processor {
 enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 				    int backbone_type,
 				    int n_fpn_scales);
+
+/*
+ * sam3_processor_init_ex - Like sam3_processor_init, but with caller-
+ * supplied cache slot counts. Pass 0 for either to use the defaults
+ * (3 image, 16 text). Pass 1 to disable multi-slot behavior.
+ */
+enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
+				       int backbone_type,
+				       int n_fpn_scales,
+				       int n_image_slots,
+				       int n_text_slots);
+
+void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which);
+void sam3_processor_cache_stats(const struct sam3_processor *proc,
+				struct sam3_cache_stats *out);
 
 /*
  * sam3_processor_load - Load model weights from an open weight file.

@@ -332,24 +332,22 @@ session_encode_frame(struct sam3_video_session *session,
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "video_encode_frame");
 
 	/*
-	 * Roll back the model_arena to the post-weight-load offset before
-	 * each frame encode. Without this, the cached features from prior
-	 * frames pile up in the persist arena and eventually exhaust it.
-	 * The frame_cache has already cloned the relevant tensors into its
-	 * own backend arena, so model_arena's per-frame outputs are safe to
-	 * discard.
+	 * Claim an image cache slot and use its arena as the per-frame
+	 * persist destination. The frame_cache has already cloned the
+	 * relevant tensors into its own backend arena, so the slot arena
+	 * can be reclaimed freely on the next call. We do not register
+	 * the slot by content hash — video frames almost never repeat,
+	 * and the tracker owns its own frame-level cache.
 	 */
-	if (ctx->proc.model_arena.offset > ctx->proc.weights_end) {
-		char *base = (char *)ctx->proc.model_arena.base;
-		size_t old_off = ctx->proc.model_arena.offset;
-		ctx->proc.model_arena.offset = ctx->proc.weights_end;
-		if (ctx->proc.backend->ops->cache_invalidate) {
-			ctx->proc.backend->ops->cache_invalidate(
-				ctx->proc.backend,
-				base + ctx->proc.weights_end,
-				old_off - ctx->proc.weights_end);
-		}
+	int slot = sam3_image_cache_claim_slot(ctx->proc.img_cache);
+	if (slot < 0) {
+		sam3_log_error("session_encode_frame: no image cache slot");
+		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
+		return SAM3_ENOMEM;
 	}
+	ctx->proc.current_img_slot = slot;
+	struct sam3_arena *persist =
+		&ctx->proc.img_cache->slots[slot].arena;
 
 	/* Reset scratch arena so the per-frame ViT/neck eval gets a clean
 	 * working area. (proc.set_image resets it for the single-image
@@ -362,7 +360,7 @@ session_encode_frame(struct sam3_video_session *session,
 					ctx->proc.backend,
 					frame,
 					&ctx->proc.scratch_arena,
-					&ctx->proc.model_arena,
+					persist,
 					ctx->proc.profiler);
 	if (err != SAM3_OK) {
 		sam3_log_error("session_encode_frame: encode frame %d "

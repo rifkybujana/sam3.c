@@ -25,7 +25,9 @@
 #include "core/weight.h"
 #include "backend/backend.h"
 #include "backend/cpu/cpu_backend.h"
+#include "util/hash.h"
 #include "util/log.h"
+#include "feature_cache.h"
 
 #include "sam3/internal/processor_normalize.h"
 #include "sam3/internal/mask_select.h"
@@ -56,8 +58,17 @@ void sam3_normalize_rgb_chw(const uint8_t *src, float *dst,
 }
 
 enum sam3_error sam3_processor_init(struct sam3_processor *proc,
-				    int backbone_type,
-				    int n_fpn_scales)
+				    int backbone_type, int n_fpn_scales)
+{
+	return sam3_processor_init_ex(proc, backbone_type, n_fpn_scales,
+				      0, 0);
+}
+
+enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
+				       int backbone_type,
+				       int n_fpn_scales,
+				       int n_image_slots,
+				       int n_text_slots)
 {
 	enum sam3_error err;
 
@@ -183,8 +194,26 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 	if (err != SAM3_OK)
 		goto cleanup_text_backend;
 
+	/*
+	 * Allocate the image feature cache. Slot arena is sized for
+	 * encoder peak output (matches the historical post-weights room
+	 * inside model_arena: a few hundred MiB worst-case across all
+	 * cached_* tensors). Use 384 MiB per slot — 3 slots default ≈
+	 * 1.1 GiB total, well inside the previous 2 GiB image budget.
+	 */
+	proc->img_cache = sam3_image_cache_create(n_image_slots,
+						  384UL * 1024 * 1024);
+	if (!proc->img_cache) {
+		err = SAM3_ENOMEM;
+		goto cleanup_image_model;
+	}
+	proc->current_img_slot = -1;
+	(void)n_text_slots; /* wired in Task 6 */
+
 	return SAM3_OK;
 
+cleanup_image_model:
+	sam3_image_model_free(&proc->model);
 cleanup_text_backend:
 	if (proc->text_backend) {
 		proc->text_backend->ops->free(proc->text_backend);
@@ -209,14 +238,8 @@ enum sam3_error sam3_processor_load(struct sam3_processor *proc,
 				    const struct sam3_weight_file *wf,
 				    const char *vocab_path)
 {
-	enum sam3_error err;
-
-	err = sam3_image_model_load(&proc->model, wf, vocab_path,
+	return sam3_image_model_load(&proc->model, wf, vocab_path,
 				     &proc->model_arena);
-	if (err == SAM3_OK)
-		proc->weights_end = proc->model_arena.offset;
-
-	return err;
 }
 
 int sam3_processor_img_size(const struct sam3_processor *proc)
@@ -232,6 +255,9 @@ void sam3_processor_free(struct sam3_processor *proc)
 	/* Join any in-flight async text worker before tearing down its
 	 * arenas and backend. */
 	join_text_worker(proc);
+
+	sam3_image_cache_destroy(proc->img_cache);
+	proc->img_cache = NULL;
 
 	sam3_image_model_free(&proc->model);
 
@@ -265,67 +291,84 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 	if (!proc || !pixels || width <= 0 || height <= 0)
 		return SAM3_EINVAL;
 
-	/*
-	 * Roll back model_arena to the post-weight-load offset so that
-	 * encoder outputs from a previous set_image call are discarded.
-	 * Without this, repeated calls (e.g. benchmarks) accumulate
-	 * persistent data and eventually exhaust the arena.
-	 *
-	 * Invalidate the backend's tensor cache for the freed region
-	 * so that stale GPU-resident arrays are evicted.
-	 */
-	if (proc->model_arena.offset > proc->weights_end) {
-		char *base = (char *)proc->model_arena.base;
-		size_t old_off = proc->model_arena.offset;
-		proc->model_arena.offset = proc->weights_end;
-		if (proc->backend->ops->cache_invalidate) {
-			proc->backend->ops->cache_invalidate(
-				proc->backend,
-				base + proc->weights_end,
-				old_off - proc->weights_end);
-		}
+	uint64_t key = SAM3_FNV1A_64_OFFSET_BASIS;
+	key = sam3_fnv1a_64((const uint8_t *)&width, sizeof(width), key);
+	key = sam3_fnv1a_64((const uint8_t *)&height, sizeof(height), key);
+	size_t n_bytes = (size_t)width * (size_t)height * 3;
+	key = sam3_fnv1a_64(pixels, n_bytes, key);
+	if (key == 0)
+		key = 1;
+
+	size_t pref_len = n_bytes < SAM3_CACHE_PREFIX_BYTES
+			      ? n_bytes : SAM3_CACHE_PREFIX_BYTES;
+
+	int hit = sam3_image_cache_lookup(proc->img_cache, key, pixels,
+					  pref_len);
+	if (hit >= 0) {
+		struct sam3_image_bundle *b =
+			&proc->img_cache->slots[hit].bundle;
+		proc->model.cached_image_features = b->image_features;
+		proc->model.cached_feat_s0_nhwc   = b->feat_s0_nhwc;
+		proc->model.cached_feat_s1_nhwc   = b->feat_s1_nhwc;
+		proc->model.cached_feat_4x_nhwc   = b->feat_4x_nhwc;
+		proc->model.cached_sam2_05x_nhwc  = b->sam2_05x_nhwc;
+		proc->model.cached_sam2_1x_nhwc   = b->sam2_1x_nhwc;
+		proc->model.cached_sam2_2x_nhwc   = b->sam2_2x_nhwc;
+		proc->model.cached_sam2_4x_nhwc   = b->sam2_4x_nhwc;
+		proc->model.image_encoded = 1;
+		proc->image_loaded = 1;
+		proc->current_img_slot = hit;
+		proc->prompt_w = b->prompt_w;
+		proc->prompt_h = b->prompt_h;
+		return SAM3_OK;
 	}
 
-	/* Reset scratch arena for this encode pass */
+	int slot = sam3_image_cache_claim_slot(proc->img_cache);
+	if (slot < 0)
+		return SAM3_ENOMEM;
+	proc->current_img_slot = slot;
+	struct sam3_arena *persist = &proc->img_cache->slots[slot].arena;
+
 	sam3_arena_reset(&proc->scratch_arena);
 
-	/*
-	 * Allocate image tensor [3, height, width] and normalize
-	 * uint8 RGB interleaved pixels to float CHW planar layout.
-	 */
 	dims[0] = 3;
 	dims[1] = height;
 	dims[2] = width;
-	image = gh_alloc_tensor(&proc->scratch_arena, SAM3_DTYPE_F32,
-				3, dims);
+	image = gh_alloc_tensor(&proc->scratch_arena, SAM3_DTYPE_F32, 3, dims);
 	if (!image)
 		return SAM3_ENOMEM;
-
 	dst = (float *)image->data;
 	SAM3_PROF_BEGIN(proc->profiler, "image_normalize");
 	sam3_normalize_rgb_chw(pixels, dst, width, height);
 	SAM3_PROF_END(proc->profiler, "image_normalize");
 
-	/* Run per-block ViT evaluation + neck */
 	SAM3_PROF_BEGIN(proc->profiler, "image_encode");
 	err = sam3_image_model_encode(&proc->model, proc->backend, image,
-				      &proc->scratch_arena,
-				      &proc->model_arena,
+				      &proc->scratch_arena, persist,
 				      proc->profiler);
 	SAM3_PROF_END(proc->profiler, "image_encode");
 	if (err != SAM3_OK)
 		return err;
 
 	proc->image_loaded = 1;
-
-	/*
-	 * Default prompt coordinate space to the provided pixel dims.
-	 * sam3_set_image_file() overrides with original image dims so
-	 * that point/box prompts in user space map correctly.
-	 */
 	proc->prompt_w = width;
 	proc->prompt_h = height;
 
+	struct sam3_image_bundle b = {0};
+	b.image_features = proc->model.cached_image_features;
+	b.feat_s0_nhwc   = proc->model.cached_feat_s0_nhwc;
+	b.feat_s1_nhwc   = proc->model.cached_feat_s1_nhwc;
+	b.feat_4x_nhwc   = proc->model.cached_feat_4x_nhwc;
+	b.sam2_05x_nhwc  = proc->model.cached_sam2_05x_nhwc;
+	b.sam2_1x_nhwc   = proc->model.cached_sam2_1x_nhwc;
+	b.sam2_2x_nhwc   = proc->model.cached_sam2_2x_nhwc;
+	b.sam2_4x_nhwc   = proc->model.cached_sam2_4x_nhwc;
+	b.prompt_w = width;
+	b.prompt_h = height;
+	b.width = width;
+	b.height = height;
+	sam3_image_cache_register(proc->img_cache, slot, key,
+				  pixels, pref_len, &b);
 	return SAM3_OK;
 }
 
@@ -1214,4 +1257,24 @@ fail:
 		}
 	}
 	return err;
+}
+
+void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which)
+{
+	if (!proc)
+		return;
+	if (which == 0 || (which & 1u))
+		sam3_image_cache_clear(proc->img_cache);
+	/* text cache cleared in Task 6 once it exists */
+}
+
+void sam3_processor_cache_stats(const struct sam3_processor *proc,
+				struct sam3_cache_stats *out)
+{
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+	if (!proc)
+		return;
+	sam3_image_cache_stats(proc->img_cache, out);
 }

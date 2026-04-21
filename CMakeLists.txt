@@ -286,6 +286,12 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
+	# test_processor_cache opens models/sam3.sam3
+	if(TARGET test_processor_cache)
+		target_compile_definitions(test_processor_cache PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
 	# test_tracker_multiplex_load opens models/sam3.1.sam3
 	if(TARGET test_tracker_multiplex_load)
 		target_compile_definitions(test_tracker_multiplex_load PRIVATE
