@@ -2179,6 +2179,16 @@ static enum sam3_error interactive_mask_decoder_forward(
 	struct sam3_tensor *s0_proj = gh_conv2d(g, arena, feat_s0,
 			md->conv_s0_w, md->conv_s0_b, 1, 0, 1);
 	if (!s1_proj || !s0_proj) return SAM3_ENOMEM;
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_s1_proj;
+		extern struct sam3_tensor *sam3_dbg_trk_iact_s0_proj;
+		s1_proj->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_s1_proj = s1_proj;
+		s0_proj->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_s0_proj = s0_proj;
+	}
+#endif
 
 	struct sam3_tensor *up = gh_conv_transpose2d(g, arena, up_in,
 			md->up0_w, md->up0_b, 2, 0);
@@ -2205,6 +2215,13 @@ static enum sam3_error interactive_mask_decoder_forward(
 	up = gh_gelu(g, arena, up);
 	if (!up) return SAM3_ENOMEM;
 	/* up: [1, 4H, 4W, 32] */
+#ifdef SAM3_DEBUG_DUMP
+	{
+		extern struct sam3_tensor *sam3_dbg_trk_iact_upscaled;
+		up->dbg_force_readback = 1;
+		sam3_dbg_trk_iact_upscaled = up;
+	}
+#endif
 
 	/* --- 8. Hypernetworks: 4 MLPs, each 256 -> 256 -> 256 -> 32 --- */
 	struct sam3_tensor *hyper_parts[4];

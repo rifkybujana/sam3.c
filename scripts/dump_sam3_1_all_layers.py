@@ -502,6 +502,26 @@ def _register_hooks(model, cap):
     if hasattr(model, "interactive_sam_mask_decoder"):
         imd = model.interactive_sam_mask_decoder
 
+        # Upscale-path bisection (iteration 14): capture the
+        # post-conv_s0 / post-conv_s1 projected high-res features (fired
+        # from forward_image on the seed frame) and the final upscaled
+        # feature map (fired from predict_masks' act2 call).
+        if hasattr(imd, "conv_s0"):
+            hooks.append(imd.conv_s0.register_forward_hook(
+                _cap_plain("iact_s0_proj")))
+        if hasattr(imd, "conv_s1"):
+            hooks.append(imd.conv_s1.register_forward_hook(
+                _cap_plain("iact_s1_proj")))
+        # output_upscaling Sequential: [dc1, ln1, act1, dc2, act2]. The
+        # final GELU (act2, index 4) is what predict_masks calls last.
+        try:
+            if len(imd.output_upscaling) >= 5:
+                hooks.append(imd.output_upscaling[4]
+                             .register_forward_hook(
+                                 _cap_plain("iact_upscaled")))
+        except (AttributeError, TypeError):
+            pass
+
         # Per-layer two-way block queries/keys.
         for i, layer in enumerate(imd.transformer.layers):
             def _cap_iactlayer(_m, _inp, out, _i=i):
@@ -626,11 +646,15 @@ _NHWC_SLOTS = {
     "mdec_upscale_dc1", "mdec_upscale_ln1", "mdec_upscale_act1",
     "mdec_upscale_dc2", "mdec_upscale_act2",
     "mdec_conv_s0", "mdec_conv_s1", "mdec_out_masks",
+    "iact_s0_proj", "iact_s1_proj", "iact_upscaled",
     "maskmem_downsampled", "maskmem_pix_proj",
     "maskmem_fuser_out", "maskmem_out",
-    # Interactive path slots with channel-first NCHW layout that needs
-    # NHWC for C parity:
-    "iact_prompt_dense", "iact_out_masks", "iact_out_masks_sliced",
+    # Interactive spatial slots (genuine channel-last NHWC features).
+    # NOT `iact_out_masks` / `iact_out_masks_sliced` — those are mask
+    # logits `[B, num_mask_tokens, H, W]` where the second axis indexes
+    # mask tokens (not channels), so an NHWC permute scrambles their
+    # byte layout against C's `[B, num_mask_tokens, H, W]` raw dump.
+    "iact_prompt_dense",
     "iact_mask_downsample", "iact_backbone", "iact_src_pre_attn",
 }
 
@@ -689,7 +713,8 @@ def _ordered_slot_names(trunk_nblocks, memattn_nlayers,
               "iact_out_sam_tokens", "iact_out_obj_score",
               "iact_out_masks_sliced", "iact_out_iou_sliced",
               "iact_out_sam_tokens_sliced",
-              "iact_obj_ptr_raw"]
+              "iact_obj_ptr_raw",
+              "iact_s1_proj", "iact_s0_proj", "iact_upscaled"]
     return names
 
 

@@ -40,6 +40,8 @@ struct sam3_vl_backbone {
 	struct sam3_neck neck;
 	struct sam3_neck sam2_neck;	/* sam2_fpn_layers (EfficientSAM3) */
 	int has_sam2_neck;		/* 1 if sam2_neck is initialized */
+	struct sam3_neck interactive_neck;	/* interactive_fpn_layers (SAM 3.1) */
+	int has_interactive_neck;		/* 1 if interactive_neck is initialized */
 	struct sam3_text_encoder_iface text_iface;
 	struct sam3_tokenizer tokenizer;
 	struct sam3_pos_encoding pos_enc;

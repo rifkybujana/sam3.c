@@ -63,6 +63,16 @@ struct sam3_image_model {
 	struct sam3_tensor *cached_sam2_1x_nhwc;  /* [1, H,   W,   d] 1x  */
 	struct sam3_tensor *cached_sam2_2x_nhwc;  /* [1, 2H, 2W,  d] 2x */
 	struct sam3_tensor *cached_sam2_4x_nhwc;  /* [1, 4H, 4W,  d] 4x */
+	/*
+	 * Interactive-side neck outputs. Populated when
+	 * backbone.has_interactive_neck=1 (SAM 3.1 only). Feed the
+	 * interactive mask decoder's conv_s0/s1 skip path on seed frames
+	 * (Python's _use_mask_as_output -> _forward_sam_heads(is_interactive=True)).
+	 */
+	struct sam3_tensor *cached_interactive_05x_nhwc; /* [1, H/2, W/2, d] 0.5x */
+	struct sam3_tensor *cached_interactive_1x_nhwc;  /* [1, H,   W,   d] 1x  */
+	struct sam3_tensor *cached_interactive_2x_nhwc;  /* [1, 2H, 2W,  d] 2x */
+	struct sam3_tensor *cached_interactive_4x_nhwc;  /* [1, 4H, 4W,  d] 4x */
 	int image_encoded;
 };
 

@@ -16,6 +16,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "vl_combiner.h"
@@ -34,6 +35,7 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	vl->scalp = 1;
 	vl->backbone_type = backbone_type;
 	vl->has_sam2_neck = 0;
+	vl->has_interactive_neck = 0;
 
 	switch (backbone_type) {
 	case SAM3_BACKBONE_HIERA:
@@ -120,6 +122,19 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	if (err != SAM3_OK)
 		return err;
 	vl->has_sam2_neck = 1;
+
+	/*
+	 * Interactive neck (SAM 3.1 tri-neck only). Feeds the interactive
+	 * mask decoder's conv_s0/s1 skip path on seed frames (Python's
+	 * `_use_mask_as_output` -> `_forward_sam_heads(is_interactive=True)`).
+	 * The loader zeroes the weights when the checkpoint lacks
+	 * `interactive_fpn_layers.*`, so the init is safe for SAM 3 too.
+	 */
+	err = sam3_neck_init(&vl->interactive_neck, 256, backbone_dim,
+			      grid_size, n_fpn_scales, scales);
+	if (err != SAM3_OK)
+		return err;
+	vl->has_interactive_neck = 1;
 
 	/* Init tokenizer (byte-level fallback vocab) */
 	err = sam3_tokenizer_init(&vl->tokenizer);
@@ -216,6 +231,34 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 		sam3_log_info("vl_backbone: sam2_fpn_layers loaded "
 			      "(backbone_dim=%d)",
 			      vl->sam2_neck.backbone_dim);
+	}
+
+	if (vl->has_interactive_neck) {
+		const char *iact_prefix =
+			"detector_model.vision_encoder.neck."
+			"interactive_fpn_layers.";
+		/*
+		 * Probe for the first expected weight: only SAM 3.1 checkpoints
+		 * ship interactive_convs / interactive_fpn_layers. For SAM 3
+		 * we skip the load (and clear the flag) so the image encoder
+		 * does not waste compute on a zero-weight neck.
+		 */
+		char probe[128];
+		snprintf(probe, sizeof(probe), "%s0.proj1.weight", iact_prefix);
+		if (wf && sam3_weight_find(wf, probe)) {
+			err = sam3_neck_load_prefixed(
+				&vl->interactive_neck, wf, arena,
+				iact_prefix);
+			if (err != SAM3_OK)
+				return err;
+			sam3_log_info("vl_backbone: interactive_fpn_layers "
+				      "loaded (backbone_dim=%d)",
+				      vl->interactive_neck.backbone_dim);
+		} else {
+			vl->has_interactive_neck = 0;
+			sam3_log_debug("vl_backbone: interactive_fpn_layers "
+				       "absent in checkpoint (SAM 3)");
+		}
 	}
 
 	err = vl->text_iface.ops->load(&vl->text_iface, wf, arena);

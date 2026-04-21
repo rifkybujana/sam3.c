@@ -51,6 +51,14 @@ struct sam3_frame_features {
 	struct sam3_tensor *feat_s0;        /* neck_2x:  [1, 144, 144, 256] (2x)  */
 	struct sam3_tensor *feat_s1;        /* neck_1x:  [1, 72,  72,  256] (1x)  */
 	struct sam3_tensor *feat_4x;        /* neck_4x:  [1, 288, 288, 256] (4x)  */
+	/*
+	 * Interactive-neck outputs (SAM 3.1 only). NULL on SAM 3 or when the
+	 * loader found no interactive_fpn_layers weights. Feeds the
+	 * interactive mask decoder's conv_s0/s1 skip path on seed frames.
+	 */
+	struct sam3_tensor *interactive_feat_s0;
+	struct sam3_tensor *interactive_feat_s1;
+	struct sam3_tensor *interactive_feat_4x;
 };
 
 /*
@@ -88,24 +96,34 @@ struct sam3_frame_cache_slot {
 	struct sam3_tensor  *feat_s0;
 	struct sam3_tensor  *feat_s1;
 	struct sam3_tensor  *feat_4x;
+	/* Interactive-neck backend tier tensors. NULL on SAM 3 checkpoints. */
+	struct sam3_tensor  *interactive_feat_s0;
+	struct sam3_tensor  *interactive_feat_s1;
+	struct sam3_tensor  *interactive_feat_4x;
 	/* Spill tier byte buffers (same layout and nbytes as backend). */
 	void                *spill_image_features;
 	void                *spill_feat_s0;
 	void                *spill_feat_s1;
 	void                *spill_feat_4x;
-	size_t               spill_bytes;     /* total bytes across all 4 */
+	void                *spill_interactive_feat_s0;
+	void                *spill_interactive_feat_s1;
+	void                *spill_interactive_feat_4x;
+	size_t               spill_bytes;     /* total bytes across all slots */
 	/*
 	 * Tensor header snapshots captured when the slot transitions to
 	 * tier=CPU_SPILL. Used by the promote-via-memcpy fast path to
 	 * rebuild backend tensors without re-running the image encoder.
 	 * The data pointer in these copies is always NULL; only the
 	 * entries whose matching spill_* byte buffer is non-NULL are
-	 * considered valid (feat_4x is optional for older models).
+	 * considered valid (feat_4x and the interactive_* set are optional).
 	 */
 	struct sam3_tensor   spill_hdr_image_features;
 	struct sam3_tensor   spill_hdr_feat_s0;
 	struct sam3_tensor   spill_hdr_feat_s1;
 	struct sam3_tensor   spill_hdr_feat_4x;
+	struct sam3_tensor   spill_hdr_interactive_feat_s0;
+	struct sam3_tensor   spill_hdr_interactive_feat_s1;
+	struct sam3_tensor   spill_hdr_interactive_feat_4x;
 	uint64_t             last_access_seq; /* LRU bookkeeping */
 };
 

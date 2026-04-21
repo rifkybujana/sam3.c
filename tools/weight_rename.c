@@ -524,6 +524,25 @@ static int handle_propagation_neck(struct rename_entry *out, int inner_idx,
 }
 
 /*
+ * SAM 3.1 interactive FPN neck:
+ * detector.backbone.vision_backbone.interactive_convs.{i}.*
+ * -> detector_model.vision_encoder.neck.interactive_fpn_layers.*
+ *
+ * Third neck in SAM 3.1's tri-neck. Feeds the interactive mask decoder's
+ * conv_s0/s1 skip path (Python's `_use_mask_as_output` ->
+ * `_forward_sam_heads(is_interactive=True)`). We keep a distinct
+ * destination prefix so the C runtime's interactive_neck plumbing can
+ * load these weights separately from propagation_convs / sam2_convs.
+ */
+static int handle_interactive_neck(struct rename_entry *out, int inner_idx,
+				   const char *rest)
+{
+	return emit_sam2_fpn(out, inner_idx,
+		"detector_model.vision_encoder.neck.interactive_fpn_layers.",
+		rest);
+}
+
+/*
  * Text encoder: detector.backbone.language_backbone.*
  * -> detector_model.text_encoder.*
  */
@@ -1493,6 +1512,8 @@ static const struct prefix_rule prefix_table[] = {
 		handle_sam2_neck},
 	{"detector.backbone.vision_backbone.propagation_convs.",
 		handle_propagation_neck},
+	{"detector.backbone.vision_backbone.interactive_convs.",
+		handle_interactive_neck},
 	{"detector.backbone.vision_backbone.convs.",
 		handle_neck},
 	{"detector.backbone.language_backbone.",

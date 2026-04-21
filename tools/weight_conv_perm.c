@@ -72,9 +72,12 @@ static int is_conv2d_weight(const char *name)
 	/* FPN neck Conv2d layers: .neck.fpn_layers.{i}.proj1/proj2.weight
 	 * (scale_layers.* are ConvTranspose2d — handled separately).
 	 * Also match the second neck (.neck.sam2_fpn_layers.) used by the
-	 * video tracker's SAM mask decoder path. */
+	 * video tracker's SAM mask decoder path, and the third neck
+	 * (.neck.interactive_fpn_layers.) used by the interactive mask
+	 * decoder's conv_s0/s1 skip path. */
 	if ((strstr(name, ".neck.fpn_layers.") ||
-	     strstr(name, ".neck.sam2_fpn_layers.")) &&
+	     strstr(name, ".neck.sam2_fpn_layers.") ||
+	     strstr(name, ".neck.interactive_fpn_layers.")) &&
 	    (str_ends_with(name, ".proj1.weight") ||
 	     str_ends_with(name, ".proj2.weight")))
 		return 1;
@@ -210,9 +213,11 @@ static int is_conv_transpose_weight(const char *name)
 	/* FPN neck scale_layers ConvTranspose2d:
 	 * detector_model.vision_encoder.neck.fpn_layers.{i}
 	 *     .scale_layers.{j}.weight
-	 * Also match the sam2 second neck (.neck.sam2_fpn_layers.). */
+	 * Also match the sam2 second neck (.neck.sam2_fpn_layers.) and the
+	 * interactive third neck (.neck.interactive_fpn_layers.). */
 	if ((strstr(name, ".neck.fpn_layers.") ||
-	     strstr(name, ".neck.sam2_fpn_layers.")) &&
+	     strstr(name, ".neck.sam2_fpn_layers.") ||
+	     strstr(name, ".neck.interactive_fpn_layers.")) &&
 	    strstr(name, ".scale_layers.") &&
 	    str_ends_with(name, ".weight"))
 		return 1;

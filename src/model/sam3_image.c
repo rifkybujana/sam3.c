@@ -757,6 +757,36 @@ enum sam3_error sam3_image_model_encode(struct sam3_image_model *model,
 			dump_tensor("/tmp/dbg_sam2_05x.bin", spfn[3]);
 		}
 
+		/*
+		 * Third neck: interactive_fpn_layers. SAM 3.1 tri-neck only —
+		 * the `has_interactive_neck` flag is 1 only when the loader
+		 * successfully bound weights for `interactive_fpn_layers.*`.
+		 * Output feeds the interactive mask decoder's conv_s0/s1 skip
+		 * path on seed frames (Python's `_use_mask_as_output` ->
+		 * `_forward_sam_heads(is_interactive=True)`).
+		 */
+		if (model->backbone.has_interactive_neck) {
+			sam3_arena_reset(scratch);
+			struct sam3_tensor *ipfn[4] = {0};
+			err = eval_neck_to_persist(
+				&model->backbone.interactive_neck, vit_out, be,
+				scratch, persist, ipfn);
+			if (err != SAM3_OK) {
+				sam3_log_error("encode: interactive_neck eval "
+					       "failed (%d)", err);
+				return err;
+			}
+			model->cached_interactive_4x_nhwc  = ipfn[0];
+			model->cached_interactive_2x_nhwc  = ipfn[1];
+			model->cached_interactive_1x_nhwc  = ipfn[2];
+			model->cached_interactive_05x_nhwc = ipfn[3];
+			dump_tensor("/tmp/dbg_iact_4x.bin",  ipfn[0]);
+			dump_tensor("/tmp/dbg_iact_2x.bin",  ipfn[1]);
+			dump_tensor("/tmp/dbg_iact_1x.bin",  ipfn[2]);
+			if (ipfn[3])
+				dump_tensor("/tmp/dbg_iact_05x.bin", ipfn[3]);
+		}
+
 #ifdef SAM3_DEBUG_DUMP
 		/*
 		 * ViT-vs-neck sub-drill (iteration 8). Publish persist-arena

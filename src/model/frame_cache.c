@@ -73,20 +73,26 @@ enum sam3_error sam3_frame_cache_init(struct sam3_frame_cache *cache,
 static size_t slot_backend_bytes(const struct sam3_frame_cache_slot *s)
 {
 	size_t b = 0;
-	if (s->image_features) b += s->image_features->nbytes;
-	if (s->feat_s0)        b += s->feat_s0->nbytes;
-	if (s->feat_s1)        b += s->feat_s1->nbytes;
-	if (s->feat_4x)        b += s->feat_4x->nbytes;
+	if (s->image_features)        b += s->image_features->nbytes;
+	if (s->feat_s0)               b += s->feat_s0->nbytes;
+	if (s->feat_s1)               b += s->feat_s1->nbytes;
+	if (s->feat_4x)               b += s->feat_4x->nbytes;
+	if (s->interactive_feat_s0)   b += s->interactive_feat_s0->nbytes;
+	if (s->interactive_feat_s1)   b += s->interactive_feat_s1->nbytes;
+	if (s->interactive_feat_4x)   b += s->interactive_feat_4x->nbytes;
 	return b;
 }
 
 static void slot_free_spill(struct sam3_frame_cache_slot *s,
 			    struct sam3_frame_cache *cache)
 {
-	free(s->spill_image_features); s->spill_image_features = NULL;
-	free(s->spill_feat_s0);        s->spill_feat_s0        = NULL;
-	free(s->spill_feat_s1);        s->spill_feat_s1        = NULL;
-	free(s->spill_feat_4x);        s->spill_feat_4x        = NULL;
+	free(s->spill_image_features);       s->spill_image_features       = NULL;
+	free(s->spill_feat_s0);              s->spill_feat_s0              = NULL;
+	free(s->spill_feat_s1);              s->spill_feat_s1              = NULL;
+	free(s->spill_feat_4x);              s->spill_feat_4x              = NULL;
+	free(s->spill_interactive_feat_s0);  s->spill_interactive_feat_s0  = NULL;
+	free(s->spill_interactive_feat_s1);  s->spill_interactive_feat_s1  = NULL;
+	free(s->spill_interactive_feat_4x);  s->spill_interactive_feat_4x  = NULL;
 	if (s->spill_bytes <= cache->spill_used)
 		cache->spill_used -= s->spill_bytes;
 	else
@@ -104,12 +110,15 @@ void sam3_frame_cache_invalidate(struct sam3_frame_cache *cache)
 		struct sam3_frame_cache_slot *s = &cache->slots[i];
 		if (s->tier == SAM3_FRAME_TIER_CPU_SPILL)
 			slot_free_spill(s, cache);
-		s->image_features  = NULL;
-		s->feat_s0         = NULL;
-		s->feat_s1         = NULL;
-		s->feat_4x         = NULL;
-		s->tier            = SAM3_FRAME_TIER_NONE;
-		s->last_access_seq = 0;
+		s->image_features       = NULL;
+		s->feat_s0              = NULL;
+		s->feat_s1              = NULL;
+		s->feat_4x              = NULL;
+		s->interactive_feat_s0  = NULL;
+		s->interactive_feat_s1  = NULL;
+		s->interactive_feat_4x  = NULL;
+		s->tier                 = SAM3_FRAME_TIER_NONE;
+		s->last_access_seq      = 0;
 	}
 	cache->backend_used   = 0;
 	cache->spill_used     = 0;
@@ -154,33 +163,47 @@ spill_slot_to_cpu(struct sam3_frame_cache_slot *s,
 	/* Spill disabled or insufficient room: drop to NONE. */
 	if (cache->spill_budget == SIZE_MAX ||
 	    cache->spill_used + total > cache->spill_budget) {
-		s->image_features = NULL;
-		s->feat_s0        = NULL;
-		s->feat_s1        = NULL;
-		s->feat_4x        = NULL;
-		s->tier           = SAM3_FRAME_TIER_NONE;
+		s->image_features      = NULL;
+		s->feat_s0             = NULL;
+		s->feat_s1             = NULL;
+		s->feat_4x             = NULL;
+		s->interactive_feat_s0 = NULL;
+		s->interactive_feat_s1 = NULL;
+		s->interactive_feat_4x = NULL;
+		s->tier                = SAM3_FRAME_TIER_NONE;
 		return SAM3_OK;
 	}
 
 	/*
 	 * image_features is NULL for SAM 3.1 tri-neck encodes (no 0.5x
-	 * scale in that checkpoint). feat_4x is also optional for older
-	 * single-scale backbones. Only feat_s0 / feat_s1 are required.
+	 * scale in that checkpoint). feat_4x is optional for older
+	 * single-scale backbones. interactive_feat_* are NULL on SAM 3
+	 * checkpoints. Only feat_s0 / feat_s1 are required.
 	 */
 	void *im = s->image_features ? malloc(s->image_features->nbytes) : NULL;
 	void *s0 = malloc(s->feat_s0->nbytes);
 	void *s1 = malloc(s->feat_s1->nbytes);
 	void *s4 = s->feat_4x ? malloc(s->feat_4x->nbytes) : NULL;
+	void *i0 = s->interactive_feat_s0 ? malloc(s->interactive_feat_s0->nbytes) : NULL;
+	void *i1 = s->interactive_feat_s1 ? malloc(s->interactive_feat_s1->nbytes) : NULL;
+	void *i4 = s->interactive_feat_4x ? malloc(s->interactive_feat_4x->nbytes) : NULL;
 	int im_ok = (!s->image_features) || (im != NULL);
 	int s4_ok = (!s->feat_4x)        || (s4 != NULL);
-	if (!im_ok || !s0 || !s1 || !s4_ok) {
+	int i0_ok = (!s->interactive_feat_s0) || (i0 != NULL);
+	int i1_ok = (!s->interactive_feat_s1) || (i1 != NULL);
+	int i4_ok = (!s->interactive_feat_4x) || (i4 != NULL);
+	if (!im_ok || !s0 || !s1 || !s4_ok || !i0_ok || !i1_ok || !i4_ok) {
 		free(im); free(s0); free(s1); free(s4);
+		free(i0); free(i1); free(i4);
 		/* Spill malloc failed; drop the slot instead. */
-		s->image_features = NULL;
-		s->feat_s0        = NULL;
-		s->feat_s1        = NULL;
-		s->feat_4x        = NULL;
-		s->tier           = SAM3_FRAME_TIER_NONE;
+		s->image_features      = NULL;
+		s->feat_s0             = NULL;
+		s->feat_s1             = NULL;
+		s->feat_4x             = NULL;
+		s->interactive_feat_s0 = NULL;
+		s->interactive_feat_s1 = NULL;
+		s->interactive_feat_4x = NULL;
+		s->tier                = SAM3_FRAME_TIER_NONE;
 		sam3_log_warn("frame_cache: spill malloc failed frame %d",
 			      s->frame_idx);
 		return SAM3_OK;
@@ -193,6 +216,15 @@ spill_slot_to_cpu(struct sam3_frame_cache_slot *s,
 	memcpy(s1, s->feat_s1->data, s->feat_s1->nbytes);
 	if (s->feat_4x)
 		memcpy(s4, s->feat_4x->data, s->feat_4x->nbytes);
+	if (s->interactive_feat_s0)
+		memcpy(i0, s->interactive_feat_s0->data,
+		       s->interactive_feat_s0->nbytes);
+	if (s->interactive_feat_s1)
+		memcpy(i1, s->interactive_feat_s1->data,
+		       s->interactive_feat_s1->nbytes);
+	if (s->interactive_feat_4x)
+		memcpy(i4, s->interactive_feat_4x->data,
+		       s->interactive_feat_4x->nbytes);
 
 	/* Snapshot tensor headers so a later promote-via-memcpy can
 	 * rebuild the backend tensors without the encoder. Clearing the
@@ -210,19 +242,37 @@ spill_slot_to_cpu(struct sam3_frame_cache_slot *s,
 		s->spill_hdr_feat_4x      = *s->feat_4x;
 		s->spill_hdr_feat_4x.data = NULL;
 	}
+	if (s->interactive_feat_s0) {
+		s->spill_hdr_interactive_feat_s0      = *s->interactive_feat_s0;
+		s->spill_hdr_interactive_feat_s0.data = NULL;
+	}
+	if (s->interactive_feat_s1) {
+		s->spill_hdr_interactive_feat_s1      = *s->interactive_feat_s1;
+		s->spill_hdr_interactive_feat_s1.data = NULL;
+	}
+	if (s->interactive_feat_4x) {
+		s->spill_hdr_interactive_feat_4x      = *s->interactive_feat_4x;
+		s->spill_hdr_interactive_feat_4x.data = NULL;
+	}
 
-	s->spill_image_features = im;
-	s->spill_feat_s0        = s0;
-	s->spill_feat_s1        = s1;
-	s->spill_feat_4x        = s4;
-	s->spill_bytes          = total;
-	cache->spill_used      += total;
+	s->spill_image_features        = im;
+	s->spill_feat_s0               = s0;
+	s->spill_feat_s1               = s1;
+	s->spill_feat_4x               = s4;
+	s->spill_interactive_feat_s0   = i0;
+	s->spill_interactive_feat_s1   = i1;
+	s->spill_interactive_feat_4x   = i4;
+	s->spill_bytes                 = total;
+	cache->spill_used             += total;
 
-	s->image_features = NULL;
-	s->feat_s0        = NULL;
-	s->feat_s1        = NULL;
-	s->feat_4x        = NULL;
-	s->tier           = SAM3_FRAME_TIER_CPU_SPILL;
+	s->image_features      = NULL;
+	s->feat_s0             = NULL;
+	s->feat_s1             = NULL;
+	s->feat_4x             = NULL;
+	s->interactive_feat_s0 = NULL;
+	s->interactive_feat_s1 = NULL;
+	s->interactive_feat_4x = NULL;
+	s->tier                = SAM3_FRAME_TIER_CPU_SPILL;
 	return SAM3_OK;
 }
 
@@ -359,6 +409,34 @@ spill_promote(struct sam3_frame_cache *cache,
 	} else {
 		out->feat_4x = NULL;
 	}
+
+	if (s->spill_interactive_feat_s0) {
+		tmp      = s->spill_hdr_interactive_feat_s0;
+		tmp.data = s->spill_interactive_feat_s0;
+		out->interactive_feat_s0 = sam3_tensor_clone_persist(arena, &tmp);
+		if (!out->interactive_feat_s0)
+			return SAM3_ENOMEM;
+	} else {
+		out->interactive_feat_s0 = NULL;
+	}
+	if (s->spill_interactive_feat_s1) {
+		tmp      = s->spill_hdr_interactive_feat_s1;
+		tmp.data = s->spill_interactive_feat_s1;
+		out->interactive_feat_s1 = sam3_tensor_clone_persist(arena, &tmp);
+		if (!out->interactive_feat_s1)
+			return SAM3_ENOMEM;
+	} else {
+		out->interactive_feat_s1 = NULL;
+	}
+	if (s->spill_interactive_feat_4x) {
+		tmp      = s->spill_hdr_interactive_feat_4x;
+		tmp.data = s->spill_interactive_feat_4x;
+		out->interactive_feat_4x = sam3_tensor_clone_persist(arena, &tmp);
+		if (!out->interactive_feat_4x)
+			return SAM3_ENOMEM;
+	} else {
+		out->interactive_feat_4x = NULL;
+	}
 	return SAM3_OK;
 }
 
@@ -378,10 +456,13 @@ enum sam3_error sam3_frame_cache_get(struct sam3_frame_cache *cache,
 	/* Fast path: already in backend tier. */
 	if (s->tier == SAM3_FRAME_TIER_BACKEND) {
 		cache->n_hits++;
-		out->image_features = s->image_features;
-		out->feat_s0        = s->feat_s0;
-		out->feat_s1        = s->feat_s1;
-		out->feat_4x        = s->feat_4x;
+		out->image_features      = s->image_features;
+		out->feat_s0             = s->feat_s0;
+		out->feat_s1             = s->feat_s1;
+		out->feat_4x             = s->feat_4x;
+		out->interactive_feat_s0 = s->interactive_feat_s0;
+		out->interactive_feat_s1 = s->interactive_feat_s1;
+		out->interactive_feat_4x = s->interactive_feat_4x;
 		return SAM3_OK;
 	}
 
@@ -445,21 +526,27 @@ enum sam3_error sam3_frame_cache_get(struct sam3_frame_cache *cache,
 		return err;
 
 	size_t total = 0;
-	if (fresh.image_features) total += fresh.image_features->nbytes;
-	if (fresh.feat_s0)        total += fresh.feat_s0->nbytes;
-	if (fresh.feat_s1)        total += fresh.feat_s1->nbytes;
-	if (fresh.feat_4x)        total += fresh.feat_4x->nbytes;
+	if (fresh.image_features)       total += fresh.image_features->nbytes;
+	if (fresh.feat_s0)              total += fresh.feat_s0->nbytes;
+	if (fresh.feat_s1)              total += fresh.feat_s1->nbytes;
+	if (fresh.feat_4x)              total += fresh.feat_4x->nbytes;
+	if (fresh.interactive_feat_s0)  total += fresh.interactive_feat_s0->nbytes;
+	if (fresh.interactive_feat_s1)  total += fresh.interactive_feat_s1->nbytes;
+	if (fresh.interactive_feat_4x)  total += fresh.interactive_feat_4x->nbytes;
 
 	/* Free prior spill bytes now that we have a backend copy. */
 	if (s->tier == SAM3_FRAME_TIER_CPU_SPILL)
 		slot_free_spill(s, cache);
 
-	s->image_features = fresh.image_features;
-	s->feat_s0        = fresh.feat_s0;
-	s->feat_s1        = fresh.feat_s1;
-	s->feat_4x        = fresh.feat_4x;
-	s->tier           = SAM3_FRAME_TIER_BACKEND;
-	cache->backend_used += total;
+	s->image_features      = fresh.image_features;
+	s->feat_s0             = fresh.feat_s0;
+	s->feat_s1             = fresh.feat_s1;
+	s->feat_4x             = fresh.feat_4x;
+	s->interactive_feat_s0 = fresh.interactive_feat_s0;
+	s->interactive_feat_s1 = fresh.interactive_feat_s1;
+	s->interactive_feat_4x = fresh.interactive_feat_4x;
+	s->tier                = SAM3_FRAME_TIER_BACKEND;
+	cache->backend_used   += total;
 
 	*out = fresh;
 	return SAM3_OK;

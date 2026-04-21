@@ -144,6 +144,12 @@ struct sam3_tensor *sam3_dbg_trk_iact_out_iou         = NULL;
 struct sam3_tensor *sam3_dbg_trk_iact_out_obj_score   = NULL;
 struct sam3_tensor *sam3_dbg_trk_iact_out_sam_tokens  = NULL;
 struct sam3_tensor *sam3_dbg_trk_iact_obj_ptr_raw     = NULL;
+/* Upscale path bisection (iteration 14): s1_proj / s0_proj are the
+ * post-conv_s1 / post-conv_s0 projected high-res features. upscaled is
+ * the final mask-decoder upsample output fed into hyper_in@upscaled^T. */
+struct sam3_tensor *sam3_dbg_trk_iact_s1_proj         = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_s0_proj         = NULL;
+struct sam3_tensor *sam3_dbg_trk_iact_upscaled        = NULL;
 
 /* Video-path tensor dumper. Used for layer-by-layer parity diffs
  * against the Python reference via scripts/dump_reference_layers.py
@@ -432,6 +438,24 @@ session_encode_frame(struct sam3_video_session *session,
 		? sam3_tensor_clone_persist(arena, src_4x)
 		: NULL;
 
+	/*
+	 * Clone interactive-neck features when the image encoder produced them
+	 * (SAM 3.1 only). NULL on SAM 3 — the interactive mask decoder is
+	 * never invoked on SAM 3, so the callers must tolerate NULLs.
+	 */
+	struct sam3_tensor *iact_2x = ctx->proc.model.cached_interactive_2x_nhwc;
+	struct sam3_tensor *iact_1x = ctx->proc.model.cached_interactive_1x_nhwc;
+	struct sam3_tensor *iact_4x = ctx->proc.model.cached_interactive_4x_nhwc;
+	out->interactive_feat_s0 = iact_2x
+		? sam3_tensor_clone_persist(arena, iact_2x)
+		: NULL;
+	out->interactive_feat_s1 = iact_1x
+		? sam3_tensor_clone_persist(arena, iact_1x)
+		: NULL;
+	out->interactive_feat_4x = iact_4x
+		? sam3_tensor_clone_persist(arena, iact_4x)
+		: NULL;
+
 	if (!out->feat_s0 || !out->feat_s1) {
 		sam3_log_error("session_encode_frame: clone frame %d failed "
 			       "(feat_s0=%p feat_s1=%p)",
@@ -454,6 +478,14 @@ session_encode_frame(struct sam3_video_session *session,
 	 */
 	if (!out->feat_4x && src_4x) {
 		sam3_log_error("session_encode_frame: feat_4x clone failed "
+			       "frame %d (arena exhausted?)", frame_idx);
+		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
+		return SAM3_ENOMEM;
+	}
+	if ((!out->interactive_feat_s0 && iact_2x) ||
+	    (!out->interactive_feat_s1 && iact_1x) ||
+	    (!out->interactive_feat_4x && iact_4x)) {
+		sam3_log_error("session_encode_frame: interactive clone failed "
 			       "frame %d (arena exhausted?)", frame_idx);
 		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
 		return SAM3_ENOMEM;
@@ -946,24 +978,31 @@ video_track_one_obj(struct sam3_video_session *session,
 	 *
 	 * Does nothing in release builds (guarded by SAM3_DEBUG_DUMP).
 	 */
+	/*
+	 * Inputs for the interactive forward come from the interactive neck
+	 * (Python native: `interactive_convs[i](x)` -> interactive mask
+	 * decoder's conv_s0/s1 skip path). SAM 3 checkpoints have no
+	 * interactive neck — the dump call is skipped in that case.
+	 */
 	if (is_multiplex && trk_mux && is_cond && frame_idx == 0 &&
-	    track_masks && track_masks->n_dims == 3 && cf.feat_s1 &&
-	    cf.feat_s0 && cf.feat_4x &&
+	    track_masks && track_masks->n_dims == 3 &&
+	    cf.interactive_feat_s1 && cf.interactive_feat_s0 &&
+	    cf.interactive_feat_4x &&
 	    trk_mux->interactivity_no_mem_embed &&
 	    trk_mux->interactivity_no_mem_embed->data &&
-	    cf.feat_s1->data && track_masks->data) {
-		const int H_ = cf.feat_s1->dims[1];
-		const int W_ = cf.feat_s1->dims[2];
+	    cf.interactive_feat_s1->data && track_masks->data) {
+		const int H_ = cf.interactive_feat_s1->dims[1];
+		const int W_ = cf.interactive_feat_s1->dims[2];
 		const int D_ = SAM3_MULTIPLEX_HIDDEN_DIM;
-		if (cf.feat_s1->n_dims == 4 &&
-		    cf.feat_s1->dims[0] == 1 &&
-		    cf.feat_s1->dims[3] == D_) {
+		if (cf.interactive_feat_s1->n_dims == 4 &&
+		    cf.interactive_feat_s1->dims[0] == 1 &&
+		    cf.interactive_feat_s1->dims[3] == D_) {
 			int bd[4] = {1, H_, W_, D_};
 			struct sam3_tensor *backbone = gh_alloc_tensor(
 				gfx, SAM3_DTYPE_F32, 4, bd);
 			if (backbone) {
-				const float *sf =
-					(const float *)cf.feat_s1->data;
+				const float *sf = (const float *)
+					cf.interactive_feat_s1->data;
 				const float *ad = (const float *)
 					trk_mux->interactivity_no_mem_embed->data;
 				float *df = (float *)backbone->data;
@@ -1018,8 +1057,9 @@ video_track_one_obj(struct sam3_video_session *session,
 						enum sam3_error ierr =
 						    sam3_multiplex_use_mask_as_output(
 							trk_mux, g2, gfx,
-							backbone, cf.feat_s0,
-							cf.feat_4x,
+							backbone,
+							cf.interactive_feat_s0,
+							cf.interactive_feat_4x,
 							binary, mh, mw, 1,
 							&iact_op);
 						if (ierr == SAM3_OK) {
@@ -1101,6 +1141,9 @@ video_track_one_obj(struct sam3_video_session *session,
 		DUMP_TRK(iact_out_obj_score);
 		DUMP_TRK(iact_out_sam_tokens);
 		DUMP_TRK(iact_obj_ptr_raw);
+		DUMP_TRK(iact_s1_proj);
+		DUMP_TRK(iact_s0_proj);
+		DUMP_TRK(iact_upscaled);
 		#undef DUMP_TRK
 	}
 #endif

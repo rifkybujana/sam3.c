@@ -104,6 +104,9 @@ _PER_FRAME = {
     "iact_out_obj_score":    "iact_out_obj_score",
     "iact_out_sam_tokens":   "iact_out_sam_tokens",
     "iact_obj_ptr_raw":      "iact_obj_ptr_raw",
+    "iact_s1_proj":          "iact_s1_proj",
+    "iact_s0_proj":          "iact_s0_proj",
+    "iact_upscaled":         "iact_upscaled",
 }
 
 # Non-frame-indexed C dumps (image pipeline runs per forward_image,
@@ -240,7 +243,8 @@ def _write_ordered_slot_list():
               "iact_out_sam_tokens", "iact_out_obj_score",
               "iact_out_masks_sliced", "iact_out_iou_sliced",
               "iact_out_sam_tokens_sliced",
-              "iact_obj_ptr_raw"]
+              "iact_obj_ptr_raw",
+              "iact_s1_proj", "iact_s0_proj", "iact_upscaled"]
     return names
 
 
