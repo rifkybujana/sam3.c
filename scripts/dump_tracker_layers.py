@@ -285,17 +285,26 @@ def _register_hooks(model, captures):
         q = _l0.image_cross_attn_q_proj(image) + _l0.cross_attn_q_proj(tgt2)
         if _l0.pos_enc_at_cross_attn_queries:
             q = q + query_pos
-        k = _l0.image_cross_attn_k_proj(memory_image) + \
-            _l0.cross_attn_k_proj(memory)
+        # Capture memory_image_pos AT CA ENTRY (post encoder transpose+pad)
+        k_img = _l0.image_cross_attn_k_proj(memory_image)
+        k_mem = _l0.cross_attn_k_proj(memory)
+        captures.setdefault("memattn_l0_ca_k_img", []).append(
+            k_img.detach().cpu().float().contiguous())
+        captures.setdefault("memattn_l0_ca_k_mem", []).append(
+            k_mem.detach().cpu().float().contiguous())
+        k = k_img + k_mem
         if _l0.pos_enc_at_cross_attn_keys:
             k = k + memory_image_pos
         v = _l0.cross_attn_v_proj(memory)
+        # Clone BEFORE cross_attention_rope to prevent in-place mutation
+        # from corrupting our post-pos k capture (RoPE applies rotations
+        # in-place on q/k via torch.view_as_complex).
         captures.setdefault("memattn_l0_ca_q", []).append(
-            q.detach().cpu().float().contiguous())
+            q.detach().clone().cpu().float().contiguous())
         captures.setdefault("memattn_l0_ca_k", []).append(
-            k.detach().cpu().float().contiguous())
+            k.detach().clone().cpu().float().contiguous())
         captures.setdefault("memattn_l0_ca_v", []).append(
-            v.detach().cpu().float().contiguous())
+            v.detach().clone().cpu().float().contiguous())
         kwds = {}
         if num_k_exclude_rope > 0:
             kwds = {"num_k_exclude_rope": num_k_exclude_rope}
@@ -617,6 +626,16 @@ def _flush_captures_delta(captures, cursors, frame_idx):
         if isinstance(memory_image_pos_t, _torch.Tensor):
             _dump(f"/tmp/py_trk_memory_image_pos_f{frame_idx}.bin",
                   memory_image_pos_t)
+        # Iteration 15: Python has a SEPARATE `memory_pos` kwarg for
+        # the obj_ptr tail. The encoder concats memory_image_pos +
+        # memory_pos[-num_obj_ptr_tokens:] internally (decoder.py:
+        # 1340-1346), so the post-pad shape equals memory's row count.
+        # Dump the raw memory_pos so we can reconstruct the padded
+        # shape on the C side for parity checks.
+        memory_pos_t = kw.get("memory_pos")
+        if isinstance(memory_pos_t, _torch.Tensor):
+            _dump(f"/tmp/py_trk_memory_pos_f{frame_idx}.bin",
+                  memory_pos_t)
     cursors[slot] = end
 
     slot = "mask_decoder_tuple"
@@ -652,7 +671,8 @@ def _flush_captures_delta(captures, cursors, frame_idx):
     # but HW contiguous and C innermost — same byte order).
     for slot in ("memattn_l0_sa_out", "memattn_l0_ca_q",
                  "memattn_l0_ca_k", "memattn_l0_ca_v",
-                 "memattn_l0_ca_attn"):
+                 "memattn_l0_ca_attn",
+                 "memattn_l0_ca_k_img", "memattn_l0_ca_k_mem"):
         start = cursors.get(slot, 0)
         end = len(captures.get(slot, []))
         if end > start:
