@@ -93,6 +93,10 @@ struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_q     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_v     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_attn  = NULL;
+/* Bisect memattn_in_memory: maskmem_backbone pre-no_obj_embed output
+ * (Python `_encode_new_memory` line 1704 `maskmem_features = maskmem_
+ * out["vision_features"]` before the per-slot no_obj_embed addition). */
+struct sam3_tensor *sam3_dbg_trk_maskmem_out         = NULL;
 /* Image-pipeline slots (populated per-frame inside
  * session_encode_frame; flushed directly there to cover both cond
  * frame 0 and propagation frames). */
@@ -1187,6 +1191,17 @@ video_track_one_obj(struct sam3_video_session *session,
 			const float mem_bias  = -1.0f;
 			const float cond_fg   = is_cond ? 1.0f : 0.0f;
 			const int   cond_ch   = SAM3_MULTIPLEX_COUNT;  /* 16 */
+			/*
+			 * Cond frames: Python's seed path (_use_mask_as_output)
+			 * emits pred_masks_high_res = mask_bool*20-10, so the
+			 * downstream sigmoid+scale+bias in _encode_new_memory
+			 * collapses to ≈ ±1 per pixel (sigmoid(±10)*2-1).
+			 * Propagation frames keep the continuous sigmoid over
+			 * the decoder's real logits. video_tracking_multiplex.py
+			 * :946-951 + :1641-1656.
+			 */
+			const float near_pos =  0.99991f;
+			const float near_neg = -0.99991f;
 			for (int y = 0; y < big_H; y++) {
 				int sy = y / up_h;
 				if (sy >= final_h) sy = final_h - 1;
@@ -1194,10 +1209,19 @@ video_track_one_obj(struct sam3_video_session *session,
 					int sx = x / up_w;
 					if (sx >= final_w) sx = final_w - 1;
 					float v = src[sy * final_w + sx];
-					float s = 1.0f / (1.0f + expf(-v));
+					float mem_v;
+					if (is_cond) {
+						mem_v = (v > 0.0f)
+							? near_pos : near_neg;
+					} else {
+						float s = 1.0f /
+							(1.0f + expf(-v));
+						mem_v = s * mem_scale
+							+ mem_bias;
+					}
 					size_t base = ((size_t)y * big_W + x)
 						* mm_C;
-					dst[base + 0] = s * mem_scale + mem_bias;
+					dst[base + 0] = mem_v;
 					dst[base + cond_ch] = cond_fg;
 				}
 			}
@@ -1272,6 +1296,29 @@ video_track_one_obj(struct sam3_video_session *session,
 	 *             from Python at frame 1 (and cascading through
 	 *             memattn / mask decoder to ±1e17 explosions).
 	 */
+#ifdef SAM3_DEBUG_DUMP
+	if (is_multiplex && mem_feat && mem_feat->data) {
+		/*
+		 * Snapshot mem_feat BEFORE the no_obj_embed correction so the
+		 * diff isolates the maskmem_backbone output itself.
+		 * Allocation is in the per-frame scratch arena so lifetime
+		 * matches the dump site in auto_dump_tensor below.
+		 */
+		int snap_dims[4] = {mem_feat->dims[0], mem_feat->dims[1],
+				    mem_feat->dims[2], mem_feat->dims[3]};
+		struct sam3_tensor *snap = gh_alloc_tensor(
+			gfx, SAM3_DTYPE_F32, 4, snap_dims);
+		if (snap) {
+			memcpy(snap->data, mem_feat->data, mem_feat->nbytes);
+			char pbuf[256];
+			snprintf(pbuf, sizeof(pbuf),
+				 "/tmp/dbg_trk_maskmem_out_f%d.bin",
+				 frame_idx);
+			auto_dump_tensor(pbuf, snap);
+		}
+	}
+#endif
+
 	if (!is_multiplex) {
 		apply_occlusion_gating(NULL, NULL, mem_feat,
 				       track_score, no_obj_ptr, no_obj_embed);

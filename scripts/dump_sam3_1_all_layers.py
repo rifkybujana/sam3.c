@@ -256,6 +256,36 @@ def _register_hooks(model, cap):
             model._prepare_memory_conditioned_features = _orig_prep
     hooks.append(_UnpatchPrep())
 
+    # --- maskmem_backbone: capture pre-no_obj_embed output and sub-ops ---
+    if hasattr(model, "maskmem_backbone"):
+        mb = model.maskmem_backbone
+
+        def _cap_mb_out(_m, _inp, out):
+            # `out` is {"vision_features": x, "vision_pos_enc": [...]}
+            if isinstance(out, dict):
+                v = out.get("vision_features")
+                if isinstance(v, torch.Tensor):
+                    cap.append("maskmem_out",
+                               v.detach().cpu().float().contiguous())
+        hooks.append(mb.register_forward_hook(_cap_mb_out))
+
+        # Sub-op hooks so we can bisect if the top-level diff is large.
+        if hasattr(mb, "mask_downsampler"):
+            hooks.append(mb.mask_downsampler.register_forward_hook(
+                lambda m, i, o: cap.append(
+                    "maskmem_downsampled",
+                    o.detach().cpu().float().contiguous())))
+        if hasattr(mb, "pix_feat_proj"):
+            hooks.append(mb.pix_feat_proj.register_forward_hook(
+                lambda m, i, o: cap.append(
+                    "maskmem_pix_proj",
+                    o.detach().cpu().float().contiguous())))
+        if hasattr(mb, "fuser"):
+            hooks.append(mb.fuser.register_forward_hook(
+                lambda m, i, o: cap.append(
+                    "maskmem_fuser_out",
+                    o.detach().cpu().float().contiguous())))
+
     # --- memory-attention encoder: per-layer + encoder inputs ---
     enc = model.transformer.encoder
 
@@ -372,6 +402,8 @@ _NHWC_SLOTS = {
     "mdec_upscale_dc1", "mdec_upscale_ln1", "mdec_upscale_act1",
     "mdec_upscale_dc2", "mdec_upscale_act2",
     "mdec_conv_s0", "mdec_conv_s1", "mdec_out_masks",
+    "maskmem_downsampled", "maskmem_pix_proj",
+    "maskmem_fuser_out", "maskmem_out",
 }
 
 
@@ -390,6 +422,8 @@ def _ordered_slot_names(trunk_nblocks, memattn_nlayers,
     names += [f"neck_prop_conv_{i}" for i in range(3)]
     names += [f"sam2_fpn_{i}" for i in range(3)]
     names += ["mdec_conv_s0", "mdec_conv_s1"]
+    names += ["maskmem_downsampled", "maskmem_pix_proj",
+              "maskmem_fuser_out", "maskmem_out"]
     names += ["image_embed"]
     names += ["memattn_in_tgt", "memattn_in_image",
               "memattn_in_memory", "memattn_in_memory_image",

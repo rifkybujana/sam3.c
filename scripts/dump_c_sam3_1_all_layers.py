@@ -83,6 +83,7 @@ _PER_FRAME = {
     "mask_dec_iou":          "mdec_out_iou",
     "mask_dec_score":        "mdec_out_obj_score",
     "mask_dec_sam":          "mdec_out_sam_tokens",
+    "maskmem_out":           "maskmem_out",
 }
 
 # Non-frame-indexed C dumps (image pipeline runs per forward_image,
@@ -183,7 +184,10 @@ def _write_ordered_slot_list():
     names += [f"neck_sam3_conv_{i}" for i in range(3)]
     names += [f"neck_prop_conv_{i}" for i in range(3)]
     names += [f"sam2_fpn_{i}" for i in range(3)]
-    names += ["mdec_conv_s0", "mdec_conv_s1", "image_embed"]
+    names += ["mdec_conv_s0", "mdec_conv_s1",
+              "maskmem_downsampled", "maskmem_pix_proj",
+              "maskmem_fuser_out", "maskmem_out",
+              "image_embed"]
     names += ["memattn_in_tgt", "memattn_in_image",
               "memattn_in_memory", "memattn_in_memory_image",
               "memattn_in_memory_image_pos", "memattn_in_memory_pos",
