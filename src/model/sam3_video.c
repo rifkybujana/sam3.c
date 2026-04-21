@@ -93,6 +93,14 @@ struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_q     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_v     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_attn  = NULL;
+/* MLP drill: capture norm3/linear1/gelu/linear2 outputs + final
+ * layer_out so the ca_attn → layer_0_out collapse can be bisected. */
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_out   = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_norm3_out = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_lin1_out = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_gelu_out = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_lin2_out = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_layer_out = NULL;
 /* Bisect memattn_in_memory: maskmem_backbone pre-no_obj_embed output
  * (Python `_encode_new_memory` line 1704 `maskmem_features = maskmem_
  * out["vision_features"]` before the per-slot no_obj_embed addition). */
@@ -936,6 +944,12 @@ video_track_one_obj(struct sam3_video_session *session,
 		DUMP_TRK(memattn_l0_ca_k);
 		DUMP_TRK(memattn_l0_ca_v);
 		DUMP_TRK(memattn_l0_ca_attn);
+		DUMP_TRK(memattn_l0_ca_out);
+		DUMP_TRK(memattn_l0_norm3_out);
+		DUMP_TRK(memattn_l0_lin1_out);
+		DUMP_TRK(memattn_l0_gelu_out);
+		DUMP_TRK(memattn_l0_lin2_out);
+		DUMP_TRK(memattn_l0_layer_out);
 		#undef DUMP_TRK
 	}
 #endif

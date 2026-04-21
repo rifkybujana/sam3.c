@@ -1259,16 +1259,55 @@ static struct sam3_tensor *memory_attn_layer(
 	tgt2 = gh_layernorm(g, a, output, L->norm3_w, L->norm3_b);
 	if (!tgt2)
 		return NULL;
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_norm3_out;
+		tgt2->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_norm3_out = tgt2;
+	}
+#endif
 	tgt2 = gh_linear(g, a, tgt2, L->lin1_w, L->lin1_b);
 	if (!tgt2)
 		return NULL;
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_lin1_out;
+		tgt2->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_lin1_out = tgt2;
+	}
+#endif
 	tgt2 = gh_gelu(g, a, tgt2);
 	if (!tgt2)
 		return NULL;
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_gelu_out;
+		tgt2->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_gelu_out = tgt2;
+	}
+#endif
 	tgt2 = gh_linear(g, a, tgt2, L->lin2_w, L->lin2_b);
 	if (!tgt2)
 		return NULL;
-	return gh_add(g, a, output, tgt2);
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_lin2_out;
+		tgt2->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_lin2_out = tgt2;
+	}
+#endif
+	struct sam3_tensor *layer_out = gh_add(g, a, output, tgt2);
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0 && layer_out) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_out;
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_layer_out;
+		output->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_ca_out = output;
+		layer_out->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_layer_out = layer_out;
+	}
+#endif
+	return layer_out;
 }
 
 struct sam3_tensor *sam3_multiplex_memory_attn_forward(
@@ -1374,14 +1413,21 @@ struct sam3_tensor *sam3_multiplex_memory_attn_forward(
 				&sam3_dbg_trk_memattn_layer2,
 				&sam3_dbg_trk_memattn_layer3,
 			};
+			output->dbg_force_readback = 1;
 			*slots[i] = output;
 		}
 #endif
 	}
 
 	/* --- Final encoder.norm (use_image_in_output=False) --- */
-	return gh_layernorm(g, arena, output,
+	struct sam3_tensor *final_out = gh_layernorm(g, arena, output,
 			    ma->final_norm_w, ma->final_norm_b);
+#ifdef SAM3_DEBUG_DUMP
+	if (final_out) {
+		final_out->dbg_force_readback = 1;
+	}
+#endif
+	return final_out;
 }
 
 /*
@@ -2888,6 +2934,7 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 #ifdef SAM3_DEBUG_DUMP
 	{
 		extern struct sam3_tensor *sam3_dbg_trk_image_embed;
+		image_embed->dbg_force_readback = 1;
 		sam3_dbg_trk_image_embed = image_embed;
 	}
 #endif
@@ -3027,6 +3074,7 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 #ifdef SAM3_DEBUG_DUMP
 			{
 				extern struct sam3_tensor *sam3_dbg_trk_memattn_out;
+				cond_2d->dbg_force_readback = 1;
 				sam3_dbg_trk_memattn_out = cond_2d;
 			}
 #endif
@@ -3078,6 +3126,10 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		extern struct sam3_tensor *sam3_dbg_trk_mask_dec_iou;
 		extern struct sam3_tensor *sam3_dbg_trk_mask_dec_score;
 		extern struct sam3_tensor *sam3_dbg_trk_mask_dec_sam;
+		if (all_masks) all_masks->dbg_force_readback = 1;
+		if (all_iou)   all_iou->dbg_force_readback = 1;
+		if (all_score) all_score->dbg_force_readback = 1;
+		if (all_sam)   all_sam->dbg_force_readback = 1;
 		sam3_dbg_trk_mask_dec_masks = all_masks;
 		sam3_dbg_trk_mask_dec_iou   = all_iou;
 		sam3_dbg_trk_mask_dec_score = all_score;
