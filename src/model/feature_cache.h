@@ -12,7 +12,7 @@
  *
  * Key types:  sam3_image_feature_cache, sam3_text_feature_cache,
  *             sam3_image_bundle, sam3_text_bundle
- * Depends on: core/alloc.h, core/tensor.h
+ * Depends on: core/alloc.h, core/tensor.h, sam3/sam3.h
  * Used by:    src/model/sam3_processor.c, src/sam3.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -25,15 +25,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "sam3/sam3.h"
 #include "core/alloc.h"
 #include "core/tensor.h"
-
-/* Defined in <sam3/sam3.h> in Task 7; forward-declared here so the
- * cache module compiles before the public API task is wired in. */
-struct sam3_cache_stats {
-	uint64_t image_hits, image_misses, image_evictions;
-	uint64_t text_hits,  text_misses,  text_evictions;
-};
 
 #define SAM3_IMAGE_CACHE_DEFAULT_SLOTS 3
 #define SAM3_IMAGE_CACHE_MAX_SLOTS     16

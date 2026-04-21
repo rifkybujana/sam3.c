@@ -134,9 +134,41 @@ static void test_text_cache_hit_skips_worker(void)
 	sam3_weight_close(&wf);
 }
 
+static void test_top_level_cache_clear_and_stats(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+	sam3_ctx *ctx = sam3_init();
+	ASSERT_NOT_NULL(ctx);
+	enum sam3_error err = sam3_load_model(ctx, MODEL_PATH);
+	ASSERT_EQ(err, SAM3_OK);
+
+	int sz = sam3_get_image_size(ctx);
+	uint8_t *pixels = calloc((size_t)sz * sz * 3, 1);
+	ASSERT_EQ(sam3_set_image(ctx, pixels, sz, sz), SAM3_OK);
+	ASSERT_EQ(sam3_set_image(ctx, pixels, sz, sz), SAM3_OK);
+
+	struct sam3_cache_stats st = {0};
+	sam3_cache_stats(ctx, &st);
+	ASSERT_EQ(st.image_hits, 1u);
+
+	sam3_cache_clear(ctx, SAM3_CACHE_IMAGE);
+	ASSERT_EQ(sam3_set_image(ctx, pixels, sz, sz), SAM3_OK);
+	sam3_cache_stats(ctx, &st);
+	/* clear resets counters, then a fresh miss bumps image_misses to 1. */
+	ASSERT_EQ(st.image_hits, 0u);
+	ASSERT(st.image_misses >= 1u);
+
+	free(pixels);
+	sam3_free(ctx);
+}
+
 int main(void)
 {
 	test_image_cache_hit_skips_encoder();
 	test_text_cache_hit_skips_worker();
+	test_top_level_cache_clear_and_stats();
 	TEST_REPORT();
 }

@@ -35,7 +35,16 @@ const char *sam3_version(void)
 
 sam3_ctx *sam3_init(void)
 {
+	return sam3_init_ex(NULL);
+}
+
+sam3_ctx *sam3_init_ex(const struct sam3_cache_opts *opts)
+{
 	sam3_ctx *ctx = calloc(1, sizeof(*ctx));
+	if (!ctx)
+		return NULL;
+	if (opts)
+		ctx->cache_opts = *opts;
 	return ctx;
 }
 
@@ -109,6 +118,10 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 		ctx->loaded = 0;
 	}
 
+	if (ctx->proc_ready) {
+		sam3_processor_cache_clear(&ctx->proc, 0);
+	}
+
 #ifdef SAM3_HAS_PROFILE
 	SAM3_PROF_BEGIN(ctx->profiler, "model_load");
 #endif
@@ -174,9 +187,11 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	}
 
 	/* Initialize processor and load model weights */
-	err = sam3_processor_init(&ctx->proc,
-				   ctx->config.backbone_type,
-				   ctx->config.n_fpn_scales);
+	err = sam3_processor_init_ex(&ctx->proc,
+				     ctx->config.backbone_type,
+				     ctx->config.n_fpn_scales,
+				     ctx->cache_opts.n_image_slots,
+				     ctx->cache_opts.n_text_slots);
 	if (err != SAM3_OK) {
 #ifdef SAM3_HAS_PROFILE
 		SAM3_PROF_END(ctx->profiler, "model_load");
@@ -464,4 +479,22 @@ enum sam3_error sam3_dump_tensors(sam3_ctx *ctx, const char *out_dir)
 	}
 
 	return SAM3_OK;
+}
+
+void sam3_cache_clear(sam3_ctx *ctx, unsigned which)
+{
+	if (!ctx || !ctx->proc_ready)
+		return;
+	sam3_processor_cache_clear(&ctx->proc, which);
+}
+
+void sam3_cache_stats(const sam3_ctx *ctx, struct sam3_cache_stats *out)
+{
+	if (!out)
+		return;
+	if (!ctx || !ctx->proc_ready) {
+		memset(out, 0, sizeof(*out));
+		return;
+	}
+	sam3_processor_cache_stats(&ctx->proc, out);
 }
