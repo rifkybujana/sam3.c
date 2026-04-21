@@ -184,6 +184,31 @@ for f in LEVEL0_FRAMES:
          f"/tmp/dbg_trk_memory_image_pos_f{f}.bin",
          f"/tmp/py_trk_memory_image_pos_f{f}.bin",
          _reshape_bank),
+        # Layer-0 sub-drill (iteration 9): intermediates inside
+        # memory_attn_layer() to bisect the 0.98→0.004 amplification.
+        # Order mirrors forward order: post-self-attn residual → cross-
+        # attn Q/K/V projections (pre-RoPE) → cross-attn body output
+        # (post out_proj, pre-residual) → full layer output.
+        (f"memattn_l0_sa_out_f{f}",
+         f"/tmp/dbg_trk_memattn_l0_sa_out_f{f}.bin",
+         f"/tmp/py_trk_memattn_l0_sa_out_f{f}.bin",
+         _reshape_memattn),
+        (f"memattn_l0_ca_q_f{f}",
+         f"/tmp/dbg_trk_memattn_l0_ca_q_f{f}.bin",
+         f"/tmp/py_trk_memattn_l0_ca_q_f{f}.bin",
+         _reshape_memattn),
+        (f"memattn_l0_ca_k_f{f}",
+         f"/tmp/dbg_trk_memattn_l0_ca_k_f{f}.bin",
+         f"/tmp/py_trk_memattn_l0_ca_k_f{f}.bin",
+         _reshape_bank),
+        (f"memattn_l0_ca_v_f{f}",
+         f"/tmp/dbg_trk_memattn_l0_ca_v_f{f}.bin",
+         f"/tmp/py_trk_memattn_l0_ca_v_f{f}.bin",
+         _reshape_bank),
+        (f"memattn_l0_ca_attn_f{f}",
+         f"/tmp/dbg_trk_memattn_l0_ca_attn_f{f}.bin",
+         f"/tmp/py_trk_memattn_l0_ca_attn_f{f}.bin",
+         _reshape_memattn),
         (f"memattn_layer0_f{f}",
          f"/tmp/dbg_trk_memattn_layer0_f{f}.bin",
          f"/tmp/py_trk_memattn_layer0_f{f}.bin",

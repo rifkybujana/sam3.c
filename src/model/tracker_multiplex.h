@@ -247,6 +247,57 @@ struct sam3_multiplex_mask_decoder {
 };
 
 /*
+ * SAM-style single-object mask decoder (sub-project 3, 131 tensors).
+ * Used for the interactive / seeded-mask path. Structurally mirrors
+ * the original SAM MaskDecoder (reference/sam3/sam3/sam/mask_decoder.py):
+ * single-object output, 4 mask tokens (num_multimask_outputs=3 + 1
+ * single-mask token), 4 hypernetworks, 4-dim IoU output.
+ *
+ * Architecturally similar to sam3_multiplex_mask_decoder (same
+ * two-way transformer layer shapes, same output upscaling, same
+ * conv_s{0,1} high-res skip convs), but with SAM-style heads.
+ */
+struct sam3_sam_mask_decoder {
+	/* 2-layer two-way transformer — same layer shapes as multiplex. */
+	struct sam3_multiplex_mask_decoder_layer layers[2];
+
+	/* final_attn_token_to_image + norm_final_attn — same as multiplex. */
+	struct sam3_tensor *final_q_w, *final_q_b;
+	struct sam3_tensor *final_k_w, *final_k_b;
+	struct sam3_tensor *final_v_w, *final_v_b;
+	struct sam3_tensor *final_out_w, *final_out_b;
+	struct sam3_tensor *norm_final_w, *norm_final_b;
+
+	/* output_upscaling: same shapes as multiplex (256 -> 64 -> 32). */
+	struct sam3_tensor *up0_w, *up0_b;
+	struct sam3_tensor *up1_w, *up1_b;   /* LN2d */
+	struct sam3_tensor *up3_w, *up3_b;
+
+	/* output_hypernetworks_mlps: 4 MLPs, each 256 -> 256 -> 256 -> 32.
+	 * num_mask_tokens = num_multimask_outputs + 1 = 4. */
+	struct sam3_tensor *hn_w[4][3];
+	struct sam3_tensor *hn_b[4][3];
+
+	/* iou_prediction_head: 3-layer MLP 256 -> 256 -> 256 -> 4. */
+	struct sam3_tensor *iou_head_w[3];
+	struct sam3_tensor *iou_head_b[3];
+
+	/* pred_obj_score_head: 3-layer MLP 256 -> 256 -> 256 -> 1
+	 * (single-object score, pred_obj_scores_mlp=True). */
+	struct sam3_tensor *score_head_w[3];
+	struct sam3_tensor *score_head_b[3];
+
+	/* High-res feature convs (same shapes as multiplex). */
+	struct sam3_tensor *conv_s0_w, *conv_s0_b;
+	struct sam3_tensor *conv_s1_w, *conv_s1_b;
+
+	/* Learned output tokens — SAM-style single-object. */
+	struct sam3_tensor *iou_token;       /* [1, 256] */
+	struct sam3_tensor *mask_tokens;     /* [4, 256] = num_multimask_outputs + 1 */
+	struct sam3_tensor *obj_score_token; /* [1, 256] */
+};
+
+/*
  * Top-level SAM 3.1 tracker. Sub-modules reserved for later phases
  * (sam_mask_decoder, interactive path) are placeholders for now —
  * see the sub-project-2 spec.
@@ -257,6 +308,56 @@ struct sam3_tracker_multiplex {
 
 	/* --- SAM mask decoder (phase 2.4a, 125 tensors) --- */
 	struct sam3_multiplex_mask_decoder sam_mask_decoder;
+
+	/* --- Interactive SAM mask decoder (sub-project 3, 131 tensors).
+	 * SAM-style single-object decoder (not multiplex). Used for the
+	 * seeded/interactive mask-input path (Python's
+	 * _use_mask_as_output → _forward_sam_heads with is_interactive=True).
+	 * Distinct weights + distinct structure: [1,256] tokens, 4
+	 * hypernetworks, 4-dim IoU output. */
+	struct sam3_sam_mask_decoder interactive_sam_mask_decoder;
+
+	/* --- Interactive SAM prompt encoder (sub-project 3, 17 tensors).
+	 * SAM-style prompt encoder: point/box/mask prompts → sparse + dense
+	 * embeddings. Used on seed frames by the interactive decoder to
+	 * produce the per-prompt token input to the interactive mask
+	 * decoder's two-way transformer. */
+	struct sam3_interactive_prompt_encoder {
+		/* mask_downscaling: Conv(1→4, k=2, s=2) → LN2d(4) → GELU →
+		 *                   Conv(4→16, k=2, s=2) → LN2d(16) → GELU →
+		 *                   Conv(16→256, k=1)
+		 * Raw PyTorch Conv2d weights arrive in OIHW; conv_perm pass
+		 * permutes them to OHWI to match gh_conv2d. */
+		struct sam3_tensor *md_conv0_w, *md_conv0_b;  /* [4, 2, 2, 1] OHWI */
+		struct sam3_tensor *md_ln0_w, *md_ln0_b;      /* [4] */
+		struct sam3_tensor *md_conv1_w, *md_conv1_b;  /* [16, 2, 2, 4] OHWI */
+		struct sam3_tensor *md_ln1_w, *md_ln1_b;      /* [16] */
+		struct sam3_tensor *md_conv2_w, *md_conv2_b;  /* [256, 1, 1, 16] OHWI */
+
+		/* Positional encoding (Gaussian basis, shared with image_pe_layer) */
+		struct sam3_tensor *pe_gauss;                /* [2, 128] */
+
+		/* Prompt-type embeddings */
+		struct sam3_tensor *no_mask_embed;           /* [1, 256] */
+		struct sam3_tensor *not_a_point_embed;       /* [1, 256] */
+		/* point_embeddings[0..3] — label types: bg, fg, box top-left,
+		 * box bottom-right (matches SAM's convention). */
+		struct sam3_tensor *point_embeddings[4];     /* [1, 256] each */
+	} interactive_sam_prompt_encoder;
+
+	/* --- Interactive obj_ptr MLP (sub-project 3, 6 tensors). Same
+	 * structure as obj_ptr_proj (3-layer MLP 256→256→256→256). Used
+	 * to project the interactive decoder's sam_output_token into an
+	 * object pointer for the memory bank on seed frames. */
+	struct sam3_multiplex_mlp3 interactive_obj_ptr_proj;
+
+	/* --- Interactive mask downsample (sub-project 3, 2 tensors).
+	 * Single Conv2d(1 → 1, k=4, s=4) — turns a full-resolution binary
+	 * seed mask into a 1/4-resolution probability map that the
+	 * interactive mask decoder can consume. Weight arrives in OHWI
+	 * after the conv_perm pass. */
+	struct sam3_tensor *interactive_mask_downsample_w;  /* [1, 4, 4, 1] */
+	struct sam3_tensor *interactive_mask_downsample_b;  /* [1] */
 
 	/* --- maskmem backbone (phase 2.1, 38 tensors) --- */
 	struct sam3_multiplex_maskmem maskmem;
@@ -547,6 +648,51 @@ struct sam3_tensor *sam3_multiplex_image_pe_layer(
 		int grid_h,
 		int grid_w);
 
+/*
+ * sam3_multiplex_use_mask_as_output - Seeded-frame interactive path.
+ *
+ * Given a binary mask from the detector (thresholded at 0), runs the
+ * interactive prompt encoder + interactive mask decoder + interactive
+ * obj_ptr_proj to produce the obj_ptr token that goes into the memory
+ * bank. Mirrors Python's `_use_mask_as_output` +
+ * `_forward_sam_heads(is_interactive=True)` in
+ * video_tracking_multiplex.py. The final mask output / iou / obj_score
+ * are discarded (Python hardcodes them from the mask input).
+ *
+ * Returns the projected obj_ptr as a [1, 256] tensor in @out_obj_ptr.
+ * Caller must evaluate the graph, then call
+ * sam3_multiplex_expand_obj_ptr() to expand to the [16, 256] per-slot
+ * bank layout.
+ */
+enum sam3_error sam3_multiplex_use_mask_as_output(
+		const struct sam3_tracker_multiplex *trk,
+		struct sam3_graph *g,
+		struct sam3_arena *arena,
+		struct sam3_tensor *backbone_features,
+		struct sam3_tensor *feat_s1,
+		struct sam3_tensor *feat_s0,
+		const float *binary_mask,
+		int mask_h, int mask_w,
+		int is_obj_appearing,
+		struct sam3_tensor **out_obj_ptr);
+
+/*
+ * sam3_multiplex_expand_obj_ptr - Expand the interactive decoder's
+ * single obj_ptr [1, 256] to [16, 256] per-slot bank layout.
+ *
+ * Per-slot logic matches Python's `_use_mask_as_output`:
+ *   slot 0:     raw obj_ptr if is_obj_appearing, else no_obj_ptr_linear(raw).
+ *   slots 1..15: always no_obj_ptr_linear(raw) (not appearing).
+ *
+ * @obj_ptr_single: [1, 256] host-resident (graph-evaluated) tensor.
+ * @out_bank_ptr:   caller-owned [16, 256] = [multiplex_count, D] buffer.
+ */
+void sam3_multiplex_expand_obj_ptr(
+		const struct sam3_tracker_multiplex *trk,
+		const struct sam3_tensor *obj_ptr_single,
+		int is_obj_appearing,
+		float *out_bank_ptr);
+
 enum sam3_error sam3_multiplex_mask_decoder_forward(
 		struct sam3_graph *g,
 		struct sam3_arena *arena,
@@ -619,6 +765,7 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		struct sam3_tensor **out_iou,
 		struct sam3_tensor **out_obj_ptrs,
 		struct sam3_tensor **out_all_iou,
-		struct sam3_tensor **out_score);
+		struct sam3_tensor **out_score,
+		struct sam3_tensor **out_all_score);
 
 #endif /* SAM3_MODEL_TRACKER_MULTIPLEX_H */

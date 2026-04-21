@@ -180,6 +180,66 @@ def _register_hooks(model, captures):
         hooks.append(layer.register_forward_hook(
             _cap(f"memattn_layer{i}")))
 
+    # Sub-drill (iteration 9): bisect layer-0 memattn amplification.
+    # The memattn inputs (tgt, memory_image, memory, memory_image_pos)
+    # match Python at cos ≈ 0.98, but memattn_layer0 drops to cos ≈ 0.004.
+    # A ~2% input residual cannot legally explode to 100% output error
+    # through one decoupled cross-attention layer — structural bug.
+    # Patch layer[0]._forward_sa and ._forward_ca to capture the
+    # intermediate tensors after each major sub-op so we can localize
+    # whether self-attn, Q/K projections, or the attention body is the
+    # culprit. _forward_ca's Q/K/V naming mirrors C's memory_attn_layer
+    # (q post img+tgt sum, k post img+mem+pos, v post v_proj, attn post
+    # cross_attn_out_proj pre-residual).
+    _l0 = model.transformer.encoder.layers[0]
+    _l0_orig_sa = _l0._forward_sa
+    _l0_orig_ca = _l0._forward_ca
+
+    def _l0_patched_sa(tgt, query_pos):
+        out = _l0_orig_sa(tgt, query_pos)
+        captures.setdefault("memattn_l0_sa_out", []).append(
+            out.detach().cpu().float().contiguous())
+        return out
+
+    def _l0_patched_ca(*, image, tgt, memory_image, memory, query_pos,
+                       memory_image_pos, num_k_exclude_rope=0):
+        # Replicate the body of _forward_ca so we can sample
+        # intermediates. Keep in sync with
+        # reference/sam3/sam3/model/decoder.py:_forward_ca.
+        tgt2 = _l0.norm2(tgt)
+        q = _l0.image_cross_attn_q_proj(image) + _l0.cross_attn_q_proj(tgt2)
+        if _l0.pos_enc_at_cross_attn_queries:
+            q = q + query_pos
+        k = _l0.image_cross_attn_k_proj(memory_image) + \
+            _l0.cross_attn_k_proj(memory)
+        if _l0.pos_enc_at_cross_attn_keys:
+            k = k + memory_image_pos
+        v = _l0.cross_attn_v_proj(memory)
+        captures.setdefault("memattn_l0_ca_q", []).append(
+            q.detach().cpu().float().contiguous())
+        captures.setdefault("memattn_l0_ca_k", []).append(
+            k.detach().cpu().float().contiguous())
+        captures.setdefault("memattn_l0_ca_v", []).append(
+            v.detach().cpu().float().contiguous())
+        kwds = {}
+        if num_k_exclude_rope > 0:
+            kwds = {"num_k_exclude_rope": num_k_exclude_rope}
+        out = _l0.cross_attention_rope(q, k, v, **kwds)
+        tgt2 = _l0.cross_attn_out_proj(out)
+        captures.setdefault("memattn_l0_ca_attn", []).append(
+            tgt2.detach().cpu().float().contiguous())
+        tgt = tgt + _l0.dropout2(tgt2)
+        return tgt
+
+    _l0._forward_sa = _l0_patched_sa
+    _l0._forward_ca = _l0_patched_ca
+
+    class _UnpatchL0:
+        def remove(self_inner):
+            _l0._forward_sa = _l0_orig_sa
+            _l0._forward_ca = _l0_orig_ca
+    hooks.append(_UnpatchL0())
+
     # Sub-drill (iteration 4): capture image features pre-flatten by
     # monkey-patching `_prepare_memory_conditioned_features` on the
     # model instance. `current_vision_feats[-1]` is [HW, 1, C] (the
@@ -481,6 +541,21 @@ def _flush_captures_delta(captures, cursors, frame_idx):
                 t = raw[1]
             elif isinstance(raw, torch.Tensor):
                 t = raw
+            if isinstance(t, torch.Tensor):
+                _dump(f"/tmp/py_trk_{slot}_f{frame_idx}.bin", t)
+        cursors[slot] = end
+
+    # Layer-0 sub-drill (iteration 9): intermediate slots captured by
+    # the patched _forward_sa / _forward_ca. Byte layout matches C's
+    # NHWC/3-D [1, N, C] dumps (Python side is [N, 1, C] pre-transpose
+    # but HW contiguous and C innermost — same byte order).
+    for slot in ("memattn_l0_sa_out", "memattn_l0_ca_q",
+                 "memattn_l0_ca_k", "memattn_l0_ca_v",
+                 "memattn_l0_ca_attn"):
+        start = cursors.get(slot, 0)
+        end = len(captures.get(slot, []))
+        if end > start:
+            t = captures[slot][end - 1]
             if isinstance(t, torch.Tensor):
                 _dump(f"/tmp/py_trk_{slot}_f{frame_idx}.bin", t)
         cursors[slot] = end

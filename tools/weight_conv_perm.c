@@ -94,14 +94,39 @@ static int is_conv2d_weight(const char *name)
 
 	/* Mask decoder multi-scale skip Conv2d:
 	 * tracker_model.mask_decoder.conv_s0/conv_s1.weight  (SAM 3)
-	 * tracker_multiplex.sam_mask_decoder.conv_s0/conv_s1.weight (SAM 3.1)
+	 * tracker_multiplex.{sam_mask_decoder,interactive_sam_mask_decoder}.
+	 *   conv_s0/conv_s1.weight (SAM 3.1 propagation + interactive)
 	 * Both are 1x1 so the permute is a no-op byte-wise, but routing
 	 * them through the allowlist is harmless and keeps the shape
 	 * declarations explicit. */
 	if (str_ends_with(name, ".mask_decoder.conv_s0.weight") ||
 	    str_ends_with(name, ".mask_decoder.conv_s1.weight") ||
 	    str_ends_with(name, ".sam_mask_decoder.conv_s0.weight") ||
-	    str_ends_with(name, ".sam_mask_decoder.conv_s1.weight"))
+	    str_ends_with(name, ".sam_mask_decoder.conv_s1.weight") ||
+	    str_ends_with(name,
+		".interactive_sam_mask_decoder.conv_s0.weight") ||
+	    str_ends_with(name,
+		".interactive_sam_mask_decoder.conv_s1.weight"))
+		return 1;
+
+	/* Interactive SAM prompt encoder mask_downscaling Conv2d stack
+	 * (sub-project 3): three stride-2 convs 1→4→16→256. Weights are
+	 * raw PyTorch Conv2d, originally OIHW.
+	 *   tracker_multiplex.interactive_sam_prompt_encoder.
+	 *     mask_downscaling.{0,3,6}.weight */
+	if (strstr(name, ".interactive_sam_prompt_encoder."
+			 "mask_downscaling.") &&
+	    (str_ends_with(name, ".0.weight") ||
+	     str_ends_with(name, ".3.weight") ||
+	     str_ends_with(name, ".6.weight")))
+		return 1;
+
+	/* Interactive mask_downsample Conv2d (sub-project 3): single
+	 * Conv2d(1 → 1, k=4, s=4) that turns a full-res binary mask into
+	 * a probability map. Used by Python's _use_mask_as_output when
+	 * feeding the interactive mask decoder.
+	 *   tracker_multiplex.interactive_mask_downsample.weight */
+	if (str_ends_with(name, ".interactive_mask_downsample.weight"))
 		return 1;
 
 	/* Memory encoder (maskmem_backbone): 4D conv weights used by the
@@ -174,12 +199,18 @@ static int is_conv_transpose_weight(const char *name)
 
 	/* Mask decoder pixel upscaling ConvTranspose2d:
 	 * tracker_model.mask_decoder.upscale_conv1/2.weight  (SAM 3)
-	 * tracker_multiplex.sam_mask_decoder.output_upscaling.{0,3}.weight
-	 *   (SAM 3.1 — 2-stage ConvTranspose 256->64, 64->32). */
+	 * tracker_multiplex.{sam,interactive_sam}_mask_decoder.
+	 *   output_upscaling.{0,3}.weight
+	 *   (SAM 3.1 — 2-stage ConvTranspose 256->64, 64->32, same for
+	 *    propagation and interactive decoders). */
 	if (str_ends_with(name, ".mask_decoder.upscale_conv1.weight") ||
 	    str_ends_with(name, ".mask_decoder.upscale_conv2.weight") ||
 	    str_ends_with(name, ".sam_mask_decoder.output_upscaling.0.weight") ||
-	    str_ends_with(name, ".sam_mask_decoder.output_upscaling.3.weight"))
+	    str_ends_with(name, ".sam_mask_decoder.output_upscaling.3.weight") ||
+	    str_ends_with(name,
+		".interactive_sam_mask_decoder.output_upscaling.0.weight") ||
+	    str_ends_with(name,
+		".interactive_sam_mask_decoder.output_upscaling.3.weight"))
 		return 1;
 
 	return 0;
