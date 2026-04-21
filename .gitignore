@@ -119,3 +119,4 @@ __pycache__
 # ==========================================
 .sam3-social/
 trackanything/
+.lock

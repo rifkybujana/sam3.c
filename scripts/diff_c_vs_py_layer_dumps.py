@@ -119,25 +119,35 @@ def main():
     c_shapes = json.load(
         open(os.path.join(args.c_dir, "shapes.json")))
 
-    py_keys = set(py_shapes)
-    c_keys = set(c_shapes)
-    overlap = sorted(py_keys & c_keys)
-    only_py = sorted(py_keys - c_keys)
-    only_c = sorted(c_keys - py_keys)
+    # Match by (frame, slot) rather than full filename so mismatched
+    # slot-list orderings between the two dump scripts (different idx
+    # prefixes) don't break the join.
+    def _index_by_frame_slot(shapes):
+        ix = {}
+        for key, shape in shapes.items():
+            frame = _frame_from_key(key)
+            slot = _slot_name_from_key(key)
+            ix[(frame, slot)] = key
+        return ix
+    py_ix = _index_by_frame_slot(py_shapes)
+    c_ix  = _index_by_frame_slot(c_shapes)
+    py_fs_keys = set(py_ix)
+    c_fs_keys  = set(c_ix)
+    overlap_fs = sorted(py_fs_keys & c_fs_keys)
+    only_py = sorted(py_ix[k] for k in (py_fs_keys - c_fs_keys))
+    only_c  = sorted(c_ix[k]  for k in (c_fs_keys - py_fs_keys))
 
     rows = []
-    for key in overlap:
-        py_shape = py_shapes[key]
-        c_shape = c_shapes[key]
-        slot = _slot_name_from_key(key)
-        frame = _frame_from_key(key)
-        py_size = int(np.prod(py_shape))
-        c_size = int(np.prod(c_shape))
+    for (frame, slot) in overlap_fs:
+        py_key = py_ix[(frame, slot)]
+        c_key  = c_ix[(frame, slot)]
+        py_shape = py_shapes[py_key]
+        c_shape = c_shapes[c_key]
         # On-disk byte size sanity-check
         py_fs = os.path.getsize(
-            os.path.join(args.py_dir, "bins", key)) // 4
+            os.path.join(args.py_dir, "bins", py_key)) // 4
         c_fs = os.path.getsize(
-            os.path.join(args.c_dir, "bins", key)) // 4
+            os.path.join(args.c_dir, "bins", c_key)) // 4
         size_match = (py_fs == c_fs)
         shape_match = (py_shape == c_shape)
 
@@ -150,11 +160,13 @@ def main():
             "size_match": size_match,
         }
         if size_match:
-            py_a, c_a = _dual_load(args.py_dir, args.c_dir, key)
+            py_a = _load_bin(os.path.join(args.py_dir, "bins", py_key))
+            c_a  = _load_bin(os.path.join(args.c_dir,  "bins", c_key))
             cos, max_abs, mean_abs, rel_l2 = _stats(py_a, c_a)
             entry.update(cos_sim=cos, max_abs_diff=max_abs,
                          mean_abs_diff=mean_abs, rel_l2=rel_l2)
         rows.append(entry)
+    overlap = sorted(py_ix[k] for k in overlap_fs)
 
     # --- Grouped human-readable summary -----------------------------
     by_cat = defaultdict(list)
@@ -166,7 +178,7 @@ def main():
     print(f"- Python dump: `{os.path.relpath(args.py_dir, _ROOT)}`")
     print(f"- C dump:      `{os.path.relpath(args.c_dir, _ROOT)}`")
     print(f"- Overlapping slots: **{len(overlap)}** / "
-          f"{len(py_keys)} (Py) / {len(c_keys)} (C)")
+          f"{len(py_fs_keys)} (Py) / {len(c_fs_keys)} (C)")
     n_shape_match = sum(1 for r in rows if r["shape_match"])
     print(f"- Shape matches: **{n_shape_match}/{len(rows)}**\n")
 

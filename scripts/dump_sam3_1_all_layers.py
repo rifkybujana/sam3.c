@@ -321,6 +321,71 @@ def _register_hooks(model, cap):
                            t.detach().cpu().float().contiguous())
         hooks.append(layer.register_forward_hook(_cap_layer))
 
+    # --- memattn layer 0 sub-op hooks (for stage-41 parity debug) ---
+    # Monkey-patch layer[0]._forward_sa and _forward_ca so we can capture
+    # intermediate tensors (sa_out, ca_q, ca_k, ca_v, ca_attn, ca_out).
+    # Mirrors the /tmp/dbg_trk_memattn_l0_* dumps the C side produces.
+    if len(enc.layers) > 0:
+        L0 = enc.layers[0]
+        _orig_sa = L0._forward_sa
+        _orig_ca = L0._forward_ca
+
+        def _wrap_sa(tgt, query_pos, _L=L0):
+            out = _orig_sa(tgt, query_pos)
+            cap.append("memattn_l0_sa_out",
+                       out.detach().cpu().float().contiguous())
+            return out
+
+        def _wrap_ca(*, image, tgt, memory_image, memory,
+                     query_pos, memory_image_pos,
+                     num_k_exclude_rope=0, _L=L0):
+            # Mirror the pre-RoPE internals of _forward_ca so we can
+            # dump q, k, v. These are the values C's level-1 hooks
+            # capture at the same point (pre-permute, pre-SDPA, pre-RoPE).
+            tgt2 = _L.norm2(tgt)
+            q = _L.image_cross_attn_q_proj(image) \
+                + _L.cross_attn_q_proj(tgt2)
+            if _L.pos_enc_at_cross_attn_queries:
+                q = q + query_pos
+            k = _L.image_cross_attn_k_proj(memory_image) \
+                + _L.cross_attn_k_proj(memory)
+            if _L.pos_enc_at_cross_attn_keys:
+                k = k + memory_image_pos
+            v = _L.cross_attn_v_proj(memory)
+            cap.append("memattn_l0_ca_q",
+                       q.detach().cpu().float().contiguous())
+            cap.append("memattn_l0_ca_k",
+                       k.detach().cpu().float().contiguous())
+            cap.append("memattn_l0_ca_v",
+                       v.detach().cpu().float().contiguous())
+            out = _orig_ca(
+                image=image, tgt=tgt,
+                memory_image=memory_image, memory=memory,
+                query_pos=query_pos,
+                memory_image_pos=memory_image_pos,
+                num_k_exclude_rope=num_k_exclude_rope,
+            )
+            # `out = tgt + dropout2(cross_attn_out_proj(sdpa_out))`.
+            # Recover ca_attn = cross_attn_out_proj(sdpa_out) as
+            # (out - tgt).
+            ca_attn = out - tgt
+            cap.append("memattn_l0_ca_attn",
+                       ca_attn.detach().cpu().float().contiguous())
+            cap.append("memattn_l0_ca_out",
+                       out.detach().cpu().float().contiguous())
+            return out
+
+        L0._forward_sa = _wrap_sa
+        L0._forward_ca = _wrap_ca
+
+        def _unpatch_L0(_sa=_orig_sa, _ca=_orig_ca, _L=L0):
+            _L._forward_sa = _sa
+            _L._forward_ca = _ca
+        class _UnpatchL0:
+            def remove(self_inner):
+                _unpatch_L0()
+        hooks.append(_UnpatchL0())
+
     if hasattr(enc, "norm"):
         hooks.append(enc.norm.register_forward_hook(
             _cap_plain("memattn_final_norm")))
@@ -429,6 +494,9 @@ def _ordered_slot_names(trunk_nblocks, memattn_nlayers,
               "memattn_in_memory", "memattn_in_memory_image",
               "memattn_in_memory_image_pos", "memattn_in_memory_pos",
               "memattn_in_src_pos"]
+    names += ["memattn_l0_sa_out", "memattn_l0_ca_q",
+              "memattn_l0_ca_k", "memattn_l0_ca_v",
+              "memattn_l0_ca_attn", "memattn_l0_ca_out"]
     names += [f"memattn_layer_{i}_out"
               for i in range(memattn_nlayers)]
     names += ["memattn_final_norm", "memattn_encoder_out"]

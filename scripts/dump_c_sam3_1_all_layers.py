@@ -79,6 +79,7 @@ _PER_FRAME = {
     "memattn_l0_ca_k":       "memattn_l0_ca_k",
     "memattn_l0_ca_v":       "memattn_l0_ca_v",
     "memattn_l0_ca_attn":    "memattn_l0_ca_attn",
+    "memattn_l0_ca_out":     "memattn_l0_ca_out",
     "mask_dec_masks":        "mdec_out_masks",
     "mask_dec_iou":          "mdec_out_iou",
     "mask_dec_score":        "mdec_out_obj_score",
@@ -192,6 +193,9 @@ def _write_ordered_slot_list():
               "memattn_in_memory", "memattn_in_memory_image",
               "memattn_in_memory_image_pos", "memattn_in_memory_pos",
               "memattn_in_src_pos"]
+    names += ["memattn_l0_sa_out", "memattn_l0_ca_q",
+              "memattn_l0_ca_k", "memattn_l0_ca_v",
+              "memattn_l0_ca_attn", "memattn_l0_ca_out"]
     names += [f"memattn_layer_{i}_out" for i in range(4)]
     names += ["memattn_final_norm", "memattn_encoder_out"]
     for i in range(2):
