@@ -16,6 +16,7 @@
 #ifndef SAM3_MODEL_SAM3_INTERNAL_H
 #define SAM3_MODEL_SAM3_INTERNAL_H
 
+#include "sam3/sam3.h"
 #include "sam3/sam3_types.h"
 #include "core/weight.h"
 #include "model/sam3_processor.h"
@@ -31,6 +32,7 @@ struct sam3_ctx {
 	int loaded;
 	struct sam3_processor proc;
 	int proc_ready;
+	struct sam3_cache_opts cache_opts;
 #ifdef SAM3_HAS_PROFILE
 	struct sam3_profiler *profiler;
 #endif

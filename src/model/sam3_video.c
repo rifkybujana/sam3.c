@@ -362,29 +362,14 @@ session_encode_frame(struct sam3_video_session *session,
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "video_encode_frame");
 
 	/*
-	 * Roll back the model_arena to the post-weight-load offset before
-	 * each frame encode. Without this, the cached features from prior
-	 * frames pile up in the persist arena and eventually exhaust it.
-	 * The frame_cache has already cloned the relevant tensors into its
-	 * own backend arena, so model_arena's per-frame outputs are safe to
-	 * discard.
+	 * Per-frame encode outputs go into proc.video_scratch_arena —
+	 * dedicated to video so that mixed image-editor + video sessions
+	 * don't evict the still-image cache. The frame_cache has already
+	 * cloned the relevant tensors into its own backend arena, so the
+	 * arena can be reset on the next frame freely.
 	 */
-	if (ctx->proc.model_arena.offset > ctx->proc.weights_end) {
-		char *base = (char *)ctx->proc.model_arena.base;
-		size_t old_off = ctx->proc.model_arena.offset;
-		ctx->proc.model_arena.offset = ctx->proc.weights_end;
-		if (ctx->proc.backend->ops->cache_invalidate) {
-			ctx->proc.backend->ops->cache_invalidate(
-				ctx->proc.backend,
-				base + ctx->proc.weights_end,
-				old_off - ctx->proc.weights_end);
-		}
-	}
-
-	/* Reset scratch arena so the per-frame ViT/neck eval gets a clean
-	 * working area. (proc.set_image resets it for the single-image
-	 * path; the video path encodes via session_encode_frame which
-	 * bypasses that helper.) */
+	sam3_arena_reset(&ctx->proc.video_scratch_arena);
+	struct sam3_arena *persist = &ctx->proc.video_scratch_arena;
 	sam3_arena_reset(&ctx->proc.scratch_arena);
 
 	enum sam3_error err =
@@ -392,7 +377,7 @@ session_encode_frame(struct sam3_video_session *session,
 					ctx->proc.backend,
 					frame,
 					&ctx->proc.scratch_arena,
-					&ctx->proc.model_arena,
+					persist,
 					ctx->proc.profiler);
 	if (err != SAM3_OK) {
 		sam3_log_error("session_encode_frame: encode frame %d "

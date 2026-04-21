@@ -24,6 +24,7 @@
 #include "sam3_image.h"
 #include "backend/backend.h"
 #include "sam3/sam3_types.h"
+#include "feature_cache.h"
 
 /* Forward declaration — only used as an opaque pointer here. */
 struct sam3_profiler;
@@ -38,37 +39,45 @@ struct sam3_profiler;
 struct sam3_processor {
 	struct sam3_image_model model;
 	struct sam3_backend *backend;
-	struct sam3_arena model_arena;    /* weights + cached features */
+	struct sam3_arena model_arena;    /* weights only (cached features in img_cache slots) */
 	struct sam3_arena scratch_arena;  /* per-inference temp */
-	size_t weights_end;              /* model_arena offset after load */
-	int image_loaded;
+	struct sam3_arena video_scratch_arena; /* video session_encode_frame persist */
+	struct sam3_image_feature_cache *img_cache;
+	int current_img_slot;            /* -1 == none */
+	int image_loaded;                /* 1 iff cached_* pointers are live */
 	int prompt_w;			 /* user-space image width for coord norm */
 	int prompt_h;			 /* user-space image height for coord norm */
 	struct sam3_profiler *profiler;   /* NULL when profiling disabled */
 
 	/*
 	 * Async text encoding state (#11). The text encoder runs on a
-	 * worker thread against its own backend and arenas so that it
-	 * overlaps with sam3_processor_set_image on the main thread.
+	 * worker thread against its own backend and scratch arena so
+	 * that it overlaps with sam3_processor_set_image on the main
+	 * thread. Results are published through txt_cache: on a miss
+	 * the worker writes its output tensor into the per-slot arena
+	 * of the slot it pre-claimed (text_worker_slot); on a hit the
+	 * cached bundle pointer is stashed in text_cached_bundle and
+	 * no worker is spawned.
 	 *
 	 * - text_backend:        second backend handle for the worker
 	 * - text_scratch_arena:  worker's per-block scratch
-	 * - text_persist_arena:  output buffer that survives the worker
+	 * - txt_cache:           LRU text feature cache
+	 * - text_cached_bundle:  hit path; cleared by segment
+	 * - text_worker_slot:    -1 or txt_cache slot the worker writes
 	 * - text_thread:         pthread handle (valid iff active=1)
 	 * - text_thread_active:  1 between pthread_create and join
 	 * - text_thread_err:     last worker exit code
-	 * - text_features_async: text features the worker produced
-	 *                        (NULL when no async result is pending)
 	 * - text_tokens:         raw token IDs the worker reads
 	 * - text_n_tokens:       number of real (non-padding) tokens
 	 */
 	struct sam3_backend *text_backend;
 	struct sam3_arena    text_scratch_arena;
-	struct sam3_arena    text_persist_arena;
+	struct sam3_text_feature_cache *txt_cache;
+	struct sam3_text_bundle *text_cached_bundle; /* hit path; cleared by segment */
+	int                      text_worker_slot;   /* -1 or txt_cache slot */
 	pthread_t            text_thread;
 	int                  text_thread_active;
 	enum sam3_error      text_thread_err;
-	struct sam3_tensor  *text_features_async;
 	int32_t              text_tokens[SAM3_PROCESSOR_MAX_TOKENS];
 	int                  text_n_tokens;
 };
@@ -89,6 +98,30 @@ struct sam3_processor {
 enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 				    int backbone_type,
 				    int n_fpn_scales);
+
+/*
+ * sam3_processor_init_ex - Like sam3_processor_init, but with caller-
+ * supplied cache slot counts. Pass 0 for either to use the defaults
+ * (3 image, 16 text). Pass 1 to disable multi-slot behavior.
+ */
+enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
+				       int backbone_type,
+				       int n_fpn_scales,
+				       int n_image_slots,
+				       int n_text_slots);
+
+/*
+ * sam3_processor_cache_clear - Flush feature caches.
+ *
+ * @proc:  Processor to flush.
+ * @which: Bitmask. Bit 0 (1) clears the image cache; bit 1 (2)
+ *         clears the text cache. Pass 0 to clear all caches.
+ */
+void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which);
+
+/* sam3_processor_cache_stats - Read aggregate cache hit/miss counters. */
+void sam3_processor_cache_stats(const struct sam3_processor *proc,
+				struct sam3_cache_stats *out);
 
 /*
  * sam3_processor_load - Load model weights from an open weight file.
@@ -156,14 +189,19 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
  * @proc: Initialized and loaded processor
  * @text: Null-terminated text prompt (e.g. "cat")
  *
- * Tokenizes the text on the caller thread, then spawns a worker
- * pthread that runs the text encoder against proc->text_backend
- * (CPU) using the per-text arenas. The call returns as soon as the
- * worker is spawned so the caller can proceed with
- * sam3_processor_set_image() (image encoder runs concurrently on
- * the Metal backend). The worker output is held in
- * text_persist_arena and consumed automatically by the next
- * sam3_processor_segment() call, which joins the worker first.
+ * Tokenizes the text on the caller thread and looks the token
+ * sequence up in proc->txt_cache. On a cache hit the cached
+ * bundle pointer is stashed in proc->text_cached_bundle and the
+ * call returns immediately — no worker is spawned. On a miss the
+ * call claims a cache slot and spawns a worker pthread that runs
+ * the text encoder against proc->text_backend (CPU), writing its
+ * output tensor into the slot's per-slot arena. The call returns
+ * as soon as the worker is spawned so the caller can proceed
+ * with sam3_processor_set_image() (image encoder runs
+ * concurrently on the Metal backend). The worker output is
+ * consumed automatically by the next sam3_processor_segment()
+ * call, which joins the worker first and reads the features
+ * directly from the cache slot.
  *
  * Calling set_text twice without an intervening segment() joins
  * the previous worker before discarding its result. The processor

@@ -138,10 +138,10 @@ enum sam3_error sam3_vit_load(struct sam3_vit *vit,
  * @vit: Initialized and loaded ViT.
  *
  * Forces the lazy precomputation that normally runs on the first
- * sam3_vit_build() call. Call this during load so that the precomputed
- * data is included in the arena offset before weights_end is saved,
- * allowing repeated set_image calls to roll back without destroying
- * the precomputed tensors.
+ * sam3_vit_build() call. Call this during load so the precomputed
+ * data lives in model_arena before set_image starts running; per-image
+ * outputs go into per-slot cache arenas, so model_arena is stable after
+ * load and the precomputed pointers remain valid across inferences.
  *
  * No-op if already precomputed. Returns SAM3_OK on success.
  */

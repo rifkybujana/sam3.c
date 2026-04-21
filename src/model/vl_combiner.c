@@ -170,10 +170,11 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 
 /*
  * Force eager computation of all lazy-init data (RoPE tables,
- * tiled pos_embed, 2D position encoding) so that it is included
- * in the arena offset before weights_end is saved. Without this,
- * arena rollbacks on repeated set_image/segment calls would
- * destroy lazily-computed data while stale pointers remain.
+ * tiled pos_embed, 2D position encoding) during load so the data
+ * lives in model_arena before set_image/segment start running. The
+ * encoder writes per-image outputs into per-slot cache arenas, so
+ * model_arena stays untouched after load — eager precompute keeps
+ * lazy pointers from being invalidated by later per-inference work.
  */
 static enum sam3_error precompute_lazy_data(struct sam3_vl_backbone *vl)
 {

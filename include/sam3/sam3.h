@@ -28,6 +28,47 @@
 sam3_ctx *sam3_init(void);
 
 /*
+ * sam3_cache_opts - Tunables for the encoder feature caches.
+ * Pass to sam3_init_ex; NULL or zero fields select the defaults
+ * (3 image slots, 16 text slots).
+ */
+struct sam3_cache_opts {
+	int n_image_slots;
+	int n_text_slots;
+};
+
+/*
+ * sam3_init_ex - Like sam3_init, but with caller-supplied cache slot
+ * counts. Pass NULL for defaults (equivalent to sam3_init).
+ */
+sam3_ctx *sam3_init_ex(const struct sam3_cache_opts *opts);
+
+enum {
+	SAM3_CACHE_IMAGE = 1 << 0,
+	SAM3_CACHE_TEXT  = 1 << 1,
+};
+
+/*
+ * sam3_cache_clear - Flush image and/or text encoder caches.
+ *
+ * @ctx:   Initialized context.
+ * @which: Bitmask of SAM3_CACHE_IMAGE | SAM3_CACHE_TEXT (0 = both).
+ */
+void sam3_cache_clear(sam3_ctx *ctx, unsigned which);
+
+/*
+ * sam3_cache_stats - Read hit/miss/eviction counters for both caches.
+ *
+ * @ctx: Initialized context; may be NULL.
+ * @out: Receives counters. Zeroed on NULL ctx.
+ */
+struct sam3_cache_stats {
+	uint64_t image_hits, image_misses, image_evictions;
+	uint64_t text_hits,  text_misses,  text_evictions;
+};
+void sam3_cache_stats(const sam3_ctx *ctx, struct sam3_cache_stats *out);
+
+/*
  * sam3_free - Release all resources held by a sam3 context.
  *
  * @ctx: Context to free (may be NULL).

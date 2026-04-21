@@ -64,13 +64,12 @@ static void test_set_text_returns_immediately(void)
 	ASSERT_EQ(proc.text_n_tokens > 0, 1);
 
 	/*
-	 * processor_free() joins the worker. After it returns the
-	 * worker has produced text_features_async (or an error code
-	 * in text_thread_err), but we just verify the join happens
-	 * without crashing or leaking. processor_free MUST run before
-	 * weight_close: while the worker is in flight it is reading
-	 * mmap'd weight tensors, and unmapping them mid-flight would
-	 * SEGV the worker.
+	 * processor_free() joins the worker. The worker writes its
+	 * output into proc.txt_cache via the slot it pre-claimed; we
+	 * just verify the join happens without crashing or leaking.
+	 * processor_free MUST run before weight_close: while the worker
+	 * is in flight it is reading mmap'd weight tensors, and
+	 * unmapping them mid-flight would SEGV the worker.
 	 */
 	sam3_processor_free(&proc);
 	sam3_weight_close(&wf);
@@ -99,10 +98,10 @@ static void test_set_text_then_segment(void)
 	ASSERT_EQ(err, SAM3_OK);
 
 	/*
-	 * Kick off async text encoding. We do not check
-	 * text_features_async here — the worker thread races us and
-	 * the field is only guaranteed valid after segment() (or
-	 * processor_free) joins the worker.
+	 * Kick off async text encoding. The worker publishes its
+	 * result through proc.txt_cache; we don't inspect it directly
+	 * here — segment() joins the worker and reads the features
+	 * from the cache slot.
 	 */
 	err = sam3_processor_set_text(&proc, "cat");
 	ASSERT_EQ(err, SAM3_OK);
@@ -133,8 +132,10 @@ static void test_set_text_then_segment(void)
 	ASSERT(result.masks != NULL);
 	ASSERT(result.n_masks > 0);
 
-	/* After consumption, text_features_async should be NULL */
-	ASSERT(proc.text_features_async == NULL);
+	/* After consumption, the cached-bundle pointer and worker slot
+	 * marker should both be cleared. */
+	ASSERT(proc.text_cached_bundle == NULL);
+	ASSERT_EQ(proc.text_worker_slot, -1);
 
 	free(pixels);
 	sam3_result_free(&result);
