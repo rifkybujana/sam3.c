@@ -395,6 +395,7 @@ set(BENCH_SOURCES
 	tests/bench_dtype.c
 	tests/bench_metal.c
 	tests/bench_tokenizer.c
+	tests/bench_segment.c
 )
 
 foreach(BENCH_SRC ${BENCH_SOURCES})
