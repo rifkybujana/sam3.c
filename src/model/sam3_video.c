@@ -1236,8 +1236,19 @@ video_track_one_obj(struct sam3_video_session *session,
 	struct sam3_tensor *no_obj_embed = is_multiplex
 		? NULL  /* multiplex no_obj_embed_spatial is [16, 256], applied later */
 		: trk->no_obj_embed_spatial;
+	/*
+	 * SAM 3.1: don't zero track_masks on is_appearing=0. Python's
+	 * _forward_sam_heads only applies the torch.where(is_obj_appearing,
+	 * masks, NO_OBJ_SCORE) gate on the mask-decoder's internal
+	 * low_res_multimasks, but the output mask that gen_video_parity_
+	 * fixtures.py writes to frame_NNNN_obj_1.png comes through a
+	 * different path where the per-slot demux keeps the raw logits.
+	 * Gating here was masking out valid content (parity log iter 15:
+	 * C slot-0 head-0 IoU vs ref = 0.47 pre-gate, 0 post-gate).
+	 */
+	struct sam3_tensor *masks_to_gate = is_multiplex ? NULL : track_masks;
 	int is_appearing = apply_occlusion_gating(
-		track_masks,
+		masks_to_gate,
 		is_multiplex ? NULL : track_obj_ptr,
 		NULL, track_score, no_obj_ptr, no_obj_embed);
 
