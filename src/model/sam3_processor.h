@@ -218,6 +218,50 @@ enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
 					const char *text);
 
 /*
+ * sam3_processor_precache_image - Encode an image into the feature
+ * cache without making it the current image.
+ *
+ * @proc: Initialized and loaded processor.
+ * @pixels, @width, @height: Same contract as sam3_processor_set_image.
+ *
+ * Hash-keys the input, and on miss claims a cache slot, runs the
+ * image encoder into it, and registers the bundle. Unlike set_image,
+ * the processor's current-image state (model.cached_*, image_loaded,
+ * current_img_slot, prompt_w/h) is preserved across the call. A later
+ * sam3_processor_set_image() with the same pixels will be a cache
+ * hit. If the hash already lives in the cache this function is a
+ * no-op (returns SAM3_OK immediately).
+ *
+ * Returns SAM3_OK on success.
+ */
+enum sam3_error sam3_processor_precache_image(struct sam3_processor *proc,
+					      const uint8_t *pixels,
+					      int width, int height);
+
+/*
+ * sam3_processor_precache_text - Encode a text prompt into the cache
+ * synchronously without making it the current pending prompt.
+ *
+ * @proc: Initialized and loaded processor.
+ * @text: Null-terminated text prompt.
+ *
+ * Tokenizes, hashes, and on miss runs the text encoder inline on
+ * proc->text_backend, then registers the bundle. Unlike set_text,
+ * no worker thread is spawned — the call blocks until the encode
+ * completes, and proc->text_cached_bundle / text_worker_slot /
+ * text_n_tokens are left as the caller had them. A later
+ * sam3_processor_set_text() with the same text will be a cache
+ * hit.
+ *
+ * If the hash already lives in the cache this function is a no-op
+ * (returns SAM3_OK immediately).
+ *
+ * Returns SAM3_OK on success.
+ */
+enum sam3_error sam3_processor_precache_text(struct sam3_processor *proc,
+					     const char *text);
+
+/*
  * sam3_processor_segment - Run segmentation with geometric prompts.
  *
  * @proc:      Processor with image already set

@@ -157,6 +157,106 @@ void sam3_set_prompt_space(sam3_ctx *ctx, int width, int height);
 enum sam3_error sam3_set_text(sam3_ctx *ctx, const char *text);
 
 /*
+ * sam3_precache_image - Populate the image feature cache without
+ * changing the current image.
+ *
+ * @ctx:    Initialized context with loaded model.
+ * @pixels: RGB pixel data (H * W * 3 uint8_t values).
+ * @width, @height: Image dimensions, same contract as sam3_set_image.
+ *
+ * Runs the image encoder (blocking) and stores the resulting features
+ * in the cache keyed by pixel content. The ctx's current-image state
+ * is untouched — a later sam3_set_image() with the same pixels will
+ * hit the cache and return in microseconds. Use this to pre-warm the
+ * cache while the app is idle (e.g. when an image is loaded into an
+ * editor tab) so the user's first prompt only pays segment latency.
+ *
+ * No-op if the same pixels are already cached.
+ */
+enum sam3_error sam3_precache_image(sam3_ctx *ctx, const uint8_t *pixels,
+				    int width, int height);
+
+/*
+ * sam3_precache_image_file - Load an image file and precache it.
+ *
+ * @ctx:  Initialized context with loaded model.
+ * @path: Path to PNG, JPEG, or BMP image file.
+ *
+ * Convenience wrapper around sam3_precache_image(): loads the image,
+ * resizes to model input size, encodes into the image cache without
+ * changing current-image state.
+ */
+enum sam3_error sam3_precache_image_file(sam3_ctx *ctx, const char *path);
+
+/*
+ * sam3_precache_text - Populate the text feature cache synchronously
+ * without changing the pending-prompt state.
+ *
+ * @ctx:  Initialized context with loaded model.
+ * @text: Null-terminated prompt text.
+ *
+ * Tokenizes, runs the text encoder on the CPU text backend (blocking),
+ * and stores the result in the text cache. Unlike sam3_set_text, no
+ * worker thread is spawned and no pending-prompt state is set — the
+ * next sam3_segment() call is unaffected unless its own sam3_set_text()
+ * happens to hit this cache entry.
+ *
+ * No-op if the same text is already cached.
+ */
+enum sam3_error sam3_precache_text(sam3_ctx *ctx, const char *text);
+
+/*
+ * sam3_cache_save_image - Serialize a cached image entry to disk.
+ *
+ * @ctx:     Initialized context with loaded model.
+ * @pixels:  Pixels used to look up the cache entry (hash-keyed).
+ * @width, @height: Dimensions (must match what was precached).
+ * @path:    Destination .sam3cache file path.
+ *
+ * Looks up the cache entry matching @pixels and writes it to @path.
+ * The saved file includes a model signature so loading into a
+ * different model will be rejected. Returns SAM3_EINVAL if no
+ * matching cache entry exists.
+ */
+enum sam3_error sam3_cache_save_image(sam3_ctx *ctx,
+				      const uint8_t *pixels,
+				      int width, int height,
+				      const char *path);
+
+/*
+ * sam3_cache_load_image - Restore a previously-saved image cache entry.
+ *
+ * @ctx:  Initialized context with loaded model.
+ * @path: .sam3cache file produced by sam3_cache_save_image.
+ *
+ * Reads @path into the image cache. A later sam3_set_image() with the
+ * pixels used at save time will hit the cache. Returns SAM3_EMODEL if
+ * the file's model signature does not match the loaded model.
+ */
+enum sam3_error sam3_cache_load_image(sam3_ctx *ctx, const char *path);
+
+/*
+ * sam3_cache_save_text - Serialize a cached text entry to disk.
+ *
+ * @ctx:  Initialized context with loaded model.
+ * @text: Text prompt used to look up the cache entry.
+ * @path: Destination .sam3cache file path.
+ *
+ * Looks up the cache entry matching the tokenization of @text and
+ * writes it to @path. Returns SAM3_EINVAL if no matching entry exists.
+ */
+enum sam3_error sam3_cache_save_text(sam3_ctx *ctx, const char *text,
+				     const char *path);
+
+/*
+ * sam3_cache_load_text - Restore a previously-saved text cache entry.
+ *
+ * @ctx:  Initialized context with loaded model.
+ * @path: .sam3cache file produced by sam3_cache_save_text.
+ */
+enum sam3_error sam3_cache_load_text(sam3_ctx *ctx, const char *path);
+
+/*
  * sam3_segment - Run segmentation with the given prompts.
  *
  * @ctx:       Context with image already set

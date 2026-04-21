@@ -918,6 +918,208 @@ enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
 	return SAM3_OK;
 }
 
+/*
+ * sam3_processor_precache_image - Populate the image feature cache for
+ * @pixels without changing the processor's current-image state.
+ *
+ * On a cache hit this is a no-op. On a miss we save model.cached_*
+ * (plus image_loaded / current_img_slot / prompt_w/h), claim a slot,
+ * encode into it, register the bundle, then restore the saved state.
+ * The encode writes into its slot's arena so the image cache grows
+ * exactly as it would under a set_image() miss.
+ */
+enum sam3_error sam3_processor_precache_image(struct sam3_processor *proc,
+					      const uint8_t *pixels,
+					      int width, int height)
+{
+	struct sam3_tensor *image;
+	enum sam3_error err;
+	int dims[3];
+
+	if (!proc || !pixels || width <= 0 || height <= 0)
+		return SAM3_EINVAL;
+
+	uint64_t key = SAM3_FNV1A_64_OFFSET_BASIS;
+	key = sam3_fnv1a_64((const uint8_t *)&width, sizeof(width), key);
+	key = sam3_fnv1a_64((const uint8_t *)&height, sizeof(height), key);
+	size_t n_bytes = (size_t)width * (size_t)height * 3;
+	key = sam3_fnv1a_64(pixels, n_bytes, key);
+	if (key == 0)
+		key = 1;
+
+	size_t pref_len = n_bytes < SAM3_CACHE_PREFIX_BYTES
+			      ? n_bytes : SAM3_CACHE_PREFIX_BYTES;
+
+	int hit = sam3_image_cache_lookup(proc->img_cache, key, pixels,
+					  pref_len);
+	if (hit >= 0)
+		return SAM3_OK;
+
+	/* Save caller-visible state — the encoder call will overwrite
+	 * model.cached_* as a side effect. */
+	struct sam3_image_model *m = &proc->model;
+	struct sam3_tensor *sv_feat = m->cached_image_features;
+	struct sam3_tensor *sv_s0   = m->cached_feat_s0_nhwc;
+	struct sam3_tensor *sv_s1   = m->cached_feat_s1_nhwc;
+	struct sam3_tensor *sv_4x   = m->cached_feat_4x_nhwc;
+	struct sam3_tensor *sv_s2_05 = m->cached_sam2_05x_nhwc;
+	struct sam3_tensor *sv_s2_1  = m->cached_sam2_1x_nhwc;
+	struct sam3_tensor *sv_s2_2  = m->cached_sam2_2x_nhwc;
+	struct sam3_tensor *sv_s2_4  = m->cached_sam2_4x_nhwc;
+	int sv_encoded  = m->image_encoded;
+	int sv_loaded   = proc->image_loaded;
+	int sv_slot     = proc->current_img_slot;
+	int sv_prompt_w = proc->prompt_w;
+	int sv_prompt_h = proc->prompt_h;
+
+	int slot = sam3_image_cache_claim_slot(proc->img_cache);
+	if (slot < 0)
+		return SAM3_ENOMEM;
+	struct sam3_arena *persist = &proc->img_cache->slots[slot].arena;
+
+	sam3_arena_reset(&proc->scratch_arena);
+
+	dims[0] = 3;
+	dims[1] = height;
+	dims[2] = width;
+	image = gh_alloc_tensor(&proc->scratch_arena, SAM3_DTYPE_F32,
+				3, dims);
+	if (!image) {
+		err = SAM3_ENOMEM;
+		goto restore;
+	}
+	SAM3_PROF_BEGIN(proc->profiler, "image_normalize");
+	sam3_normalize_rgb_chw(pixels, (float *)image->data, width, height);
+	SAM3_PROF_END(proc->profiler, "image_normalize");
+
+	SAM3_PROF_BEGIN(proc->profiler, "image_encode");
+	err = sam3_image_model_encode(&proc->model, proc->backend, image,
+				      &proc->scratch_arena, persist,
+				      proc->profiler);
+	SAM3_PROF_END(proc->profiler, "image_encode");
+	if (err != SAM3_OK)
+		goto restore;
+
+	struct sam3_image_bundle bundle = {0};
+	bundle.image_features = m->cached_image_features;
+	bundle.feat_s0_nhwc   = m->cached_feat_s0_nhwc;
+	bundle.feat_s1_nhwc   = m->cached_feat_s1_nhwc;
+	bundle.feat_4x_nhwc   = m->cached_feat_4x_nhwc;
+	bundle.sam2_05x_nhwc  = m->cached_sam2_05x_nhwc;
+	bundle.sam2_1x_nhwc   = m->cached_sam2_1x_nhwc;
+	bundle.sam2_2x_nhwc   = m->cached_sam2_2x_nhwc;
+	bundle.sam2_4x_nhwc   = m->cached_sam2_4x_nhwc;
+	bundle.prompt_w = width;
+	bundle.prompt_h = height;
+	bundle.width = width;
+	bundle.height = height;
+	sam3_image_cache_register(proc->img_cache, slot, key,
+				  pixels, pref_len, &bundle);
+	err = SAM3_OK;
+
+restore:
+	m->cached_image_features = sv_feat;
+	m->cached_feat_s0_nhwc   = sv_s0;
+	m->cached_feat_s1_nhwc   = sv_s1;
+	m->cached_feat_4x_nhwc   = sv_4x;
+	m->cached_sam2_05x_nhwc  = sv_s2_05;
+	m->cached_sam2_1x_nhwc   = sv_s2_1;
+	m->cached_sam2_2x_nhwc   = sv_s2_2;
+	m->cached_sam2_4x_nhwc   = sv_s2_4;
+	m->image_encoded = sv_encoded;
+	proc->image_loaded = sv_loaded;
+	proc->current_img_slot = sv_slot;
+	proc->prompt_w = sv_prompt_w;
+	proc->prompt_h = sv_prompt_h;
+	return err;
+}
+
+/*
+ * sam3_processor_precache_text - Synchronously encode @text into the
+ * text cache without touching the caller's pending-prompt state.
+ *
+ * On hit: no-op. On miss: tokenize, claim a slot, run the text
+ * encoder inline on proc->text_backend (no worker thread), and
+ * register the bundle. The proc's text_tokens / text_n_tokens /
+ * text_worker_slot / text_cached_bundle are saved and restored so a
+ * prior set_text()'s pending state survives the call intact.
+ */
+enum sam3_error sam3_processor_precache_text(struct sam3_processor *proc,
+					     const char *text)
+{
+	if (!proc || !text)
+		return SAM3_EINVAL;
+	if (!proc->text_backend) {
+		sam3_log_error("precache_text: text_backend unavailable");
+		return SAM3_EBACKEND;
+	}
+
+	/* Wait for any in-flight worker so we don't race on text_tokens /
+	 * text_worker_slot. */
+	join_text_worker(proc);
+
+	/* Save caller-visible state. */
+	int32_t saved_tokens[SAM3_PROCESSOR_MAX_TOKENS];
+	memcpy(saved_tokens, proc->text_tokens, sizeof(saved_tokens));
+	int saved_n_tokens = proc->text_n_tokens;
+	int saved_worker_slot = proc->text_worker_slot;
+	struct sam3_text_bundle *saved_bundle = proc->text_cached_bundle;
+
+	struct sam3_text_encoder_iface *te_iface =
+		&proc->model.backbone.text_iface;
+	int ctx_len = te_iface->ctx_len;
+
+	int n_tokens = sam3_tokenizer_encode(
+		&proc->model.backbone.tokenizer, text,
+		proc->text_tokens, ctx_len);
+	if (n_tokens <= 0) {
+		sam3_log_error("precache_text: tokenize failed");
+		memcpy(proc->text_tokens, saved_tokens, sizeof(saved_tokens));
+		proc->text_n_tokens = saved_n_tokens;
+		return SAM3_EINVAL;
+	}
+	proc->text_n_tokens = n_tokens;
+
+	uint64_t key = SAM3_FNV1A_64_OFFSET_BASIS;
+	key = sam3_fnv1a_64((const uint8_t *)proc->text_tokens,
+			    (size_t)n_tokens * sizeof(int32_t), key);
+	if (key == 0)
+		key = 1;
+
+	int hit = sam3_text_cache_lookup(proc->txt_cache, key,
+					 proc->text_tokens, n_tokens);
+	if (hit >= 0) {
+		memcpy(proc->text_tokens, saved_tokens, sizeof(saved_tokens));
+		proc->text_n_tokens = saved_n_tokens;
+		proc->text_worker_slot = saved_worker_slot;
+		proc->text_cached_bundle = saved_bundle;
+		return SAM3_OK;
+	}
+
+	int slot = sam3_text_cache_claim_slot(proc->txt_cache);
+	if (slot < 0) {
+		memcpy(proc->text_tokens, saved_tokens, sizeof(saved_tokens));
+		proc->text_n_tokens = saved_n_tokens;
+		return SAM3_ENOMEM;
+	}
+	proc->text_worker_slot = slot;
+
+	sam3_arena_reset(&proc->text_scratch_arena);
+	proc->text_thread_err = SAM3_OK;
+
+	/* Synchronous reuse of the worker entry point — no thread. */
+	(void)text_worker_main(proc);
+	enum sam3_error err = proc->text_thread_err;
+	proc->text_thread_err = SAM3_OK;
+
+	/* Restore caller-visible state regardless of success. */
+	memcpy(proc->text_tokens, saved_tokens, sizeof(saved_tokens));
+	proc->text_n_tokens = saved_n_tokens;
+	proc->text_worker_slot = saved_worker_slot;
+	proc->text_cached_bundle = saved_bundle;
+	return err;
+}
+
 enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       const struct sam3_prompt *prompts,
 				       int n_prompts,
