@@ -174,6 +174,29 @@ def _register_hooks(model, captures):
 
     # Capture _encode_new_memory's pred_masks_high_res to verify C's
     # resolution-matching vs Python's multi-hop path on cond frames.
+    # Capture the final video_res output yielded by propagate_in_video
+    # — this is what gen_video_parity_fixtures.py writes to the ref
+    # fixture PNG. The raw `_forward_sam_heads` output gets gated to
+    # NO_OBJ_SCORE on multiplex propagation frames, but somewhere
+    # between that and the yielded mask the content is restored (parity
+    # log iter 15 — exact path not yet traced; empirically the C side
+    # skipping apply_occlusion_gating on track_masks matches Python at
+    # IoU ~0.47).
+    _orig_gvr = model._get_orig_video_res_output
+    def _patched_gvr(inference_state, any_res_masks):
+        any_r, vrm = _orig_gvr(inference_state, any_res_masks)
+        captures.setdefault("gvr_output", []).append(
+            vrm.detach().clone().cpu().float().contiguous())
+        return any_r, vrm
+    model._get_orig_video_res_output = _patched_gvr
+
+    class _UnpatchGVR:
+        def remove(self_inner):
+            model._get_orig_video_res_output = _orig_gvr
+    hooks.append(_UnpatchGVR())
+
+    # Capture _forward_sam_heads output to see gating effect
+
     _orig_enm = model._encode_new_memory
     def _patched_enm(image, current_vision_feats, feat_sizes,
                      pred_masks_high_res, object_score_logits,
@@ -592,7 +615,8 @@ def _flush_captures_delta(captures, cursors, frame_idx):
                  "maskmem_stage0_conv", "maskmem_stage0_act",
                  "maskmem_stage1_conv", "maskmem_stage1_act",
                  "maskmem_stage2_conv", "maskmem_stage2_act",
-                 "maskmem_stage3_conv", "maskmem_stage3_act"):
+                 "maskmem_stage3_conv", "maskmem_stage3_act",
+                 "gvr_output"):
         start = cursors.get(slot, 0)
         end = len(captures.get(slot, []))
         if end > start:
