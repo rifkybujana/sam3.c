@@ -1211,6 +1211,16 @@ static struct sam3_tensor *memory_attn_layer(
 					       L->img_k_w, L->img_k_b);
 	if (!k_mem || !k_img)
 		return NULL;
+#ifdef SAM3_DEBUG_DUMP
+	if (layer_idx == 0) {
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k_img;
+		extern struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k_mem;
+		k_mem->dbg_force_readback = 1;
+		k_img->dbg_force_readback = 1;
+		sam3_dbg_trk_memattn_l0_ca_k_img = k_img;
+		sam3_dbg_trk_memattn_l0_ca_k_mem = k_mem;
+	}
+#endif
 	k = gh_add(g, a, k_img, k_mem);
 	if (!k)
 		return NULL;

@@ -92,6 +92,9 @@ struct sam3_tensor *sam3_dbg_trk_memattn_l0_sa_out   = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_q     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k     = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_v     = NULL;
+/* Ca_k component bisection: pre-sum projections of memory_image / memory. */
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k_img = NULL;
+struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_k_mem = NULL;
 struct sam3_tensor *sam3_dbg_trk_memattn_l0_ca_attn  = NULL;
 /* MLP drill: capture norm3/linear1/gelu/linear2 outputs + final
  * layer_out so the ca_attn → layer_0_out collapse can be bisected. */
@@ -1112,6 +1115,8 @@ video_track_one_obj(struct sam3_video_session *session,
 		DUMP_TRK(memattn_l0_ca_q);
 		DUMP_TRK(memattn_l0_ca_k);
 		DUMP_TRK(memattn_l0_ca_v);
+		DUMP_TRK(memattn_l0_ca_k_img);
+		DUMP_TRK(memattn_l0_ca_k_mem);
 		DUMP_TRK(memattn_l0_ca_attn);
 		DUMP_TRK(memattn_l0_ca_out);
 		DUMP_TRK(memattn_l0_norm3_out);
@@ -1495,6 +1500,16 @@ video_track_one_obj(struct sam3_video_session *session,
 			}
 			free(mask_upsampled);
 #undef BILINEAR_UPSAMPLE
+
+#ifdef SAM3_DEBUG_DUMP
+			{
+				char pbuf[256];
+				snprintf(pbuf, sizeof(pbuf),
+					 "/tmp/dbg_trk_mem_input_f%d.bin",
+					 frame_idx);
+				auto_dump_tensor(pbuf, multi_mask);
+			}
+#endif
 
 			mem_feat = sam3_multiplex_maskmem_forward(
 				&g, gfx, &trk_mux->maskmem,

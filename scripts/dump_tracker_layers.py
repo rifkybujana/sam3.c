@@ -172,23 +172,31 @@ def _register_hooks(model, captures):
     hooks.append(model.transformer.encoder.register_forward_hook(
         _cap_encoder, with_kwargs=True))
 
-    # Capture the input mask_inputs arriving at _use_mask_as_output
-    # (or equivalently _encode_new_memory's pred_masks_high_res) to
-    # verify C's resolution-matching vs Python's video_res-hop on cond
-    # frames.
-    _orig_use_mask = model._use_mask_as_output
-    def _patched_use_mask(backbone_features, high_res_features,
-                          mask_inputs, multiplex_state, objects_in_mask=None):
-        captures.setdefault("use_mask_mask_inputs", []).append(
-            mask_inputs.detach().cpu().float().contiguous())
-        return _orig_use_mask(backbone_features, high_res_features,
-                              mask_inputs, multiplex_state, objects_in_mask)
-    model._use_mask_as_output = _patched_use_mask
+    # Capture _encode_new_memory's pred_masks_high_res to verify C's
+    # resolution-matching vs Python's multi-hop path on cond frames.
+    _orig_enm = model._encode_new_memory
+    def _patched_enm(image, current_vision_feats, feat_sizes,
+                     pred_masks_high_res, object_score_logits,
+                     is_mask_from_pts, *, conditioning_objects=None,
+                     multiplex_state=None):
+        captures.setdefault("enm_pred_masks_high_res", []).append(
+            pred_masks_high_res.detach().cpu().float().contiguous())
+        return _orig_enm(
+            image=image,
+            current_vision_feats=current_vision_feats,
+            feat_sizes=feat_sizes,
+            pred_masks_high_res=pred_masks_high_res,
+            object_score_logits=object_score_logits,
+            is_mask_from_pts=is_mask_from_pts,
+            conditioning_objects=conditioning_objects,
+            multiplex_state=multiplex_state,
+        )
+    model._encode_new_memory = _patched_enm
 
-    class _UnpatchUseMask:
+    class _UnpatchENM:
         def remove(self_inner):
-            model._use_mask_as_output = _orig_use_mask
-    hooks.append(_UnpatchUseMask())
+            model._encode_new_memory = _orig_enm
+    hooks.append(_UnpatchENM())
 
     # Iteration 15: Maskmem bisection. Capture:
     #   - maskmem_out: final maskmem_backbone output (pre no_obj_embed)
@@ -580,7 +588,7 @@ def _flush_captures_delta(captures, cursors, frame_idx):
     # the final output + internal intermediates so compare_tracker_layers
     # can localize maskmem internal divergence vs input gap amplification.
     for slot in ("maskmem_out", "maskmem_proj", "maskmem_pix_proj",
-                 "maskmem_downsampler_in", "use_mask_mask_inputs",
+                 "maskmem_downsampler_in", "enm_pred_masks_high_res",
                  "maskmem_stage0_conv", "maskmem_stage0_act",
                  "maskmem_stage1_conv", "maskmem_stage1_act",
                  "maskmem_stage2_conv", "maskmem_stage2_act",
