@@ -9,6 +9,25 @@
 **Tech Stack:** C11, arena allocators, graph IR, Metal/CPU backends, existing `SAM3_OP_CONV2D` (with groups) and `SAM3_OP_BATCHNORM` for RepMixer, Python/PyTorch for golden fixtures.
 
 **Spec:** `docs/superpowers/specs/2026-04-20-mobileclip-text-encoder-design.md`
+**Audit:** `docs/superpowers/specs/notes/2026-04-20-mobileclip-key-audit.md` (Phase 0 .pt key inventory)
+
+> **Revision note (2026-04-20, post-Phase-0):** The Phase 0 audit + reference
+> Python check changed the RepMixer design:
+> - **S0 has 6 transformer blocks total** (indices 0–5; not 12 as the audit
+>   doc initially extrapolated). RepMixer at indices **{0, 5}** (the
+>   bookends), standard pre-norm transformer blocks at {1, 2, 3, 4}.
+> - **MobileOne reparameterization is NOT collapsed** at export — both
+>   RepMixer blocks ship parallel BN/conv branches that must be summed at
+>   inference (see spec section "RepMixer block (S0 blocks 0 and 5) —
+>   verified from reference" for exact arithmetic).
+>
+> Variant config now carries `n_repmixer_blocks` + `repmixer_block_indices[]`
+> instead of a boolean, and the per-layer struct is a tagged union (std vs
+> repmixer). Tasks 4.3, 4.5, 6.1, and 6.2 were drafted before the audit and
+> contain stale `has_repmixer_block_0` / `repmixer_block_0` references — the
+> implementer for those tasks must adapt to the tagged-union layer layout
+> shown in Task 4.1. **Treat the spec as authoritative** if any code snippet
+> below contradicts it.
 
 ---
 
@@ -1170,10 +1189,11 @@ Create `src/model/mobileclip_text.h`:
  *
  * Pre-norm transformer text encoder with non-causal attention. Covers
  * three variants from one code path, parameterized by config (n_layers,
- * width, n_heads, mlp_dim, has_repmixer_block_0). The S0 variant's first
- * block is a RepMixer (depthwise conv + ConvFFN) instead of standard
- * pre-norm-MHA + pre-norm-FFN; this is implemented as a conditional
- * branch in the per-block evaluator.
+ * width, n_heads, mlp_dim, n_repmixer_blocks). The S0 variant has
+ * RepMixer blocks at indices listed in cfg.repmixer_block_indices
+ * (verified in the .pt audit at indices 0 and 5); S1 and L have no
+ * RepMixer blocks. Each layer slot uses either the std or repmixer
+ * sub-struct depending on the per-block flag.
  *
  * Output contract matches sam3_text_encoder: per-token [ctx_len, 256]
  * plus pooled [256] from the EOT position.
@@ -1197,18 +1217,20 @@ Create `src/model/mobileclip_text.h`:
 #include "backend/backend.h"
 
 #define SAM3_MOBILECLIP_MAX_LAYERS 12
+#define SAM3_MOBILECLIP_MAX_REPMIXER_BLOCKS 4
 
 struct sam3_mobileclip_config {
 	int  text_backbone;             /* enum sam3_text_backbone */
-	int  n_layers;
+	int  n_layers;                  /* total transformer block count (12 for all variants) */
 	int  width;                     /* embedding/transformer dim */
 	int  n_heads;
 	int  mlp_dim;
 	int  ctx_len;
 	int  out_dim;                   /* always 256 for SAM3 */
 	int  vocab_size;                /* always 49408 */
-	int  has_repmixer_block_0;      /* 1 for S0, 0 for S1/L */
 	int  pos_embed_table_len;       /* always 77 */
+	int  n_repmixer_blocks;         /* 0 for S1/L; 2 for S0 (indices 0,5) */
+	int  repmixer_block_indices[SAM3_MOBILECLIP_MAX_REPMIXER_BLOCKS];
 };
 
 struct sam3_mobileclip_layer_std {
@@ -1220,22 +1242,74 @@ struct sam3_mobileclip_layer_std {
 	struct sam3_tensor *fc2_w, *fc2_b;
 };
 
-/* Populated only when has_repmixer_block_0 is set. */
+/*
+ * RepMixer block weights (S0 blocks 0 and 5). MobileOne reparameterization
+ * is NOT collapsed at export, so we ship parallel BN/conv branches that
+ * the build code sums at inference. eps=1e-5 for every BN.
+ *
+ * Audit-verified key shapes (S0, width=512):
+ *   norm_skip_*       (512,)             — single BN on input
+ *   mixer_skip_*      (512,)             — branch 1: BN(x)
+ *   mixer_conv_w      (512,1,1,11)       — depthwise 1×11 conv
+ *   mixer_conv_bn_*   (512,)             — branch 2: BN(conv(x))
+ *   tm_layer_scale    (512,1,1)          — token-mixer residual scale
+ *   convffn_dw_w      (512,1,1,11)       — convffn.conv: depthwise 1×11
+ *   convffn_dw_bn_*   (512,)             — convffn.conv.bn
+ *   convffn_fc1_w     (2048,512,1,1)     — convffn.fc1: 1×1, [512→2048]
+ *   convffn_fc1_b     (2048,)
+ *   convffn_fc2_w     (512,2048,1,1)     — convffn.fc2: 1×1, [2048→512]
+ *   convffn_fc2_b     (512,)
+ *   outer_layer_scale (512,1,1)          — outer block residual scale
+ */
 struct sam3_mobileclip_layer_repmixer {
-	/* token mixer */
-	struct sam3_tensor *tm_norm_w, *tm_norm_b;             /* BN, optional */
-	struct sam3_tensor *tm_norm_running_mean;              /* BN, optional */
-	struct sam3_tensor *tm_norm_running_var;               /* BN, optional */
-	struct sam3_tensor *tm_mixer_w;                        /* depthwise conv */
-	struct sam3_tensor *tm_layer_scale;                    /* [width,1,1] */
-	/* convffn */
-	struct sam3_tensor *cf_fc1_w;                          /* 1x1 conv */
-	struct sam3_tensor *cf_fc1_bn_w, *cf_fc1_bn_b;         /* BN, optional */
-	struct sam3_tensor *cf_fc1_bn_rm, *cf_fc1_bn_rv;       /* BN, optional */
-	struct sam3_tensor *cf_fc2_w;                          /* 1x1 conv */
-	struct sam3_tensor *cf_fc2_bn_w, *cf_fc2_bn_b;         /* BN, optional */
-	struct sam3_tensor *cf_fc2_bn_rm, *cf_fc2_bn_rv;       /* BN, optional */
-	struct sam3_tensor *outer_layer_scale;                 /* [width,1,1] */
+	/* token_mixer.norm — single standalone BN */
+	struct sam3_tensor *norm_skip_w, *norm_skip_b;
+	struct sam3_tensor *norm_skip_rm, *norm_skip_rv;
+
+	/* token_mixer.mixer.rbr_skip — BN-only branch */
+	struct sam3_tensor *mixer_skip_w, *mixer_skip_b;
+	struct sam3_tensor *mixer_skip_rm, *mixer_skip_rv;
+
+	/* token_mixer.mixer.rbr_conv[0] — depthwise conv + BN branch */
+	struct sam3_tensor *mixer_conv_w;                    /* [512,1,1,11] */
+	struct sam3_tensor *mixer_conv_bn_w, *mixer_conv_bn_b;
+	struct sam3_tensor *mixer_conv_bn_rm, *mixer_conv_bn_rv;
+
+	/* (Optional) token_mixer.mixer.rbr_scale — 1×1 conv + BN branch.
+	 * Absent in the audited S0 checkpoint; loader leaves NULL when
+	 * keys are missing and build_repmixer_block skips the branch. */
+	struct sam3_tensor *mixer_scale_w;                   /* [512,512,1,1] or NULL */
+	struct sam3_tensor *mixer_scale_bn_w, *mixer_scale_bn_b;
+	struct sam3_tensor *mixer_scale_bn_rm, *mixer_scale_bn_rv;
+
+	/* token_mixer residual scale: x + tm_layer_scale * (mixer_out - norm_out) */
+	struct sam3_tensor *tm_layer_scale;                  /* [512,1,1] */
+
+	/* convffn.conv — depthwise 1×11 conv + BN */
+	struct sam3_tensor *convffn_dw_w;                    /* [512,1,1,11] */
+	struct sam3_tensor *convffn_dw_bn_w, *convffn_dw_bn_b;
+	struct sam3_tensor *convffn_dw_bn_rm, *convffn_dw_bn_rv;
+
+	/* convffn.fc1 — 1×1 conv (with bias) */
+	struct sam3_tensor *convffn_fc1_w, *convffn_fc1_b;
+
+	/* convffn.fc2 — 1×1 conv (with bias) */
+	struct sam3_tensor *convffn_fc2_w, *convffn_fc2_b;
+
+	/* outer block residual scale: x + outer_layer_scale * convffn(x) */
+	struct sam3_tensor *outer_layer_scale;               /* [512,1,1] */
+};
+
+/*
+ * Tagged per-block layer slot. is_repmixer=1 selects the repmixer union
+ * arm; is_repmixer=0 selects std. Set by the loader from cfg.repmixer_block_indices.
+ */
+struct sam3_mobileclip_layer {
+	int is_repmixer;
+	union {
+		struct sam3_mobileclip_layer_std       std;
+		struct sam3_mobileclip_layer_repmixer  repmixer;
+	} u;
 };
 
 struct sam3_mobileclip_text_encoder {
@@ -1243,23 +1317,19 @@ struct sam3_mobileclip_text_encoder {
 
 	/* Embeddings */
 	struct sam3_tensor *token_embedding;   /* [vocab_size, width] */
-	struct sam3_tensor *pos_embed_full;    /* [77, width] (sliced at build) */
+	struct sam3_tensor *pos_embed_full;    /* [1,1,77,width] (sliced at build) */
 
 	/* Final norm + projection */
 	struct sam3_tensor *ln_final_w;
 	struct sam3_tensor *ln_final_b;
-	struct sam3_tensor *projection_layer;  /* [width, width] */
+	struct sam3_tensor *projection_layer;  /* [width, width], stored as raw tensor (no .weight suffix) */
 
 	/* External 256-dim projector (TextStudentEncoder.projector) */
 	struct sam3_tensor *out_proj_w;        /* [256, width] */
-	struct sam3_tensor *out_proj_b;        /* [256] (or NULL if absent) */
+	struct sam3_tensor *out_proj_b;        /* [256] */
 
-	/* Standard blocks (always populated for blocks 1..n_layers-1; for
-	 * S0 block 0 is unused and the repmixer slot below is populated). */
-	struct sam3_mobileclip_layer_std        layers[SAM3_MOBILECLIP_MAX_LAYERS];
-
-	/* RepMixer block-0 weights (S0 only). */
-	struct sam3_mobileclip_layer_repmixer  repmixer_block_0;
+	/* Per-block tagged layers. cfg.n_layers entries used. */
+	struct sam3_mobileclip_layer layers[SAM3_MOBILECLIP_MAX_LAYERS];
 };
 
 enum sam3_error sam3_mobileclip_text_load(
@@ -1343,42 +1413,45 @@ Create `src/model/mobileclip_text.c`:
 /* --- Variant configs (spec table) --- */
 
 static const struct sam3_mobileclip_config mobileclip_s0 = {
-	.text_backbone        = SAM3_TEXT_MOBILECLIP_S0,
-	.n_layers             = 6,
-	.width                = 512,
-	.n_heads              = 8,
-	.mlp_dim              = 2048,
-	.ctx_len              = 16,
-	.out_dim              = 256,
-	.vocab_size           = 49408,
-	.has_repmixer_block_0 = 1,
-	.pos_embed_table_len  = 77,
+	.text_backbone           = SAM3_TEXT_MOBILECLIP_S0,
+	.n_layers                = 6,
+	.width                   = 512,
+	.n_heads                 = 8,
+	.mlp_dim                 = 2048,
+	.ctx_len                 = 16,
+	.out_dim                 = 256,
+	.vocab_size              = 49408,
+	.pos_embed_table_len     = 77,
+	.n_repmixer_blocks       = 2,
+	.repmixer_block_indices  = { 0, 5, 0, 0 },
 };
 
 static const struct sam3_mobileclip_config mobileclip_s1 = {
-	.text_backbone        = SAM3_TEXT_MOBILECLIP_S1,
-	.n_layers             = 12,
-	.width                = 512,
-	.n_heads              = 8,
-	.mlp_dim              = 2048,
-	.ctx_len              = 16,
-	.out_dim              = 256,
-	.vocab_size           = 49408,
-	.has_repmixer_block_0 = 0,
-	.pos_embed_table_len  = 77,
+	.text_backbone           = SAM3_TEXT_MOBILECLIP_S1,
+	.n_layers                = 12,
+	.width                   = 512,
+	.n_heads                 = 8,
+	.mlp_dim                 = 2048,
+	.ctx_len                 = 16,
+	.out_dim                 = 256,
+	.vocab_size              = 49408,
+	.pos_embed_table_len     = 77,
+	.n_repmixer_blocks       = 0,
+	.repmixer_block_indices  = { 0 },
 };
 
 static const struct sam3_mobileclip_config mobileclip_l = {
-	.text_backbone        = SAM3_TEXT_MOBILECLIP_L,
-	.n_layers             = 12,
-	.width                = 768,
-	.n_heads              = 12,
-	.mlp_dim              = 3072,
-	.ctx_len              = 16,
-	.out_dim              = 256,
-	.vocab_size           = 49408,
-	.has_repmixer_block_0 = 0,
-	.pos_embed_table_len  = 77,
+	.text_backbone           = SAM3_TEXT_MOBILECLIP_L,
+	.n_layers                = 12,
+	.width                   = 768,
+	.n_heads                 = 12,
+	.mlp_dim                 = 3072,
+	.ctx_len                 = 16,
+	.out_dim                 = 256,
+	.vocab_size              = 49408,
+	.pos_embed_table_len     = 77,
+	.n_repmixer_blocks       = 0,
+	.repmixer_block_indices  = { 0 },
 };
 
 const struct sam3_mobileclip_config *sam3_mobileclip_config_for(int text_backbone)
@@ -1616,14 +1689,20 @@ enum sam3_error sam3_mobileclip_text_load(
 		wf, arena, BACKBONE_PFX "projector.bias");
 	/* projector.bias may legitimately be absent (Linear with bias=False). */
 
-	/* Per-layer standard blocks (block 0 is RepMixer for S0 — handled
-	 * in Task 6.1; here we still populate layers[0] for non-S0 variants
-	 * and skip it for S0). */
+	/* Per-layer load. RepMixer indices (S0 only) are handled by Task 6.1
+	 * via load_repmixer_block; here we populate the standard-block tensors
+	 * into enc->layers[i].u.std and set is_repmixer=0. */
 	for (int i = 0; i < cfg->n_layers; i++) {
-		if (cfg->has_repmixer_block_0 && i == 0)
-			continue; /* loaded by Task 6.x */
-
-		struct sam3_mobileclip_layer_std *L = &enc->layers[i];
+		int is_rep = 0;
+		for (int k = 0; k < cfg->n_repmixer_blocks; k++) {
+			if (cfg->repmixer_block_indices[k] == i) { is_rep = 1; break; }
+		}
+		if (is_rep) {
+			enc->layers[i].is_repmixer = 1;
+			continue; /* loaded by Task 6.1 */
+		}
+		enc->layers[i].is_repmixer = 0;
+		struct sam3_mobileclip_layer_std *L = &enc->layers[i].u.std;
 
 		dims[0] = cfg->width;
 		snprintf(name, sizeof(name),
@@ -1782,11 +1861,9 @@ struct sam3_tensor *sam3_mobileclip_text_build(
 	int slice_dims[2];
 	int eot_idx;
 
-	if (cfg->has_repmixer_block_0) {
-		sam3_log_error("mobileclip_build: S0 RepMixer path not yet "
-			       "implemented (use _perblock or finish Phase 6)");
-		return NULL;
-	}
+	/* No RepMixer guard: build dispatches per-block on is_repmixer
+	 * (set by the loader from cfg.repmixer_block_indices). For S1/L
+	 * every block is_repmixer=0 so the loop runs the standard path. */
 
 	/* 1. Token embedding lookup [ctx_len, width] */
 	x = gh_embedding_lookup(g, enc->token_embedding, token_ids, arena);
@@ -1799,10 +1876,20 @@ struct sam3_tensor *sam3_mobileclip_text_build(
 		       /*start*/ 0, /*end*/ cfg->ctx_len, arena);
 	x = gh_add(g, x, pos, arena);
 
-	/* 3. Transformer blocks (no causal mask) */
-	for (int i = 0; i < cfg->n_layers; i++)
-		x = build_std_block(g, &enc->layers[i], x,
+	/* 3. Transformer blocks (no causal mask). Per-block dispatch
+	 *    on is_repmixer; RepMixer wiring lands in Phase 6. */
+	for (int i = 0; i < cfg->n_layers; i++) {
+		const struct sam3_mobileclip_layer *L = &enc->layers[i];
+		if (L->is_repmixer) {
+			/* Filled in by Task 6.2; no-op for S1/L. */
+			sam3_log_error("mobileclip_build: RepMixer block %d "
+				       "reached before Phase 6 wired it",
+				       i);
+			return NULL;
+		}
+		x = build_std_block(g, &L->u.std, x,
 				    cfg->n_heads, cfg->width, arena);
+	}
 
 	/* 4. Final LN */
 	x = gh_layernorm(g, x, enc->ln_final_w, enc->ln_final_b, arena);
@@ -1875,11 +1962,8 @@ struct sam3_tensor *sam3_mobileclip_text_build_perblock(
 	struct sam3_tensor *x_persist;
 	int blocks_per_eval = 4;
 
-	if (cfg->has_repmixer_block_0) {
-		/* Phase 6 fills this in. */
-		sam3_log_error("mobileclip_perblock: S0 RepMixer not yet wired");
-		return NULL;
-	}
+	/* No top-level RepMixer guard: the block loop dispatches per-block.
+	 * Phase 6 wires the L->is_repmixer arm. */
 
 	/* === Pre-block setup: embed + add pos, evaluated in scratch and
 	 *     copied into persist === */
@@ -1899,24 +1983,37 @@ struct sam3_tensor *sam3_mobileclip_text_build_perblock(
 		sam3_arena_reset(scratch);
 	}
 
-	/* === Block loop === */
-	for (int start = 0; start < cfg->n_layers; start += blocks_per_eval) {
-		int end = start + blocks_per_eval;
-		if (end > cfg->n_layers) end = cfg->n_layers;
+	/* === Block loop ===
+	 *
+	 * For S1/L: every block is_repmixer=0, so the loop runs the
+	 * standard path. We still emit one block per group rather than
+	 * batching 4 — this keeps the dispatch identical for both std
+	 * and RepMixer blocks once Phase 6 lands. If profiling shows
+	 * the per-block overhead matters, batch consecutive std blocks
+	 * (see Task 6.2 step 3 for the batching pattern).
+	 */
+	for (int i = 0; i < cfg->n_layers; i++) {
+		const struct sam3_mobileclip_layer *L = &enc->layers[i];
 
 		struct sam3_graph g;
 		sam3_graph_init(&g, scratch);
 
 		struct sam3_tensor *x = gh_alias(&g, x_persist);
-		for (int i = start; i < end; i++)
-			x = build_std_block(&g, &enc->layers[i], x,
-					    cfg->n_heads, cfg->width, scratch);
+		if (L->is_repmixer) {
+			/* Filled in by Task 6.2; no-op for S1/L. */
+			sam3_log_error("mobileclip_perblock: RepMixer block %d "
+				       "reached before Phase 6 wired it", i);
+			return NULL;
+		}
+		x = build_std_block(&g, &L->u.std, x,
+				    cfg->n_heads, cfg->width, scratch);
 
 		sam3_backend_eval(be, &g);
 		x_persist = gh_persist_copy(persist, x);
 
 		sam3_arena_reset(scratch);
 	}
+	(void)blocks_per_eval; /* unused after refactor */
 
 	/* === Tail: final LN + inner proj + external projector === */
 	{
@@ -2276,10 +2373,42 @@ git commit -m "tests: parity for MobileCLIP-L"
 
 ## Phase 6 — RepMixer block (S0 only)
 
-### Task 6.1 — Load RepMixer block-0 weights
+### Task 6.1 — Load RepMixer block weights (S0 indices 0 and 5)
 
 **Files:**
 - Modify: `src/model/mobileclip_text.c` (extend loader)
+
+**Audit-verified key inventory** (per `docs/superpowers/specs/notes/2026-04-20-mobileclip-key-audit.md`).
+For each S0 block index `i` in `cfg.repmixer_block_indices` (i ∈ {0, 5}):
+
+```
+transformer.<i>.layer_scale                                            (512,1,1)
+transformer.<i>.token_mixer.layer_scale                                (512,1,1)
+transformer.<i>.token_mixer.norm.rbr_skip.{weight,bias,running_mean,running_var}    (512,)
+transformer.<i>.token_mixer.mixer.rbr_skip.{weight,bias,running_mean,running_var}   (512,)
+transformer.<i>.token_mixer.mixer.rbr_conv.0.bn.{weight,bias,running_mean,running_var} (512,)
+transformer.<i>.token_mixer.mixer.rbr_conv.0.conv.weight               (512,1,1,11)
+transformer.<i>.convffn.conv.bn.{weight,bias,running_mean,running_var} (512,)
+transformer.<i>.convffn.conv.conv.weight                               (512,1,1,11)
+transformer.<i>.convffn.fc1.{weight,bias}                              (2048,512,1,1) / (2048,)
+transformer.<i>.convffn.fc2.{weight,bias}                              (512,2048,1,1) / (512,)
+```
+
+**Mapping into `struct sam3_mobileclip_layer_repmixer`** (declared in Task 4.1):
+
+| C field                           | Source key (`<P>` = `ENC_PFX "transformer.%d." % i`) |
+|-----------------------------------|------------------------------------------------------|
+| `outer_layer_scale`               | `<P>layer_scale`                                     |
+| `tm_layer_scale`                  | `<P>token_mixer.layer_scale`                         |
+| `norm_skip_{w,b,rm,rv}`           | `<P>token_mixer.norm.rbr_skip.{weight,bias,running_mean,running_var}` |
+| `mixer_skip_{w,b,rm,rv}`          | `<P>token_mixer.mixer.rbr_skip.{weight,bias,running_mean,running_var}` |
+| `mixer_conv_w`                    | `<P>token_mixer.mixer.rbr_conv.0.conv.weight`        |
+| `mixer_conv_bn_{w,b,rm,rv}`       | `<P>token_mixer.mixer.rbr_conv.0.bn.{...}`           |
+| `mixer_scale_*` (optional)        | `<P>token_mixer.mixer.rbr_scale.*` (NULL on miss — current S0 lacks it) |
+| `convffn_dw_w`                    | `<P>convffn.conv.conv.weight`                        |
+| `convffn_dw_bn_{w,b,rm,rv}`       | `<P>convffn.conv.bn.{...}`                           |
+| `convffn_fc1_{w,b}`               | `<P>convffn.fc1.{weight,bias}`                       |
+| `convffn_fc2_{w,b}`               | `<P>convffn.fc2.{weight,bias}`                       |
 
 - [ ] **Step 1: Add the RepMixer loader**
 
@@ -2287,97 +2416,97 @@ Add this function before `sam3_mobileclip_text_load`:
 
 ```c
 /*
- * load_repmixer_block_0 - Populate enc->repmixer_block_0 for S0.
+ * load_repmixer_block - Populate one repmixer layer slot.
  *
- * BN params are optional: if the keys are absent we assume MobileOne
- * reparameterization folded BN into conv at export, and the build-time
- * branch skips BN ops. The exact key shapes were captured in Phase 0
- * (docs/superpowers/specs/notes/2026-04-20-mobileclip-key-audit.md).
+ * @R:           Repmixer struct to fill (zeroed by caller).
+ * @wf:          Open weight file.
+ * @arena:       Arena for tensor descriptors.
+ * @layer_idx:   The transformer.<layer_idx> index in the source state-dict.
+ * @width:       cfg.width (channel count, e.g., 512 for S0).
+ * @mlp_dim:     cfg.mlp_dim (e.g., 2048 for S0).
+ *
+ * BN params are required by the audited S0 checkpoint (no fold). All four
+ * (weight, bias, running_mean, running_var) per BN must load successfully;
+ * a missing key is a model-format error. The optional rbr_scale branch
+ * (mixer_scale_*) tolerates absence — when NULL, build skips the branch.
  */
-static enum sam3_error load_repmixer_block_0(
-	struct sam3_mobileclip_text_encoder *enc,
+static enum sam3_error load_repmixer_block(
+	struct sam3_mobileclip_layer_repmixer *R,
 	const struct sam3_weight_file *wf,
-	struct sam3_arena *arena)
+	struct sam3_arena *arena,
+	int layer_idx, int width, int mlp_dim)
 {
-	struct sam3_mobileclip_layer_repmixer *R = &enc->repmixer_block_0;
-	int W = enc->cfg.width;
-	int M = enc->cfg.mlp_dim;
-	int dims[4];
+	char k[256];
+	#define K(suffix) (snprintf(k, sizeof(k), \
+		ENC_PFX "transformer.%d." suffix, layer_idx), k)
 
-	/* Outer layer scale */
-	dims[0] = W; dims[1] = 1; dims[2] = 1;
-	R->outer_layer_scale = load_or_zero(
-		wf, arena, ENC_PFX "transformer.0.layer_scale",
-		SAM3_DTYPE_F32, 3, dims);
+	/* Outer + token-mixer scales. */
+	R->outer_layer_scale = load_required(wf, arena, K("layer_scale"));
+	R->tm_layer_scale    = load_required(wf, arena, K("token_mixer.layer_scale"));
 
-	/* Token mixer: optional BN + depthwise conv + per-channel scale */
-	dims[0] = W;
-	R->tm_norm_w = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.token_mixer.norm.weight");
-	R->tm_norm_b = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.token_mixer.norm.bias");
-	R->tm_norm_running_mean = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.token_mixer.norm.running_mean");
-	R->tm_norm_running_var = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.token_mixer.norm.running_var");
+	/* token_mixer.norm.rbr_skip — single BN. */
+	R->norm_skip_w  = load_required(wf, arena, K("token_mixer.norm.rbr_skip.weight"));
+	R->norm_skip_b  = load_required(wf, arena, K("token_mixer.norm.rbr_skip.bias"));
+	R->norm_skip_rm = load_required(wf, arena, K("token_mixer.norm.rbr_skip.running_mean"));
+	R->norm_skip_rv = load_required(wf, arena, K("token_mixer.norm.rbr_skip.running_var"));
 
-	/* depthwise conv: [W, 1, 1, 11] when groups=W (OHWI conv layout) */
-	dims[0] = W; dims[1] = 1; dims[2] = 1; dims[3] = 11;
-	R->tm_mixer_w = load_required(wf, arena,
-		ENC_PFX "transformer.0.token_mixer.mixer.weight");
-	if (!R->tm_mixer_w) return SAM3_EMODEL;
+	/* token_mixer.mixer.rbr_skip — BN-only branch. */
+	R->mixer_skip_w  = load_required(wf, arena, K("token_mixer.mixer.rbr_skip.weight"));
+	R->mixer_skip_b  = load_required(wf, arena, K("token_mixer.mixer.rbr_skip.bias"));
+	R->mixer_skip_rm = load_required(wf, arena, K("token_mixer.mixer.rbr_skip.running_mean"));
+	R->mixer_skip_rv = load_required(wf, arena, K("token_mixer.mixer.rbr_skip.running_var"));
 
-	dims[0] = W; dims[1] = 1; dims[2] = 1;
-	R->tm_layer_scale = load_or_zero(
-		wf, arena, ENC_PFX "transformer.0.token_mixer.layer_scale",
-		SAM3_DTYPE_F32, 3, dims);
+	/* token_mixer.mixer.rbr_conv[0] — depthwise conv + BN branch. */
+	R->mixer_conv_w     = load_required(wf, arena, K("token_mixer.mixer.rbr_conv.0.conv.weight"));
+	R->mixer_conv_bn_w  = load_required(wf, arena, K("token_mixer.mixer.rbr_conv.0.bn.weight"));
+	R->mixer_conv_bn_b  = load_required(wf, arena, K("token_mixer.mixer.rbr_conv.0.bn.bias"));
+	R->mixer_conv_bn_rm = load_required(wf, arena, K("token_mixer.mixer.rbr_conv.0.bn.running_mean"));
+	R->mixer_conv_bn_rv = load_required(wf, arena, K("token_mixer.mixer.rbr_conv.0.bn.running_var"));
 
-	/* convffn fc1: [M, W, 1, 1] */
-	dims[0] = M; dims[1] = W; dims[2] = 1; dims[3] = 1;
-	R->cf_fc1_w = load_required(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc1.weight");
-	if (!R->cf_fc1_w) return SAM3_EMODEL;
-	R->cf_fc1_bn_w = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc1.bn.weight");
-	R->cf_fc1_bn_b = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc1.bn.bias");
-	R->cf_fc1_bn_rm = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc1.bn.running_mean");
-	R->cf_fc1_bn_rv = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc1.bn.running_var");
+	/* token_mixer.mixer.rbr_scale — optional 1×1 conv + BN branch. */
+	R->mixer_scale_w     = gh_load_mmap(wf, arena, K("token_mixer.mixer.rbr_scale.conv.weight"));
+	R->mixer_scale_bn_w  = gh_load_mmap(wf, arena, K("token_mixer.mixer.rbr_scale.bn.weight"));
+	R->mixer_scale_bn_b  = gh_load_mmap(wf, arena, K("token_mixer.mixer.rbr_scale.bn.bias"));
+	R->mixer_scale_bn_rm = gh_load_mmap(wf, arena, K("token_mixer.mixer.rbr_scale.bn.running_mean"));
+	R->mixer_scale_bn_rv = gh_load_mmap(wf, arena, K("token_mixer.mixer.rbr_scale.bn.running_var"));
 
-	/* convffn fc2: [W, M, 1, 1] */
-	dims[0] = W; dims[1] = M; dims[2] = 1; dims[3] = 1;
-	R->cf_fc2_w = load_required(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc2.weight");
-	if (!R->cf_fc2_w) return SAM3_EMODEL;
-	R->cf_fc2_bn_w = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc2.bn.weight");
-	R->cf_fc2_bn_b = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc2.bn.bias");
-	R->cf_fc2_bn_rm = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc2.bn.running_mean");
-	R->cf_fc2_bn_rv = gh_load_mmap(wf, arena,
-		ENC_PFX "transformer.0.convffn.fc2.bn.running_var");
+	/* convffn.conv — depthwise conv + BN. */
+	R->convffn_dw_w     = load_required(wf, arena, K("convffn.conv.conv.weight"));
+	R->convffn_dw_bn_w  = load_required(wf, arena, K("convffn.conv.bn.weight"));
+	R->convffn_dw_bn_b  = load_required(wf, arena, K("convffn.conv.bn.bias"));
+	R->convffn_dw_bn_rm = load_required(wf, arena, K("convffn.conv.bn.running_mean"));
+	R->convffn_dw_bn_rv = load_required(wf, arena, K("convffn.conv.bn.running_var"));
 
-	int bn_present = R->cf_fc1_bn_w || R->cf_fc2_bn_w || R->tm_norm_w;
-	sam3_log_info("mobileclip_s0: RepMixer block-0 loaded "
-		      "(BN params %s)", bn_present ? "present" : "absent (folded)");
+	/* convffn.fc1 / convffn.fc2 — 1×1 convs with bias. */
+	R->convffn_fc1_w = load_required(wf, arena, K("convffn.fc1.weight"));
+	R->convffn_fc1_b = load_required(wf, arena, K("convffn.fc1.bias"));
+	R->convffn_fc2_w = load_required(wf, arena, K("convffn.fc2.weight"));
+	R->convffn_fc2_b = load_required(wf, arena, K("convffn.fc2.bias"));
+	#undef K
+
+	/* Quick null check — load_required already logs each miss; this catches
+	 * the cumulative case so the caller can return EMODEL cleanly. */
+	if (!R->mixer_conv_w || !R->convffn_dw_w ||
+	    !R->convffn_fc1_w || !R->convffn_fc2_w) {
+		sam3_log_error("mobileclip: RepMixer block %d incomplete", layer_idx);
+		return SAM3_EMODEL;
+	}
+
+	(void)width; (void)mlp_dim;  /* width/mlp_dim used only for logging; can drop */
+	sam3_log_info("mobileclip_s0: RepMixer block %d loaded%s",
+		      layer_idx,
+		      R->mixer_scale_w ? " (rbr_scale present)" : "");
 	return SAM3_OK;
 }
 ```
 
-In `sam3_mobileclip_text_load`, after the standard-block loop, add:
+In `sam3_mobileclip_text_load`, replace the layer loop so it dispatches per-block based on `cfg.repmixer_block_indices`. The loop body should:
 
-```c
-	if (cfg->has_repmixer_block_0) {
-		enum sam3_error e = load_repmixer_block_0(enc, wf, arena);
-		if (e != SAM3_OK)
-			return e;
-	}
-```
+1. Check whether `i` appears in `cfg.repmixer_block_indices[0..n_repmixer_blocks)`.
+2. If yes, set `enc->layers[i].is_repmixer = 1` and call `load_repmixer_block(&enc->layers[i].u.repmixer, wf, arena, i, cfg->width, cfg->mlp_dim)`.
+3. Otherwise, set `enc->layers[i].is_repmixer = 0` and load the standard-block tensors into `enc->layers[i].u.std` (the same code that previously populated `enc->layers[i]` directly).
 
-**Important**: confirm the actual key name strings against the Phase 0 audit (`docs/superpowers/specs/notes/2026-04-20-mobileclip-key-audit.md`). Edit each `ENC_PFX "transformer.0..."` literal to match the audit's recorded names. The literals above are the spec's best guess.
+A small helper `is_repmixer_index(cfg, i)` returning a bool keeps the loop tidy.
 
 - [ ] **Step 2: Build**
 
@@ -2388,7 +2517,7 @@ Expected: success.
 
 ```bash
 git add src/model/mobileclip_text.c
-git commit -m "mobileclip: load RepMixer block-0 weights (S0)"
+git commit -m "mobileclip: load RepMixer block weights (S0 indices 0 and 5)"
 ```
 
 ### Task 6.2 — Build the RepMixer block
@@ -2396,75 +2525,137 @@ git commit -m "mobileclip: load RepMixer block-0 weights (S0)"
 **Files:**
 - Modify: `src/model/mobileclip_text.c`
 
-- [ ] **Step 1: Add the RepMixer block builder**
+**Reference arithmetic** (authoritative — see spec section "RepMixer block (S0 blocks 0 and 5) — verified from reference"):
+
+```
+x_in: [1, C=width, 1, W=seq_len]   (already reshaped by caller)
+
+# token_mixer.norm — single standalone BN
+norm_out  = bn(x; norm_skip_*)
+
+# token_mixer.mixer — sum of branches
+y_skip    = bn(x; mixer_skip_*)
+y_conv    = bn( conv2d(x, mixer_conv_w, kernel=[1,11], pad=[0,5], groups=C) ; mixer_conv_bn_* )
+y_scale   = bn( conv2d(x, mixer_scale_w, kernel=[1,1])                      ; mixer_scale_bn_* )  # optional
+mixer_out = y_skip + y_conv [+ y_scale if present]
+
+# Token-mixer residual with internal scale (NOTE: SUBTRACTION between mixer and norm)
+x = x + tm_layer_scale * (mixer_out - norm_out)
+
+# ConvFFN — sequential
+y = bn( conv2d(x, convffn_dw_w, kernel=[1,11], pad=[0,5], groups=C) ; convffn_dw_bn_* )
+y = conv2d(y, convffn_fc1_w, bias=convffn_fc1_b, kernel=[1,1])    # [C → mlp_dim]
+y = GELU(y)
+y = conv2d(y, convffn_fc2_w, bias=convffn_fc2_b, kernel=[1,1])    # [mlp_dim → C]
+
+# Outer block residual with outer scale
+x = x + outer_layer_scale * y
+```
+
+eps=1e-5 for every BN. `bias=NULL` for BN-fused convs (mixer_conv_w, convffn_dw_w, mixer_scale_w); the BN supplies the bias. `convffn.fc1` and `convffn.fc2` ship explicit `bias`.
+
+- [ ] **Step 1: Add a small BN helper**
+
+If `gh_batchnorm` is not already a one-shot helper that takes `(weight, bias, running_mean, running_var, eps)`, add a static helper at the top of `mobileclip_text.c`:
+
+```c
+static struct sam3_tensor *bn(struct sam3_graph *g, struct sam3_tensor *x,
+			      struct sam3_tensor *w, struct sam3_tensor *b,
+			      struct sam3_tensor *rm, struct sam3_tensor *rv,
+			      struct sam3_arena *arena)
+{
+	return gh_batchnorm(g, x, w, b, rm, rv, /*eps*/ 1e-5f, arena);
+}
+```
+
+Confirm the existing `gh_batchnorm` signature first via:
+
+```bash
+grep -n "gh_batchnorm" src/model/graph_helpers.h
+```
+
+Adapt the wrapper if the actual helper differs.
+
+- [ ] **Step 2: Implement build_repmixer_block**
 
 Add (above `sam3_mobileclip_text_build`):
 
 ```c
 /*
- * build_repmixer_block - S0 block 0: conv-based token mixer + ConvFFN.
+ * build_repmixer_block - One RepMixer block (S0 indices 0 and 5).
  *
- * Input:  x [seq_len, width]
- * Output: x [seq_len, width]
+ * Caller provides x already reshaped to NCHW=[1, width, 1, seq_len].
+ * Returns the same NCHW shape (caller reshapes back to [seq, width] when
+ * dispatching from the per-block evaluator).
  *
- * Reshape into NCHW=[1, width, 1, seq_len] for the conv ops, then
- * reshape back. BN ops are emitted only when BN params loaded
- * (see load_repmixer_block_0 — folded MobileOne ships without BN).
+ * See spec section "RepMixer block (S0 blocks 0 and 5) — verified from
+ * reference" for the exact arithmetic. eps=1e-5 for every BN. Optional
+ * mixer.rbr_scale branch is added when R->mixer_scale_w is non-NULL.
  */
 static struct sam3_tensor *build_repmixer_block(
 	struct sam3_graph *g,
 	const struct sam3_mobileclip_layer_repmixer *R,
-	struct sam3_tensor *x_seq,
+	struct sam3_tensor *x,
 	int width,
-	int seq_len,
 	struct sam3_arena *arena)
 {
-	int nchw_dims[4] = { 1, width, 1, seq_len };
-	struct sam3_tensor *x = gh_reshape(g, x_seq, 4, nchw_dims, arena);
-	struct sam3_tensor *t;
+	struct sam3_tensor *norm_out, *y_skip, *y_conv, *mixer_out, *t;
+	struct sam3_tensor *y;
 
-	/* Token mixer: optional BN -> depthwise conv -> layer_scale + residual */
-	t = x;
-	if (R->tm_norm_w) {
-		t = gh_batchnorm(g, t,
-				 R->tm_norm_w, R->tm_norm_b,
-				 R->tm_norm_running_mean,
-				 R->tm_norm_running_var,
-				 /*eps*/ 1e-5f, arena);
-	}
-	t = gh_conv2d(g, t, R->tm_mixer_w, /*bias*/ NULL,
-		      /*stride*/ 1, 1,
-		      /*pad_h*/ 0, /*pad_w*/ 5,
+	/* token_mixer.norm — single BN on the input. */
+	norm_out = bn(g, x, R->norm_skip_w, R->norm_skip_b,
+		      R->norm_skip_rm, R->norm_skip_rv, arena);
+
+	/* token_mixer.mixer.rbr_skip branch: BN on the input. */
+	y_skip = bn(g, x, R->mixer_skip_w, R->mixer_skip_b,
+		    R->mixer_skip_rm, R->mixer_skip_rv, arena);
+
+	/* token_mixer.mixer.rbr_conv[0] branch: depthwise conv 1×11 + BN. */
+	t = gh_conv2d(g, x, R->mixer_conv_w, /*bias*/ NULL,
+		      /*stride*/ 1, 1, /*pad_h*/ 0, /*pad_w*/ 5,
 		      /*groups*/ width, arena);
+	y_conv = bn(g, t, R->mixer_conv_bn_w, R->mixer_conv_bn_b,
+		    R->mixer_conv_bn_rm, R->mixer_conv_bn_rv, arena);
+
+	mixer_out = gh_add(g, y_skip, y_conv, arena);
+
+	/* Optional rbr_scale branch (1×1 conv + BN). */
+	if (R->mixer_scale_w) {
+		struct sam3_tensor *y_scale;
+		t = gh_conv2d(g, x, R->mixer_scale_w, /*bias*/ NULL,
+			      1, 1, 0, 0, /*groups*/ 1, arena);
+		y_scale = bn(g, t,
+			     R->mixer_scale_bn_w, R->mixer_scale_bn_b,
+			     R->mixer_scale_bn_rm, R->mixer_scale_bn_rv,
+			     arena);
+		mixer_out = gh_add(g, mixer_out, y_scale, arena);
+	}
+
+	/* Token-mixer residual: x + tm_layer_scale * (mixer_out - norm_out). */
+	t = gh_sub(g, mixer_out, norm_out, arena);
 	t = gh_mul_per_channel(g, t, R->tm_layer_scale, arena);
 	x = gh_add(g, x, t, arena);
 
-	/* ConvFFN: 1x1 -> BN -> GELU -> 1x1 -> BN -> outer_layer_scale + residual */
-	t = gh_conv2d(g, x, R->cf_fc1_w, /*bias*/ NULL,
+	/* ConvFFN: depthwise 1×11 + BN -> 1×1 (with bias) -> GELU -> 1×1 (with bias). */
+	y = gh_conv2d(g, x, R->convffn_dw_w, /*bias*/ NULL,
+		      1, 1, 0, 5, /*groups*/ width, arena);
+	y = bn(g, y, R->convffn_dw_bn_w, R->convffn_dw_bn_b,
+	       R->convffn_dw_bn_rm, R->convffn_dw_bn_rv, arena);
+	y = gh_conv2d(g, y, R->convffn_fc1_w, R->convffn_fc1_b,
 		      1, 1, 0, 0, /*groups*/ 1, arena);
-	if (R->cf_fc1_bn_w) {
-		t = gh_batchnorm(g, t,
-				 R->cf_fc1_bn_w, R->cf_fc1_bn_b,
-				 R->cf_fc1_bn_rm, R->cf_fc1_bn_rv,
-				 1e-5f, arena);
-	}
-	t = gh_gelu(g, t, arena);
-	t = gh_conv2d(g, t, R->cf_fc2_w, /*bias*/ NULL,
+	y = gh_gelu(g, y, arena);
+	y = gh_conv2d(g, y, R->convffn_fc2_w, R->convffn_fc2_b,
 		      1, 1, 0, 0, /*groups*/ 1, arena);
-	if (R->cf_fc2_bn_w) {
-		t = gh_batchnorm(g, t,
-				 R->cf_fc2_bn_w, R->cf_fc2_bn_b,
-				 R->cf_fc2_bn_rm, R->cf_fc2_bn_rv,
-				 1e-5f, arena);
-	}
-	t = gh_mul_per_channel(g, t, R->outer_layer_scale, arena);
-	x = gh_add(g, x, t, arena);
 
-	/* Reshape back to [seq, width] */
-	int seq_dims[2] = { seq_len, width };
-	return gh_reshape(g, x, 2, seq_dims, arena);
+	/* Outer block residual with outer scale. */
+	y = gh_mul_per_channel(g, y, R->outer_layer_scale, arena);
+	x = gh_add(g, x, y, arena);
+
+	return x;
 }
 ```
+
+If the codebase lacks `gh_sub`, implement it as `x + (-y)` using `gh_mul` with a constant `-1` tensor, or add a real elementwise-sub helper. `gh_mul_per_channel` is nominal — verify against `graph_helpers.h`; if absent, use `gh_mul` with the broadcast tensor `[width,1,1]`.
 
 `gh_conv2d`, `gh_batchnorm`, `gh_mul_per_channel`, `gh_reshape` names are nominal. Verify with:
 
@@ -2476,42 +2667,62 @@ If `gh_mul_per_channel` doesn't exist, look for `gh_mul_broadcast` or use `gh_mu
 
 - [ ] **Step 2: Wire into `sam3_mobileclip_text_build`**
 
-Replace the early-return `if (cfg->has_repmixer_block_0)` block in `sam3_mobileclip_text_build` with:
+Replace the early-return-for-RepMixer guard and standard block loop in `sam3_mobileclip_text_build` with a per-block dispatch on `enc->layers[i].is_repmixer`:
 
 ```c
-	if (cfg->has_repmixer_block_0)
-		x = build_repmixer_block(g, &enc->repmixer_block_0, x,
-					 cfg->width, cfg->ctx_len, arena);
-	int start_block = cfg->has_repmixer_block_0 ? 1 : 0;
-	for (int i = start_block; i < cfg->n_layers; i++)
-		x = build_std_block(g, &enc->layers[i], x,
-				    cfg->n_heads, cfg->width, arena);
+	for (int i = 0; i < cfg->n_layers; i++) {
+		const struct sam3_mobileclip_layer *L = &enc->layers[i];
+
+		if (L->is_repmixer) {
+			/* Reshape [seq, width] -> [1, width, 1, seq], run
+			 * RepMixer, reshape back. */
+			int nchw[4] = { 1, cfg->width, 1, cfg->ctx_len };
+			int seq2[2] = { cfg->ctx_len, cfg->width };
+			x = gh_reshape(g, x, 4, nchw, arena);
+			x = build_repmixer_block(g, &L->u.repmixer, x,
+						 cfg->width, arena);
+			x = gh_reshape(g, x, 2, seq2, arena);
+		} else {
+			x = build_std_block(g, &L->u.std, x,
+					    cfg->n_heads, cfg->width, arena);
+		}
+	}
 ```
 
-(Replacing the previous block loop that started at `i = 0`.)
+(Removes the old early-return for S0 and the `start_block = 1` adjustment.)
 
 - [ ] **Step 3: Wire into `sam3_mobileclip_text_build_perblock`**
 
-In the per-block evaluator, before the standard block loop, evaluate the RepMixer block as its own group (so it gets its own scratch reset):
+In the per-block evaluator, the block loop must dispatch per-block on `is_repmixer`. Since RepMixer blocks have a different working layout (NCHW conv) than standard blocks (sequence-major), each RepMixer block needs its own evaluation group rather than being batched with adjacent standard blocks. The cleanest pattern is one block per group when crossing a layout boundary; the simplest pattern is **one block per group always** (give up the 4-block batching for MobileCLIP). Both work; the simpler pattern is acceptable here because MobileCLIP has at most 12 blocks (vs CLIP's 24) and the per-block overhead is small.
 
 ```c
-	int start_block = 0;
-	if (cfg->has_repmixer_block_0) {
+	for (int i = 0; i < cfg->n_layers; i++) {
+		const struct sam3_mobileclip_layer *L = &enc->layers[i];
 		struct sam3_graph g;
+		struct sam3_tensor *x;
+
 		sam3_graph_init(&g, scratch);
-		struct sam3_tensor *x = gh_alias(&g, x_persist);
-		x = build_repmixer_block(&g, &enc->repmixer_block_0, x,
-					 cfg->width, cfg->ctx_len, scratch);
+		x = gh_alias(&g, x_persist);
+
+		if (L->is_repmixer) {
+			int nchw[4] = { 1, cfg->width, 1, cfg->ctx_len };
+			int seq2[2] = { cfg->ctx_len, cfg->width };
+			x = gh_reshape(&g, x, 4, nchw, scratch);
+			x = build_repmixer_block(&g, &L->u.repmixer, x,
+						 cfg->width, scratch);
+			x = gh_reshape(&g, x, 2, seq2, scratch);
+		} else {
+			x = build_std_block(&g, &L->u.std, x,
+					    cfg->n_heads, cfg->width, scratch);
+		}
+
 		sam3_backend_eval(be, &g);
 		x_persist = gh_persist_copy(persist, x);
 		sam3_arena_reset(scratch);
-		start_block = 1;
-	}
-
-	for (int start = start_block; start < cfg->n_layers; start += blocks_per_eval) {
-		/* (existing standard-block loop body) */
 	}
 ```
+
+If the existing standard-block evaluator batches 4 blocks per group and you want to preserve that for the standard runs, the dispatch becomes a small state machine: accumulate consecutive standard blocks into a group, flush + start a new group when crossing a RepMixer block, evaluate the RepMixer alone, then continue. Implement only if profiling later shows the per-block overhead matters.
 
 - [ ] **Step 4: Build**
 
@@ -2522,7 +2733,7 @@ Expected: success.
 
 ```bash
 git add src/model/mobileclip_text.c
-git commit -m "mobileclip: build RepMixer block (S0 block 0)"
+git commit -m "mobileclip: build RepMixer blocks (S0 indices 0 and 5)"
 ```
 
 ### Task 6.3 — Convert S0 .pt and run S0 parity test

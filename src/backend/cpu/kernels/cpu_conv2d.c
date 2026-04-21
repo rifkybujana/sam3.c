@@ -54,7 +54,7 @@
 static void im2col_nhwc_f32(const float *in, float *col,
 			     int C, int H, int W,
 			     int KH, int KW,
-			     int stride, int pad,
+			     int stride, int pad_h, int pad_w,
 			     int OH, int OW,
 			     int c_off, int C_grp)
 {
@@ -65,9 +65,9 @@ static void im2col_nhwc_f32(const float *in, float *col,
 		for (int ow = 0; ow < OW; ow++) {
 			float *dst = col + (size_t)(oh * OW + ow) * K;
 			for (int kh = 0; kh < KH; kh++) {
-				int ih = oh * stride + kh - pad;
+				int ih = oh * stride + kh - pad_h;
 				for (int kw = 0; kw < KW; kw++) {
-					int iw = ow * stride + kw - pad;
+					int iw = ow * stride + kw - pad_w;
 					float *d = dst +
 						((size_t)kh * KW + kw) *
 						C_grp;
@@ -338,8 +338,11 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 	int KIC = weight->dims[3];
 
 	int stride = node->params[0] > 0 ? node->params[0] : 1;
-	int pad = node->params[1];
+	int pad_h = node->params[1];
 	int groups = node->params[2] > 0 ? node->params[2] : 1;
+	/* params[3]=pad_w: non-zero enables asymmetric H/W padding.
+	 * Zero means symmetric (pad_w = pad_h). */
+	int pad_w = node->params[3] ? node->params[3] : pad_h;
 
 	if (KIC * groups != C_in) {
 		sam3_log_error("conv2d: channel mismatch %d*%d != %d",
@@ -387,7 +390,7 @@ enum sam3_error cpu_kernel_conv2d(const struct sam3_node *node,
 		for (int g = 0; g < groups; g++) {
 			im2col_nhwc_f32(in_n, col,
 					C_in, H, W, KH, KW,
-					stride, pad, OH, OW,
+					stride, pad_h, pad_w, OH, OW,
 					g * cpg_in, cpg_in);
 
 			/* OHWI weight for group g: contiguous

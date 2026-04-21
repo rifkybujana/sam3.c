@@ -626,11 +626,14 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 		 * params[2] = groups (0 means 1)
 		 */
 		int stride = node->params[0] ? node->params[0] : 1;
-		int pad = node->params[1];
+		int pad_h = node->params[1];
 		int groups = node->params[2] > 0 ? node->params[2] : 1;
+		/* params[3]=pad_w: non-zero enables asymmetric H/W padding.
+		 * Zero means symmetric (pad_w = pad_h). */
+		int pad_w = node->params[3] ? node->params[3] : pad_h;
 
 		rc = mlx_conv2d(&result, inputs[0], inputs[1],
-				stride, stride, pad, pad,
+				stride, stride, pad_h, pad_w,
 				1, 1,  /* dilation */
 				groups,
 				stream);

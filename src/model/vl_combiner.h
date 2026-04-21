@@ -2,14 +2,16 @@
  * src/model/vl_combiner.h - Vision-language backbone combiner
  *
  * Wraps the image encoder (Hiera ViT or EfficientViT), feature pyramid
- * neck, CLIP text encoder, BPE tokenizer, and 2D position encoding into
- * a single composite module. This is a structural wrapper that organizes
- * sub-modules and provides unified init/load/build entry points for the
- * SAM3 inference pipeline. Backbone dispatch is based on backbone_type.
+ * neck, text encoder iface (CLIP or MobileCLIP), BPE tokenizer, and 2D
+ * position encoding into a single composite module. This is a structural
+ * wrapper that organizes sub-modules and provides unified init/load/build
+ * entry points for the SAM3 inference pipeline. Backbone dispatch is
+ * based on backbone_type.
  *
  * Key types:  sam3_vl_backbone
  * Depends on: image_encoder.h, image_encoder_efficientvit.h, necks.h,
- *             text_encoder.h, tokenizer.h, position_encoding.h
+ *             text_encoder.h, text_encoder_iface.h, tokenizer.h,
+ *             position_encoding.h
  * Used by:    sam3.c (top-level image model)
  *
  * Copyright (c) 2026
@@ -24,6 +26,7 @@
 #include "image_encoder_tinyvit.h"
 #include "necks.h"
 #include "text_encoder.h"
+#include "text_encoder_iface.h"
 #include "tokenizer.h"
 #include "position_encoding.h"
 
@@ -37,7 +40,7 @@ struct sam3_vl_backbone {
 	struct sam3_neck neck;
 	struct sam3_neck sam2_neck;	/* sam2_fpn_layers (EfficientSAM3) */
 	int has_sam2_neck;		/* 1 if sam2_neck is initialized */
-	struct sam3_text_encoder text_enc;
+	struct sam3_text_encoder_iface text_iface;
 	struct sam3_tokenizer tokenizer;
 	struct sam3_pos_encoding pos_enc;
 	int scalp;	/* 1 -- number of scales to keep from the end */
@@ -163,6 +166,23 @@ struct sam3_tensor *sam3_vl_backbone_build_text(
 	struct sam3_graph *g,
 	const char *text,
 	struct sam3_tensor **pooled_out,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_vl_backbone_set_text_backbone - Reinitialize the text iface.
+ *
+ * Called by the loader after reading the .sam3 v4 header so the iface
+ * matches the file's text_backbone. Must be called BEFORE
+ * sam3_vl_backbone_load.
+ *
+ * @vl:            Initialized VL backbone
+ * @text_backbone: enum sam3_text_backbone (SAM3_TEXT_CLIP or MOBILECLIP_*)
+ * @arena:         Arena used during vl_backbone_init
+ *
+ * Returns SAM3_OK on success, SAM3_EINVAL for unknown backbone.
+ */
+enum sam3_error sam3_vl_backbone_set_text_backbone(
+	struct sam3_vl_backbone *vl, int text_backbone,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_VL_COMBINER_H */

@@ -126,13 +126,17 @@ enum sam3_error sam3_vl_backbone_init(struct sam3_vl_backbone *vl,
 	if (err != SAM3_OK)
 		return err;
 
-	/* Init text encoder config (weights loaded separately) */
-	vl->text_enc.d_model = 256;
-	vl->text_enc.width = 1024;
-	vl->text_enc.n_heads = 16;
-	vl->text_enc.n_layers = 24;
-	vl->text_enc.context_len = 32;
-	vl->text_enc.vocab_size = 49408;
+	/*
+	 * Init text encoder iface. Default to CLIP here; the variant
+	 * passed to sam3_vl_backbone_init may not yet be wired (callers
+	 * may overwrite via sam3_vl_backbone_set_text_backbone before
+	 * load). The actual variant flows through sam3_load_model from
+	 * the .sam3 v4 header.
+	 */
+	err = sam3_text_encoder_iface_init(&vl->text_iface,
+					   SAM3_TEXT_CLIP, arena);
+	if (err != SAM3_OK)
+		return err;
 
 	/*
 	 * Lazy 2D sinusoidal position encoding for encoder grid.
@@ -214,7 +218,7 @@ enum sam3_error sam3_vl_backbone_load(struct sam3_vl_backbone *vl,
 			      vl->sam2_neck.backbone_dim);
 	}
 
-	err = sam3_text_encoder_load(&vl->text_enc, wf, arena);
+	err = vl->text_iface.ops->load(&vl->text_iface, wf, arena);
 	if (err != SAM3_OK)
 		return err;
 
@@ -352,27 +356,35 @@ struct sam3_tensor *sam3_vl_backbone_build_text(
 	struct sam3_tensor **pooled_out,
 	struct sam3_arena *arena)
 {
-	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+	int ctx = vl->text_iface.ctx_len;
+	int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN]; /* current value 32; clamps below */
 	int n_tokens;
 	struct sam3_tensor *tok_tensor;
 	int dims[1];
 
-	/* Tokenize the input text */
-	n_tokens = sam3_tokenizer_encode(&vl->tokenizer, text,
-					  tokens, SAM3_TOKENIZER_CONTEXT_LEN);
+	if (ctx > SAM3_TOKENIZER_CONTEXT_LEN)
+		ctx = SAM3_TOKENIZER_CONTEXT_LEN;
+
+	n_tokens = sam3_tokenizer_encode(&vl->tokenizer, text, tokens, ctx);
 	if (n_tokens <= 0)
 		return NULL;
 
-	/* Create token ID tensor [context_len] */
-	dims[0] = SAM3_TOKENIZER_CONTEXT_LEN;
+	dims[0] = ctx;
 	tok_tensor = gh_alloc_tensor(arena, SAM3_DTYPE_I32, 1, dims);
 	if (!tok_tensor)
 		return NULL;
+	memcpy(tok_tensor->data, tokens, (size_t)ctx * sizeof(int32_t));
 
-	memcpy(tok_tensor->data, tokens,
-	       SAM3_TOKENIZER_CONTEXT_LEN * sizeof(int32_t));
+	return vl->text_iface.ops->build(&vl->text_iface, g, tok_tensor,
+					 pooled_out, arena);
+}
 
-	/* Run text encoder: tokens -> per-token embeddings + pooled */
-	return sam3_text_encoder_build(&vl->text_enc, g, tok_tensor,
-				       pooled_out, arena);
+enum sam3_error sam3_vl_backbone_set_text_backbone(
+	struct sam3_vl_backbone *vl, int text_backbone,
+	struct sam3_arena *arena)
+{
+	if (!vl || !arena)
+		return SAM3_EINVAL;
+	return sam3_text_encoder_iface_init(&vl->text_iface,
+					    text_backbone, arena);
 }

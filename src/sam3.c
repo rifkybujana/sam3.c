@@ -131,6 +131,7 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 	ctx->config.backbone_type    = (int)h->reserved[0];
 	ctx->config.variant          = (int)h->reserved[1];
 	ctx->config.n_fpn_scales     = (int)h->reserved[2];
+	ctx->config.text_backbone    = (int)ctx->weights.text_backbone;
 
 	/* Legacy (pre-SAM3.1) .sam3 files have reserved[1..2] == 0.
 	 * Treat that as SAM 3 with 4 FPN scales. */
@@ -153,12 +154,23 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 
 	ctx->loaded = 1;
 
-	/* Auto-discover BPE vocab file next to model */
+	/* Auto-discover BPE vocab file next to model. Without it the
+	 * tokenizer falls back to byte-level encoding, which produces
+	 * garbage text features for any real prompt. The fallback masks
+	 * the failure silently otherwise — emit a loud warning. */
 	char bpe_path[1024];
 	const char *vocab = NULL;
 	if (find_bpe_next_to_model(path, bpe_path, sizeof(bpe_path))) {
 		vocab = bpe_path;
 		sam3_log_info("auto-discovered BPE vocab: %s", bpe_path);
+	} else {
+		sam3_log_warn("BPE vocab not found next to model %s "
+			      "(expected bpe_simple_vocab_16e6.txt.gz "
+			      "in same directory). Tokenizer will use "
+			      "byte-level fallback — text prompts will "
+			      "produce poor masks. Call sam3_load_bpe() "
+			      "explicitly or place the vocab file next "
+			      "to the .sam3 model.", path);
 	}
 
 	/* Initialize processor and load model weights */
@@ -175,6 +187,22 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 #ifdef SAM3_HAS_PROFILE
 	ctx->proc.profiler = ctx->profiler;
 #endif
+
+	/* Reinitialize text iface to match the text_backbone from the
+	 * .sam3 v4 header (default CLIP was set in vl_backbone_init). */
+	err = sam3_vl_backbone_set_text_backbone(
+		&ctx->proc.model.backbone,
+		ctx->config.text_backbone,
+		&ctx->proc.model_arena);
+	if (err != SAM3_OK) {
+		sam3_log_error("sam3_load: text_backbone init failed (%d)",
+			       err);
+		sam3_processor_free(&ctx->proc);
+#ifdef SAM3_HAS_PROFILE
+		SAM3_PROF_END(ctx->profiler, "model_load");
+#endif
+		return err;
+	}
 
 	err = sam3_processor_load(&ctx->proc, &ctx->weights, vocab);
 	if (err != SAM3_OK) {

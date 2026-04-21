@@ -706,9 +706,13 @@ static void join_text_worker(struct sam3_processor *proc)
 static void *text_worker_main(void *arg)
 {
 	struct sam3_processor *proc = arg;
-	struct sam3_text_encoder *te = &proc->model.backbone.text_enc;
+	struct sam3_text_encoder_iface *te_iface =
+		&proc->model.backbone.text_iface;
+	int ctx = te_iface->ctx_len;
 	struct sam3_tensor *tok_tensor;
-	int tok_dims[1] = {te->context_len};
+	int tok_dims[1];
+
+	tok_dims[0] = ctx;
 
 	/*
 	 * Wrap the pre-tokenized buffer (lives in proc->text_tokens,
@@ -723,11 +727,11 @@ static void *text_worker_main(void *arg)
 		return NULL;
 	}
 	memcpy(tok_tensor->data, proc->text_tokens,
-	       (size_t)te->context_len * sizeof(int32_t));
+	       (size_t)ctx * sizeof(int32_t));
 
 	struct sam3_tensor *features;
-	features = sam3_text_encoder_build_perblock(
-		te, proc->text_backend, tok_tensor,
+	features = te_iface->ops->build_perblock(
+		te_iface, proc->text_backend, tok_tensor,
 		&proc->text_scratch_arena,
 		&proc->text_persist_arena);
 	if (!features) {
@@ -763,7 +767,8 @@ static void *text_worker_main(void *arg)
 enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
 					const char *text)
 {
-	struct sam3_text_encoder *te;
+	struct sam3_text_encoder_iface *te_iface;
+	int ctx;
 	int n_tokens;
 	int rc;
 
@@ -783,12 +788,13 @@ enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
 	proc->text_features_async = NULL;
 	proc->text_thread_err = SAM3_OK;
 
-	te = &proc->model.backbone.text_enc;
+	te_iface = &proc->model.backbone.text_iface;
+	ctx = te_iface->ctx_len;
 
 	/* Tokenize on the caller thread (cheap, < 1ms). */
 	n_tokens = sam3_tokenizer_encode(
 		&proc->model.backbone.tokenizer, text,
-		proc->text_tokens, te->context_len);
+		proc->text_tokens, ctx);
 	if (n_tokens <= 0) {
 		sam3_log_error("set_text: tokenize failed");
 		return SAM3_EINVAL;
@@ -930,9 +936,10 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 			 * proc->model_arena. Used when set_text() was not
 			 * called before segment().
 			 */
-			struct sam3_text_encoder *te =
-				&proc->model.backbone.text_enc;
-			int32_t tokens[77]; /* max context_len */
+			struct sam3_text_encoder_iface *te_iface =
+				&proc->model.backbone.text_iface;
+			int ctx = te_iface->ctx_len;
+			int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
 			int n_tokens;
 			struct sam3_tensor *tok_tensor;
 			int tok_dims[1];
@@ -940,7 +947,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 			SAM3_PROF_BEGIN(proc->profiler, "tokenize");
 			n_tokens = sam3_tokenizer_encode(
 				&proc->model.backbone.tokenizer, text,
-				tokens, te->context_len);
+				tokens, ctx);
 			SAM3_PROF_END(proc->profiler, "tokenize");
 			if (n_tokens <= 0) {
 				sam3_log_error("segment: tokenize failed");
@@ -948,7 +955,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				goto fail;
 			}
 
-			tok_dims[0] = te->context_len;
+			tok_dims[0] = ctx;
 			sam3_arena_reset(&proc->scratch_arena);
 			tok_tensor = gh_alloc_tensor(&proc->model_arena,
 						      SAM3_DTYPE_I32, 1,
@@ -958,11 +965,11 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				goto fail;
 			}
 			memcpy(tok_tensor->data, tokens,
-			       (size_t)te->context_len * sizeof(int32_t));
+			       (size_t)ctx * sizeof(int32_t));
 
 			SAM3_PROF_BEGIN(proc->profiler, "text_blocks");
-			text_features = sam3_text_encoder_build_perblock(
-				te, proc->backend, tok_tensor,
+			text_features = te_iface->ops->build_perblock(
+				te_iface, proc->backend, tok_tensor,
 				&proc->scratch_arena, &proc->model_arena);
 			SAM3_PROF_END(proc->profiler, "text_blocks");
 			if (!text_features) {

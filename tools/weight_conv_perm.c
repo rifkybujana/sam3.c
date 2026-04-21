@@ -174,6 +174,26 @@ static int is_conv2d_weight(const char *name)
 	     str_ends_with(name, ".projection.conv2.weight")))
 		return 1;
 
+	/*
+	 * MobileCLIP S0 text encoder RepMixer conv weights:
+	 *   encoder.transformer.{0,5}.token_mixer.mixer.rbr_conv.0.conv.weight
+	 *   encoder.transformer.{0,5}.convffn.conv.conv.weight
+	 *   encoder.transformer.{0,5}.token_mixer.mixer.rbr_scale.conv.weight
+	 *   encoder.transformer.{0,5}.convffn.fc1.weight
+	 *   encoder.transformer.{0,5}.convffn.fc2.weight
+	 *
+	 * All are 4D conv weights that need OIHW→OHWI permutation.
+	 * The first two are depthwise 1×11; the rest are 1×1 pointwise
+	 * (permutation is a no-op on data for 1×1 but reorders dims to OHWI).
+	 */
+	if (strstr(name, ".text_encoder.encoder.transformer.") &&
+	    (str_ends_with(name, ".rbr_conv.0.conv.weight") ||
+	     str_ends_with(name, ".convffn.conv.conv.weight") ||
+	     str_ends_with(name, ".rbr_scale.conv.weight") ||
+	     str_ends_with(name, ".convffn.fc1.weight") ||
+	     str_ends_with(name, ".convffn.fc2.weight")))
+		return 1;
+
 	return 0;
 }
 

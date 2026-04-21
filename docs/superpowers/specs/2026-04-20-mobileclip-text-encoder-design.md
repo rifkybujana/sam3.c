@@ -73,11 +73,13 @@ that this spec mirrors for the text side.
 All three MobileCLIP variants share the same code path, parameterized
 by a config struct loaded from a `static const` table at module init:
 
-| Variant            | n_layers | width | n_heads | mlp_dim | ctx_len | out_dim | repmixer block 0 |
-|--------------------|----------|-------|---------|---------|---------|---------|------------------|
-| `MOBILECLIP_S0`    | 6        | 512   | 8       | 2048    | 16      | 256     | yes              |
-| `MOBILECLIP_S1`    | 12       | 512   | 8       | 2048    | 16      | 256     | no               |
-| `MOBILECLIP_L`     | 12       | 768   | 12      | 3072    | 16      | 256     | no               |
+| Variant            | n_layers | width | n_heads | mlp_dim | ctx_len | out_dim | RepMixer blocks |
+|--------------------|----------|-------|---------|---------|---------|---------|-----------------|
+| `MOBILECLIP_S0`    | 6        | 512   | 8       | 2048    | 16      | 256     | **{0, 5}**      |
+| `MOBILECLIP_S1`    | 12       | 512   | 8       | 2048    | 16      | 256     | (none)          |
+| `MOBILECLIP_L`     | 12       | 768   | 12      | 3072    | 16      | 256     | (none)          |
+
+(The earlier draft of this spec listed S0 as a 6-layer model with RepMixer at block 0 only. The audit + reference Python confirm S0 has **6 transformer blocks** total; RepMixer blocks live at indices 0 and 5 (the bookends), and indices 1–4 are standard pre-norm transformer blocks.)
 
 Vocab size = 49408 (shared CLIP BPE). Output contract is `[ctx_len, 256]`
 per-token plus `[256]` pooled, matching the existing CLIP encoder so
@@ -124,35 +126,60 @@ NULL` and `rope = false`. The current CLIP path hardcodes a causal mask;
 parameterize the helper call site (the underlying graph helper already
 accepts `NULL`).
 
-### RepMixer block (S0 block 0 only)
+### RepMixer block (S0 blocks 0 and 5) — verified from reference
+
+**Audit correction**: S0's RepMixer appears at blocks **0 and 5**, not just block 0.
+**Audit correction**: MobileOne reparameterization is **NOT collapsed** at export — the checkpoint ships parallel BN/conv branches that must be summed at inference time.
+**Authoritative source**: `docs/superpowers/specs/notes/2026-04-20-mobileclip-key-audit.md` and `reference/efficientsam3/sam3/sam3/backbones/mobile_clip.py`.
+
+The block computes:
 
 ```
 x_in: [seq_len, width=512]
-  reshape → [N=1, C=512, H=1, W=seq_len]   (channels = width, spatial = seq)
+  reshape → [N=1, C=512, H=1, W=seq_len]
 
-  ── token_mixer (RepMixer) ──
-    norm:   BatchNorm2d on C=512               (omit if BN folded into conv)
-    mixer:  depthwise Conv2D, kernel=[1,11],
-            padding=[0,5], groups=512
-    layer_scale1: per-channel mul, gamma1: [512,1,1]
-    + residual
+  ── token_mixer (RepMixer.forward) ──
+     # Two branches inside `mixer` (rbr_skip + rbr_conv[0] only;
+     # rbr_scale is absent in this checkpoint despite MobileOneBlock's
+     # default — verified by audit grep):
+     y_skip  = bn(x; mixer.rbr_skip.{w,b,rm,rv})
+     y_conv  = bn( conv1d_dw(x, kernel=[1,11], pad=[0,5], groups=512;
+                              mixer.rbr_conv.0.conv.weight);
+                  mixer.rbr_conv.0.bn.{w,b,rm,rv} )
+     mixer_out = y_skip + y_conv
 
-  ── convffn ──
-    fc1:    Conv2D 1×1, [512 → 2048]
-    BatchNorm2d on 2048                        (omit if folded)
-    GELU
-    fc2:    Conv2D 1×1, [2048 → 512]
-    BatchNorm2d on 512                         (omit if folded)
-    layer_scale2: per-channel mul, gamma2: [512,1,1]
-    + residual
+     # `norm` is a single standalone BN (no conv branch):
+     norm_out  = bn(x; norm.rbr_skip.{w,b,rm,rv})
+
+     # Token-mixer residual with internal layer_scale and SUBTRACTION:
+     x = x + token_mixer.layer_scale * (mixer_out - norm_out)
+
+  ── convffn (sequential) ──
+     # Three sequential ops (NOT three parallel branches):
+     y = bn( conv1d_dw(x, kernel=[1,11], pad=[0,5], groups=512;
+                       convffn.conv.conv.weight);
+            convffn.conv.bn.{w,b,rm,rv} )
+     y = conv2d_1x1(y, [512→2048]; convffn.fc1.{weight,bias})
+     y = GELU(y)
+     y = conv2d_1x1(y, [2048→512]; convffn.fc2.{weight,bias})
+
+  ── outer block residual with outer layer_scale ──
+     x = x + transformer.<i>.layer_scale * y
 
   reshape → [seq_len, 512]
 ```
 
-All ops already exist in the C codebase. Whether BN is folded into the
-conv weights at export is determined by inspecting the actual `.pt`
-state dict during implementation; the loader handles both cases by
-checking for the BN parameter keys.
+Notes for the C port:
+
+- **eps = 1e-5** for every BN (PyTorch default; confirmed in reference).
+- **Two RepMixer block indices**: variant config carries an array `repmixer_block_indices = [0, 5]`, not a `has_repmixer_block_0` boolean. All other S0 blocks (1, 2, 3, 4) use the standard pre-norm transformer block.
+- **The `mixer - norm` subtraction** in the token_mixer residual is critical and easy to miss.
+- **`norm` and `mixer.rbr_skip` are independent BNs** with their own running stats — not the same op.
+- **`rbr_scale` is absent** in this checkpoint, so the `mixer` sum has only two terms. If a future checkpoint ships rbr_scale keys, add a third branch unconditionally — the loader uses `gh_load_mmap` which returns NULL for missing keys, allowing a clean conditional.
+- **`convffn.conv` is itself a depthwise 1×11 conv + BN** (NOT a pointwise conv). The pointwise convs are `convffn.fc1` (512→2048) and `convffn.fc2` (2048→512). All three live inside ConvFFN; only the outer `convffn.conv` has BN.
+- **`convffn.fc1` and `convffn.fc2` ship with bias** (`weight` shape `[2048,512,1,1]`, `bias` shape `[2048]` etc.). They are 1×1 Conv2d, equivalent to per-position Linear.
+
+All ops already exist in the C codebase (`SAM3_OP_CONV2D` with groups, `SAM3_OP_BATCHNORM`, `SAM3_OP_MUL` with broadcasting for layer_scale).
 
 ### Final stack (all variants)
 
@@ -372,16 +399,25 @@ Tokenizer at ctx=16 gets its own test in `test_tokenizer.c`
 
 ## Risks and open questions
 
-- **External 256-dim projector key location**: not visible in the
-  `language_backbone.encoder.*` prefix. Likely
-  `detector.backbone.language_backbone.projector.*` based on the
-  reference's `TextStudentEncoder.projector` field, but must be
-  confirmed during implementation. If naming diverges, the loader
-  needs a small per-variant lookup table.
-- **BN folding in MobileOne blocks**: the `.pt` may ship pre-folded
-  (no BN params) or unfolded (BN params present). Loader must handle
-  both. Mitigation: per-key existence check at load time, conditional
-  graph emission.
+### Resolved by the Phase 0 key audit
+
+- ✅ **External 256-dim projector key location**: confirmed at
+  `detector.backbone.language_backbone.projector.{weight,bias}`,
+  shape `[256, width]` / `[256]`.
+- ✅ **BN folding in MobileOne blocks**: BN params are **present**
+  (not folded) in all three checkpoints. The C loader emits BN ops
+  unconditionally for RepMixer blocks.
+- ✅ **S0 RepMixer block locations**: blocks **0 and 5** (not just
+  block 0 as initially guessed). S0 has 12 transformer blocks total.
+- ✅ **MobileCLIP2-L key prefix**: identical to S1 — the "2" in
+  the filename is metadata; key paths are the same.
+- ✅ **`projection_layer`**: stored as a raw tensor (no `.weight`
+  suffix) at `language_backbone.encoder.projection_layer`.
+- ✅ **`positional_embedding.pos_embed.pos_embed`**: doubly-nested
+  name confirmed; tensor shape `[1, 1, 77, width]`.
+
+### Still open
+
 - **Position embedding interpolation vs slicing**: reference uses
   `resize_pos_embed(16)` which is a slice for the down-from-77 case
   (no interpolation needed when target ≤ source). Confirm at
@@ -391,3 +427,9 @@ Tokenizer at ctx=16 gets its own test in `test_tokenizer.c`
   CLIP encoder builds a causal mask unconditionally. Refactoring
   must keep CLIP behavior bit-identical (no functional change to
   the existing path).
+- **`mixer.rbr_scale` absence**: the audit found only two branches
+  in the token mixer (`rbr_skip` and `rbr_conv[0]`), despite
+  MobileOneBlock's default `use_scale_branch=True`. The C path
+  unconditionally checks for `rbr_scale.*` keys and adds a third
+  branch when present, so behavior is correct for both this
+  checkpoint and any future one that ships rbr_scale.

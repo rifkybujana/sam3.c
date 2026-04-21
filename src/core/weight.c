@@ -97,6 +97,7 @@ enum sam3_error sam3_weight_write(const char *output_path,
 	hdr.reserved[0]      = (uint32_t)config->backbone_type;
 	hdr.reserved[1]      = (uint32_t)config->variant;
 	hdr.reserved[2]      = (uint32_t)config->n_fpn_scales;
+	hdr.text_backbone    = (uint32_t)config->text_backbone;
 
 	/* Build tensor descriptors */
 	descs = calloc((size_t)n, sizeof(*descs));
@@ -353,19 +354,35 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 		return SAM3_EMODEL;
 	}
 
-	if (hdr->version != SAM3_WEIGHT_VERSION) {
+	size_t header_size;
+	uint32_t text_backbone;
+
+	if (hdr->version == 3) {
+		/*
+		 * v3 backward-compat: header is 48 bytes (no text_backbone).
+		 * Tensor table starts at offset 48, not
+		 * sizeof(struct sam3_weight_header). text_backbone defaults
+		 * to SAM3_TEXT_CLIP (0).
+		 */
+		header_size   = 48;
+		text_backbone = 0; /* SAM3_TEXT_CLIP */
+	} else if (hdr->version == 4) {
+		header_size   = sizeof(struct sam3_weight_header);
+		text_backbone = hdr->text_backbone;
+	} else {
 		sam3_log_error("weight_open: unsupported version %u in %s "
-			       "(expected %u; regenerate via sam3_convert)",
-			       hdr->version, path, SAM3_WEIGHT_VERSION);
+			       "(expected 3 or 4; regenerate via sam3_convert)",
+			       hdr->version, path);
 		munmap(mapped, file_size);
 		memset(wf, 0, sizeof(*wf));
 		return SAM3_EMODEL;
 	}
+	wf->text_backbone = text_backbone;
 
 	/* Validate tensor table fits in file */
 	size_t table_size = (size_t)hdr->n_tensors *
 			    sizeof(struct sam3_weight_tensor_desc);
-	size_t table_end = sizeof(struct sam3_weight_header) + table_size;
+	size_t table_end = header_size + table_size;
 
 	if (table_end > file_size) {
 		sam3_log_error("weight_open: tensor table exceeds file: %s",
@@ -390,8 +407,7 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 	wf->mapped_size = file_size;
 	wf->header      = hdr;
 	wf->tensors     = (const struct sam3_weight_tensor_desc *)
-			  ((const char *)mapped +
-			   sizeof(struct sam3_weight_header));
+			  ((const char *)mapped + header_size);
 	wf->data_base   = (const char *)mapped + data_start;
 
 	/* Validate all tensor data ranges fit in file */

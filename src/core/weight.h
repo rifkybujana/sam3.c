@@ -25,7 +25,7 @@
 
 /* .sam3 file magic: ASCII "SAM3" = 0x53414D33 (little-endian: 0x334D4153) */
 #define SAM3_WEIGHT_MAGIC   0x334D4153
-#define SAM3_WEIGHT_VERSION 3
+#define SAM3_WEIGHT_VERSION 4
 
 #define SAM3_WEIGHT_NAME_MAX   128
 #define SAM3_WEIGHT_DATA_ALIGN 64   /* per-tensor alignment in data blob */
@@ -34,8 +34,12 @@
 /* ── On-disk structures (little-endian) ─────────────────────────────── */
 
 /*
- * File header: 48 bytes.
+ * File header: 52 bytes (v4) / 48 bytes (v3, backward-compat read).
  * Sits at offset 0 in the .sam3 file.
+ *
+ * v4 added `text_backbone` (enum sam3_text_backbone). v3 readers see
+ * the trailing 4 bytes as the start of the tensor descriptor table —
+ * weight.c handles version-aware sizing in sam3_weight_open.
  */
 struct sam3_weight_header {
 	uint32_t magic;
@@ -47,7 +51,8 @@ struct sam3_weight_header {
 	int32_t  decoder_dim;
 	int32_t  n_encoder_layers;
 	int32_t  n_decoder_layers;
-	uint32_t reserved[3];
+	uint32_t reserved[3];     /* [0]=backbone_type, [1]=variant, [2]=n_fpn_scales */
+	uint32_t text_backbone;   /* v4: enum sam3_text_backbone (0=CLIP) */
 };
 
 /*
@@ -64,8 +69,8 @@ struct sam3_weight_tensor_desc {
 	uint64_t reserved;
 };
 
-_Static_assert(sizeof(struct sam3_weight_header) == 48,
-	       "header must be exactly 48 bytes on disk");
+_Static_assert(sizeof(struct sam3_weight_header) == 52,
+	       "header must be exactly 52 bytes on disk (v4)");
 _Static_assert(sizeof(struct sam3_weight_tensor_desc) == 176,
 	       "tensor desc must be exactly 176 bytes on disk");
 
@@ -85,6 +90,7 @@ struct sam3_weight_file {
 	uint32_t                              hash_capacity;
 	pthread_t                             prefetch_thread;
 	int                                   prefetch_active;
+	uint32_t                              text_backbone; /* derived from header */
 };
 
 #define SAM3_WEIGHT_HASH_EMPTY UINT32_MAX
