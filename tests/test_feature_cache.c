@@ -155,6 +155,71 @@ static void test_image_cache_clear(void)
 	sam3_image_cache_destroy(c);
 }
 
+static void test_text_cache_miss_then_hit(void)
+{
+	struct sam3_text_feature_cache *c = sam3_text_cache_create(4,
+							       64 * 1024);
+	int idx = sam3_text_cache_lookup(c, 0xCAFEULL, NULL, 0);
+	ASSERT_EQ(idx, -1);
+
+	int slot = sam3_text_cache_claim_slot(c);
+	ASSERT(slot >= 0);
+	struct sam3_text_bundle b = {.features = NULL, .n_tokens = 5};
+	int32_t toks[3] = {10, 20, 30};
+	sam3_text_cache_register(c, slot, 0xCAFEULL, toks, 3, &b);
+
+	int hit = sam3_text_cache_lookup(c, 0xCAFEULL, toks, 3);
+	ASSERT_EQ(hit, slot);
+	ASSERT_EQ(c->slots[hit].bundle.n_tokens, 5);
+
+	struct sam3_cache_stats s = {0};
+	sam3_text_cache_stats(c, &s);
+	ASSERT_EQ(s.text_hits, 1u);
+	ASSERT_EQ(s.text_misses, 1u);
+
+	sam3_text_cache_destroy(c);
+}
+
+static void test_text_cache_lru_eviction(void)
+{
+	struct sam3_text_feature_cache *c = sam3_text_cache_create(2,
+							       64 * 1024);
+	int sa = sam3_text_cache_claim_slot(c);
+	struct sam3_text_bundle ba = {.features = NULL, .n_tokens = 1};
+	sam3_text_cache_register(c, sa, 0xA1ULL, NULL, 0, &ba);
+
+	int sb = sam3_text_cache_claim_slot(c);
+	struct sam3_text_bundle bb = {.features = NULL, .n_tokens = 2};
+	sam3_text_cache_register(c, sb, 0xB2ULL, NULL, 0, &bb);
+
+	ASSERT_EQ(sam3_text_cache_lookup(c, 0xA1ULL, NULL, 0), sa);
+
+	int sc = sam3_text_cache_claim_slot(c);
+	ASSERT_EQ(sc, sb);
+	struct sam3_text_bundle bc = {.features = NULL, .n_tokens = 3};
+	sam3_text_cache_register(c, sc, 0xC3ULL, NULL, 0, &bc);
+
+	ASSERT_EQ(sam3_text_cache_lookup(c, 0xA1ULL, NULL, 0), sa);
+	ASSERT_EQ(sam3_text_cache_lookup(c, 0xB2ULL, NULL, 0), -1);
+	ASSERT_EQ(sam3_text_cache_lookup(c, 0xC3ULL, NULL, 0), sc);
+
+	sam3_text_cache_destroy(c);
+}
+
+static void test_text_cache_clear(void)
+{
+	struct sam3_text_feature_cache *c = sam3_text_cache_create(2,
+							       64 * 1024);
+	int slot = sam3_text_cache_claim_slot(c);
+	struct sam3_text_bundle b = {.features = NULL, .n_tokens = 1};
+	sam3_text_cache_register(c, slot, 0xEEULL, NULL, 0, &b);
+
+	sam3_text_cache_clear(c);
+	ASSERT_EQ(sam3_text_cache_lookup(c, 0xEEULL, NULL, 0), -1);
+
+	sam3_text_cache_destroy(c);
+}
+
 int main(void)
 {
 	test_image_cache_init_default_slots();
@@ -164,5 +229,8 @@ int main(void)
 	test_image_cache_lru_eviction();
 	test_image_cache_collision_verifies_prefix();
 	test_image_cache_clear();
+	test_text_cache_miss_then_hit();
+	test_text_cache_lru_eviction();
+	test_text_cache_clear();
 	TEST_REPORT();
 }
