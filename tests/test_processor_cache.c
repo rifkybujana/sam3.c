@@ -23,6 +23,7 @@
 #include "core/weight.h"
 #include "model/sam3_processor.h"
 #include "model/feature_cache.h"
+#include "model/sam3_internal.h"
 
 #ifndef SAM3_SOURCE_DIR
 #define SAM3_SOURCE_DIR "."
@@ -242,6 +243,173 @@ static void test_image_cache_clear_drops_cached_pointers(void)
 	sam3_free(ctx);
 }
 
+/*
+ * test_precache_image_preserves_state - sam3_precache_image must
+ * populate the cache without touching the processor's current-image
+ * state. A later set_image with the same pixels hits the cache.
+ */
+static void test_precache_image_preserves_state(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+
+	sam3_ctx *ctx = sam3_init();
+	ASSERT_NOT_NULL(ctx);
+	ASSERT_EQ(sam3_load_model(ctx, MODEL_PATH), SAM3_OK);
+
+	int sz = sam3_get_image_size(ctx);
+	uint8_t *pix_a = calloc((size_t)sz * sz * 3, 1);
+	uint8_t *pix_b = calloc((size_t)sz * sz * 3, 1);
+	for (int i = 0; i < sz * sz * 3; i++)
+		pix_b[i] = (uint8_t)(i & 0xff);
+
+	/* Make A current, then precache B — A must stay current. */
+	ASSERT_EQ(sam3_set_image(ctx, pix_a, sz, sz), SAM3_OK);
+	int slot_a = ctx->proc.current_img_slot;
+	ASSERT_EQ(sam3_precache_image(ctx, pix_b, sz, sz), SAM3_OK);
+	ASSERT_EQ(ctx->proc.current_img_slot, slot_a);
+	ASSERT_EQ(ctx->proc.image_loaded, 1);
+
+	/* Now activate B via set_image — it should hit the precache. */
+	struct sam3_cache_stats before = {0};
+	sam3_cache_stats(ctx, &before);
+	ASSERT_EQ(sam3_set_image(ctx, pix_b, sz, sz), SAM3_OK);
+	struct sam3_cache_stats after = {0};
+	sam3_cache_stats(ctx, &after);
+	ASSERT_EQ(after.image_hits, before.image_hits + 1u);
+
+	free(pix_a);
+	free(pix_b);
+	sam3_free(ctx);
+}
+
+/*
+ * test_precache_text_preserves_state - sam3_precache_text must
+ * populate the text cache synchronously without setting any
+ * pending-prompt state on the processor.
+ */
+static void test_precache_text_preserves_state(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+
+	sam3_ctx *ctx = sam3_init();
+	ASSERT_NOT_NULL(ctx);
+	ASSERT_EQ(sam3_load_model(ctx, MODEL_PATH), SAM3_OK);
+
+	/* Precache "cat" — no worker should be active, no bundle pending. */
+	ASSERT_EQ(sam3_precache_text(ctx, "cat"), SAM3_OK);
+	ASSERT_EQ(ctx->proc.text_thread_active, 0);
+	ASSERT(ctx->proc.text_cached_bundle == NULL);
+	ASSERT_EQ(ctx->proc.text_worker_slot, -1);
+
+	/* A later set_text("cat") must hit the cache. */
+	struct sam3_cache_stats before = {0};
+	sam3_cache_stats(ctx, &before);
+	ASSERT_EQ(sam3_set_text(ctx, "cat"), SAM3_OK);
+	struct sam3_cache_stats after = {0};
+	sam3_cache_stats(ctx, &after);
+	ASSERT_EQ(after.text_hits, before.text_hits + 1u);
+	ASSERT_EQ(ctx->proc.text_thread_active, 0);
+
+	sam3_free(ctx);
+}
+
+/*
+ * test_cache_persist_image_roundtrip - Precache an image, save it to
+ * a .sam3cache file, load it into a FRESH ctx, verify set_image on
+ * the same pixels hits the cache.
+ */
+static void test_cache_persist_image_roundtrip(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+
+	const char *tmpfile = "/tmp/sam3_test_image.sam3cache";
+	int sz;
+	uint8_t *pix;
+
+	/* Session 1: precache + save. */
+	{
+		sam3_ctx *ctx = sam3_init();
+		ASSERT_NOT_NULL(ctx);
+		ASSERT_EQ(sam3_load_model(ctx, MODEL_PATH), SAM3_OK);
+		sz = sam3_get_image_size(ctx);
+		pix = malloc((size_t)sz * sz * 3);
+		for (int i = 0; i < sz * sz * 3; i++)
+			pix[i] = (uint8_t)((i * 17) & 0xff);
+		ASSERT_EQ(sam3_precache_image(ctx, pix, sz, sz), SAM3_OK);
+		ASSERT_EQ(sam3_cache_save_image(ctx, pix, sz, sz, tmpfile),
+			  SAM3_OK);
+		sam3_free(ctx);
+	}
+
+	/* Session 2: fresh ctx, load from disk, verify hit. */
+	{
+		sam3_ctx *ctx = sam3_init();
+		ASSERT_NOT_NULL(ctx);
+		ASSERT_EQ(sam3_load_model(ctx, MODEL_PATH), SAM3_OK);
+		ASSERT_EQ(sam3_cache_load_image(ctx, tmpfile), SAM3_OK);
+
+		struct sam3_cache_stats before = {0};
+		sam3_cache_stats(ctx, &before);
+		ASSERT_EQ(sam3_set_image(ctx, pix, sz, sz), SAM3_OK);
+		struct sam3_cache_stats after = {0};
+		sam3_cache_stats(ctx, &after);
+		ASSERT_EQ(after.image_hits, before.image_hits + 1u);
+		sam3_free(ctx);
+	}
+
+	free(pix);
+	unlink(tmpfile);
+}
+
+/*
+ * test_cache_persist_text_roundtrip - Same for text.
+ */
+static void test_cache_persist_text_roundtrip(void)
+{
+	if (!model_available()) {
+		printf("  model weights missing, skipping\n");
+		return;
+	}
+
+	const char *tmpfile = "/tmp/sam3_test_text.sam3cache";
+	const char *text = "cat";
+
+	{
+		sam3_ctx *ctx = sam3_init();
+		ASSERT_NOT_NULL(ctx);
+		ASSERT_EQ(sam3_load_model(ctx, MODEL_PATH), SAM3_OK);
+		ASSERT_EQ(sam3_precache_text(ctx, text), SAM3_OK);
+		ASSERT_EQ(sam3_cache_save_text(ctx, text, tmpfile), SAM3_OK);
+		sam3_free(ctx);
+	}
+
+	{
+		sam3_ctx *ctx = sam3_init();
+		ASSERT_NOT_NULL(ctx);
+		ASSERT_EQ(sam3_load_model(ctx, MODEL_PATH), SAM3_OK);
+		ASSERT_EQ(sam3_cache_load_text(ctx, tmpfile), SAM3_OK);
+
+		struct sam3_cache_stats before = {0};
+		sam3_cache_stats(ctx, &before);
+		ASSERT_EQ(sam3_set_text(ctx, text), SAM3_OK);
+		struct sam3_cache_stats after = {0};
+		sam3_cache_stats(ctx, &after);
+		ASSERT_EQ(after.text_hits, before.text_hits + 1u);
+		sam3_free(ctx);
+	}
+
+	unlink(tmpfile);
+}
+
 int main(void)
 {
 	test_image_cache_hit_skips_encoder();
@@ -249,5 +417,9 @@ int main(void)
 	test_top_level_cache_clear_and_stats();
 	test_segment_does_not_grow_model_arena();
 	test_image_cache_clear_drops_cached_pointers();
+	test_precache_image_preserves_state();
+	test_precache_text_preserves_state();
+	test_cache_persist_image_roundtrip();
+	test_cache_persist_text_roundtrip();
 	TEST_REPORT();
 }

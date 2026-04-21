@@ -27,6 +27,10 @@
 #include "util/image.h"
 #include "util/log.h"
 #include "model/sam3_internal.h"
+#include "model/feature_cache.h"
+#include "model/feature_cache_persist.h"
+#include "model/tokenizer.h"
+#include "util/hash.h"
 
 const char *sam3_version(void)
 {
@@ -338,6 +342,216 @@ enum sam3_error sam3_set_text(sam3_ctx *ctx, const char *text)
 		return SAM3_EINVAL;
 
 	return sam3_processor_set_text(&ctx->proc, text);
+}
+
+enum sam3_error sam3_precache_image(sam3_ctx *ctx, const uint8_t *pixels,
+				    int width, int height)
+{
+	if (!ctx || !pixels || width <= 0 || height <= 0)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	return sam3_processor_precache_image(&ctx->proc, pixels,
+					     width, height);
+}
+
+enum sam3_error sam3_precache_image_file(sam3_ctx *ctx, const char *path)
+{
+	if (!ctx || !path)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	struct sam3_image raw = {0};
+	enum sam3_error err = sam3_image_load(path, &raw);
+	if (err)
+		return err;
+
+	int target = ctx->config.image_size;
+	if (target <= 0)
+		target = 1008;
+
+	struct sam3_image resized = {0};
+	err = sam3_image_resize(&raw, &resized, target, target);
+	sam3_image_free(&raw);
+	if (err)
+		return err;
+
+	err = sam3_processor_precache_image(&ctx->proc, resized.pixels,
+					    resized.width, resized.height);
+	sam3_image_free(&resized);
+	return err;
+}
+
+enum sam3_error sam3_precache_text(sam3_ctx *ctx, const char *text)
+{
+	if (!ctx || !text)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	return sam3_processor_precache_text(&ctx->proc, text);
+}
+
+static void fill_persist_sig(const sam3_ctx *ctx,
+			     struct sam3_cache_persist_sig *sig)
+{
+	memset(sig, 0, sizeof(*sig));
+	sig->image_size     = ctx->config.image_size;
+	sig->encoder_dim    = ctx->config.encoder_dim;
+	sig->decoder_dim    = ctx->config.decoder_dim;
+	sig->backbone_type  = ctx->config.backbone_type;
+	sig->variant        = ctx->config.variant;
+	sig->n_fpn_scales   = ctx->config.n_fpn_scales;
+	sig->text_backbone  = ctx->config.text_backbone;
+}
+
+static uint64_t hash_image_pixels(const uint8_t *pixels, int width, int height,
+				  size_t *out_pref_len)
+{
+	uint64_t key = SAM3_FNV1A_64_OFFSET_BASIS;
+	key = sam3_fnv1a_64((const uint8_t *)&width, sizeof(width), key);
+	key = sam3_fnv1a_64((const uint8_t *)&height, sizeof(height), key);
+	size_t n_bytes = (size_t)width * (size_t)height * 3;
+	key = sam3_fnv1a_64(pixels, n_bytes, key);
+	if (key == 0)
+		key = 1;
+	if (out_pref_len)
+		*out_pref_len = n_bytes < SAM3_CACHE_PREFIX_BYTES
+				   ? n_bytes : SAM3_CACHE_PREFIX_BYTES;
+	return key;
+}
+
+enum sam3_error sam3_cache_save_image(sam3_ctx *ctx,
+				      const uint8_t *pixels,
+				      int width, int height,
+				      const char *path)
+{
+	if (!ctx || !pixels || width <= 0 || height <= 0 || !path)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	size_t pref_len;
+	uint64_t key = hash_image_pixels(pixels, width, height, &pref_len);
+
+	int slot = sam3_image_cache_lookup(ctx->proc.img_cache, key,
+					   pixels, pref_len);
+	if (slot < 0) {
+		sam3_log_error("cache_save_image: not in cache "
+			       "(call sam3_precache_image first)");
+		return SAM3_EINVAL;
+	}
+
+	struct sam3_cache_persist_sig sig;
+	fill_persist_sig(ctx, &sig);
+
+	const struct sam3_image_bundle *b =
+		&ctx->proc.img_cache->slots[slot].bundle;
+	return sam3_image_bundle_save(path, &sig, key, pixels, pref_len, b);
+}
+
+enum sam3_error sam3_cache_load_image(sam3_ctx *ctx, const char *path)
+{
+	if (!ctx || !path)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	struct sam3_cache_persist_sig sig;
+	fill_persist_sig(ctx, &sig);
+
+	/* Claim a slot up front so the decoded tensors land in a real
+	 * cache arena that outlives this call. */
+	int slot = sam3_image_cache_claim_slot(ctx->proc.img_cache);
+	if (slot < 0)
+		return SAM3_ENOMEM;
+
+	uint64_t hash = 0;
+	uint8_t prefix[SAM3_CACHE_PREFIX_BYTES];
+	size_t prefix_len = 0;
+	struct sam3_image_bundle bundle = {0};
+
+	enum sam3_error err = sam3_image_bundle_load(path, &sig,
+		&ctx->proc.img_cache->slots[slot].arena,
+		&hash, prefix, &prefix_len, &bundle);
+	if (err != SAM3_OK)
+		return err;
+
+	sam3_image_cache_register(ctx->proc.img_cache, slot, hash,
+				  prefix, prefix_len, &bundle);
+	return SAM3_OK;
+}
+
+enum sam3_error sam3_cache_save_text(sam3_ctx *ctx, const char *text,
+				     const char *path)
+{
+	if (!ctx || !text || !path)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	struct sam3_text_encoder_iface *te_iface =
+		&ctx->proc.model.backbone.text_iface;
+	int ctx_len = te_iface->ctx_len;
+	int32_t tokens[SAM3_PROCESSOR_MAX_TOKENS];
+	int n_tokens = sam3_tokenizer_encode(
+		&ctx->proc.model.backbone.tokenizer, text, tokens, ctx_len);
+	if (n_tokens <= 0) {
+		sam3_log_error("cache_save_text: tokenize failed");
+		return SAM3_EINVAL;
+	}
+
+	uint64_t key = SAM3_FNV1A_64_OFFSET_BASIS;
+	key = sam3_fnv1a_64((const uint8_t *)tokens,
+			    (size_t)n_tokens * sizeof(int32_t), key);
+	if (key == 0)
+		key = 1;
+
+	int slot = sam3_text_cache_lookup(ctx->proc.txt_cache, key,
+					  tokens, n_tokens);
+	if (slot < 0) {
+		sam3_log_error("cache_save_text: not in cache "
+			       "(call sam3_precache_text first)");
+		return SAM3_EINVAL;
+	}
+
+	struct sam3_cache_persist_sig sig;
+	fill_persist_sig(ctx, &sig);
+	const struct sam3_text_bundle *b =
+		&ctx->proc.txt_cache->slots[slot].bundle;
+	return sam3_text_bundle_save(path, &sig, key, tokens, n_tokens, b);
+}
+
+enum sam3_error sam3_cache_load_text(sam3_ctx *ctx, const char *path)
+{
+	if (!ctx || !path)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	struct sam3_cache_persist_sig sig;
+	fill_persist_sig(ctx, &sig);
+
+	int slot = sam3_text_cache_claim_slot(ctx->proc.txt_cache);
+	if (slot < 0)
+		return SAM3_ENOMEM;
+
+	uint64_t hash = 0;
+	int32_t prefix_tokens[SAM3_CACHE_PREFIX_BYTES / 4];
+	int prefix_len = 0;
+	struct sam3_text_bundle bundle = {0};
+
+	enum sam3_error err = sam3_text_bundle_load(path, &sig,
+		&ctx->proc.txt_cache->slots[slot].arena,
+		&hash, prefix_tokens, &prefix_len, &bundle);
+	if (err != SAM3_OK)
+		return err;
+
+	sam3_text_cache_register(ctx->proc.txt_cache, slot, hash,
+				 prefix_tokens, prefix_len, &bundle);
+	return SAM3_OK;
 }
 
 enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
