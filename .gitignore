@@ -110,12 +110,16 @@ tests/fixtures/*
 !tests/fixtures/video_kids/README.md
 !tests/fixtures/mobileclip_s0/
 !tests/fixtures/mobileclip_s0/*.npy
+tests/fixtures/mobileclip_s0/*.sam3
+tests/fixtures/mobileclip_s0/*.txt.gz
 !tests/fixtures/mobileclip_s1/
 !tests/fixtures/mobileclip_s1/*.npy
 tests/fixtures/mobileclip_s1/*.sam3
+tests/fixtures/mobileclip_s1/*.txt.gz
 !tests/fixtures/mobileclip_l/
 !tests/fixtures/mobileclip_l/*.npy
 tests/fixtures/mobileclip_l/*.sam3
+tests/fixtures/mobileclip_l/*.txt.gz
 
 TODO*
 
