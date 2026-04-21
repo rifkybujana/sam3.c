@@ -332,27 +332,14 @@ session_encode_frame(struct sam3_video_session *session,
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "video_encode_frame");
 
 	/*
-	 * Claim an image cache slot and use its arena as the per-frame
-	 * persist destination. The frame_cache has already cloned the
-	 * relevant tensors into its own backend arena, so the slot arena
-	 * can be reclaimed freely on the next call. We do not register
-	 * the slot by content hash — video frames almost never repeat,
-	 * and the tracker owns its own frame-level cache.
+	 * Per-frame encode outputs go into proc.video_scratch_arena —
+	 * dedicated to video so that mixed image-editor + video sessions
+	 * don't evict the still-image cache. The frame_cache has already
+	 * cloned the relevant tensors into its own backend arena, so the
+	 * arena can be reset on the next frame freely.
 	 */
-	int slot = sam3_image_cache_claim_slot(ctx->proc.img_cache);
-	if (slot < 0) {
-		sam3_log_error("session_encode_frame: no image cache slot");
-		SAM3_PROF_END(ctx->proc.profiler, "video_encode_frame");
-		return SAM3_ENOMEM;
-	}
-	ctx->proc.current_img_slot = slot;
-	struct sam3_arena *persist =
-		&ctx->proc.img_cache->slots[slot].arena;
-
-	/* Reset scratch arena so the per-frame ViT/neck eval gets a clean
-	 * working area. (proc.set_image resets it for the single-image
-	 * path; the video path encodes via session_encode_frame which
-	 * bypasses that helper.) */
+	sam3_arena_reset(&ctx->proc.video_scratch_arena);
+	struct sam3_arena *persist = &ctx->proc.video_scratch_arena;
 	sam3_arena_reset(&ctx->proc.scratch_arena);
 
 	enum sam3_error err =

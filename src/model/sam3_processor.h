@@ -39,8 +39,9 @@ struct sam3_profiler;
 struct sam3_processor {
 	struct sam3_image_model model;
 	struct sam3_backend *backend;
-	struct sam3_arena model_arena;    /* weights + cached features */
+	struct sam3_arena model_arena;    /* weights only (cached features in img_cache slots) */
 	struct sam3_arena scratch_arena;  /* per-inference temp */
+	struct sam3_arena video_scratch_arena; /* video session_encode_frame persist */
 	struct sam3_image_feature_cache *img_cache;
 	int current_img_slot;            /* -1 == none */
 	int image_loaded;                /* 1 iff cached_* pointers are live */
@@ -103,7 +104,17 @@ enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
 				       int n_image_slots,
 				       int n_text_slots);
 
+/*
+ * sam3_processor_cache_clear - Flush feature caches.
+ *
+ * @proc:  Processor to flush.
+ * @which: Bitmask. Bit 0 (1) clears the image cache; bit 1 (2) is
+ *         reserved for the text cache (no-op until Task 6 wires it).
+ *         Pass 0 to clear all caches.
+ */
 void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which);
+
+/* sam3_processor_cache_stats - Read aggregate cache hit/miss counters. */
 void sam3_processor_cache_stats(const struct sam3_processor *proc,
 				struct sam3_cache_stats *out);
 
