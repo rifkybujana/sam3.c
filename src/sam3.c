@@ -49,6 +49,14 @@ sam3_ctx *sam3_init_ex(const struct sam3_cache_opts *opts)
 		return NULL;
 	if (opts)
 		ctx->cache_opts = *opts;
+	/*
+	 * Apply a sane default image-cache memory budget so fresh
+	 * contexts don't OOM on deep caches. User can opt out by passing
+	 * opts with image_mem_budget_bytes explicitly set to SIZE_MAX
+	 * (or any value large enough to exceed n_slots × per-slot).
+	 */
+	if (ctx->cache_opts.image_mem_budget_bytes == 0)
+		ctx->cache_opts.image_mem_budget_bytes = 1024UL * 1024 * 1024;
 	return ctx;
 }
 
@@ -195,7 +203,9 @@ enum sam3_error sam3_load_model(sam3_ctx *ctx, const char *path)
 				     ctx->config.backbone_type,
 				     ctx->config.n_fpn_scales,
 				     ctx->cache_opts.n_image_slots,
-				     ctx->cache_opts.n_text_slots);
+				     ctx->cache_opts.n_text_slots,
+				     ctx->cache_opts.image_mem_budget_bytes,
+				     ctx->cache_opts.image_spill_dir);
 	if (err != SAM3_OK) {
 #ifdef SAM3_HAS_PROFILE
 		SAM3_PROF_END(ctx->profiler, "model_load");

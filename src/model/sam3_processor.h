@@ -101,14 +101,19 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 
 /*
  * sam3_processor_init_ex - Like sam3_processor_init, but with caller-
- * supplied cache slot counts. Pass 0 for either to use the defaults
- * (3 image, 16 text). Pass 1 to disable multi-slot behavior.
+ * supplied cache slot counts and image-cache memory budget. Pass 0
+ * for slot counts to use defaults. image_mem_budget_bytes caps the
+ * image cache resident-memory usage; excess slots are spilled to
+ * image_spill_dir (or a per-process /tmp dir when NULL). Pass 0 for
+ * the budget to disable spilling entirely.
  */
 enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
 				       int backbone_type,
 				       int n_fpn_scales,
 				       int n_image_slots,
-				       int n_text_slots);
+				       int n_text_slots,
+				       size_t image_mem_budget_bytes,
+				       const char *image_spill_dir);
 
 /*
  * sam3_processor_cache_clear - Flush feature caches.

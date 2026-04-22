@@ -29,7 +29,7 @@
 #include "core/alloc.h"
 #include "core/tensor.h"
 
-#define SAM3_IMAGE_CACHE_DEFAULT_SLOTS 3
+#define SAM3_IMAGE_CACHE_DEFAULT_SLOTS 8
 #define SAM3_IMAGE_CACHE_MAX_SLOTS     16
 #define SAM3_TEXT_CACHE_DEFAULT_SLOTS  16
 #define SAM3_TEXT_CACHE_MAX_SLOTS      64
@@ -52,21 +52,41 @@ struct sam3_image_bundle {
 	int height;
 };
 
+/*
+ * Each slot is in one of three tiers:
+ *   EMPTY: hash == 0, disk_path == NULL, arena live (reset).
+ *   HOT:   hash != 0, disk_path == NULL, arena.base != NULL.
+ *   DISK:  hash != 0, disk_path != NULL, arena.base == NULL.
+ *
+ * Memory budget caps the number of HOT slots at any time. When the
+ * budget is saturated and a new entry needs RAM (either register or a
+ * cold-lookup promote), the LRU HOT slot is demoted to DISK — its
+ * bundle is streamed out to a file under spill_dir and its 256 MiB
+ * arena is freed. On lookup hit, DISK slots are promoted back into a
+ * fresh arena and their spill file is unlinked.
+ */
 struct sam3_image_cache_slot {
 	uint64_t hash;             /* 0 == empty */
 	uint64_t lru_tick;
 	struct sam3_arena arena;
+	size_t arena_bytes;        /* capacity to re-init on promote */
 	struct sam3_image_bundle bundle;
 	uint8_t prefix[SAM3_CACHE_PREFIX_BYTES];
 	size_t prefix_len;
+	char   *disk_path;         /* non-NULL iff DISK tier (malloc'd) */
 };
 
 struct sam3_image_feature_cache {
 	int n_slots;
+	int n_hot_max;             /* 0 == unlimited (all slots stay HOT) */
+	char *spill_dir;           /* directory for DISK tier files */
+	int  owns_spill_dir;       /* 1 iff we mkdir'd it and should rmdir */
 	uint64_t next_tick;
 	uint64_t hits;
 	uint64_t misses;
 	uint64_t evictions;
+	uint64_t demotions;
+	uint64_t promotions;
 	struct sam3_image_cache_slot *slots;
 };
 
@@ -99,6 +119,22 @@ struct sam3_text_feature_cache {
 
 struct sam3_image_feature_cache *
 sam3_image_cache_create(int n_slots, size_t slot_arena_bytes);
+
+/*
+ * sam3_image_cache_create_ex - Create an image feature cache with a
+ * memory budget cap. When @mem_budget_bytes > 0, at most
+ * (mem_budget_bytes / slot_arena_bytes) slots stay HOT; additional
+ * populated slots are transparently spilled to @spill_dir as
+ * uncompressed bundle files. Pass 0 for @mem_budget_bytes (or NULL
+ * for @spill_dir) to match the old all-hot behavior.
+ *
+ * If @spill_dir is NULL, a per-process directory is created under
+ * /tmp via mkdtemp and owned by the cache (rm'd on destroy).
+ */
+struct sam3_image_feature_cache *
+sam3_image_cache_create_ex(int n_slots, size_t slot_arena_bytes,
+			   size_t mem_budget_bytes,
+			   const char *spill_dir);
 void sam3_image_cache_destroy(struct sam3_image_feature_cache *c);
 int  sam3_image_cache_n_slots(const struct sam3_image_feature_cache *c);
 void sam3_image_cache_clear(struct sam3_image_feature_cache *c);

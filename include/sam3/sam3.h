@@ -29,12 +29,27 @@ sam3_ctx *sam3_init(void);
 
 /*
  * sam3_cache_opts - Tunables for the encoder feature caches.
- * Pass to sam3_init_ex; NULL or zero fields select the defaults
- * (3 image slots, 16 text slots).
+ * Pass to sam3_init_ex; NULL or zero fields select the defaults.
+ *
+ * Defaults (on NULL / zero):
+ *   n_image_slots          = 8 (upper bound on cached images)
+ *   n_text_slots           = 16
+ *   image_mem_budget_bytes = 1 GiB (≈ 4 hot image slots at 256 MiB)
+ *   image_spill_dir        = auto-created temp dir under /tmp
+ *
+ * The image cache keeps at most (image_mem_budget_bytes /
+ * per_slot_bytes) slots resident in RAM; older entries are spilled to
+ * image_spill_dir as uncompressed bundle files. Set
+ * image_mem_budget_bytes to 0 to disable spilling (all slots stay in
+ * RAM, which may OOM on large caches). Set image_spill_dir to an
+ * existing directory to control where spill files live (defaults are
+ * fine for local single-process use).
  */
 struct sam3_cache_opts {
-	int n_image_slots;
-	int n_text_slots;
+	int         n_image_slots;
+	int         n_text_slots;
+	size_t      image_mem_budget_bytes;
+	const char *image_spill_dir;
 };
 
 /*

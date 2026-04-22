@@ -76,14 +76,16 @@ enum sam3_error sam3_processor_init(struct sam3_processor *proc,
 				    int backbone_type, int n_fpn_scales)
 {
 	return sam3_processor_init_ex(proc, backbone_type, n_fpn_scales,
-				      0, 0);
+				      0, 0, 0, NULL);
 }
 
 enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
 				       int backbone_type,
 				       int n_fpn_scales,
 				       int n_image_slots,
-				       int n_text_slots)
+				       int n_text_slots,
+				       size_t image_mem_budget_bytes,
+				       const char *image_spill_dir)
 {
 	enum sam3_error err;
 
@@ -176,9 +178,10 @@ enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
 	 * f32 tensor; max sized for 77 tokens × 1024 d_model = 308 KiB.
 	 * Bundle a 1 MiB cell to leave room for tensor headers and
 	 * worker-local scratch. Default 16 slots → 16 MiB total.
+	 * (Observed real usage on realistic prompts: ~170 KiB per slot.)
 	 */
 	proc->txt_cache = sam3_text_cache_create(n_text_slots,
-						 16UL * 1024 * 1024);
+						 1UL * 1024 * 1024);
 	if (!proc->txt_cache) {
 		err = SAM3_ENOMEM;
 		goto cleanup_text_scratch_arena;
@@ -227,13 +230,15 @@ enum sam3_error sam3_processor_init_ex(struct sam3_processor *proc,
 
 	/*
 	 * Allocate the image feature cache. Slot arena is sized for
-	 * encoder peak output (matches the historical post-weights room
-	 * inside model_arena: a few hundred MiB worst-case across all
-	 * cached_* tensors). Use 384 MiB per slot — 3 slots default ≈
-	 * 1.1 GiB total, well inside the previous 2 GiB image budget.
+	 * encoder peak output (the FPN + SAM2 neck scales, all in f32).
+	 * Observed usage on Hiera @ 1008×1008: ~235 MiB per bundle.
+	 * Use 256 MiB per slot (~9% headroom). When a budget is set,
+	 * excess slots spill to disk under image_spill_dir.
 	 */
-	proc->img_cache = sam3_image_cache_create(n_image_slots,
-						  384UL * 1024 * 1024);
+	proc->img_cache = sam3_image_cache_create_ex(n_image_slots,
+						     256UL * 1024 * 1024,
+						     image_mem_budget_bytes,
+						     image_spill_dir);
 	if (!proc->img_cache) {
 		err = SAM3_ENOMEM;
 		goto cleanup_video_arena;

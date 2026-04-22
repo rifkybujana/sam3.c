@@ -94,4 +94,27 @@ enum sam3_error sam3_text_bundle_load(const char *path,
 	int32_t *out_prefix_tokens, int *out_prefix_len,
 	struct sam3_text_bundle *out_bundle);
 
+/* --- disk-backed spill helpers --- */
+
+/*
+ * sam3_image_bundle_write_uncompressed - Serialize a bundle to @path
+ * without compression. Used as the on-disk format for in-process
+ * tiered spill: writes fast (SSD-bandwidth limited) at the cost of a
+ * larger file than the .sam3cache compressed format. No magic or
+ * signature is written — the file is only valid for the lifetime of
+ * the originating process.
+ */
+enum sam3_error sam3_image_bundle_write_uncompressed(
+	const char *path,
+	const struct sam3_image_bundle *bundle);
+
+/*
+ * sam3_image_bundle_read_uncompressed - Inverse of the above.
+ * Restores a bundle from @path into @arena.
+ */
+enum sam3_error sam3_image_bundle_read_uncompressed(
+	const char *path,
+	struct sam3_arena *arena,
+	struct sam3_image_bundle *out_bundle);
+
 #endif /* SAM3_MODEL_FEATURE_CACHE_PERSIST_H */

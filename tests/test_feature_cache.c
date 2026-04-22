@@ -21,7 +21,7 @@ static void test_image_cache_init_default_slots(void)
 {
 	struct sam3_image_feature_cache *c = sam3_image_cache_create(0, 1024);
 	ASSERT_NOT_NULL(c);
-	ASSERT_EQ(sam3_image_cache_n_slots(c), 3);
+	ASSERT_EQ(sam3_image_cache_n_slots(c), SAM3_IMAGE_CACHE_DEFAULT_SLOTS);
 	struct sam3_cache_stats s = {0};
 	sam3_image_cache_stats(c, &s);
 	ASSERT_EQ(s.image_hits, 0u);
@@ -54,6 +54,7 @@ static struct sam3_tensor *make_dummy_tensor(struct sam3_arena *a, int v)
 	t->dims[0] = 1;
 	t->data = sam3_arena_alloc(a, sizeof(float));
 	if (!t->data) return NULL;
+	t->nbytes = sizeof(float);
 	((float *)t->data)[0] = (float)v;
 	return t;
 }
@@ -220,6 +221,118 @@ static void test_text_cache_clear(void)
 	sam3_text_cache_destroy(c);
 }
 
+/* --- tiering: budget-bounded hot slots, disk-backed cold --- */
+
+static void test_image_cache_unbounded_budget_keeps_all_hot(void)
+{
+	/* mem_budget = 0 → no cap, matches pre-tiering behavior. */
+	struct sam3_image_feature_cache *c =
+		sam3_image_cache_create_ex(2, 4 * 1024, 0, NULL);
+
+	int sa = sam3_image_cache_claim_slot(c);
+	struct sam3_image_bundle ba = {0};
+	ba.image_features = make_dummy_tensor(&c->slots[sa].arena, 1);
+	sam3_image_cache_register(c, sa, 0xA1ULL, NULL, 0, &ba);
+
+	int sb = sam3_image_cache_claim_slot(c);
+	struct sam3_image_bundle bb = {0};
+	bb.image_features = make_dummy_tensor(&c->slots[sb].arena, 2);
+	sam3_image_cache_register(c, sb, 0xB2ULL, NULL, 0, &bb);
+
+	ASSERT(c->slots[sa].disk_path == NULL);
+	ASSERT(c->slots[sb].disk_path == NULL);
+	ASSERT_EQ(c->demotions, 0u);
+
+	sam3_image_cache_destroy(c);
+}
+
+static void test_image_cache_budget_spills_lru_to_disk(void)
+{
+	/*
+	 * Budget 4 KiB, per-slot 4 KiB -> n_hot_max = 1. Second
+	 * registration must demote the first.
+	 */
+	struct sam3_image_feature_cache *c =
+		sam3_image_cache_create_ex(2, 4 * 1024, 4 * 1024, NULL);
+	ASSERT_EQ(c->n_hot_max, 1);
+	ASSERT_NOT_NULL(c->spill_dir);
+
+	int sa = sam3_image_cache_claim_slot(c);
+	struct sam3_image_bundle ba = {0};
+	ba.image_features = make_dummy_tensor(&c->slots[sa].arena, 11);
+	sam3_image_cache_register(c, sa, 0xA1ULL, NULL, 0, &ba);
+	ASSERT(c->slots[sa].disk_path == NULL);
+	ASSERT_EQ(c->demotions, 0u);
+
+	int sb = sam3_image_cache_claim_slot(c);
+	/* claim_slot() reserved room: slot A should already be on disk. */
+	ASSERT(c->slots[sa].disk_path != NULL);
+	ASSERT(c->slots[sa].arena.base == NULL);
+	ASSERT_EQ(c->demotions, 1u);
+
+	struct sam3_image_bundle bb = {0};
+	bb.image_features = make_dummy_tensor(&c->slots[sb].arena, 22);
+	sam3_image_cache_register(c, sb, 0xB2ULL, NULL, 0, &bb);
+	ASSERT(c->slots[sb].disk_path == NULL);
+
+	sam3_image_cache_destroy(c);
+}
+
+static void test_image_cache_lookup_promotes_from_disk(void)
+{
+	struct sam3_image_feature_cache *c =
+		sam3_image_cache_create_ex(2, 4 * 1024, 4 * 1024, NULL);
+
+	int sa = sam3_image_cache_claim_slot(c);
+	struct sam3_image_bundle ba = {0};
+	ba.image_features = make_dummy_tensor(&c->slots[sa].arena, 42);
+	sam3_image_cache_register(c, sa, 0xA1ULL, NULL, 0, &ba);
+
+	int sb = sam3_image_cache_claim_slot(c);
+	struct sam3_image_bundle bb = {0};
+	bb.image_features = make_dummy_tensor(&c->slots[sb].arena, 77);
+	sam3_image_cache_register(c, sb, 0xB2ULL, NULL, 0, &bb);
+
+	ASSERT(c->slots[sa].disk_path != NULL);
+
+	int hit = sam3_image_cache_lookup(c, 0xA1ULL, NULL, 0);
+	ASSERT_EQ(hit, sa);
+	ASSERT(c->slots[sa].disk_path == NULL);
+	ASSERT(c->slots[sa].arena.base != NULL);
+	ASSERT_EQ(c->promotions, 1u);
+	ASSERT_EQ(((float *)c->slots[sa].bundle.image_features->data)[0],
+		  42.0f);
+	/* Promoting A forced B back to disk to respect the budget. */
+	ASSERT(c->slots[sb].disk_path != NULL);
+	ASSERT_EQ(c->demotions, 2u);
+
+	sam3_image_cache_destroy(c);
+}
+
+static void test_image_cache_clear_drops_disk_spills(void)
+{
+	struct sam3_image_feature_cache *c =
+		sam3_image_cache_create_ex(2, 4 * 1024, 4 * 1024, NULL);
+
+	int sa = sam3_image_cache_claim_slot(c);
+	struct sam3_image_bundle ba = {0};
+	ba.image_features = make_dummy_tensor(&c->slots[sa].arena, 1);
+	sam3_image_cache_register(c, sa, 0xA1ULL, NULL, 0, &ba);
+	int sb = sam3_image_cache_claim_slot(c);
+	struct sam3_image_bundle bb = {0};
+	bb.image_features = make_dummy_tensor(&c->slots[sb].arena, 2);
+	sam3_image_cache_register(c, sb, 0xB2ULL, NULL, 0, &bb);
+	ASSERT(c->slots[sa].disk_path != NULL);
+
+	sam3_image_cache_clear(c);
+	for (int i = 0; i < c->n_slots; i++) {
+		ASSERT(c->slots[i].disk_path == NULL);
+		ASSERT(c->slots[i].arena.base != NULL);
+	}
+
+	sam3_image_cache_destroy(c);
+}
+
 int main(void)
 {
 	test_image_cache_init_default_slots();
@@ -229,6 +342,10 @@ int main(void)
 	test_image_cache_lru_eviction();
 	test_image_cache_collision_verifies_prefix();
 	test_image_cache_clear();
+	test_image_cache_unbounded_budget_keeps_all_hot();
+	test_image_cache_budget_spills_lru_to_disk();
+	test_image_cache_lookup_promotes_from_disk();
+	test_image_cache_clear_drops_disk_spills();
 	test_text_cache_miss_then_hit();
 	test_text_cache_lru_eviction();
 	test_text_cache_clear();

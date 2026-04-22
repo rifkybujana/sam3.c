@@ -7,7 +7,15 @@
  * and a sequence of tensor records. Tensors with NULL pointers are
  * written as "not present" and restored to NULL. All integers are
  * little-endian on disk (the implementation relies on the host being
- * LE — documented below; macOS arm64 and Linux x86_64 both qualify).
+ * LE; macOS arm64 and Linux x86_64 both qualify).
+ *
+ * Tensor bodies are stored raw — no compression. Earlier versions
+ * deflated each body with zlib; the compression throughput (~12 MB/s
+ * at level 6, ~50 MB/s at level 1) made saves and in-memory spills
+ * unacceptably slow on 235 MiB image bundles, so version 3 drops it
+ * entirely. Bundle files are ~40% larger as a result, which is the
+ * right trade for a cache whose working set is local SSD. Older
+ * version-1/2 files are rejected with SAM3_EMODEL (users re-precache).
  *
  * Key types:  sam3_cache_persist_sig
  * Depends on: feature_cache_persist.h, core/tensor.h, core/alloc.h,
@@ -30,7 +38,7 @@
 #include "util/log.h"
 
 static const char SAM3_CACHE_MAGIC[8] = {'S','A','M','3','C','A','C','H'};
-#define SAM3_CACHE_VERSION 1u
+#define SAM3_CACHE_VERSION 3u
 #define SAM3_CACHE_TYPE_IMAGE 0u
 #define SAM3_CACHE_TYPE_TEXT  1u
 
@@ -154,11 +162,10 @@ static enum sam3_error read_tensor(FILE *f, struct sam3_arena *arena,
 			       (unsigned long long)h.nbytes);
 		return SAM3_EIO;
 	}
-	if (h.nbytes > 0) {
-		if (fread(t->data, 1, h.nbytes, f) != h.nbytes) {
-			sam3_log_error("cache_load: short read on tensor data");
-			return SAM3_EIO;
-		}
+	if (h.nbytes > 0 &&
+	    fread(t->data, 1, h.nbytes, f) != h.nbytes) {
+		sam3_log_error("cache_load: short read on tensor body");
+		return SAM3_EIO;
 	}
 	*out = t;
 	return SAM3_OK;
@@ -402,6 +409,117 @@ enum sam3_error sam3_text_bundle_load(const char *path,
 	out_bundle->n_tokens = eh.n_tokens;
 	err = read_tensor(f, arena, &out_bundle->features);
 
+done:
+	fclose(f);
+	return err;
+}
+
+/* --- disk-backed spill (no signature/magic) --- */
+
+/*
+ * In-process spill file layout. No magic / version / signature —
+ * these files are only valid within the writing process's lifetime
+ * (auto-deleted on promote or cache_destroy). The tensor records
+ * reuse the same on-disk layout as the portable .sam3cache format
+ * (see write_tensor/read_tensor above) but without the file header
+ * or model signature; we just need geometry fields plus the bundle's
+ * tensors.
+ */
+struct spill_hdr {
+	int32_t  prompt_w;
+	int32_t  prompt_h;
+	int32_t  width;
+	int32_t  height;
+	uint32_t n_tensors;
+};
+
+enum sam3_error sam3_image_bundle_write_uncompressed(
+	const char *path,
+	const struct sam3_image_bundle *bundle)
+{
+	if (!path || !bundle)
+		return SAM3_EINVAL;
+	FILE *f = fopen(path, "wb");
+	if (!f) {
+		sam3_log_error("spill_write: open %s failed", path);
+		return SAM3_EIO;
+	}
+	struct spill_hdr h = {0};
+	h.prompt_w  = bundle->prompt_w;
+	h.prompt_h  = bundle->prompt_h;
+	h.width     = bundle->width;
+	h.height    = bundle->height;
+	h.n_tensors = 8;
+
+	enum sam3_error err = SAM3_OK;
+	if (fwrite(&h, sizeof(h), 1, f) != 1) {
+		err = SAM3_EIO;
+		goto done;
+	}
+	const struct sam3_tensor *ts[8] = {
+		bundle->image_features,
+		bundle->feat_s0_nhwc,
+		bundle->feat_s1_nhwc,
+		bundle->feat_4x_nhwc,
+		bundle->sam2_05x_nhwc,
+		bundle->sam2_1x_nhwc,
+		bundle->sam2_2x_nhwc,
+		bundle->sam2_4x_nhwc,
+	};
+	for (int i = 0; i < 8; i++) {
+		err = write_tensor(f, ts[i]);
+		if (err != SAM3_OK)
+			goto done;
+	}
+done:
+	fclose(f);
+	if (err != SAM3_OK)
+		remove(path);
+	return err;
+}
+
+enum sam3_error sam3_image_bundle_read_uncompressed(
+	const char *path,
+	struct sam3_arena *arena,
+	struct sam3_image_bundle *out_bundle)
+{
+	if (!path || !arena || !out_bundle)
+		return SAM3_EINVAL;
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		sam3_log_error("spill_read: open %s failed", path);
+		return SAM3_EIO;
+	}
+	struct spill_hdr h;
+	enum sam3_error err = SAM3_OK;
+	if (fread(&h, sizeof(h), 1, f) != 1) {
+		err = SAM3_EIO;
+		goto done;
+	}
+	if (h.n_tensors != 8) {
+		err = SAM3_EIO;
+		goto done;
+	}
+	memset(out_bundle, 0, sizeof(*out_bundle));
+	out_bundle->prompt_w = h.prompt_w;
+	out_bundle->prompt_h = h.prompt_h;
+	out_bundle->width    = h.width;
+	out_bundle->height   = h.height;
+	struct sam3_tensor **slots[8] = {
+		&out_bundle->image_features,
+		&out_bundle->feat_s0_nhwc,
+		&out_bundle->feat_s1_nhwc,
+		&out_bundle->feat_4x_nhwc,
+		&out_bundle->sam2_05x_nhwc,
+		&out_bundle->sam2_1x_nhwc,
+		&out_bundle->sam2_2x_nhwc,
+		&out_bundle->sam2_4x_nhwc,
+	};
+	for (int i = 0; i < 8; i++) {
+		err = read_tensor(f, arena, slots[i]);
+		if (err != SAM3_OK)
+			goto done;
+	}
 done:
 	fclose(f);
 	return err;
