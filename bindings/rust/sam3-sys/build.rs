@@ -33,6 +33,7 @@ fn main() {
         .allowlist_function("sam3_.*")
         .allowlist_type("sam3_.*")
         .allowlist_var("SAM3_.*")
+        .prepend_enum_name(false)
         .newtype_enum("sam3_error")
         .rustified_enum("sam3_log_level")
         .rustified_enum("sam3_dtype")
