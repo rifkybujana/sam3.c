@@ -149,10 +149,8 @@ sam3.c ships bindings for multiple languages under `bindings/`:
   `SegmentResult::nms` matching the CLI's post-processing). See
   `bindings/rust/README.md`.
 
-> **Cache API status:** the RAM-budget + disk-spill cache tunables
-> (`sam3_cache_opts`, `precache_image/text`, `cache_save/load_image/text`)
-> are exposed in the Rust binding. Python bindings for these are planned
-> but not yet implemented; see
+> **Python cache-API gap:** the [caching API](#caching) is exposed in the
+> Rust binding but not yet in Python; see
 > `docs/superpowers/plans/2026-04-22-cache-api-bindings.md`.
 
 ### Python
@@ -275,6 +273,69 @@ on matmul microbenchmarks and up to 149x speedup over CPU for F16 workloads.
 
 Full kernel-level and pipeline benchmark results are in
 [BENCHMARK.md](BENCHMARK.md).
+
+## Caching
+
+sam3.c caches encoded image and text features so repeated prompts on the
+same inputs resolve in microseconds instead of re-running the encoders.
+The caches are enabled by default with tunable slot counts, an LRU RAM
+budget, and optional disk spill.
+
+**Defaults** — override via `sam3_cache_opts` + `sam3_init_ex()`:
+
+| Tunable | Default | Purpose |
+|---|---|---|
+| `n_image_slots` | 8 | Max cached image entries |
+| `n_text_slots` | 16 | Max cached text entries |
+| `image_mem_budget_bytes` | 1 GiB (~4 hot slots at 256 MiB) | RAM ceiling; excess slots spill to disk |
+| `image_spill_dir` | auto-created `/tmp` dir | Where spilled bundles live |
+
+### Pre-warm
+
+Populate the cache while the app is idle so the user's first prompt only
+pays segment latency:
+
+```c
+sam3_precache_image_file(ctx, "photo.jpg");   /* runs image encoder now */
+sam3_precache_text(ctx, "person");            /* runs text encoder now */
+
+/* Later: these hit the cache and return in microseconds */
+sam3_set_image_file(ctx, "photo.jpg");
+sam3_set_text(ctx, "person");
+```
+
+### Persist across runs
+
+Serialize an encoded entry to a `.sam3cache` file and reload it on the
+next startup. Files are model-signature-gated — loading into a different
+model is rejected with `SAM3_EMODEL`:
+
+```c
+sam3_cache_save_image(ctx, pixels, w, h, "photo.sam3cache");
+/* Next run, after sam3_load_model(): */
+sam3_cache_load_image(ctx, "photo.sam3cache");
+sam3_set_image(ctx, pixels, w, h);            /* cache hit */
+```
+
+### Inspect and flush
+
+```c
+struct sam3_cache_stats s;
+sam3_cache_stats(ctx, &s);
+/* s.image_hits, s.image_misses, s.image_evictions, and text_* */
+
+sam3_cache_clear(ctx, SAM3_CACHE_IMAGE | SAM3_CACHE_TEXT);
+```
+
+### Video frame cache
+
+Video tracking has its own two-tier cache for per-frame backbone
+features, tuned via `sam3_video_start_opts`:
+
+- `frame_cache_backend_budget` — resident RAM (default 4 GiB)
+- `frame_cache_spill_budget` — disk spill (default 16 GiB; `SIZE_MAX` disables spill)
+
+See `include/sam3/sam3.h` for the full cache API.
 
 ## Weight Format
 
