@@ -561,10 +561,11 @@ def _flush_captures_delta(captures, cursors, frame_idx):
     cursors[slot] = end
 
     # ViT sub-drill (iteration 8.5): pre-blocks state + per-block
-    # outputs. Only dump for the last propagation frame (frame 2)
+    # outputs. Only dump for the last propagation frame (frame 3)
     # to match the C side's fixed-path dumps that get overwritten
-    # each encode. Dumped as raw [np, e] F32 with no permute.
-    if frame_idx == 2:
+    # each encode (with --frames 3, C's last ViT eval is frame 3).
+    # Dumped as raw [np, e] F32 with no permute.
+    if frame_idx == 3:
         for slot in (["vit_patch_only", "vit_pre_blocks"] +
                      [f"vit_block{bi:02d}"
                       for bi in (0, 3, 7, 11, 13, 14, 15, 16, 17,
