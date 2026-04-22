@@ -143,17 +143,85 @@ ctest --output-on-failure
 
 sam3.c ships bindings for multiple languages under `bindings/`:
 
-- **Python** — `bindings/python/`. Install with `pip install -e bindings/python`.
+- **Python** — `bindings/python/`, CFFI-based. Requires Python ≥ 3.9.
 - **Rust** — `bindings/rust/`. Cargo workspace with `sam3-sys` (FFI) and
   `sam3` (safe API: owned `Ctx`, typed prompt enum, RAII result cleanup,
   `SegmentResult::nms` matching the CLI's post-processing). See
   `bindings/rust/README.md`.
 
-Both bindings link dynamically against `libsam3.{dylib,so}` built with
-`cmake -S . -B build -DSAM3_SHARED=ON && cmake --build build`. At runtime
-set `DYLD_LIBRARY_PATH` (macOS) or `LD_LIBRARY_PATH` (Linux) to the build
-directory, or install `libsam3` system-wide so the dynamic loader can
-find it.
+> **Cache API status:** the RAM-budget + disk-spill cache tunables
+> (`sam3_cache_opts`, `precache_image/text`, `cache_save/load_image/text`)
+> are exposed in the Rust binding. Python bindings for these are planned
+> but not yet implemented; see
+> `docs/superpowers/plans/2026-04-22-cache-api-bindings.md`.
+
+### Python
+
+```bash
+pip install -e bindings/python
+```
+
+`setup.py` runs CMake under the hood: it configures the project with
+`-DSAM3_SHARED=ON`, builds `libsam3.{dylib,so}` into `build-python/`,
+and copies the shared library into the installed package. **No manual
+`cmake` step, no `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH` setup** — the
+package ships its own libsam3 next to `sam3/_lib.py` and loads it by
+relative path. First install takes ~10-15 minutes because CMake also
+compiles FFmpeg from source; reinstalls are fast.
+
+Requirements:
+
+- Python ≥ 3.9
+- CMake ≥ 3.20 and a C11 toolchain on `$PATH`
+- `cffi>=1.15`, `numpy>=1.21` (installed automatically)
+- On macOS, Xcode command-line tools; on Linux, a recent GCC/Clang
+
+Minimal usage:
+
+```python
+import sam3
+
+with sam3.Model("models/sam3.sam3") as model:
+    model.set_image("photo.jpg")
+    result = model.segment(text="person")
+    print(result.masks.shape, result.iou_scores[:3])
+```
+
+Run the test suite:
+
+```bash
+pip install -e 'bindings/python[dev]'
+pytest bindings/python/tests -v
+```
+
+Troubleshooting — if `import sam3` raises
+`OSError: libsam3 not found at .../sam3/libsam3.dylib`, the package
+was installed without the bundled shared library (usually a stale
+install from before `setup.py` was updated). Force a rebuild with:
+
+```bash
+pip install --force-reinstall --no-deps -e bindings/python
+```
+
+### Rust
+
+Build `libsam3` shared once, then build/test the crate against it:
+
+```bash
+# 1. Build libsam3.{dylib,so}
+cmake -S . -B build -DSAM3_SHARED=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+
+# 2. Build + test the Rust workspace (point the loader at build/)
+cd bindings/rust
+DYLD_LIBRARY_PATH=../../build cargo test --release   # macOS
+LD_LIBRARY_PATH=../../build  cargo test --release   # Linux
+```
+
+Install `libsam3` system-wide (`cmake --install build`) to skip the env
+var step; the loader will then find it on the default search path. See
+`bindings/rust/README.md` for the three supported runtime resolution
+workflows (env var, system install, rpath-shipped).
 
 Minimal Rust usage:
 
