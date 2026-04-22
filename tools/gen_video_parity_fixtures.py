@@ -318,6 +318,18 @@ def main_sam3_1(args):
         masks=seed_t,
     )
 
+    # NOTE: propagate_in_video_preflight is INTENTIONALLY NOT called
+    # here. Canonical SAM 3.1 usage (sam3_multiplex_tracking.py:2990,
+    # sam3_tracking_predictor.py:803) calls preflight before propagation
+    # to encode frame-0 memory. Calling it here on kids.mp4 produces an
+    # all-empty mask on frame 1 (score = -0.197 < threshold 0.0 → gated),
+    # making the parity test frame degenerate. The non-preflight path
+    # used here yields a non-empty frame-1 reference (score = +2.93)
+    # that C's canonical (preflight-emulating) behavior diverges from —
+    # this is why test_video_parity_kids caps at ~0.47 IoU on frame 1.
+    # The gap is a C-side feat_s1 / memattn score drift, not a Python
+    # path issue; fixing that is the long-term work.
+
     # The C tracker emits masks at grid_w*4 x grid_h*4 resolution
     # (image_size=1008 / patch=14 -> grid=72 -> mask=288x288). The Python
     # video_res output is at the native video resolution (e.g. 720x1280

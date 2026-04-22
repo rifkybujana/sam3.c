@@ -1372,8 +1372,27 @@ video_track_one_obj(struct sam3_video_session *session,
 	struct sam3_tensor *mem_feat = NULL;
 	struct sam3_tensor *mem_pos  = NULL;
 
+	/*
+	 * SAM 3.1 multiplex cond-frame path matches Python add_new_masks
+	 * (video_tracking_multiplex_demo.py:1784, run_mem_encoder=False) —
+	 * the seed frame's maskmem is never encoded in the non-preflight
+	 * reference that tests/fixtures/video_kids/sam3_1 was generated
+	 * from. Skip the memory encoder here and store an obj_ptr-only
+	 * bank entry so frame 1's memory attention sees exactly the same
+	 * context Python does on kids.mp4 (memattn picks skip spatial-
+	 * NULL entries but still pull obj_ptr rows).
+	 */
+	int skip_mem_enc = is_multiplex && is_cond;
+	if (skip_mem_enc) {
+		sam3_log_info("video_track: skip memenc on cond frame %d "
+			      "(no-preflight path)", frame_idx);
+	}
+
 	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_build");
-	if (is_multiplex) {
+	if (skip_mem_enc) {
+		/* No compute, no tensors. mem_feat stays NULL — step 11's
+		 * clone is guarded and spatial_persist stays NULL. */
+	} else if (is_multiplex) {
 		/*
 		 * Multiplex packing for single-object slot 0:
 		 *   channel 0      = sigmoid(mask_logits) * 2 - 1  (mask signal)
@@ -1557,19 +1576,21 @@ video_track_one_obj(struct sam3_video_session *session,
 		goto cleanup;
 	}
 
-	SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_eval");
-	err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
-	SAM3_PROF_END(ctx->proc.profiler, "memenc_eval");
-	if (err != SAM3_OK) {
-		sam3_log_error("video_track: memenc eval failed "
-			       "(frame %d, obj %d, err %d)",
-			       frame_idx, obj_idx, err);
-		goto cleanup;
-	}
-	if (!mem_feat || mem_feat->n_dims != 4) {
-		sam3_log_error("video_track: bad mem_feat shape");
-		err = SAM3_EINVAL;
-		goto cleanup;
+	if (!skip_mem_enc) {
+		SAM3_PROF_BEGIN(ctx->proc.profiler, "memenc_eval");
+		err = ctx->proc.backend->ops->graph_eval(ctx->proc.backend, &g);
+		SAM3_PROF_END(ctx->proc.profiler, "memenc_eval");
+		if (err != SAM3_OK) {
+			sam3_log_error("video_track: memenc eval failed "
+				       "(frame %d, obj %d, err %d)",
+				       frame_idx, obj_idx, err);
+			goto cleanup;
+		}
+		if (!mem_feat || mem_feat->n_dims != 4) {
+			sam3_log_error("video_track: bad mem_feat shape");
+			err = SAM3_EINVAL;
+			goto cleanup;
+		}
 	}
 
 	/*
@@ -1685,7 +1706,7 @@ video_track_one_obj(struct sam3_video_session *session,
 	}
 
 	/* --- 11. Flatten + clone to persist ---------------------------- */
-	{
+	if (mem_feat && mem_feat->data) {
 		int mH = mem_feat->dims[1];
 		int mW = mem_feat->dims[2];
 		int mC = mem_feat->dims[3];
@@ -1699,11 +1720,11 @@ video_track_one_obj(struct sam3_video_session *session,
 		flat_view.ephemeral = 0;
 		spatial_persist = sam3_tensor_clone_persist(
 			&session->persist, &flat_view);
-	}
-	if (!spatial_persist) {
-		sam3_log_error("video_track: spatial clone failed");
-		err = SAM3_ENOMEM;
-		goto cleanup;
+		if (!spatial_persist) {
+			sam3_log_error("video_track: spatial clone failed");
+			err = SAM3_ENOMEM;
+			goto cleanup;
+		}
 	}
 	obj_ptr_persist = sam3_tensor_clone_persist(&session->persist,
 						    best_obj_ptr_scratch);

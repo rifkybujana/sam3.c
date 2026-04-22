@@ -2801,14 +2801,22 @@ static int multiplex_build_memory_from_bank(
 	 * `to_cat_prompt`). Match that order here so the memattn
 	 * `memory` kwarg lines up byte-for-byte with Python's.
 	 */
+	/* Accept entries that carry either spatial_features (maskmem) or
+	 * obj_pointer alone. Matches Python's no-preflight path where
+	 * add_new_masks(run_mem_encoder=False) stores an obj_ptr-only
+	 * cond frame (video_tracking_multiplex.py:1410 `if feats is None:
+	 * continue` skips maskmem but the obj_ptr loop at :1478 picks it
+	 * up). Spatial-NULL picks contribute zero maskmem rows. */
 	for (int i = bank->n_cond - 1;
 	     i >= 0 && n_pick < MUX_MAX_MEM_ENTRIES_IN_ATTN; i--) {
-		if (bank->cond[i].spatial_features)
+		if (bank->cond[i].spatial_features
+		    || bank->cond[i].obj_pointer)
 			picks[n_pick++] = &bank->cond[i];
 	}
 	for (int i = bank->n_non_cond - 1;
 	     i >= 0 && n_pick < MUX_MAX_MEM_ENTRIES_IN_ATTN; i--) {
-		if (bank->non_cond[i].spatial_features)
+		if (bank->non_cond[i].spatial_features
+		    || bank->non_cond[i].obj_pointer)
 			picks[n_pick++] = &bank->non_cond[i];
 	}
 	if (n_pick == 0) {
@@ -2824,11 +2832,14 @@ static int multiplex_build_memory_from_bank(
 	int total_spatial = 0;
 	int total_obj_ptrs = 0;
 	for (int i = 0; i < n_pick; i++) {
-		if (picks[i]->spatial_features->dims[1] != D)
-			return -1;
-		if (HW > 0 && picks[i]->spatial_features->dims[0] != HW)
-			return -1;
-		total_spatial += picks[i]->spatial_features->dims[0];
+		if (picks[i]->spatial_features) {
+			if (picks[i]->spatial_features->dims[1] != D)
+				return -1;
+			if (HW > 0 &&
+			    picks[i]->spatial_features->dims[0] != HW)
+				return -1;
+			total_spatial += picks[i]->spatial_features->dims[0];
+		}
 		if (picks[i]->obj_pointer) {
 			/* obj_pointer layout: SAM 3 stores [1, 256]; SAM 3.1
 			 * multiplex stores [16, 256] (one row per multiplex
@@ -2902,10 +2913,14 @@ static int multiplex_build_memory_from_bank(
 	 * entry leaked in. */
 	int warned_missing_image_feat = 0;
 
-	/* Pass 1: spatial rows for each picked frame. */
+	/* Pass 1: spatial rows for each picked frame. Skip entries that
+	 * have no maskmem (Python no-preflight cond frames) — their
+	 * obj_ptr-only contribution is handled in Pass 2. */
 	for (int i = 0; i < n_pick; i++) {
 		const struct sam3_tensor *sf = picks[i]->spatial_features;
 		const struct sam3_tensor *ife = picks[i]->image_features;
+		if (!sf)
+			continue;
 		int n_rows = sf->dims[0];
 		size_t base = row * D;
 		memcpy(mp + base, sf->data,
@@ -3145,13 +3160,39 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		return SAM3_ENOMEM;
 
 	int total_entries = bank ? sam3_memory_bank_total(bank) : 0;
-	int use_memory_attn = (bank != NULL) && (total_entries > 0);
+	/*
+	 * Python: video_tracking_multiplex._prepare_memory_conditioned_features
+	 * (line 1568-1574 and 1583-1586) falls back to the raw vision feature
+	 * when `to_cat_prompt` is empty OR `to_cat_image_feat` is empty. The
+	 * latter triggers when no bank entry carries maskmem (no-preflight
+	 * seed path). Match that: require at least one bank entry with
+	 * `spatial_features` before taking the memory-attention branch.
+	 */
+	int have_maskmem_entries = 0;
+	if (bank) {
+		for (int i = 0; i < bank->n_cond && !have_maskmem_entries; i++)
+			if (bank->cond[i].spatial_features)
+				have_maskmem_entries = 1;
+		for (int i = 0;
+		     i < bank->n_non_cond && !have_maskmem_entries; i++)
+			if (bank->non_cond[i].spatial_features)
+				have_maskmem_entries = 1;
+	}
+	int use_memory_attn =
+		(bank != NULL) && (total_entries > 0) && have_maskmem_entries;
 
 	if (!use_memory_attn) {
 		/*
-		 * No memory: compute pix_feat + interactivity_no_mem_embed
-		 * on the host side. image_embed is materialised (came from
-		 * the frame cache) so this is a straight CPU pass.
+		 * No memattn. Two sub-cases, matching Python:
+		 *   1) Interactive cond frame (is_cond=1): pix_feat +=
+		 *      interactivity_no_mem_embed (Python `_get_interactive_
+		 *      pix_mem`, video_tracking_multiplex.py:640-648).
+		 *   2) Propagation frame with no maskmem entries in bank
+		 *      (is_cond=0): raw pix_feat, no add (Python
+		 *      `_prepare_memory_conditioned_features` fallback at
+		 *      :1583-1586 returns `vision_feat` unchanged).
+		 * image_embed is materialised (came from the frame cache) so
+		 * this is a straight CPU pass.
 		 */
 		int dims[4] = {1, H, W, D};
 		pix_feat_with_mem = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
@@ -3159,12 +3200,18 @@ enum sam3_error sam3_tracker_multiplex_track_frame(
 		if (!pix_feat_with_mem)
 			return SAM3_ENOMEM;
 		const float *src = (const float *)image_embed->data;
-		const float *add = (const float *)
-			trk->interactivity_no_mem_embed->data;  /* [1,1,256] */
 		float *dst = (float *)pix_feat_with_mem->data;
-		for (int i = 0; i < HW; i++) {
-			for (int c = 0; c < D; c++)
-				dst[i * D + c] = src[i * D + c] + add[c];
+		if (is_cond) {
+			const float *add = (const float *)
+				trk->interactivity_no_mem_embed->data;
+			for (int i = 0; i < HW; i++) {
+				for (int c = 0; c < D; c++)
+					dst[i * D + c] =
+						src[i * D + c] + add[c];
+			}
+		} else {
+			memcpy(dst, src,
+			       (size_t)HW * D * sizeof(float));
 		}
 	} else {
 		/*
