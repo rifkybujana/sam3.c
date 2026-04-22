@@ -301,6 +301,17 @@ def _register_hooks(model, captures):
     _l0_orig_sa = _l0._forward_sa
     _l0_orig_ca = _l0._forward_ca
 
+    # NOTE (iter 15): the _l0 sa/ca replacements below alter Python's
+    # runtime behavior — propagation scores diverge from a clean run,
+    # e.g. frame 1 obj_score is -0.20 under this script but +2.93 under
+    # gen_video_parity_fixtures.py. Exact cause not yet isolated (likely
+    # Python closure/state interaction with model.transformer's
+    # activation_ckpt_wrapper). For parity drills where the *result*
+    # tensors matter, keep this flag True; flip to False only when you
+    # need the sa/ca intermediates (memattn_l0_{sa_out,ca_q,ca_k,ca_v,
+    # ca_attn} slots). Don't diff fsh_ / mask_dec_ slots while patched.
+    _DISABLE_L0_PATCH = True
+
     def _l0_patched_sa(tgt, query_pos):
         out = _l0_orig_sa(tgt, query_pos)
         captures.setdefault("memattn_l0_sa_out", []).append(
@@ -346,8 +357,9 @@ def _register_hooks(model, captures):
         tgt = tgt + _l0.dropout2(tgt2)
         return tgt
 
-    _l0._forward_sa = _l0_patched_sa
-    _l0._forward_ca = _l0_patched_ca
+    if not _DISABLE_L0_PATCH:
+        _l0._forward_sa = _l0_patched_sa
+        _l0._forward_ca = _l0_patched_ca
 
     class _UnpatchL0:
         def remove(self_inner):
