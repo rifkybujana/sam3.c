@@ -2986,8 +2986,15 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			scores = sam3_dot_scorer_build(&model->scorer,
-				&g, q_wrap2, ctx_wrap, scratch);
+			if (q_wrap2->n_dims == 3) {
+				scores = sam3_dot_scorer_build_batched(
+					&model->scorer, &g, q_wrap2,
+					ctx_wrap, scratch);
+			} else {
+				scores = sam3_dot_scorer_build(
+					&model->scorer, &g, q_wrap2,
+					ctx_wrap, scratch);
+			}
 			if (!scores) {
 				sam3_log_error("seg: scorer build failed");
 				err = SAM3_ENOMEM;

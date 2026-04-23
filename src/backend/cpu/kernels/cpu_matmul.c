@@ -193,7 +193,7 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	/* A: [M, K], B: [K, N], C: [M, N] */
+	/* A: [..., M, K], B: [..., K, N], C: [..., M, N] */
 	if (a->n_dims < 1 || b->n_dims < 1) {
 		sam3_log_error("matmul: need at least 1D tensors");
 		return SAM3_EINVAL;
@@ -222,36 +222,83 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	if (sam3_tensor_nelems(c) != M * N) {
-		sam3_log_error("matmul: output size mismatch %d != %d",
-			       sam3_tensor_nelems(c), M * N);
+	/*
+	 * Batched matmul: when A carries leading batch dims (A has rank >= 3),
+	 * iterate the 2D GEMM over the flattened batch. Supports the common
+	 * SAM3 pattern where B is either:
+	 *   - rank-2 (broadcast to all batch slots), or
+	 *   - same rank as A (per-slot weights, e.g. batched scorer prompt^T).
+	 * Other broadcasting patterns are rejected.
+	 */
+	int batch = 1;
+	int a_nb = a->n_dims - 2;
+	int b_nb = b->n_dims - 2;
+
+	if (a_nb > 0) {
+		for (int i = 0; i < a_nb; i++) {
+			if (a->dims[i] <= 0) {
+				sam3_log_error("matmul: non-positive batch "
+					       "dim %d = %d",
+					       i, a->dims[i]);
+				return SAM3_EINVAL;
+			}
+			batch *= a->dims[i];
+		}
+	}
+
+	int b_batch = 1;
+	if (b_nb > 0) {
+		for (int i = 0; i < b_nb; i++)
+			b_batch *= b->dims[i];
+	}
+	if (b_nb > 0 && b_batch != batch) {
+		sam3_log_error("matmul: batch mismatch a=%d b=%d",
+			       batch, b_batch);
 		return SAM3_EINVAL;
 	}
 
+	if (sam3_tensor_nelems(c) != batch * M * N) {
+		sam3_log_error("matmul: output size mismatch %d != %d",
+			       sam3_tensor_nelems(c), batch * M * N);
+		return SAM3_EINVAL;
+	}
+
+	size_t a_stride = (size_t)M * (size_t)K_a;
+	size_t b_stride = (b_nb > 0) ? (size_t)K_b * (size_t)N : 0;
+	size_t c_stride = (size_t)M * (size_t)N;
+
+	for (int g = 0; g < batch; g++) {
+		const float *a_ptr = (const float *)a->data +
+				     (size_t)g * a_stride;
+		const float *b_ptr = (const float *)b->data +
+				     (size_t)g * b_stride;
+		float *c_ptr = (float *)c->data + (size_t)g * c_stride;
+
 #ifdef SAM3_HAS_BLAS
-	(void)pool;
-	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-		    M, N, K_a,
-		    1.0f,
-		    (const float *)a->data, K_a,
-		    (const float *)b->data, N,
-		    0.0f,
-		    (float *)c->data, N);
+		(void)pool;
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+			    M, N, K_a,
+			    1.0f,
+			    a_ptr, K_a,
+			    b_ptr, N,
+			    0.0f,
+			    c_ptr, N);
 #else
-	struct matmul_par_ctx ctx = {
-		.a = (const float *)a->data,
-		.b = (const float *)b->data,
-		.c = (float *)c->data,
-		.M = M, .K = K_a, .N = N,
-	};
+		struct matmul_par_ctx ctx = {
+			.a = a_ptr,
+			.b = b_ptr,
+			.c = c_ptr,
+			.M = M, .K = K_a, .N = N,
+		};
 
-	int n_tasks = sam3_threadpool_n_threads(pool);
-	if (n_tasks < 1)
-		n_tasks = 1;
+		int n_tasks = sam3_threadpool_n_threads(pool);
+		if (n_tasks < 1)
+			n_tasks = 1;
 
-	sam3_threadpool_parallel_for(pool, matmul_parallel_fn, &ctx,
-				     n_tasks);
+		sam3_threadpool_parallel_for(pool, matmul_parallel_fn, &ctx,
+					     n_tasks);
 #endif
+	}
 
 	return SAM3_OK;
 }

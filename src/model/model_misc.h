@@ -83,4 +83,40 @@ struct sam3_tensor *sam3_dot_scorer_build(struct sam3_dot_scorer *ds,
 					  struct sam3_tensor *prompt,
 					  struct sam3_arena *arena);
 
+/*
+ * sam3_dot_scorer_build_batched - Batched dot-product scoring graph.
+ *
+ * Batched variant of sam3_dot_scorer_build. Every tensor gains a
+ * leading batch dim B. Each batch slot runs the same 6-step pipeline
+ * (prompt MLP -> mean pool -> dual projection -> scaled dot product)
+ * independently; outputs for different slots are concatenated along
+ * the batch dim.
+ *
+ * @ds:      Loaded dot scorer
+ * @g:       Graph to add nodes to
+ * @queries: [B, n_queries, d_model]
+ * @prompt:  [B, seq_len, d_model]
+ * @arena:   Arena for intermediate tensors
+ *
+ * Returns confidence logits [B, n_queries, 1], or NULL on error.
+ * The caller applies sigmoid for probabilities.
+ */
+struct sam3_tensor *sam3_dot_scorer_build_batched(
+	struct sam3_dot_scorer *ds,
+	struct sam3_graph *g,
+	struct sam3_tensor *queries,
+	struct sam3_tensor *prompt,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_dot_scorer_alloc_synthetic - Allocate test weights on an arena.
+ *
+ * Fills a pre-initialized (d_model / d_proj / d_ffn set) dot scorer
+ * with deterministic F32 values on @arena so unit tests can exercise
+ * the graph without a real model file. Returns 0 on success, -1 on
+ * allocation failure. Not intended for production use.
+ */
+int sam3_dot_scorer_alloc_synthetic(struct sam3_dot_scorer *ds,
+				    struct sam3_arena *arena);
+
 #endif /* SAM3_MODEL_MISC_H */

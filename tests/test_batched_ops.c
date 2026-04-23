@@ -20,12 +20,15 @@
 
 #include "test_helpers.h"
 
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "backend/backend.h"
 #include "core/alloc.h"
 #include "core/graph.h"
 #include "model/graph_helpers.h"
+#include "model/model_misc.h"
 
 /*
  * Helper: run a backend-parameterized test case on both CPU and Metal.
@@ -55,23 +58,107 @@ static void run_both_backends(backend_test_fn fn)
 }
 
 /*
- * Placeholder so the file compiles before Task 3 fills in the scorer
- * test body. Tasks 3-13 will declare more case fns above main() and
- * invoke them via run_both_backends().
+ * scorer_batched_case - Verify batched dot scorer matches per-slot 2D.
+ *
+ * Runs sam3_dot_scorer_build_batched on B=2 synthetic inputs, then
+ * rebuilds the 2D scorer per slot and compares element-wise with a
+ * backend-dependent tolerance.
  */
-static void scorer_batched_case(struct sam3_backend *be, const char *name);
+static void scorer_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int d = 16;
+	const int seq = 3;
+	const int nq = 8;
+	const int B = 2;
+	const int d_ffn = 32;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_dot_scorer sc = {0};
+	sc.d_model = d;
+	sc.d_proj = d;
+	sc.d_ffn = d_ffn;
+	ASSERT_EQ(sam3_dot_scorer_alloc_synthetic(&sc, &ar), 0);
+
+	int qb_dims[] = {B, nq, d};
+	int pb_dims[] = {B, seq, d};
+	struct sam3_tensor *qb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 qb_dims);
+	struct sam3_tensor *pb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 pb_dims);
+	ASSERT_NOT_NULL(qb);
+	ASSERT_NOT_NULL(pb);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)qb->data)[i] = (float)(i % 13) * 0.1f;
+	for (int i = 0; i < B * seq * d; i++)
+		((float *)pb->data)[i] = (float)(i % 17) * 0.2f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *sb = sam3_dot_scorer_build_batched(
+		&sc, &g, qb, pb, &ar);
+	ASSERT_NOT_NULL(sb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(sb->n_dims, 3);
+	ASSERT_EQ(sb->dims[0], B);
+	ASSERT_EQ(sb->dims[1], nq);
+	ASSERT_EQ(sb->dims[2], 1);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {nq, d};
+		int p1_dims[] = {seq, d};
+		struct sam3_tensor *q1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		struct sam3_tensor *p1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, p1_dims);
+		ASSERT_NOT_NULL(q1);
+		ASSERT_NOT_NULL(p1);
+		memcpy(q1->data,
+		       (char *)qb->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(p1->data,
+		       (char *)pb->data +
+			       (size_t)b * seq * d * sizeof(float),
+		       (size_t)seq * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *s1 = sam3_dot_scorer_build(
+			&sc, &g1, q1, p1, &ar);
+		ASSERT_NOT_NULL(s1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(s1->dims[0], nq);
+		ASSERT_EQ(s1->dims[1], 1);
+
+		const float *bptr = (const float *)sb->data +
+			(size_t)b * nq;
+		const float *sptr = (const float *)s1->data;
+		for (int i = 0; i < nq; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s] b=%d q=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected,
+					tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
 
 static void test_scorer_batched_equals_per_slot(void)
 {
-	/* Filled in Task 3; stub for now so the file compiles. */
-	(void)scorer_batched_case;
-}
-
-static void scorer_batched_case(struct sam3_backend *be, const char *name)
-{
-	(void)be;
-	(void)name;
-	/* Filled in Task 3. */
+	run_both_backends(scorer_batched_case);
 }
 
 int main(void)
