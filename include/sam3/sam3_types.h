@@ -92,6 +92,18 @@ struct sam3_prompt {
 	};
 };
 
+/*
+ * A single prompt set for batch segmentation: one logical query (a bundle
+ * of points/boxes/text that together describe one object or one textual
+ * concept). Batch segmentation runs N prompt sets against the same cached
+ * image and returns N independent results. The prompts pointer must remain
+ * valid for the duration of the sam3_segment_batch call only.
+ */
+struct sam3_prompt_set {
+	const struct sam3_prompt *prompts;
+	int                       n_prompts;
+};
+
 /* Result of a segmentation inference. */
 struct sam3_result {
 	float *masks;        /* Output masks: n_masks * H * W floats */
