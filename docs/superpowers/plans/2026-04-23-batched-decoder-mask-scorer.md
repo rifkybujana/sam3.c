@@ -24,9 +24,10 @@ New/modified files, with one-line responsibilities:
 
 Guiding principles:
 1. **Test B=1 equivalence at every step.** After every change, the single-shot path (now implemented as `batch with B=1`) must produce byte-identical output to the pre-refactor commit on main. A scripted parity test pins this.
-2. **Introduce B by adding a new leading dim, not by reshaping the existing inner dim.** This minimizes the diff at call sites and keeps 2D/3D reshape-view ops intact.
-3. **For per-head SDPA, wrap the batched `[B, nq, hd]` slice into a 4D `[B, 1, nq, hd]`** via `gh_reshape` and unwrap the output the same way, to reuse the existing 4D SDPA path in the Metal backend.
-4. **Never mutate shared state across batch slots.** In the decoder loop, ref_boxes/query_pos/queries all become `[B, 200, *]` on the persist arena; the per-layer CPU box refinement iterates over B internally.
+2. **Every new unit test must run on Metal.** The deployment backend is Metal. Per-task tests loop over both backends: `for (enum sam3_backend_type bt : {SAM3_BACKEND_CPU, SAM3_BACKEND_METAL}) { … }` — CPU first so failures are easier to diagnose, Metal second because that's what ships. A Metal failure is a blocker; a CPU failure usually points to a logic bug before backend divergence. Use the `run_both_backends` helper introduced in Task 2.
+3. **Introduce B by adding a new leading dim, not by reshaping the existing inner dim.** This minimizes the diff at call sites and keeps 2D/3D reshape-view ops intact.
+4. **For per-head SDPA, wrap the batched `[B, nq, hd]` slice into a 4D `[B, 1, nq, hd]`** via `gh_reshape` and unwrap the output the same way, to reuse the existing 4D SDPA path in the Metal backend.
+5. **Never mutate shared state across batch slots.** In the decoder loop, ref_boxes/query_pos/queries all become `[B, 200, *]` on the persist arena; the per-layer CPU box refinement iterates over B internally.
 
 ---
 
@@ -228,7 +229,7 @@ The scorer produces `[200, 1]` from `queries[200, d]` + `prompt[seq, d]`. Batchi
 - Create: `tests/test_batched_ops.c`
 - Modify: `CMakeLists.txt` (register)
 
-- [ ] **Step 1: Write the failing test for scorer B=2**
+- [ ] **Step 1: Write the failing test scaffold + the `run_both_backends` helper**
 
 ```c
 /* tests/test_batched_ops.c */
@@ -240,13 +241,45 @@ The scorer produces `[200, 1]` from `queries[200, d]` + `prompt[seq, d]`. Batchi
 #include "core/graph.h"
 #include "model/graph_helpers.h"
 
+/*
+ * Helper: every batched-op unit test is run on both CPU and Metal.
+ * CPU first to localize logic bugs; Metal second because that's the
+ * deployment backend. A Metal-only failure indicates a backend
+ * divergence worth flagging to the user.
+ */
+typedef void (*backend_test_fn)(struct sam3_backend *be, const char *name);
+
+static void run_both_backends(backend_test_fn fn)
+{
+	{
+		struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+		ASSERT_NOT_NULL(cpu);
+		fn(cpu, "CPU");
+		sam3_backend_free(cpu);
+	}
+	{
+		struct sam3_backend *mtl = sam3_backend_init(SAM3_BACKEND_METAL);
+		if (!mtl) {
+			printf("  skip Metal: backend unavailable\n");
+			return;
+		}
+		fn(mtl, "Metal");
+		sam3_backend_free(mtl);
+	}
+}
+
 /* When I wire batched scorer:
  * Input:  queries[B=2, 200, 256], prompt[B=2, seq=3, 256]
  * Output: scores[B=2, 200, 1]
- * Check:  result[0] == scorer(queries[0], prompt[0])   — byte-exact
+ * Check:  result[0] == scorer(queries[0], prompt[0])  — within fp tolerance
  *         result[1] == scorer(queries[1], prompt[1])
  */
-static void test_scorer_batched_equals_per_slot(void) { /* filled in Task 3 */ }
+static void scorer_batched_case(struct sam3_backend *be, const char *name);
+
+static void test_scorer_batched_equals_per_slot(void)
+{
+	run_both_backends(scorer_batched_case);
+}
 
 int main(void)
 {
@@ -254,6 +287,8 @@ int main(void)
 	TEST_REPORT();
 }
 ```
+
+`scorer_batched_case` body is filled in by Task 3. Note: on Metal, byte-exact equality does NOT hold across different graphs; use `ASSERT_NEAR` with `rtol=1e-4, atol=1e-5` for Metal comparisons, and `memcmp`-exact only for CPU. The `name` parameter lets tests pick the tolerance.
 
 - [ ] **Step 2: Register**
 
@@ -286,41 +321,27 @@ git commit -m "tests/batched: scaffold unit test harness for batched ops"
 - Modify: `tests/test_batched_ops.c` — fill test body
 - Modify: `src/model/sam3_image.c` (Stage 4e call site at line 2967+) — pass `[B, nq, d]`, `[B, seq, d]`
 
-- [ ] **Step 1: Fill in the scorer batched unit test**
+- [ ] **Step 1: Fill in the scorer-batched case**
 
-Replace `test_scorer_batched_equals_per_slot` with a test that:
-1. Builds a processor + loads weights (or zero-inits scorer weights and uses random inputs — the test doesn't need a real model; it just checks B=2 equals per-slot).
-2. Allocates `queries[2, 8, d]` and `prompt[2, 3, d]` with distinct random data per slot.
-3. Runs scorer once as `B=2`, captures output.
-4. Runs scorer twice with `B=1` slices, captures each.
-5. `memcmp` batched[0] with slot0, batched[1] with slot1 — must be byte-exact.
-
-Use zero-initialized weights (or `memset` after load) so there's no need for a model file.
-
-Exact code:
+Replace the forward-declared `scorer_batched_case` stub with the real body. It must run correctly on CPU and Metal — tolerance is per-backend.
 
 ```c
-static void test_scorer_batched_equals_per_slot(void)
+static void scorer_batched_case(struct sam3_backend *be, const char *name)
 {
 	const int d = 16;       /* small d_model for unit test */
 	const int seq = 3;
 	const int nq = 8;
 	const int B = 2;
 	const int d_ffn = 32;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
 
-	/* Synthesize a dot-scorer with tiny weights on an arena. */
 	struct sam3_arena ar;
 	sam3_arena_init(&ar, 1 << 22);
 	struct sam3_dot_scorer sc = {0};
 	sam3_dot_scorer_init(&sc, d, d_ffn);
-	/* Fill weights with a deterministic pattern. */
-	int ok = sam3_dot_scorer_alloc_synthetic(&sc, &ar);
-	ASSERT_EQ(ok, 0);
+	ASSERT_EQ(sam3_dot_scorer_alloc_synthetic(&sc, &ar), 0);
 
-	struct sam3_backend *be = sam3_backend_init(SAM3_BACKEND_CPU);
-	ASSERT_NOT_NULL(be);
-
-	/* Inputs */
 	int qb_dims[] = {B, nq, d};
 	int pb_dims[] = {B, seq, d};
 	struct sam3_tensor *qb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3, qb_dims);
@@ -336,7 +357,8 @@ static void test_scorer_batched_equals_per_slot(void)
 	ASSERT_EQ(sb->n_dims, 3);
 	ASSERT_EQ(sb->dims[0], B);
 
-	/* Run per-slot twice. */
+	/* Run per-slot; verify each batch slot matches the unbatched reference
+	 * within the backend-appropriate tolerance. */
 	for (int b = 0; b < B; b++) {
 		int q1_dims[] = {nq, d};
 		int p1_dims[] = {seq, d};
@@ -354,11 +376,18 @@ static void test_scorer_batched_equals_per_slot(void)
 
 		const float *bptr = (const float *)sb->data + (size_t)b * nq;
 		const float *sptr = (const float *)s1->data;
-		for (int i = 0; i < nq; i++)
-			ASSERT_NEAR(bptr[i], sptr[i], 1e-6);
+		for (int i = 0; i < nq; i++) {
+			float tol = atol + rtol * fabsf(sptr[i]);
+			if (fabsf(bptr[i] - sptr[i]) > tol) {
+				fprintf(stderr, "FAIL [%s] batch %d query %d: "
+					"batched=%.6f per-slot=%.6f tol=%g\n",
+					name, b, i, bptr[i], sptr[i], tol);
+				tests_failed++;
+			}
+			tests_run++;
+		}
 	}
 
-	sam3_backend_free(be);
 	sam3_arena_free(&ar);
 }
 ```
@@ -448,9 +477,9 @@ Four sub-stages mirror Stages 4a-4e in `src/model/sam3_image.c:2440-2956`.
 
 **Files:** `src/model/segmentation.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Add failing unit test**
+- [ ] **Step 1: Add failing unit test using `run_both_backends`**
 
-Synthesize `x[B=2, n_pixels=16, d=8]` and `text[B=2, seq=3, d=8]`. Call `sam3_seg_head_build_cross_attn_batched`, eval, compare each batch slot with a B=1 call. Test fails until the batched builder exists.
+Synthesize `x[B=2, n_pixels=16, d=8]` and `text[B=2, seq=3, d=8]`. Call `sam3_seg_head_build_cross_attn_batched`, eval, compare each batch slot with a B=1 call. **Both CPU and Metal** — wrap the case fn with `run_both_backends(cross_attn_case)`. Test fails until the batched builder exists.
 
 - [ ] **Step 2: Implement batched cross-attn**
 
@@ -501,9 +530,9 @@ git commit -am "model/segmentation: batched prompt cross-attn"
 
 **Files:** `src/model/segmentation.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test**
+- [ ] **Step 1: Failing unit test (CPU + Metal via `run_both_backends`)**
 
-Synthesize `enc[B=2, 18, 18, 16]` + feat_2x `[B=2, 36, 36, 16]` + feat_4x `[B=2, 72, 72, 16]`. Call `sam3_seg_head_build_fpn_batched(enc, f2, f4)` → `[B, 72, 72, 16]`. Compare vs B=1 per-slot.
+Synthesize `enc[B=2, 18, 18, 16]` + feat_2x `[B=2, 36, 36, 16]` + feat_4x `[B=2, 72, 72, 16]`. Call `sam3_seg_head_build_fpn_batched(enc, f2, f4)` → `[B, 72, 72, 16]`. Compare vs B=1 per-slot. Use the same per-backend tolerance (`rtol=1e-4/atol=1e-5` on Metal, `1e-6` on CPU).
 
 - [ ] **Step 2: Implement**
 
@@ -529,7 +558,7 @@ git commit -am "model/segmentation: batched FPN + instance projection"
 
 **Files:** `src/model/segmentation.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test** — Synthesize `queries[B=2, 8, 16]`. Run `sam3_seg_head_build_mask_mlp_batched`. Compare vs B=1 per-slot.
+- [ ] **Step 1: Failing unit test (CPU + Metal via `run_both_backends`)** — Synthesize `queries[B=2, 8, 16]`. Run `sam3_seg_head_build_mask_mlp_batched`. Compare vs B=1 per-slot on each backend.
 
 - [ ] **Step 2: Implement** — Existing 3-layer MLP uses `gh_linear + gh_relu + gh_linear + gh_relu + gh_linear`. All are batch-transparent. The "batched" version is trivially the same code with the rank assertion relaxed; expose it as a new entry point or update the existing one. Prefer the former to keep diff minimal.
 
@@ -545,9 +574,9 @@ git commit -am "model/segmentation: batched FPN + instance projection"
 
 **Files:** `src/model/sam3_image.c` Stage 4e area, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test**
+- [ ] **Step 1: Failing unit test (CPU + Metal via `run_both_backends`)**
 
-Synthesize `mask_embed[B=2, 8, 16]` and `inst[B=2, 18, 18, 16]`. Compute batched dot product → `[B, 8, 18, 18]`. Compare vs B=1.
+Synthesize `mask_embed[B=2, 8, 16]` and `inst[B=2, 18, 18, 16]`. Compute batched dot product → `[B, 8, 18, 18]`. Compare vs B=1 on each backend.
 
 - [ ] **Step 2: Implement**
 
@@ -581,9 +610,9 @@ All ops are batch-transparent; the only change is the reshape sizes.
 
 **Files:** `src/model/sam3_image.c` (around line 106 `cpu_box_refine`), `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test**
+- [ ] **Step 1: Failing unit test (CPU + Metal via `run_both_backends`)**
 
-Synthesize `queries[B=2, 8, 16]` and `ref_boxes[B=2, 8, 4]`. Call `cpu_box_refine_batched` (new). Compare vs calling `cpu_box_refine` per slot.
+Synthesize `queries[B=2, 8, 16]` and `ref_boxes[B=2, 8, 4]`. Call `cpu_box_refine_batched` (new). Compare vs calling `cpu_box_refine` per slot on each backend. Note: `cpu_box_refine` uses the backend for the box_head MLP (not purely CPU despite its name), so backend coverage matters here.
 
 - [ ] **Step 2: Implement**
 
@@ -610,7 +639,7 @@ The box_head MLP is per-query — run it on the batched tensor (batch-transparen
 
 **Files:** `src/model/decoder.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test** — Given `ref_boxes[B=2, 8, 4]`, `H=W=6`, assert output `[B, n_heads, 8, 36]` is identical to 2 calls of the current 2D API.
+- [ ] **Step 1: Failing unit test (CPU + Metal via `run_both_backends`)** — Given `ref_boxes[B=2, 8, 4]`, `H=W=6`, assert output `[B, n_heads, 8, 36]` matches 2 calls of the current 2D API on each backend. RPB itself is a CPU computation but the ref_point_head MLP calls inside go through the backend, so run both.
 
 - [ ] **Step 2: Add a batched overload**
 
@@ -632,7 +661,7 @@ Implementation: wrap the existing CPU code in a `for (int b = 0; b < B; b++)` an
 
 **Files:** `src/model/decoder.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test** — Given `ref_boxes[B=2, 8, 4]`, assert batched qpos equals 2× per-slot call.
+- [ ] **Step 1: Failing unit test (CPU + Metal via `run_both_backends`)** — Given `ref_boxes[B=2, 8, 4]`, assert batched qpos equals 2× per-slot call on each backend.
 
 - [ ] **Step 2: Add batched overload**
 
@@ -655,7 +684,7 @@ Sine position embed over `B * nq * 4` iterations on CPU → packs into a `[B, nq
 
 **Files:** `src/model/decoder.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test** — `q[B=2, 8, 16]`, `qpos[B=2, 8, 16]`. Run `sam3_decoder_build_sa_batched`. Compare vs B=1 per-slot.
+- [ ] **Step 1: Failing unit test (CPU + Metal via `run_both_backends`)** — `q[B=2, 8, 16]`, `qpos[B=2, 8, 16]`. Run `sam3_decoder_build_sa_batched`. Compare vs B=1 per-slot on each backend. This is the first test that exercises the 4D SDPA path (`[B, 1, nq, hd]`) on Metal; if Metal SDPA rejects `B>1`, this task surfaces it.
 
 - [ ] **Step 2: Implement**
 
@@ -677,7 +706,7 @@ Current `sam3_decoder_build_sa` (in `decoder.c`) wraps `decoder_self_attention_w
 
 **Files:** `src/model/decoder.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit tests — one for TCA (text), one for CA (vision, with RPB)**
+- [ ] **Step 1: Failing unit tests — one for TCA (text), one for CA (vision, with RPB). Both use `run_both_backends`.**
 
 - [ ] **Step 2: Implement**
 
@@ -692,7 +721,7 @@ Current `sam3_decoder_build_sa` (in `decoder.c`) wraps `decoder_self_attention_w
 
 **Files:** `src/model/decoder.h/.c`, `tests/test_batched_ops.c`
 
-- [ ] **Step 1: Failing unit test for `sam3_decoder_build_ffn_batched`**
+- [ ] **Step 1: Failing unit test for `sam3_decoder_build_ffn_batched` (CPU + Metal via `run_both_backends`)**
 
 - [ ] **Step 2: Implement FFN batched (trivial — `gh_mlp` + `gh_add` + `gh_layernorm` are batch-transparent).**
 
@@ -858,7 +887,7 @@ Both must pass. If either regresses, revert the last task's commit and bisect wi
 
 ## Risks and open questions
 
-1. **`gh_sdpa` with 3D `[B, nq, hd]`** — survey says it supports 2D or 4D. Task 11/12 reshape to 4D `[B, 1, nq, hd]`. If the Metal backend rejects `B>1` on the leading dim of SDPA, we'll need a small kernel fix first. Mitigation: Task 11's unit test exercises exactly this case with a CPU backend first (where the shape handling is more permissive), then switches to Metal.
+1. **`gh_sdpa` with 4D `[B, 1, nq, hd]` on Metal** — survey says the Metal backend supports 2D and 4D. The batched decoder reshapes each head slice to `[B, 1, nq, hd]` before `gh_sdpa`. If the MLX/Metal 4D path assumes `H > 1` or a different axis order, Task 11's Metal assertion will fail. Mitigation: Task 11's test uses `run_both_backends` — the CPU path typically passes first (more permissive shape handling); a Metal-only failure localizes the problem to the backend. Fix options: add a leading-1 squeeze-expand in `gh_sdpa`, or wrap heads differently (e.g., pack `B` into the head dim as `[1, B, nq, hd]`).
 2. **Variable text sequence length across sets** — if set A has text with 3 tokens and set B has 6 tokens, stacking forces padding. Phase 1 punts: require all sets in a batch to share text length (pad up to max, mask out). This is a soft constraint we document in the docstring; relaxing it is a Phase 2 improvement.
 3. **Arena size growth** — `rpb_buf` grows from `n_heads * nq * n_pixels` to `B * n_heads * nq * n_pixels`. For nq=200, n_heads=8, n_pixels=5184, B=8, that's ~265 MiB of persist arena. Check `proc->model_arena` capacity before running (likely need to raise default).
 4. **Metal tensor cache invalidation** — if the batched pipeline leaves `[B, ...]` tensors in the model arena past `persist_save` rollback, the backend's tensor-cache could return stale handles. The existing `cache_invalidate` call at `sam3_processor.c:1494` handles this; verify it's still invoked after Task 15.
