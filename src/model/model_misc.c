@@ -7,7 +7,7 @@
  * to produce per-query confidence logits.
  *
  * Key types:  sam3_dot_scorer
- * Depends on: model_misc.h, graph_helpers.h
+ * Depends on: model_misc.h, graph_helpers.h, util/log.h
  * Used by:    sam3_image.c
  *
  * Copyright (c) 2026
@@ -19,6 +19,7 @@
 
 #include "model_misc.h"
 #include "graph_helpers.h"
+#include "util/log.h"
 
 #define SCORE_PREFIX "tracker_model.mask_decoder.pred_obj_score_head."
 
@@ -233,8 +234,15 @@ struct sam3_tensor *sam3_dot_scorer_build_batched(
 	struct sam3_tensor *proj_p_t, *scores, *scale;
 
 	if (queries->n_dims != 3 || prompt->n_dims != 3 ||
-	    prompt->dims[0] != queries->dims[0])
+	    prompt->dims[0] != queries->dims[0]) {
+		sam3_log_error("scorer_batched: shape mismatch "
+			       "queries.n_dims=%d prompt.n_dims=%d "
+			       "queries.B=%d prompt.B=%d",
+			       queries->n_dims, prompt->n_dims,
+			       queries->n_dims >= 1 ? queries->dims[0] : -1,
+			       prompt->n_dims >= 1 ? prompt->dims[0] : -1);
 		return NULL;
+	}
 
 	int B = queries->dims[0];
 	int seq_len = prompt->dims[1];
@@ -316,6 +324,7 @@ struct sam3_tensor *sam3_dot_scorer_build_batched(
 	if (!proj_p)
 		return NULL;
 
+	/* gh_transpose swaps the last two dims: [B, 1, d_proj] -> [B, d_proj, 1]. */
 	proj_p_t = gh_transpose(g, arena, proj_p);
 	if (!proj_p_t)
 		return NULL;
