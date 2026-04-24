@@ -2541,9 +2541,15 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			seg_enc = sam3_seg_head_build_cross_attn(
-				&model->seg_head, &g,
-				enc_wrap, txt_wrap, scratch);
+			if (enc_wrap->n_dims == 3) {
+				seg_enc = sam3_seg_head_build_cross_attn_batched(
+					&model->seg_head, &g,
+					enc_wrap, txt_wrap, scratch);
+			} else {
+				seg_enc = sam3_seg_head_build_cross_attn(
+					&model->seg_head, &g,
+					enc_wrap, txt_wrap, scratch);
+			}
 			if (!seg_enc) {
 				sam3_log_error("segment: cross-attn "
 					       "build failed");

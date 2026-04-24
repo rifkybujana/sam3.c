@@ -29,6 +29,7 @@
 #include "core/graph.h"
 #include "model/graph_helpers.h"
 #include "model/model_misc.h"
+#include "model/segmentation.h"
 
 /*
  * Helper: run a backend-parameterized test case on both CPU and Metal.
@@ -259,9 +260,173 @@ static void test_sdpa_4d_batch_equals_per_slot(void)
 	run_both_backends(sdpa_4d_batch_case);
 }
 
+/*
+ * fill_sin_pattern - Deterministic non-degenerate fill for test tensors.
+ *
+ * Each call uses a unique offset so swapping two tensors (e.g. a Q
+ * weight vs a K weight) would change the output and trip the parity
+ * check. sin/cos keep the magnitudes bounded.
+ */
+static void fill_sin_pattern(struct sam3_tensor *t, float offset)
+{
+	int n = 1;
+	for (int i = 0; i < t->n_dims; i++)
+		n *= t->dims[i];
+	float *data = (float *)t->data;
+	for (int i = 0; i < n; i++)
+		data[i] = 0.1f * sinf(offset + (float)i * 0.137f);
+}
+
+/*
+ * cross_attn_batched_case - Verify batched seg cross-attn matches per-slot 2D.
+ *
+ * Builds a synthetic seg head (only the prompt cross-attn weights are
+ * populated) and checks that the batched builder produces the same
+ * output as calling the 2D builder once per batch slot.
+ */
+static void cross_attn_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 9;
+	const int ntxt = 4;
+	const int d = 16;
+	const int n_heads = 2;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_seg_head head = {0};
+	head.d_model = d;
+	head.n_attn_heads = n_heads;
+
+	int d_dims[] = {d};
+	int dd_dims[] = {d, d};
+
+	head.pxattn_norm_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_norm_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_q_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_q_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_k_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_k_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_v_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_v_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_o_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_o_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	ASSERT_NOT_NULL(head.pxattn_norm_w);
+	ASSERT_NOT_NULL(head.pxattn_norm_b);
+	ASSERT_NOT_NULL(head.pxattn_q_w);
+	ASSERT_NOT_NULL(head.pxattn_q_b);
+	ASSERT_NOT_NULL(head.pxattn_k_w);
+	ASSERT_NOT_NULL(head.pxattn_k_b);
+	ASSERT_NOT_NULL(head.pxattn_v_w);
+	ASSERT_NOT_NULL(head.pxattn_v_b);
+	ASSERT_NOT_NULL(head.pxattn_o_w);
+	ASSERT_NOT_NULL(head.pxattn_o_b);
+
+	/*
+	 * Norm weights kept near-identity so the LN step does something
+	 * sensible; biases small. Other tensors get unique sin offsets so
+	 * weight/bias mix-ups would surface as numeric differences.
+	 */
+	float *nw = (float *)head.pxattn_norm_w->data;
+	float *nb = (float *)head.pxattn_norm_b->data;
+	for (int i = 0; i < d; i++) {
+		nw[i] = 1.0f + 0.01f * sinf((float)i);
+		nb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(head.pxattn_q_w, 1.0f);
+	fill_sin_pattern(head.pxattn_q_b, 2.0f);
+	fill_sin_pattern(head.pxattn_k_w, 3.0f);
+	fill_sin_pattern(head.pxattn_k_b, 4.0f);
+	fill_sin_pattern(head.pxattn_v_w, 5.0f);
+	fill_sin_pattern(head.pxattn_v_b, 6.0f);
+	fill_sin_pattern(head.pxattn_o_w, 7.0f);
+	fill_sin_pattern(head.pxattn_o_b, 8.0f);
+
+	int x_dims[] = {B, nq, d};
+	int t_dims[] = {B, ntxt, d};
+	struct sam3_tensor *xb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 x_dims);
+	struct sam3_tensor *tb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 t_dims);
+	ASSERT_NOT_NULL(xb);
+	ASSERT_NOT_NULL(tb);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)xb->data)[i] = (float)((i * 7 + 3) % 23) * 0.13f;
+	for (int i = 0; i < B * ntxt * d; i++)
+		((float *)tb->data)[i] = (float)((i * 11 + 5) % 19) * 0.09f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_seg_head_build_cross_attn_batched(
+		&head, &g, xb, tb, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		int x1_dims[] = {nq, d};
+		int t1_dims[] = {ntxt, d};
+		struct sam3_tensor *x1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, x1_dims);
+		struct sam3_tensor *t1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, t1_dims);
+		ASSERT_NOT_NULL(x1);
+		ASSERT_NOT_NULL(t1);
+		memcpy(x1->data,
+		       (char *)xb->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(t1->data,
+		       (char *)tb->data +
+			       (size_t)b * ntxt * d * sizeof(float),
+		       (size_t)ntxt * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_seg_head_build_cross_attn(
+			&head, &g1, x1, t1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s xattn] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_cross_attn_batched_equals_per_slot(void)
+{
+	run_both_backends(cross_attn_batched_case);
+}
+
 int main(void)
 {
 	test_scorer_batched_equals_per_slot();
 	test_sdpa_4d_batch_equals_per_slot();
+	test_cross_attn_batched_equals_per_slot();
 	TEST_REPORT();
 }

@@ -140,6 +140,28 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
 	struct sam3_arena *arena);
 
 /*
+ * sam3_seg_head_build_cross_attn_batched - Batched prompt cross-attention.
+ *
+ * Batched variant of sam3_seg_head_build_cross_attn. Every tensor gains
+ * a leading batch dim B. Per-head SDPA uses the [B, 1, head_len, hd]
+ * 4D reshape so the existing Metal 4D SDPA path handles B > 1.
+ *
+ * @head:           Loaded seg head
+ * @g:              Graph to add nodes to
+ * @encoder_states: [B, n_pixels, d_model]
+ * @text_features:  [B, n_text, d_model]
+ * @arena:          Arena for intermediate tensors
+ *
+ * Returns cross-attended encoder states [B, n_pixels, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_cross_attn_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *encoder_states,
+	struct sam3_tensor *text_features,
+	struct sam3_arena *arena);
+
+/*
  * Build FPN pixel decoder only (no instance projection). Operates on
  * NHWC tensors [1, H, W, d].
  */
