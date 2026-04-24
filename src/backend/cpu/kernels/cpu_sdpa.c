@@ -173,7 +173,9 @@ struct sdpa_par_ctx {
 	float        scale;
 	int          head_stride_q;  /* seq_q * head_dim */
 	int          head_stride_k;  /* seq_k * head_dim */
-	int          mask_bh_stride; /* per-bh mask stride; 0 if shared */
+	int          H;              /* heads per batch (for bh -> (b,h)) */
+	int          mask_b_stride;  /* floats per batch slot (0 for 2D/3D) */
+	int          mask_h_stride;  /* floats per head slot (0 for 2D) */
 };
 
 static void sdpa_parallel_fn(void *arg, int task_id, int n_tasks)
@@ -196,10 +198,22 @@ static void sdpa_parallel_fn(void *arg, int task_id, int n_tasks)
 		const float *vd = ctx->vbase + (size_t)bh * ctx->head_stride_k;
 		float *od       = ctx->obase + (size_t)bh * ctx->head_stride_q;
 
-		const float *mask_row = ctx->mdata
+		/*
+		 * Derive (b, h) from the flat bh index; the mask may
+		 * broadcast across either axis depending on its rank:
+		 *   2D -> b_stride=0, h_stride=0 (fully shared)
+		 *   3D -> b_stride=0, h_stride>0 (per-head, shared across B)
+		 *   4D -> b_stride>0, h_stride>0 (per (b, h))
+		 */
+		int b = bh / ctx->H;
+		int h = bh % ctx->H;
+		const float *mrow_base = ctx->mdata
 			? ctx->mdata
-				+ (size_t)bh * ctx->mask_bh_stride
-				+ (size_t)i * ctx->seq_k
+				+ (size_t)b * ctx->mask_b_stride
+				+ (size_t)h * ctx->mask_h_stride
+			: NULL;
+		const float *mask_row = mrow_base
+			? mrow_base + (size_t)i * ctx->seq_k
 			: NULL;
 
 		sdpa_row_f32(qd + i * ctx->head_dim,
@@ -255,12 +269,15 @@ enum sam3_error cpu_kernel_sdpa(const struct sam3_node *node,
 		 *   3D [H, seq_q, seq_k]      -> per-head, shared across B
 		 *   4D [B, H, seq_q, seq_k]   -> per-batch-head
 		 */
-		int mask_bh_stride = 0;
+		int mask_b_stride = 0;
+		int mask_h_stride = 0;
 		if (mask) {
-			if (mask->n_dims == 3)
-				mask_bh_stride = seq_q * seq_k;
-			else if (mask->n_dims == 4)
-				mask_bh_stride = seq_q * seq_k;
+			if (mask->n_dims == 3) {
+				mask_h_stride = seq_q * seq_k;
+			} else if (mask->n_dims == 4) {
+				mask_b_stride = H * seq_q * seq_k;
+				mask_h_stride = seq_q * seq_k;
+			}
 		}
 
 		struct sdpa_par_ctx ctx = {
@@ -277,7 +294,9 @@ enum sam3_error cpu_kernel_sdpa(const struct sam3_node *node,
 			.scale         = scale,
 			.head_stride_q = seq_q * head_dim,
 			.head_stride_k = seq_k * head_dim,
-			.mask_bh_stride = mask_bh_stride,
+			.H             = H,
+			.mask_b_stride = mask_b_stride,
+			.mask_h_stride = mask_h_stride,
 		};
 
 		sam3_threadpool_parallel_for(pool, sdpa_parallel_fn,
@@ -302,7 +321,9 @@ enum sam3_error cpu_kernel_sdpa(const struct sam3_node *node,
 		.scale         = scale,
 		.head_stride_q = seq_q * head_dim,
 		.head_stride_k = seq_k * head_dim,
-		.mask_bh_stride = 0,
+		.H             = 1,
+		.mask_b_stride = 0,
+		.mask_h_stride = 0,
 	};
 
 	sam3_threadpool_parallel_for(pool, sdpa_parallel_fn,
