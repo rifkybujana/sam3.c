@@ -3794,16 +3794,18 @@ enum sam3_error sam3_image_model_segment_batched(
 		goto fail;
 	}
 
-	/* Broadcast shared image features to [B, H, W, d]. */
-	struct sam3_tensor *feat_2x_b;
-	struct sam3_tensor *feat_4x_b;
-	feat_2x_b = gh_broadcast_batch(scratch, model->cached_feat_s0_nhwc,
-					B);
-	feat_4x_b = gh_broadcast_batch(scratch, model->cached_feat_4x_nhwc,
-					B);
+	/*
+	 * Pass shared image features as [1, H, W, d]. The FPN's gh_add
+	 * now takes prev (at [B, H, W, d]) first, so Metal MLX broadcasts
+	 * these [1, H, W, d] skip features across the batch dim on-device.
+	 * This avoids an arena-straining memcpy of up to B * 132 MiB at
+	 * full resolution that was overflowing scratch at B >= 4.
+	 */
+	struct sam3_tensor *feat_2x_b = model->cached_feat_s0_nhwc;
+	struct sam3_tensor *feat_4x_b = model->cached_feat_4x_nhwc;
 	if (!feat_2x_b || !feat_4x_b) {
-		sam3_log_error("segment_batched: feature broadcast failed");
-		err = SAM3_ENOMEM;
+		sam3_log_error("segment_batched: missing cached features");
+		err = SAM3_EINVAL;
 		goto fail;
 	}
 

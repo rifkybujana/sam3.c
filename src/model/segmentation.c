@@ -403,8 +403,21 @@ static struct sam3_tensor *build_pixel_decoder(
 				       i, ph, pw, ch, cw);
 		}
 
-		/* Skip connection: curr + upsampled prev */
-		prev = gh_add(g, a, curr, prev);
+		/*
+		 * Skip connection: upsampled prev + curr.
+		 *
+		 * prev is first so gh_add allocates the output at
+		 * prev's shape. In the 2D path and pre-batched unit
+		 * tests both tensors share the same batch dim so the
+		 * order is semantically neutral (add is commutative).
+		 *
+		 * In the batched driver prev is [B, H, W, d] while
+		 * curr is the shared image feature [1, H, W, d].
+		 * Putting prev first keeps the output at [B, H, W, d]
+		 * and lets Metal MLX broadcast curr across the batch
+		 * dim on-device, avoiding a large host-side tile.
+		 */
+		prev = gh_add(g, a, prev, curr);
 		if (!prev) {
 			sam3_log_error("seg: FPN stage %d add fail", i);
 			return NULL;
