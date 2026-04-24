@@ -427,3 +427,11 @@ foreach(BENCH_SRC ${BENCH_SOURCES})
 	add_executable(${BENCH_NAME} ${BENCH_SRC})
 	target_link_libraries(${BENCH_NAME} sam3)
 endforeach()
+
+# Per-batch-size segment latency bench (gated; needs models/sam3.sam3)
+if(SAM3_BENCH)
+	add_executable(bench_segment_batch tests/bench_segment_batch.c)
+	target_link_libraries(bench_segment_batch sam3)
+	target_compile_definitions(bench_segment_batch PRIVATE
+		SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
