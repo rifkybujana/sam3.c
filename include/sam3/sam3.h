@@ -313,6 +313,20 @@ enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
  * the same cached image, but in a single API call with a single failure
  * path. Returns SAM3_OK on success. Returns SAM3_EINVAL if any set is
  * empty or no image is set.
+ *
+ * Implementation note: This API currently dispatches a serial per-set
+ * sam3_segment loop internally. Graph-level batched segmentation is
+ * implemented (sam3_image_model_segment_batched, callable directly by
+ * advanced users) and validated byte-close against the serial path at
+ * B=1..3, but the benchmark at full model resolution shows it is
+ * slower than the serial path at B=2..8 (18% slower at B=2, 6%
+ * slower at B=4) and exceeds the Metal scratch arena at B=8. The
+ * bottlenecks are (a) per-slot geometry + fusion stacking remaining
+ * serial, (b) CPU <-> Metal backend hops for the decoder, and (c)
+ * per-layer RPB buffer allocation that scales with B. Future work on
+ * a true batched fusion + single-backend decoder would unlock the
+ * speedup; until then the serial dispatch preserves correctness and
+ * never regresses wall-clock time.
  */
 enum sam3_error sam3_segment_batch(sam3_ctx *ctx,
 				   const struct sam3_prompt_set *sets,
