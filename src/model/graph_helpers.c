@@ -118,6 +118,15 @@ struct sam3_tensor *gh_broadcast_batch(struct sam3_arena *arena,
 		return NULL;
 
 	/*
+	 * Planning-pass arena: gh_alloc_tensor returns data=NULL when
+	 * arena->skip_data is set. Shape is still computed correctly; skip
+	 * the memcpy. Real data is filled later when the arena is switched
+	 * to allocation mode.
+	 */
+	if (!out->data || !input->data)
+		return out;
+
+	/*
 	 * Per-slot byte count: input->nbytes already excludes any leading-1
 	 * dim's contribution (since 1 * X == X), so it equals the payload
 	 * size of one batch slot regardless of whether we dropped a dim.
