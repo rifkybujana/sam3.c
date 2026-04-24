@@ -3176,6 +3176,7 @@ enum sam3_error sam3_image_model_segment_batched(
 		struct sam3_tensor *slot_tf_p = NULL;
 		struct sam3_tensor *slot_masks = NULL;
 		struct sam3_tensor *slot_scores = NULL;
+		size_t inner_save;
 
 		if (prompt_tokens) {
 			int pt_n = prompt_tokens->dims[1];
@@ -3215,6 +3216,8 @@ enum sam3_error sam3_image_model_segment_batched(
 					  sam3_dtype_size(slot_tf.dtype);
 			slot_tf_p = &slot_tf;
 		}
+
+		inner_save = persist->offset;
 
 		err = sam3_image_model_segment(
 			model, be, cpu_be,
@@ -3267,6 +3270,22 @@ enum sam3_error sam3_image_model_segment_batched(
 				     (size_t)b * slot_bytes;
 			memcpy(dst, slot_scores->data, slot_bytes);
 		}
+
+		/*
+		 * Roll back persist to the pre-inner-call point so the B
+		 * per-slot masks/scores don't accumulate. batched_masks and
+		 * batched_scores live at offsets below inner_save, so they
+		 * are preserved. Invalidate backend-cached tensor handles
+		 * that point into the reclaimed region before rewinding.
+		 */
+		if (persist->offset > inner_save &&
+		    be->ops->cache_invalidate) {
+			char *base = (char *)persist->base;
+			be->ops->cache_invalidate(
+				be, base + inner_save,
+				persist->offset - inner_save);
+		}
+		persist->offset = inner_save;
 	}
 
 	*out_masks = batched_masks;
