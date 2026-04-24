@@ -202,13 +202,15 @@ enum sam3_error sam3_image_model_segment(
  * API that accepts stacked [B, ...] inputs and produces stacked
  * [B, ...] outputs.
  *
- * Current implementation serializes Stages 1-4 per batch slot under
- * the hood (invoking sam3_image_model_segment once per b) and stacks
- * the results along the leading batch dim. The internal graph-level
- * batching of Stages 3 (DETR decoder) and 4 (seg head + scorer) via
- * the already-landed _batched substep builders is a follow-up
- * optimization; the public API and output layout match the final
- * design so callers can adopt the entry point today.
+ * Stages 1+2 (geometry encoder + DETR encoder fusion) run per batch
+ * slot via the run_geom_and_fusion helper and outputs are stacked
+ * along the leading batch dim. Stage 3 (DETR decoder) then runs once
+ * as a batched 6-layer loop using the _batched substep builders plus
+ * batched cpu_box_refine / query_pos / RPB helpers between layers.
+ * Stage 4 (seg head + mask logits) and the dot-product scorer likewise
+ * run once on the stacked queries and broadcast image features. At
+ * B=1 the pipeline is bit-for-bit identical to sam3_image_model_segment;
+ * test_segment_batch_parity pins this equivalence.
  *
  * @model:          Loaded image model (must be image-encoded).
  * @be, @cpu_be:    Main + CPU-side decoder backends (same roles as

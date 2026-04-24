@@ -3121,15 +3121,17 @@ fail:
 /*
  * sam3_image_model_segment_batched - Batched segmentation entry point.
  *
- * Current implementation serializes per-slot calls to
- * sam3_image_model_segment and stacks the outputs along the leading
- * batch dim. This preserves byte-for-byte parity with the existing 2D
- * path while giving callers the batched API shape
- * (sam3_processor_segment_batch in Task 15, future video paths). The
- * already-landed _batched substep builders (decoder SA/TCA/CA/FFN,
- * seg head cross-attn/FPN/mask MLP/mask logits, dot-scorer) are
- * unchanged and remain available for a follow-up that lifts Stages
- * 3+4 to run once on stacked [B, ...] tensors.
+ * Graph-level batched segmentation pipeline. Stages 1+2 (geometry
+ * encoder + DETR encoder fusion) run per-slot via run_geom_and_fusion
+ * and the outputs are stacked along the leading batch dim. Stage 3
+ * (DETR decoder) then runs ONCE as a batched 6-layer loop using the
+ * _batched substep builders plus batched cpu_box_refine / query_pos /
+ * RPB helpers between layers. Stage 4 (seg head + mask logits) and the
+ * dot-product scorer likewise run ONCE on the stacked queries and
+ * broadcast image features.
+ *
+ * At B=1 the graph is bit-for-bit identical to sam3_image_model_segment;
+ * test_segment_batch_parity pins this equivalence.
  */
 enum sam3_error sam3_image_model_segment_batched(
 	struct sam3_image_model *model,
@@ -3144,12 +3146,29 @@ enum sam3_error sam3_image_model_segment_batched(
 	struct sam3_tensor **out_scores,
 	struct sam3_profiler *profiler)
 {
+	/*
+	 * dec_be selects which backend runs Stage 3 (decoder) + scorer.
+	 * Matches sam3_image_model_segment: CPU avoids GPU-specific
+	 * float32 reduction divergence that compounds across layers.
+	 */
+	struct sam3_backend *dec_be = cpu_be ? cpu_be : be;
+
+#define DEC_BE_ARENA_RESET() do { \
+	if (dec_be->ops->arena_reset) \
+		dec_be->ops->arena_reset(dec_be); \
+} while (0)
+
 	enum sam3_error err;
 	size_t outer_save;
 	struct sam3_tensor *batched_masks = NULL;
 	struct sam3_tensor *batched_scores = NULL;
-	int nq, mh, mw;
-	size_t dsz;
+	struct sam3_tensor *fused_stacked = NULL;
+	struct sam3_tensor *context_stacked = NULL;
+	struct sam3_graph g;
+	int nq, d, n_heads, mh, mw;
+	int n_pixels, pe_H, pe_W;
+	int seq = 0;
+	int has_context = 0;
 
 	if (!model || !be || !scratch || !persist || !out_masks)
 		return SAM3_EINVAL;
@@ -3182,19 +3201,21 @@ enum sam3_error sam3_image_model_segment_batched(
 
 	outer_save = persist->offset;
 
-	/*
-	 * Allocate batched output tensors up-front so they survive the
-	 * inner persist rollback that sam3_image_model_segment performs
-	 * on each slot.
-	 *
-	 * Mask spatial dims come from cached_feat_4x_nhwc (the FPN's
-	 * final upsampled scale), n_queries from the decoder config.
-	 */
 	nq = model->decoder.n_queries;
+	d = model->decoder.d_model;
+	n_heads = model->decoder.n_heads;
 	mh = model->cached_feat_4x_nhwc->dims[1];
 	mw = model->cached_feat_4x_nhwc->dims[2];
-	dsz = sizeof(float);
+	n_pixels = model->cached_feat_s1_nhwc->dims[1]
+		 * model->cached_feat_s1_nhwc->dims[2];
+	pe_H = model->cached_feat_s1_nhwc->dims[1];
+	pe_W = model->cached_feat_s1_nhwc->dims[2];
 
+	/*
+	 * Allocate batched output tensors up-front so they live below
+	 * any persist allocations we make for fused/context/decoder
+	 * state and survive persist rollback.
+	 */
 	{
 		int m_dims[4] = {B, nq, mh, mw};
 		batched_masks = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
@@ -3215,19 +3236,38 @@ enum sam3_error sam3_image_model_segment_batched(
 	}
 
 	/*
-	 * Per-slot loop. Wrap the b-th slice of the stacked inputs as a
-	 * 2D tensor and invoke the existing per-image pipeline. Copy the
-	 * returned masks/scores into the stacked outputs before moving on
-	 * — the inner function's persist rollback makes the returned
-	 * pointers live only until the next allocation on @persist.
+	 * Stages 1+2: run run_geom_and_fusion per slot and stack outputs
+	 * into fused_stacked [B, n_pixels, d] + context_stacked [B, seq, d].
+	 *
+	 * We pre-allocate the stacked buffers on persist, then for each
+	 * slot run Stages 1+2 into a temporary offset inside persist,
+	 * memcpy the results into the stacked slot, and roll persist back
+	 * to just above fused_stacked / context_stacked so per-slot
+	 * scratch (img_with_pos, ref_boxes, etc.) doesn't accumulate.
+	 */
+	{
+		int fs_dims[3] = {B, n_pixels, d};
+		fused_stacked = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						 3, fs_dims);
+		if (!fused_stacked) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+	}
+
+	/*
+	 * Slot 0 determines the context sequence length (text + N+1).
+	 * All slots must agree; this is enforced below via the seq check.
+	 * Python's processor in Task 15 will ensure this by padding.
 	 */
 	for (int b = 0; b < B; b++) {
 		struct sam3_tensor slot_pt;
 		struct sam3_tensor slot_tf;
 		struct sam3_tensor *slot_pt_p = NULL;
 		struct sam3_tensor *slot_tf_p = NULL;
-		struct sam3_tensor *slot_masks = NULL;
-		struct sam3_tensor *slot_scores = NULL;
+		struct sam3_tensor *slot_fused = NULL;
+		struct sam3_tensor *slot_context = NULL;
+		struct sam3_tensor *slot_img_2d = NULL;
 		size_t inner_save;
 
 		if (prompt_tokens) {
@@ -3271,65 +3311,122 @@ enum sam3_error sam3_image_model_segment_batched(
 
 		inner_save = persist->offset;
 
-		err = sam3_image_model_segment(
-			model, be, cpu_be,
-			slot_pt_p, slot_tf_p,
-			scratch, persist,
-			&slot_masks,
-			batched_scores ? &slot_scores : NULL,
-			profiler);
+		err = run_geom_and_fusion(model, be, cpu_be,
+					   slot_pt_p, slot_tf_p,
+					   scratch, persist, profiler,
+					   &slot_fused, &slot_context,
+					   &slot_img_2d);
 		if (err != SAM3_OK) {
-			sam3_log_error("segment_batched: slot %d failed: %d",
-				       b, err);
+			sam3_log_error("segment_batched: slot %d "
+				       "geom+fusion failed: %d", b, err);
 			goto fail;
 		}
 
-		/* Validate shape consistency across slots. */
-		if (slot_masks->n_dims != 3 ||
-		    slot_masks->dims[0] != nq ||
-		    slot_masks->dims[1] != mh ||
-		    slot_masks->dims[2] != mw) {
-			sam3_log_error("segment_batched: slot %d mask shape "
-				       "mismatch", b);
+		if (slot_fused->n_dims != 2 ||
+		    slot_fused->dims[0] != n_pixels ||
+		    slot_fused->dims[1] != d) {
+			sam3_log_error("segment_batched: slot %d fused "
+				       "shape [%d,%d] expected [%d,%d]",
+				       b, slot_fused->dims[0],
+				       slot_fused->dims[1], n_pixels, d);
 			err = SAM3_EINVAL;
 			goto fail;
 		}
 
 		{
-			size_t slot_bytes = (size_t)nq * (size_t)mh *
-					     (size_t)mw * dsz;
-			char *dst = (char *)batched_masks->data +
+			size_t slot_bytes = (size_t)n_pixels * (size_t)d *
+					     sizeof(float);
+			char *dst = (char *)fused_stacked->data +
 				     (size_t)b * slot_bytes;
-			memcpy(dst, slot_masks->data, slot_bytes);
+			memcpy(dst, slot_fused->data, slot_bytes);
 		}
 
-		if (batched_scores) {
-			if (!slot_scores) {
+		if (slot_context) {
+			if (b == 0) {
+				has_context = 1;
+				seq = slot_context->dims[0];
+				int cs_dims[3] = {B, seq, d};
+				/*
+				 * Rewind persist to before this slot's
+				 * transients but after fused_stacked, then
+				 * allocate context_stacked. This keeps
+				 * context_stacked at a stable low offset.
+				 */
+				if (persist->offset > inner_save &&
+				    be->ops->cache_invalidate) {
+					char *base = (char *)persist->base;
+					be->ops->cache_invalidate(
+						be, base + inner_save,
+						persist->offset -
+							inner_save);
+				}
+				persist->offset = inner_save;
+				context_stacked = gh_alloc_tensor(
+					persist, SAM3_DTYPE_F32, 3, cs_dims);
+				if (!context_stacked) {
+					err = SAM3_ENOMEM;
+					goto fail;
+				}
+				/*
+				 * Re-run slot 0's Stages 1+2 so we can copy
+				 * the context in. Deterministic, no cache —
+				 * running twice costs about 0.3s on the
+				 * first slot, amortized against the batched
+				 * Stage 3+4 savings.
+				 */
+				inner_save = persist->offset;
+				err = run_geom_and_fusion(
+					model, be, cpu_be,
+					slot_pt_p, slot_tf_p,
+					scratch, persist, profiler,
+					&slot_fused, &slot_context,
+					&slot_img_2d);
+				if (err != SAM3_OK) {
+					sam3_log_error("segment_batched: "
+						       "slot 0 replay "
+						       "failed: %d", err);
+					goto fail;
+				}
+				/* fused was already copied; copy it again
+				 * since we ran the computation from the
+				 * same inputs. Result is bitwise identical. */
+				{
+					size_t sb = (size_t)n_pixels *
+						     (size_t)d *
+						     sizeof(float);
+					char *dst = (char *)fused_stacked->data;
+					memcpy(dst, slot_fused->data, sb);
+				}
+			}
+
+			if (slot_context->n_dims != 2 ||
+			    slot_context->dims[0] != seq ||
+			    slot_context->dims[1] != d) {
 				sam3_log_error("segment_batched: slot %d "
-					       "missing scores", b);
+					       "context shape [%d,%d] "
+					       "expected [%d,%d]",
+					       b, slot_context->dims[0],
+					       slot_context->dims[1], seq,
+					       d);
 				err = SAM3_EINVAL;
 				goto fail;
 			}
-			if (slot_scores->n_dims != 2 ||
-			    slot_scores->dims[0] != nq) {
-				sam3_log_error("segment_batched: slot %d "
-					       "score shape mismatch", b);
-				err = SAM3_EINVAL;
-				goto fail;
+			{
+				size_t slot_bytes = (size_t)seq *
+						     (size_t)d *
+						     sizeof(float);
+				char *dst = (char *)context_stacked->data +
+					     (size_t)b * slot_bytes;
+				memcpy(dst, slot_context->data, slot_bytes);
 			}
-			size_t slot_bytes = (size_t)nq * dsz;
-			char *dst = (char *)batched_scores->data +
-				     (size_t)b * slot_bytes;
-			memcpy(dst, slot_scores->data, slot_bytes);
+		} else if (has_context) {
+			sam3_log_error("segment_batched: slot %d missing "
+				       "context while slot 0 has it", b);
+			err = SAM3_EINVAL;
+			goto fail;
 		}
 
-		/*
-		 * Roll back persist to the pre-inner-call point so the B
-		 * per-slot masks/scores don't accumulate. batched_masks and
-		 * batched_scores live at offsets below inner_save, so they
-		 * are preserved. Invalidate backend-cached tensor handles
-		 * that point into the reclaimed region before rewinding.
-		 */
+		/* Reclaim per-slot transients. */
 		if (persist->offset > inner_save &&
 		    be->ops->cache_invalidate) {
 			char *base = (char *)persist->base;
@@ -3340,6 +3437,531 @@ enum sam3_error sam3_image_model_segment_batched(
 		persist->offset = inner_save;
 	}
 
+	sam3_log_debug("segment_batched: Stages 1+2 done B=%d "
+		       "persist=%zu/%zu", B, persist->offset, persist->size);
+
+	/*
+	 * Stage 3: batched DETR decoder — 6 layers of SA -> TCA -> CA -> FFN.
+	 * Each substep is a separate graph, mirroring the 2D path exactly,
+	 * to keep Metal/MLX behavior and parity at B=1.
+	 */
+	SAM3_PROF_BEGIN(profiler, "decoder");
+
+	/*
+	 * Persist state that must survive inter-layer scratch resets:
+	 *   q_buf    [B, nq, d]
+	 *   qpos_buf [B, nq, d]
+	 *   ref_boxes[B, nq, 4]
+	 *   rpb_buf  [B, n_heads, nq, n_pixels]
+	 *   br_tmp1  [nq, max(d, 4)]   (shared across slots inside helper)
+	 *   br_tmp2  [nq, d]
+	 */
+	float *q_buf = (float *)sam3_arena_alloc(
+		persist, (size_t)B * nq * d * sizeof(float));
+	float *qpos_buf = (float *)sam3_arena_alloc(
+		persist, (size_t)B * nq * d * sizeof(float));
+	float *ref_boxes = (float *)sam3_arena_alloc(
+		persist, (size_t)B * nq * 4 * sizeof(float));
+	float *rpb_buf = (float *)sam3_arena_alloc(
+		persist, (size_t)B * n_heads * nq * n_pixels *
+			  sizeof(float));
+	float *br_tmp1 = (float *)sam3_arena_alloc(
+		persist, (size_t)nq * d * sizeof(float));
+	float *br_tmp2 = (float *)sam3_arena_alloc(
+		persist, (size_t)nq * d * sizeof(float));
+	if (!q_buf || !qpos_buf || !ref_boxes || !rpb_buf ||
+	    !br_tmp1 || !br_tmp2) {
+		err = SAM3_ENOMEM;
+		goto fail;
+	}
+
+	/*
+	 * Initial state: tile dec->query_embed B times into q_buf;
+	 * sigmoid of dec->reference_points B times into ref_boxes.
+	 */
+	{
+		size_t q_stride = (size_t)nq * (size_t)d * sizeof(float);
+		const float *qsrc =
+			(const float *)model->decoder.query_embed->data;
+		for (int b = 0; b < B; b++)
+			memcpy((char *)q_buf + (size_t)b * q_stride,
+			       qsrc, q_stride);
+
+		const float *rp =
+			(const float *)model->decoder.reference_points->data;
+		for (int b = 0; b < B; b++) {
+			float *dst = ref_boxes + (size_t)b * nq * 4;
+			for (int ri = 0; ri < nq * 4; ri++)
+				dst[ri] = 1.0f / (1.0f + expf(-rp[ri]));
+		}
+	}
+
+	/* Initial query_pos via batched compute_query_pos. */
+	{
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *qpos;
+		qpos = sam3_decoder_compute_query_pos_batched(
+			&model->decoder, &g, scratch, ref_boxes, B);
+		if (!qpos) {
+			sam3_log_error("segment_batched: qpos build failed");
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = dec_be->ops->graph_eval(dec_be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: qpos eval failed: %d",
+				       err);
+			goto fail;
+		}
+
+		memcpy(qpos_buf, qpos->data,
+		       (size_t)B * nq * d * sizeof(float));
+	}
+
+	/* Position encoding (shared across batch). */
+	struct sam3_tensor *pos_enc_t;
+	pos_enc_t = sam3_pos_encoding_get(&model->backbone.pos_enc);
+	int pe_dims_2d[] = {pe_H * pe_W, d};
+
+	int q_dims[] = {B, nq, d};
+	int fs_dims[] = {B, n_pixels, d};
+	int ctx_dims[3];
+	if (has_context) {
+		ctx_dims[0] = B;
+		ctx_dims[1] = seq;
+		ctx_dims[2] = d;
+	}
+	int rpb_dims[] = {B, n_heads, nq, n_pixels};
+
+	for (int li = 0; li < model->decoder.n_layers; li++) {
+		struct sam3_tensor *q_in;
+		struct sam3_tensor *qpos_in;
+		struct sam3_tensor *enc_wrap;
+		struct sam3_tensor *enc_pos_wrap;
+		struct sam3_tensor *txt_wrap;
+		struct sam3_tensor *q_out;
+
+#define DEC_BATCHED_WRAP_INPUTS() do { \
+	q_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, \
+			       3, q_dims, q_buf); \
+	qpos_in = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, \
+				  3, q_dims, qpos_buf); \
+	enc_wrap = gh_tensor_wrap(scratch, fused_stacked->dtype, \
+				   3, fs_dims, fused_stacked->data); \
+	enc_pos_wrap = gh_tensor_wrap(scratch, SAM3_DTYPE_F32, \
+				       2, pe_dims_2d, \
+				       pos_enc_t->data); \
+	txt_wrap = has_context \
+		? gh_tensor_wrap(scratch, context_stacked->dtype, \
+				 3, ctx_dims, context_stacked->data) \
+		: NULL; \
+	if (!q_in || !qpos_in || !enc_wrap || !enc_pos_wrap) { \
+		err = SAM3_ENOMEM; \
+		goto fail; \
+	} \
+} while (0)
+
+		/* Substep A: Self-attention */
+		SAM3_PROF_BEGIN(profiler, "dec_sa");
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+		DEC_BATCHED_WRAP_INPUTS();
+		q_out = sam3_decoder_build_sa_batched(
+			&model->decoder, li, &g, q_in, qpos_in, scratch);
+		if (!q_out) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		err = dec_be->ops->graph_eval(dec_be, &g);
+		if (err != SAM3_OK) goto fail;
+		memcpy(q_buf, q_out->data,
+		       (size_t)B * nq * d * sizeof(float));
+		SAM3_PROF_END(profiler, "dec_sa");
+
+		/* Substep B: Text cross-attention */
+		SAM3_PROF_BEGIN(profiler, "dec_tca");
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+		DEC_BATCHED_WRAP_INPUTS();
+		q_out = sam3_decoder_build_tca_batched(
+			&model->decoder, li, &g, q_in, qpos_in, txt_wrap,
+			scratch);
+		if (!q_out) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		err = dec_be->ops->graph_eval(dec_be, &g);
+		if (err != SAM3_OK) goto fail;
+		memcpy(q_buf, q_out->data,
+		       (size_t)B * nq * d * sizeof(float));
+		SAM3_PROF_END(profiler, "dec_tca");
+
+		/* Substep C: Vision cross-attention with boxRPB */
+		SAM3_PROF_BEGIN(profiler, "dec_rpb");
+		sam3_decoder_compute_rpb_batched(&model->decoder,
+						   ref_boxes,
+						   B, pe_H, pe_W, rpb_buf);
+		SAM3_PROF_END(profiler, "dec_rpb");
+
+		SAM3_PROF_BEGIN(profiler, "dec_ca");
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+		DEC_BATCHED_WRAP_INPUTS();
+		struct sam3_tensor *rpb_wrap;
+		rpb_wrap = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+					   4, rpb_dims, rpb_buf);
+		if (!rpb_wrap) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		q_out = sam3_decoder_build_ca_batched(
+			&model->decoder, li, &g, q_in, qpos_in,
+			enc_wrap, enc_pos_wrap, rpb_wrap, scratch);
+		if (!q_out) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		err = dec_be->ops->graph_eval(dec_be, &g);
+		if (err != SAM3_OK) goto fail;
+		memcpy(q_buf, q_out->data,
+		       (size_t)B * nq * d * sizeof(float));
+		SAM3_PROF_END(profiler, "dec_ca");
+
+		/* Substep D: FFN */
+		SAM3_PROF_BEGIN(profiler, "dec_ffn");
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+		DEC_BATCHED_WRAP_INPUTS();
+		q_out = sam3_decoder_build_ffn_batched(
+			&model->decoder, li, &g, q_in, scratch);
+		if (!q_out) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		err = dec_be->ops->graph_eval(dec_be, &g);
+		if (err != SAM3_OK) goto fail;
+		memcpy(q_buf, q_out->data,
+		       (size_t)B * nq * d * sizeof(float));
+		SAM3_PROF_END(profiler, "dec_ffn");
+
+#undef DEC_BATCHED_WRAP_INPUTS
+
+		/* Box refinement + query_pos update between layers. */
+		SAM3_PROF_BEGIN(profiler, "dec_box_refine");
+		cpu_box_refine_batched(q_buf, &model->decoder,
+					ref_boxes, B, nq, d,
+					br_tmp1, br_tmp2);
+		SAM3_PROF_END(profiler, "dec_box_refine");
+
+		if (li < model->decoder.n_layers - 1) {
+			DEC_BE_ARENA_RESET();
+			sam3_arena_reset(scratch);
+			sam3_graph_init(&g);
+
+			struct sam3_tensor *qpos;
+			qpos = sam3_decoder_compute_query_pos_batched(
+				&model->decoder, &g, scratch,
+				ref_boxes, B);
+			if (!qpos) {
+				sam3_log_error("segment_batched: qpos "
+					       "rebuild failed at layer %d",
+					       li);
+				err = SAM3_ENOMEM;
+				goto fail;
+			}
+
+			err = dec_be->ops->graph_eval(dec_be, &g);
+			if (err != SAM3_OK) {
+				sam3_log_error("segment_batched: qpos eval "
+					       "failed at layer %d: %d",
+					       li, err);
+				goto fail;
+			}
+
+			memcpy(qpos_buf, qpos->data,
+			       (size_t)B * nq * d * sizeof(float));
+		}
+	}
+
+	/* Final output layernorm. */
+	struct sam3_tensor *queries;
+	{
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *q_final;
+		q_final = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
+					  3, q_dims, q_buf);
+		if (!q_final) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		queries = sam3_decoder_build_final_batched(
+			&model->decoder, &g, q_final, scratch);
+		if (!queries) {
+			sam3_log_error("segment_batched: dec final ln failed");
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = dec_be->ops->graph_eval(dec_be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: dec final eval "
+				       "failed");
+			goto fail;
+		}
+
+		queries = persist_tensor(persist, queries);
+		if (!queries) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+	}
+
+	SAM3_PROF_END(profiler, "decoder");
+
+	/*
+	 * Stage 4: batched seg head — prompt cross-attn -> FPN + inst_proj
+	 * -> mask embed MLP -> dot-product mask logits.
+	 */
+	SAM3_PROF_BEGIN(profiler, "seg_head");
+
+	/* Stage 4a: Prompt cross-attention (only if context present). */
+	struct sam3_tensor *seg_enc = fused_stacked;
+	if (has_context) {
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *enc_wrap;
+		struct sam3_tensor *txt_wrap;
+		enc_wrap = gh_tensor_wrap(scratch, fused_stacked->dtype,
+					   3, fs_dims, fused_stacked->data);
+		txt_wrap = gh_tensor_wrap(scratch, context_stacked->dtype,
+					   3, ctx_dims,
+					   context_stacked->data);
+		if (!enc_wrap || !txt_wrap) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		seg_enc = sam3_seg_head_build_cross_attn_batched(
+			&model->seg_head, &g, enc_wrap, txt_wrap, scratch);
+		if (!seg_enc) {
+			sam3_log_error("segment_batched: cross-attn build "
+				       "failed");
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: cross-attn eval "
+				       "failed: %d", err);
+			goto fail;
+		}
+
+		seg_enc = persist_tensor(persist, seg_enc);
+		if (!seg_enc) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+	}
+
+	/*
+	 * Reshape seg_enc [B, n_pixels, d] -> NHWC [B, H, W, d].
+	 * NHWC row-major layout matches (B, h*W + w, d), so this is a
+	 * pure view change.
+	 */
+	int nhwc_dims[] = {B, pe_H, pe_W, d};
+	struct sam3_tensor *enc_nhwc;
+	sam3_arena_reset(scratch);
+	sam3_graph_init(&g);
+	enc_nhwc = gh_tensor_wrap(scratch, seg_enc->dtype,
+				   4, nhwc_dims, seg_enc->data);
+	if (!enc_nhwc) {
+		err = SAM3_ENOMEM;
+		goto fail;
+	}
+
+	/* Broadcast shared image features to [B, H, W, d]. */
+	struct sam3_tensor *feat_2x_b;
+	struct sam3_tensor *feat_4x_b;
+	feat_2x_b = gh_broadcast_batch(scratch, model->cached_feat_s0_nhwc,
+					B);
+	feat_4x_b = gh_broadcast_batch(scratch, model->cached_feat_4x_nhwc,
+					B);
+	if (!feat_2x_b || !feat_4x_b) {
+		sam3_log_error("segment_batched: feature broadcast failed");
+		err = SAM3_ENOMEM;
+		goto fail;
+	}
+
+	/* Stage 4b+c: FPN pixel decoder + 1x1 instance projection. */
+	struct sam3_tensor *inst;
+	{
+		inst = sam3_seg_head_build_fpn_batched(
+			&model->seg_head, &g, enc_nhwc,
+			feat_2x_b, feat_4x_b, scratch);
+		if (!inst) {
+			sam3_log_error("segment_batched: FPN build failed");
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: FPN eval failed");
+			goto fail;
+		}
+
+		inst = persist_tensor(persist, inst);
+		if (!inst) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+	}
+
+	/* Stage 4d: Mask embedder MLP on queries. */
+	struct sam3_tensor *mask_embed;
+	{
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *q_wrap;
+		q_wrap = gh_tensor_wrap(scratch, queries->dtype,
+					 queries->n_dims, queries->dims,
+					 queries->data);
+		if (!q_wrap) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		mask_embed = sam3_seg_head_build_mask_embed_batched(
+			&model->seg_head, &g, q_wrap, scratch);
+		if (!mask_embed) {
+			sam3_log_error("segment_batched: mask MLP failed");
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: mask MLP eval "
+				       "failed");
+			goto fail;
+		}
+
+		mask_embed = persist_tensor(persist, mask_embed);
+		if (!mask_embed) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+	}
+
+	/* Stage 4e: Dot-product mask logits. */
+	struct sam3_tensor *masks;
+	{
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *me_wrap;
+		struct sam3_tensor *inst_wrap;
+		me_wrap = gh_tensor_wrap(scratch, mask_embed->dtype,
+					  mask_embed->n_dims,
+					  mask_embed->dims,
+					  mask_embed->data);
+		inst_wrap = gh_tensor_wrap(scratch, inst->dtype,
+					    inst->n_dims, inst->dims,
+					    inst->data);
+		if (!me_wrap || !inst_wrap) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		masks = sam3_seg_head_build_mask_logits_batched(
+			&g, me_wrap, inst_wrap, scratch);
+		if (!masks) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = be->ops->graph_eval(be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: mask logits eval "
+				       "failed");
+			goto fail;
+		}
+	}
+
+	if (masks->n_dims != 4 || masks->dims[0] != B ||
+	    masks->dims[1] != nq || masks->dims[2] != mh ||
+	    masks->dims[3] != mw) {
+		sam3_log_error("segment_batched: mask shape mismatch");
+		err = SAM3_EINVAL;
+		goto fail;
+	}
+	memcpy(batched_masks->data, masks->data,
+	       (size_t)B * nq * mh * mw * sizeof(float));
+
+	/* Stage 4f: Objectness scorer (only if context present). */
+	if (has_context && batched_scores) {
+		DEC_BE_ARENA_RESET();
+		sam3_arena_reset(scratch);
+		sam3_graph_init(&g);
+
+		struct sam3_tensor *q_wrap;
+		struct sam3_tensor *ctx_wrap;
+		q_wrap = gh_tensor_wrap(scratch, queries->dtype,
+					 queries->n_dims, queries->dims,
+					 queries->data);
+		ctx_wrap = gh_tensor_wrap(scratch, context_stacked->dtype,
+					   3, ctx_dims,
+					   context_stacked->data);
+		if (!q_wrap || !ctx_wrap) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		struct sam3_tensor *scores;
+		scores = sam3_dot_scorer_build_batched(
+			&model->scorer, &g, q_wrap, ctx_wrap, scratch);
+		if (!scores) {
+			sam3_log_error("segment_batched: scorer build failed");
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+
+		err = dec_be->ops->graph_eval(dec_be, &g);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: scorer eval failed");
+			goto fail;
+		}
+
+		if (scores->n_dims != 3 || scores->dims[0] != B ||
+		    scores->dims[1] != nq || scores->dims[2] != 1) {
+			sam3_log_error("segment_batched: score shape "
+				       "mismatch");
+			err = SAM3_EINVAL;
+			goto fail;
+		}
+
+		memcpy(batched_scores->data, scores->data,
+		       (size_t)B * nq * sizeof(float));
+	}
+
+	SAM3_PROF_END(profiler, "seg_head");
+
 	*out_masks = batched_masks;
 	if (out_scores)
 		*out_scores = batched_scores;
@@ -3348,4 +3970,6 @@ enum sam3_error sam3_image_model_segment_batched(
 fail:
 	persist->offset = outer_save;
 	return err;
+
+#undef DEC_BE_ARENA_RESET
 }
