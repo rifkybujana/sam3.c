@@ -346,4 +346,63 @@ struct sam3_tensor *sam3_decoder_build_ffn(
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_arena *arena);
 
+/*
+ * sam3_decoder_build_ffn_batched - Batched decoder FFN substep.
+ *
+ * gh_mlp + gh_add + gh_layernorm; all batch-transparent. Input/output
+ * is [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_ffn_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_final_batched - Batched output layernorm.
+ *
+ * Trivial rank-3 wrapper around gh_layernorm using output_ln weights.
+ * Input/output is [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_final_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_layer_batched - Compose one batched decoder layer.
+ *
+ * Runs SA -> TCA -> CA -> FFN using the _batched substep builders.
+ * Same param semantics as sam3_decoder_build_layer but every tensor
+ * carries a leading batch dim B. Takes @rpb_mask directly instead of
+ * the 2D version's boxes pointer-to-pointer; the caller (Task 14's
+ * decoder loop) is responsible for running cpu_box_refine_batched +
+ * sam3_decoder_compute_query_pos_batched + sam3_decoder_compute_rpb_batched
+ * between layers — this builder does not update box state.
+ *
+ * @dec:           Decoder
+ * @layer_idx:     Which layer's weights to use
+ * @g:             Graph
+ * @q:             [B, n_q, d_model]
+ * @query_pos:     [B, n_q, d_model]
+ * @enc_features:  [B, n_kv, d_model]
+ * @enc_pos:       [n_kv, d_model] or [B, n_kv, d_model] or NULL
+ * @text_features: [B, n_text, d_model] or NULL
+ * @rpb_mask:      [B, n_heads, n_q, n_kv] or NULL
+ * @arena:         Arena
+ *
+ * Returns updated queries [B, n_queries, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_decoder_build_layer_batched(
+	struct sam3_decoder *dec,
+	int layer_idx,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features,
+	struct sam3_tensor *enc_pos,
+	struct sam3_tensor *text_features,
+	struct sam3_tensor *rpb_mask,
+	struct sam3_arena *arena);
+
 #endif /* SAM3_MODEL_DECODER_H */

@@ -1992,6 +1992,71 @@ struct sam3_tensor *sam3_decoder_build_ffn(
 	return q;
 }
 
+struct sam3_tensor *sam3_decoder_build_ffn_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_arena *arena)
+{
+	int i = layer_idx;
+
+	struct sam3_tensor *ff = gh_mlp(g, arena, q,
+					 dec->layers[i].ffn_fc1_w,
+					 dec->layers[i].ffn_fc1_b,
+					 dec->layers[i].ffn_fc2_w,
+					 dec->layers[i].ffn_fc2_b,
+					 SAM3_OP_RELU);
+	if (!ff)
+		return NULL;
+
+	q = gh_add(g, arena, q, ff);
+	if (!q)
+		return NULL;
+	return gh_layernorm(g, arena, q,
+			    dec->layers[i].ffn_ln_w,
+			    dec->layers[i].ffn_ln_b);
+}
+
+struct sam3_tensor *sam3_decoder_build_final_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_arena *arena)
+{
+	return gh_layernorm(g, arena, q,
+			    dec->output_ln_w, dec->output_ln_b);
+}
+
+struct sam3_tensor *sam3_decoder_build_layer_batched(
+	struct sam3_decoder *dec,
+	int layer_idx,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features,
+	struct sam3_tensor *enc_pos,
+	struct sam3_tensor *text_features,
+	struct sam3_tensor *rpb_mask,
+	struct sam3_arena *arena)
+{
+	q = sam3_decoder_build_sa_batched(dec, layer_idx, g, q, query_pos,
+					   arena);
+	if (!q)
+		return NULL;
+
+	q = sam3_decoder_build_tca_batched(dec, layer_idx, g, q, query_pos,
+					    text_features, arena);
+	if (!q)
+		return NULL;
+
+	q = sam3_decoder_build_ca_batched(dec, layer_idx, g, q, query_pos,
+					   enc_features, enc_pos, rpb_mask,
+					   arena);
+	if (!q)
+		return NULL;
+
+	return sam3_decoder_build_ffn_batched(dec, layer_idx, g, q, arena);
+}
+
 struct sam3_tensor *sam3_decoder_build(
 	struct sam3_decoder *dec,
 	struct sam3_graph *g,
