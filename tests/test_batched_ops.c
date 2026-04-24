@@ -161,8 +161,107 @@ static void test_scorer_batched_equals_per_slot(void)
 	run_both_backends(scorer_batched_case);
 }
 
+/*
+ * sdpa_4d_batch_case - Derisk the Metal 4D SDPA batching path.
+ *
+ * The batched decoder (Tasks 11-13) reshapes each per-head attention
+ * slice from [nq, hd] to [B, 1, nq, hd] to reuse the existing 4D SDPA
+ * path. This smoke test validates that both CPU and Metal SDPA accept
+ * B > 1 with a leading-1 head dim and produce per-slot-equivalent
+ * output. A failure here would force a decoder-batching strategy pivot
+ * before sinking time into Tasks 11-13.
+ */
+static void sdpa_4d_batch_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int nkv = 5;
+	const int hd = 8;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	int q_dims[] = {B, 1, nq, hd};
+	int k_dims[] = {B, 1, nkv, hd};
+	struct sam3_tensor *Qb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, q_dims);
+	struct sam3_tensor *Kb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k_dims);
+	struct sam3_tensor *Vb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k_dims);
+	ASSERT_NOT_NULL(Qb);
+	ASSERT_NOT_NULL(Kb);
+	ASSERT_NOT_NULL(Vb);
+	for (int i = 0; i < B * nq * hd; i++)
+		((float *)Qb->data)[i] = (float)((i * 7 + 3) % 23) * 0.13f;
+	for (int i = 0; i < B * nkv * hd; i++) {
+		((float *)Kb->data)[i] = (float)((i * 11 + 5) % 19) * 0.09f;
+		((float *)Vb->data)[i] = (float)((i * 13 + 7) % 17) * 0.11f;
+	}
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = gh_sdpa(&g, &ar, Qb, Kb, Vb, NULL, hd);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 4);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], 1);
+	ASSERT_EQ(outb->dims[2], nq);
+	ASSERT_EQ(outb->dims[3], hd);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {1, 1, nq, hd};
+		int k1_dims[] = {1, 1, nkv, hd};
+		struct sam3_tensor *Q1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, q1_dims);
+		struct sam3_tensor *K1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k1_dims);
+		struct sam3_tensor *V1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k1_dims);
+		ASSERT_NOT_NULL(Q1);
+		ASSERT_NOT_NULL(K1);
+		ASSERT_NOT_NULL(V1);
+		memcpy(Q1->data,
+		       (char *)Qb->data + (size_t)b * nq * hd * sizeof(float),
+		       (size_t)nq * hd * sizeof(float));
+		memcpy(K1->data,
+		       (char *)Kb->data + (size_t)b * nkv * hd * sizeof(float),
+		       (size_t)nkv * hd * sizeof(float));
+		memcpy(V1->data,
+		       (char *)Vb->data + (size_t)b * nkv * hd * sizeof(float),
+		       (size_t)nkv * hd * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = gh_sdpa(&g1, &ar, Q1, K1, V1, NULL, hd);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * hd;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * hd; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr, "FAIL [%s sdpa] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_sdpa_4d_batch_equals_per_slot(void)
+{
+	run_both_backends(sdpa_4d_batch_case);
+}
+
 int main(void)
 {
 	test_scorer_batched_equals_per_slot();
+	test_sdpa_4d_batch_equals_per_slot();
 	TEST_REPORT();
 }
