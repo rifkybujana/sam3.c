@@ -18,6 +18,8 @@
 
 #include "test_helpers.h"
 
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -43,8 +45,28 @@ static void fill_deterministic(uint8_t *pix, int sz)
 		pix[i] = (uint8_t)((i * 31 + 17) & 0xff);
 }
 
-static void assert_results_byte_exact(const struct sam3_result *a,
-				       const struct sam3_result *b)
+/*
+ * assert_results_close - Compare two sam3_results with per-tensor
+ * Metal tolerance. Metal float reassociation between the single-slot
+ * segment path and the batched-driver path produces ULP-level
+ * differences at the mask/score outputs, even when each batched op
+ * is byte-exact at its own unit test.
+ *
+ * Tolerance is split by internal dtype:
+ *   - mask logits run F16 end-to-end on Metal; accumulated
+ *     reassociation reaches ~1 F16 ULP. F16 ULP at magnitude M is
+ *     2^(floor(log2(M))-10); at M=8 that is 0.0078. rtol=2e-3
+ *     atol=5e-3 covers 1 ULP up to M~32 with margin, and beyond
+ *     that rtol*M dominates, still within noise.
+ *   - iou_scores and boxes are F32 end-to-end; hold them to the
+ *     per-op Metal tolerance used across the batched unit tests.
+ *
+ * Each tensor is checked element-wise but reported as one assert per
+ * tensor (early-exit on first divergence) to keep the test count
+ * comparable to the previous memcmp-based helper.
+ */
+static void assert_results_close(const struct sam3_result *a,
+				 const struct sam3_result *b)
 {
 	ASSERT_EQ(a->n_masks,      b->n_masks);
 	ASSERT_EQ(a->mask_height,  b->mask_height);
@@ -53,15 +75,84 @@ static void assert_results_byte_exact(const struct sam3_result *a,
 	ASSERT_EQ(a->boxes_valid,  b->boxes_valid);
 	ASSERT_EQ(a->best_mask,    b->best_mask);
 
+	const float mask_rtol = 2e-3f;
+	const float mask_atol = 5e-3f;
+	const float fp32_rtol = 1e-4f;
+	const float fp32_atol = 1e-5f;
+
+	const float *am = (const float *)a->masks;
+	const float *bm = (const float *)b->masks;
 	size_t mn = (size_t)a->n_masks * a->mask_height * a->mask_width;
-	ASSERT_EQ(memcmp(a->masks, b->masks, mn * sizeof(float)), 0);
-	ASSERT_EQ(memcmp(a->iou_scores, b->iou_scores,
-			 (size_t)a->n_masks * sizeof(float)),
-		  0);
-	if (a->boxes_valid)
-		ASSERT_EQ(memcmp(a->boxes, b->boxes,
-				 (size_t)a->n_masks * 4 * sizeof(float)),
-			  0);
+	int mask_fail = 0;
+	size_t fail_idx = 0;
+	float fail_a = 0.f, fail_b = 0.f;
+	for (size_t i = 0; i < mn; i++) {
+		float tol = mask_atol + mask_rtol * fabsf(bm[i]);
+		if (fabsf(am[i] - bm[i]) > tol) {
+			mask_fail = 1;
+			fail_idx = i;
+			fail_a = am[i];
+			fail_b = bm[i];
+			break;
+		}
+	}
+	if (mask_fail) {
+		fprintf(stderr,
+			"FAIL %s:%d: masks tolerance at idx %zu: "
+			"a=%.6f b=%.6f\n",
+			__FILE__, __LINE__, fail_idx,
+			(double)fail_a, (double)fail_b);
+		tests_failed++;
+	}
+	tests_run++;
+
+	int iou_fail = 0;
+	int iou_fail_i = 0;
+	float iou_a = 0.f, iou_b = 0.f;
+	for (int i = 0; i < a->n_masks; i++) {
+		float tol = fp32_atol + fp32_rtol * fabsf(b->iou_scores[i]);
+		if (fabsf(a->iou_scores[i] - b->iou_scores[i]) > tol) {
+			iou_fail = 1;
+			iou_fail_i = i;
+			iou_a = a->iou_scores[i];
+			iou_b = b->iou_scores[i];
+			break;
+		}
+	}
+	if (iou_fail) {
+		fprintf(stderr,
+			"FAIL %s:%d: iou_scores tolerance at idx %d: "
+			"a=%.6f b=%.6f\n",
+			__FILE__, __LINE__, iou_fail_i,
+			(double)iou_a, (double)iou_b);
+		tests_failed++;
+	}
+	tests_run++;
+
+	if (a->boxes_valid) {
+		int box_fail = 0;
+		int box_fail_i = 0;
+		float box_a = 0.f, box_b = 0.f;
+		for (int i = 0; i < a->n_masks * 4; i++) {
+			float tol = fp32_atol + fp32_rtol * fabsf(b->boxes[i]);
+			if (fabsf(a->boxes[i] - b->boxes[i]) > tol) {
+				box_fail = 1;
+				box_fail_i = i;
+				box_a = a->boxes[i];
+				box_b = b->boxes[i];
+				break;
+			}
+		}
+		if (box_fail) {
+			fprintf(stderr,
+				"FAIL %s:%d: boxes tolerance at idx %d: "
+				"a=%.6f b=%.6f\n",
+				__FILE__, __LINE__, box_fail_i,
+				(double)box_a, (double)box_b);
+			tests_failed++;
+		}
+		tests_run++;
+	}
 }
 
 /*
@@ -100,7 +191,7 @@ static void test_batch_vs_single_identical_sets(void)
 	ASSERT_EQ(sam3_segment_batch(ctx, sets, 3, batch), SAM3_OK);
 
 	for (int i = 0; i < 3; i++)
-		assert_results_byte_exact(&refs[i], &batch[i]);
+		assert_results_close(&refs[i], &batch[i]);
 
 	for (int i = 0; i < 3; i++) {
 		sam3_result_free(&refs[i]);
@@ -145,8 +236,8 @@ static void test_batch_vs_single_different_sets(void)
 	struct sam3_result batch[2] = {0};
 	ASSERT_EQ(sam3_segment_batch(ctx, sets, 2, batch), SAM3_OK);
 
-	assert_results_byte_exact(&ref_a, &batch[0]);
-	assert_results_byte_exact(&ref_b, &batch[1]);
+	assert_results_close(&ref_a, &batch[0]);
+	assert_results_close(&ref_b, &batch[1]);
 
 	sam3_result_free(&ref_a);
 	sam3_result_free(&ref_b);

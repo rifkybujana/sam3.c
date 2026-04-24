@@ -1525,14 +1525,223 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 			   /* use_async_text= */ 1);
 }
 
+/*
+ * prepare_set_inputs - Produce prompt_tokens and text_features for one
+ * prompt set without running the image model. The tensors are
+ * persist-allocated (proc->model_arena) so they survive across sets in
+ * a batch.
+ *
+ * Either @out_prompt or @out_text may be written as NULL: NULL means
+ * "this set has no geometric (or text) prompts". The existing inline
+ * text path in segment_one injects a dummy "visual" text for pure
+ * geometric sets; this helper mirrors that behavior.
+ *
+ * Returns SAM3_OK on success. On failure the caller is expected to
+ * roll back proc->model_arena.
+ */
+static enum sam3_error prepare_set_inputs(
+	struct sam3_processor *proc,
+	const struct sam3_prompt *prompts, int n_prompts,
+	struct sam3_tensor **out_prompt,
+	struct sam3_tensor **out_text)
+{
+	struct sam3_tensor *prompt_tokens = NULL;
+	struct sam3_tensor *text_features = NULL;
+	const char *text;
+	int n_points, n_boxes;
+
+	*out_prompt = NULL;
+	*out_text = NULL;
+
+	text = find_text_prompt(prompts, n_prompts);
+	if (!text) {
+		count_prompts_by_type(prompts, n_prompts,
+				      &n_points, &n_boxes);
+		if (n_points > 0 || n_boxes > 0) {
+			text = "visual";
+			sam3_log_info("segment_batch: injecting dummy text "
+				      "\"visual\" for geometric prompts");
+		}
+	}
+
+	/* Stage A: Text encode (inline, on main backend). */
+	if (text) {
+		struct sam3_text_encoder_iface *te_iface =
+			&proc->model.backbone.text_iface;
+		int ctx = te_iface->ctx_len;
+		int32_t tokens[SAM3_TOKENIZER_CONTEXT_LEN];
+		int n_tokens;
+		struct sam3_tensor *tok_tensor;
+		int tok_dims[1];
+
+		SAM3_PROF_BEGIN(proc->profiler, "tokenize");
+		n_tokens = sam3_tokenizer_encode(
+			&proc->model.backbone.tokenizer, text,
+			tokens, ctx);
+		SAM3_PROF_END(proc->profiler, "tokenize");
+		if (n_tokens <= 0) {
+			sam3_log_error("segment_batch: tokenize failed");
+			return SAM3_EINVAL;
+		}
+
+		tok_dims[0] = ctx;
+		sam3_arena_reset(&proc->scratch_arena);
+		tok_tensor = gh_alloc_tensor(&proc->model_arena,
+					      SAM3_DTYPE_I32, 1, tok_dims);
+		if (!tok_tensor)
+			return SAM3_ENOMEM;
+		memcpy(tok_tensor->data, tokens,
+		       (size_t)ctx * sizeof(int32_t));
+
+		SAM3_PROF_BEGIN(proc->profiler, "text_blocks");
+		text_features = te_iface->ops->build_perblock(
+			te_iface, proc->backend, tok_tensor,
+			&proc->scratch_arena, &proc->model_arena);
+		SAM3_PROF_END(proc->profiler, "text_blocks");
+		if (!text_features) {
+			sam3_log_error("segment_batch: text encode "
+				       "perblock failed");
+			return SAM3_ENOMEM;
+		}
+
+		/*
+		 * Truncate to real (non-padding) tokens. Mirrors segment_one:
+		 * softmax over non-masked tokens equals softmax over truncated
+		 * set, so dropping padding is safe and keeps shapes tight.
+		 */
+		if (text_features->dims[0] > n_tokens) {
+			int d = text_features->dims[1];
+			int trunc_dims[2] = {n_tokens, d};
+			struct sam3_tensor *trunc;
+
+			trunc = gh_alloc_tensor(&proc->model_arena,
+						 SAM3_DTYPE_F32, 2,
+						 trunc_dims);
+			if (!trunc)
+				return SAM3_ENOMEM;
+			memcpy(trunc->data, text_features->data,
+			       (size_t)n_tokens * (size_t)d * sizeof(float));
+			text_features = trunc;
+		}
+	}
+
+	/* Stage B: Project geometric prompts (CPU, on model_arena). */
+	count_prompts_by_type(prompts, n_prompts, &n_points, &n_boxes);
+	if (n_points > 0 || n_boxes > 0) {
+		SAM3_PROF_BEGIN(proc->profiler, "prompt_project");
+		prompt_tokens = sam3_project_prompts(
+			&proc->model,
+			proc->model.cached_feat_s1_nhwc,
+			prompts, n_prompts,
+			proc->prompt_w, proc->prompt_h,
+			&proc->model_arena);
+		SAM3_PROF_END(proc->profiler, "prompt_project");
+		if (!prompt_tokens)
+			return SAM3_ENOMEM;
+	}
+
+	if (!prompt_tokens && !text_features)
+		return SAM3_EINVAL;
+
+	*out_prompt = prompt_tokens;
+	*out_text = text_features;
+	return SAM3_OK;
+}
+
+/*
+ * extract_result_slot - Populate results[i] from the i-th slot of the
+ * stacked mask/score tensors produced by sam3_image_model_segment_batched.
+ *
+ * Mirrors the postprocessing tail of segment_one (mask malloc, iou sigmoid,
+ * stability mask selection, masks-to-boxes). The only difference is where
+ * we read the per-slot data from.
+ */
+static enum sam3_error extract_result_slot(
+	struct sam3_result *result,
+	const struct sam3_tensor *batched_masks,
+	const struct sam3_tensor *batched_scores,
+	int slot_idx)
+{
+	int nq = batched_masks->dims[1];
+	int H = batched_masks->dims[2];
+	int W = batched_masks->dims[3];
+	size_t mask_bytes = (size_t)nq * (size_t)H * (size_t)W *
+			    sizeof(float);
+	const float *mask_src = (const float *)batched_masks->data +
+				 (size_t)slot_idx * nq * H * W;
+
+	memset(result, 0, sizeof(*result));
+	result->n_masks = nq;
+	result->mask_height = H;
+	result->mask_width = W;
+
+	result->masks = malloc(mask_bytes);
+	if (!result->masks)
+		return SAM3_ENOMEM;
+	memcpy(result->masks, mask_src, mask_bytes);
+
+	result->iou_scores = calloc((size_t)nq, sizeof(float));
+	if (!result->iou_scores) {
+		free(result->masks);
+		result->masks = NULL;
+		return SAM3_ENOMEM;
+	}
+
+	if (batched_scores) {
+		const float *sdata = (const float *)batched_scores->data +
+				      (size_t)slot_idx * nq;
+		for (int i = 0; i < nq; i++)
+			result->iou_scores[i] = 1.0f /
+				(1.0f + expf(-sdata[i]));
+		result->iou_valid = 1;
+	} else {
+		result->iou_valid = 0;
+	}
+
+	result->best_mask = -1;
+	if (result->n_masks > 1 &&
+	    result->n_masks <= SAM3_MASK_DEC_MASKS &&
+	    result->iou_valid) {
+		result->best_mask = sam3_mask_select_best(
+			result->masks, result->iou_scores,
+			result->n_masks,
+			result->mask_height, result->mask_width,
+			SAM3_STABILITY_DELTA,
+			SAM3_STABILITY_THRESH);
+	}
+
+	result->boxes = calloc((size_t)result->n_masks * 4, sizeof(float));
+	if (result->boxes) {
+		sam3_masks_to_boxes(result->masks, result->n_masks,
+				    result->mask_height, result->mask_width,
+				    result->boxes);
+		result->boxes_valid = 1;
+	} else {
+		result->boxes_valid = 0;
+	}
+
+	return SAM3_OK;
+}
+
 enum sam3_error sam3_processor_segment_batch(
 	struct sam3_processor *proc,
 	const struct sam3_prompt_set *sets,
 	int n_sets,
 	struct sam3_result *results)
 {
-	int i;
+	int i, j;
 	enum sam3_error err;
+	size_t persist_save;
+	struct sam3_tensor **per_set_prompt = NULL;
+	struct sam3_tensor **per_set_text = NULL;
+	struct sam3_tensor *prompt_stacked = NULL;
+	struct sam3_tensor *text_stacked = NULL;
+	struct sam3_tensor *batched_masks = NULL;
+	struct sam3_tensor *batched_scores = NULL;
+	int all_prompt_compat = 1, all_text_compat = 1;
+	int ref_prompt_len = -1, ref_text_len = -1;
+	int ref_text_d = -1;
+	int d_model;
 
 	if (!proc || !sets || n_sets <= 0 || !results)
 		return SAM3_EINVAL;
@@ -1564,23 +1773,220 @@ enum sam3_error sam3_processor_segment_batch(
 	proc->text_cached_bundle = NULL;
 	proc->text_worker_slot = -1;
 
-	for (i = 0; i < n_sets; i++) {
-		err = segment_one(proc, sets[i].prompts, sets[i].n_prompts,
-				  &results[i], /* use_async_text= */ 0);
+	/* Single-set shortcut: go straight to segment_one — the batched
+	 * driver at B=1 would just do extra memcpys. segment_one is the
+	 * byte-exact parity reference. */
+	if (n_sets == 1) {
+		err = segment_one(proc, sets[0].prompts, sets[0].n_prompts,
+				  &results[0], /* use_async_text= */ 0);
 		if (err != SAM3_OK) {
-			int j;
-			sam3_log_error("segment_batch: set %d/%d failed: %d",
-				       i + 1, n_sets, err);
+			memset(results, 0, sizeof(results[0]));
+			return err;
+		}
+		sam3_log_info("segment_batch: 1 set completed");
+		return SAM3_OK;
+	}
+
+	d_model = proc->model.decoder.d_model;
+	persist_save = proc->model_arena.offset;
+
+	/*
+	 * Phase 1: per-set prompt + text encoding. Collect tensors and
+	 * detect shape compatibility (same N+1, same trimmed seq).
+	 */
+	per_set_prompt = sam3_arena_alloc(&proc->model_arena,
+					   (size_t)n_sets *
+						   sizeof(*per_set_prompt));
+	per_set_text = sam3_arena_alloc(&proc->model_arena,
+					 (size_t)n_sets *
+						 sizeof(*per_set_text));
+	if (!per_set_prompt || !per_set_text) {
+		err = SAM3_ENOMEM;
+		goto fail;
+	}
+	memset(per_set_prompt, 0, (size_t)n_sets * sizeof(*per_set_prompt));
+	memset(per_set_text, 0, (size_t)n_sets * sizeof(*per_set_text));
+
+	for (i = 0; i < n_sets; i++) {
+		err = prepare_set_inputs(proc,
+					 sets[i].prompts, sets[i].n_prompts,
+					 &per_set_prompt[i],
+					 &per_set_text[i]);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batch: prepare set %d/%d "
+				       "failed: %d", i + 1, n_sets, err);
+			goto fail;
+		}
+
+		/* Shape compat: prompt_tokens are [N+1, d]. */
+		if (per_set_prompt[i]) {
+			int len = per_set_prompt[i]->dims[0];
+			if (ref_prompt_len < 0) {
+				ref_prompt_len = len;
+				/* If first present set is not slot 0, earlier
+				 * slots were NULL — mixed present/absent. */
+				if (i > 0)
+					all_prompt_compat = 0;
+			} else if (ref_prompt_len != len) {
+				all_prompt_compat = 0;
+			}
+		} else if (ref_prompt_len >= 0) {
+			all_prompt_compat = 0;  /* mixed present/absent */
+		}
+
+		/* Shape compat: text_features are [seq, d_text]. */
+		if (per_set_text[i]) {
+			int len = per_set_text[i]->dims[0];
+			int d = per_set_text[i]->dims[1];
+			if (ref_text_len < 0) {
+				ref_text_len = len;
+				ref_text_d = d;
+				if (i > 0)
+					all_text_compat = 0;
+			} else if (ref_text_len != len || ref_text_d != d) {
+				all_text_compat = 0;
+			}
+		} else if (ref_text_len >= 0) {
+			all_text_compat = 0;
+		}
+	}
+
+	/*
+	 * Phase 2: dispatch. If shapes don't line up across sets, fall
+	 * back to the serial per-set loop. The serial path is the same
+	 * reference used by test_segment_batch_parity.
+	 */
+	if (!all_prompt_compat || !all_text_compat) {
+		sam3_log_info("segment_batch: serial fallback "
+			      "(n_sets=%d prompt_compat=%d text_compat=%d)",
+			      n_sets, all_prompt_compat, all_text_compat);
+
+		/* Roll back prepare_set_inputs allocations; segment_one
+		 * will redo them cleanly per set. */
+		proc->model_arena.offset = persist_save;
+
+		for (i = 0; i < n_sets; i++) {
+			err = segment_one(proc, sets[i].prompts,
+					  sets[i].n_prompts, &results[i],
+					  /* use_async_text= */ 0);
+			if (err != SAM3_OK) {
+				sam3_log_error("segment_batch: set %d/%d "
+					       "failed: %d",
+					       i + 1, n_sets, err);
+				for (j = 0; j < i; j++)
+					sam3_result_free(&results[j]);
+				memset(results, 0,
+				       (size_t)n_sets * sizeof(results[0]));
+				return err;
+			}
+		}
+		sam3_log_info("segment_batch: %d sets completed (serial)",
+			      n_sets);
+		return SAM3_OK;
+	}
+
+	/*
+	 * Phase 3: stack per-set tensors along a new leading B dim.
+	 */
+	if (ref_prompt_len >= 0) {
+		int dims[3] = {n_sets, ref_prompt_len, d_model};
+		prompt_stacked = gh_alloc_tensor(&proc->model_arena,
+						  SAM3_DTYPE_F32, 3, dims);
+		if (!prompt_stacked) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		size_t per_slot_bytes = (size_t)ref_prompt_len *
+					 (size_t)d_model * sizeof(float);
+		for (i = 0; i < n_sets; i++)
+			memcpy((char *)prompt_stacked->data +
+				(size_t)i * per_slot_bytes,
+			       per_set_prompt[i]->data, per_slot_bytes);
+	}
+
+	if (ref_text_len >= 0) {
+		int dims[3] = {n_sets, ref_text_len, ref_text_d};
+		text_stacked = gh_alloc_tensor(&proc->model_arena,
+						SAM3_DTYPE_F32, 3, dims);
+		if (!text_stacked) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+		size_t per_slot_bytes = (size_t)ref_text_len *
+					 (size_t)ref_text_d * sizeof(float);
+		for (i = 0; i < n_sets; i++)
+			memcpy((char *)text_stacked->data +
+				(size_t)i * per_slot_bytes,
+			       per_set_text[i]->data, per_slot_bytes);
+	}
+
+	/*
+	 * Phase 4: single batched pipeline call.
+	 */
+	SAM3_PROF_BEGIN(proc->profiler, "mask_decode");
+	err = sam3_image_model_segment_batched(
+		&proc->model, proc->backend, proc->text_backend,
+		prompt_stacked, text_stacked, n_sets,
+		&proc->scratch_arena, &proc->model_arena,
+		&batched_masks, &batched_scores, proc->profiler);
+	SAM3_PROF_END(proc->profiler, "mask_decode");
+	if (err != SAM3_OK) {
+		sam3_log_error("segment_batch: batched pipeline failed: %d",
+			       err);
+		goto fail;
+	}
+
+	/*
+	 * Phase 5: unpack per-set results from the stacked outputs.
+	 */
+	SAM3_PROF_BEGIN(proc->profiler, "postprocess");
+	for (i = 0; i < n_sets; i++) {
+		err = extract_result_slot(&results[i], batched_masks,
+					   batched_scores, i);
+		if (err != SAM3_OK) {
 			for (j = 0; j < i; j++)
 				sam3_result_free(&results[j]);
 			memset(results, 0,
 			       (size_t)n_sets * sizeof(results[0]));
-			return err;
+			SAM3_PROF_END(proc->profiler, "postprocess");
+			goto fail;
+		}
+	}
+	SAM3_PROF_END(proc->profiler, "postprocess");
+
+	/* Phase 6: roll back inter-stage persist data and invalidate stale
+	 * backend cache entries for the freed arena region. */
+	{
+		size_t end_off = proc->model_arena.offset;
+		proc->model_arena.offset = persist_save;
+		if (end_off > persist_save &&
+		    proc->backend->ops->cache_invalidate) {
+			char *base = (char *)proc->model_arena.base;
+			proc->backend->ops->cache_invalidate(
+				proc->backend,
+				base + persist_save,
+				end_off - persist_save);
 		}
 	}
 
-	sam3_log_info("segment_batch: %d sets completed", n_sets);
+	sam3_log_info("segment_batch: %d sets completed (batched)", n_sets);
 	return SAM3_OK;
+
+fail:
+	{
+		size_t end_off = proc->model_arena.offset;
+		proc->model_arena.offset = persist_save;
+		if (end_off > persist_save &&
+		    proc->backend->ops->cache_invalidate) {
+			char *base = (char *)proc->model_arena.base;
+			proc->backend->ops->cache_invalidate(
+				proc->backend,
+				base + persist_save,
+				end_off - persist_save);
+		}
+	}
+	memset(results, 0, (size_t)n_sets * sizeof(results[0]));
+	return err;
 }
 
 void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which)
