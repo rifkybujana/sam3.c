@@ -185,6 +185,30 @@ struct sam3_tensor *sam3_decoder_compute_query_pos(
 	const float *ref_boxes);
 
 /*
+ * sam3_decoder_compute_query_pos_batched - Batched query_pos.
+ *
+ * Same as sam3_decoder_compute_query_pos but accepts [B, nq, 4]
+ * ref_boxes flat and returns [B, nq, d_model]. Sine embedding runs
+ * CPU-side for all slots into a [B, nq, 2*d] tensor, then the
+ * ref_point_head MLP (gh_linear + ReLU + gh_linear) runs on the
+ * batched tensor (batch-transparent).
+ *
+ * @dec:       Initialized and loaded decoder
+ * @g:         Graph to add ref_point_head nodes to
+ * @arena:     Arena for intermediate tensors
+ * @ref_boxes: [B * nq * 4] flat, sigmoid-ed cxcywh
+ * @B:         Batch size (>= 1)
+ *
+ * Returns [B, nq, d_model] query_pos, or NULL.
+ */
+struct sam3_tensor *sam3_decoder_compute_query_pos_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_arena *arena,
+	const float *ref_boxes,
+	int B);
+
+/*
  * sam3_decoder_build_final - Apply output layer norm after all layers.
  *
  * @dec:   Initialized and loaded decoder

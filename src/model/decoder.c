@@ -686,6 +686,67 @@ static struct sam3_tensor *gen_sine_position_embed(
 }
 
 /*
+ * gen_sine_position_embed_batched - Batched sine position embeddings.
+ *
+ * Allocates [B, nq, 2*d_model] tensor and fills each batch slot by
+ * invoking the same math as gen_sine_position_embed on its [nq, 4]
+ * coordinate slice. Honors arena->skip_data so planning-pass arenas
+ * compute shape without touching data.
+ */
+static struct sam3_tensor *gen_sine_position_embed_batched(
+	struct sam3_arena *arena,
+	const float *coords, int B, int nq, int d_model)
+{
+	int num_feats = d_model / 2;
+	int out_dim = d_model * 2;
+	int out_dims[] = {B, nq, out_dim};
+
+	struct sam3_tensor *out = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						  3, out_dims);
+	if (!out)
+		return NULL;
+
+	if (arena->skip_data)
+		return out;
+
+	float *dst_base = (float *)out->data;
+	float scale = 2.0f * (float)M_PI;
+
+	/* Same dim_t precompute as the 2D path. */
+	float dim_t[256]; /* num_feats <= 256 */
+	for (int j = 0; j < num_feats; j++) {
+		float exp = 2.0f * (float)(j / 2) / (float)num_feats;
+		dim_t[j] = powf(10000.0f, exp);
+	}
+
+	int coord_order[] = {1, 0, 2, 3}; /* y, x, w, h */
+
+	const size_t coords_stride = (size_t)nq * 4u;
+	const size_t dst_stride    = (size_t)nq * (size_t)out_dim;
+
+	for (int b = 0; b < B; b++) {
+		const float *c_slot = coords + (size_t)b * coords_stride;
+		float *dst_slot = dst_base + (size_t)b * dst_stride;
+
+		for (int q = 0; q < nq; q++) {
+			float *row = dst_slot + q * out_dim;
+			for (int c = 0; c < 4; c++) {
+				int ci = coord_order[c];
+				float val = c_slot[q * 4 + ci] * scale;
+				float *block = row + c * num_feats;
+				for (int j = 0; j < num_feats; j += 2) {
+					float v = val / dim_t[j];
+					block[j]     = sinf(v);
+					block[j + 1] = cosf(v);
+				}
+			}
+		}
+	}
+
+	return out;
+}
+
+/*
  * sam3_decoder_compute_query_pos - Compute DAB-DETR query_pos.
  *
  * Computes query_pos from reference_points by:
@@ -721,6 +782,37 @@ struct sam3_tensor *sam3_decoder_compute_query_pos(
 	if (!qpos)
 		sam3_log_error("decoder: ref_point_head mlp failed");
 
+	return qpos;
+}
+
+struct sam3_tensor *sam3_decoder_compute_query_pos_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_arena *arena,
+	const float *ref_boxes,
+	int B)
+{
+	if (!dec || !g || !arena || !ref_boxes || B < 1) {
+		sam3_log_error("query_pos_batched: bad args (B=%d)", B);
+		return NULL;
+	}
+
+	int nq = dec->n_queries;
+	int d = dec->d_model;
+
+	struct sam3_tensor *sine_embed =
+		gen_sine_position_embed_batched(arena, ref_boxes, B, nq, d);
+	if (!sine_embed) {
+		sam3_log_error("query_pos_batched: sine embed alloc failed");
+		return NULL;
+	}
+
+	struct sam3_tensor *qpos = gh_mlp(g, arena, sine_embed,
+					   dec->rph_fc1_w, dec->rph_fc1_b,
+					   dec->rph_fc2_w, dec->rph_fc2_b,
+					   SAM3_OP_RELU);
+	if (!qpos)
+		sam3_log_error("query_pos_batched: ref_point_head mlp failed");
 	return qpos;
 }
 

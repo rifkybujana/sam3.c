@@ -1155,6 +1155,127 @@ static void test_rpb_batched_equals_per_slot(void)
 	run_both_backends(rpb_batched_case);
 }
 
+/*
+ * query_pos_batched_case - Verify sam3_decoder_compute_query_pos_batched
+ *                          matches the 2D path per-slot.
+ *
+ * Builds a tiny decoder with only the ref_point_head MLP weights populated
+ * (rph_fc{1,2}_{w,b}). The ref_point_head is Linear(2*d -> d) + ReLU +
+ * Linear(d -> d); weight layout matches gh_linear (OUT x IN). Runs the
+ * batched builder on [B=2, nq=4, 4] ref_boxes and compares element-wise
+ * against calling the 2D builder once per batch slot on the same backend.
+ */
+static void query_pos_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int d = 16;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_queries = nq;
+
+	/*
+	 * ref_point_head: Linear(2*d -> d) + ReLU + Linear(d -> d).
+	 * gh_linear weight layout is OUT x IN (transposed at build time).
+	 */
+	int fc1_w_dims[] = {d, 2 * d};
+	int fc1_b_dims[] = {d};
+	int fc2_w_dims[] = {d, d};
+	int fc2_b_dims[] = {d};
+
+	dec.rph_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc1_w_dims);
+	dec.rph_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc1_b_dims);
+	dec.rph_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc2_w_dims);
+	dec.rph_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc2_b_dims);
+	ASSERT_NOT_NULL(dec.rph_fc1_w);
+	ASSERT_NOT_NULL(dec.rph_fc1_b);
+	ASSERT_NOT_NULL(dec.rph_fc2_w);
+	ASSERT_NOT_NULL(dec.rph_fc2_b);
+
+	fill_sin_pattern(dec.rph_fc1_w, 1.0f);
+	fill_sin_pattern(dec.rph_fc1_b, 2.0f);
+	fill_sin_pattern(dec.rph_fc2_w, 3.0f);
+	fill_sin_pattern(dec.rph_fc2_b, 4.0f);
+
+	/*
+	 * Ref boxes in (0, 1). Per-slot-differing values surface any slot
+	 * aliasing in the sine embedding helper.
+	 */
+	int rb_dims[] = {B, nq, 4};
+	struct sam3_tensor *ref_boxes_b = gh_alloc_tensor(
+		&ar, SAM3_DTYPE_F32, 3, rb_dims);
+	ASSERT_NOT_NULL(ref_boxes_b);
+	float *rb = (float *)ref_boxes_b->data;
+	for (int b = 0; b < B; b++) {
+		for (int q = 0; q < nq; q++) {
+			float *row = rb + (b * nq + q) * 4;
+			row[0] = 0.4f + 0.05f * sinf(0.3f * (float)b +
+						     (float)q);
+			row[1] = 0.5f + 0.05f * cosf(0.3f * (float)b +
+						     (float)q);
+			row[2] = 0.2f + 0.02f * sinf(0.7f * (float)q +
+						     (float)b);
+			row[3] = 0.2f + 0.02f * cosf(0.7f * (float)q +
+						     (float)b);
+		}
+	}
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_decoder_compute_query_pos_batched(
+		&dec, &g, &ar, (const float *)ref_boxes_b->data, B);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		const float *rb_slot = (const float *)ref_boxes_b->data +
+			(size_t)b * nq * 4;
+		struct sam3_tensor *out1 = sam3_decoder_compute_query_pos(
+			&dec, &g1, &ar, rb_slot);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s query_pos] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_query_pos_batched_equals_per_slot(void)
+{
+	run_both_backends(query_pos_batched_case);
+}
+
 int main(void)
 {
 	test_scorer_batched_equals_per_slot();
@@ -1166,5 +1287,6 @@ int main(void)
 	test_mask_logits_batched_equals_per_slot();
 	test_box_refine_batched_equals_per_slot();
 	test_rpb_batched_equals_per_slot();
+	test_query_pos_batched_equals_per_slot();
 	TEST_REPORT();
 }
