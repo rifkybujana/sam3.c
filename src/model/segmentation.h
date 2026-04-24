@@ -258,4 +258,25 @@ struct sam3_tensor *sam3_seg_head_build_mask_embed(
 	struct sam3_tensor *queries,
 	struct sam3_arena *arena);
 
+/*
+ * sam3_seg_head_build_mask_embed_batched - Batched mask embedder MLP.
+ *
+ * Same as sam3_seg_head_build_mask_embed but accepts [B, n_queries, d]
+ * and returns [B, n_queries, d]. Underlying 3-layer MLP uses only
+ * gh_linear / gh_relu (batch-transparent), so this wrapper is naming-
+ * consistency only.
+ *
+ * @head:    Loaded seg head with mask_mlp[0..2] weights
+ * @g:       Graph to add nodes to
+ * @queries: [B, n_queries, d_model]
+ * @arena:   Arena for intermediate tensors
+ *
+ * Returns mask embeddings [B, n_queries, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_mask_embed_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *queries,
+	struct sam3_arena *arena);
+
 #endif /* SAM3_MODEL_SEGMENTATION_H */

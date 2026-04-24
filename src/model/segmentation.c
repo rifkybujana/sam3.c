@@ -577,6 +577,18 @@ struct sam3_tensor *sam3_seg_head_build_mask_embed(
 	return build_mask_embedder(head, g, queries, arena);
 }
 
+struct sam3_tensor *sam3_seg_head_build_mask_embed_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *queries,
+	struct sam3_arena *arena)
+{
+	/* gh_linear and gh_relu both thread a leading batch dim, so
+	 * build_mask_embedder works directly on [B, nq, d]. Wrapper
+	 * for naming consistency with other _batched entry points. */
+	return build_mask_embedder(head, g, queries, arena);
+}
+
 struct sam3_tensor *sam3_seg_head_build(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
