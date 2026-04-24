@@ -900,7 +900,17 @@ static struct sam3_tensor *concat_2d_persist(struct sam3_arena *persist,
 	return out;
 }
 
-enum sam3_error sam3_image_model_segment(
+/*
+ * run_geom_and_fusion - Execute segment Stages 1+2 (geometry encoder +
+ * DETR encoder fusion) and produce the inputs Stage 3 consumes.
+ *
+ * Pure mechanical extraction from sam3_image_model_segment — the body
+ * is byte-identical to the inline version. Outputs (fused, context,
+ * img_2d) are persist-allocated so they survive the caller's scratch
+ * resets during Stage 3+. On failure returns an error code; the caller
+ * is responsible for rolling back its own persist save.
+ */
+static enum sam3_error run_geom_and_fusion(
 	struct sam3_image_model *model,
 	struct sam3_backend *be,
 	struct sam3_backend *cpu_be,
@@ -908,45 +918,19 @@ enum sam3_error sam3_image_model_segment(
 	struct sam3_tensor *text_features,
 	struct sam3_arena *scratch,
 	struct sam3_arena *persist,
-	struct sam3_tensor **out_masks,
-	struct sam3_tensor **out_scores,
-	struct sam3_profiler *profiler)
+	struct sam3_profiler *profiler,
+	struct sam3_tensor **out_fused,
+	struct sam3_tensor **out_context,
+	struct sam3_tensor **out_img_2d)
 {
-	/*
-	 * dec_be: backend for decoder + scorer stages.
-	 * Using CPU avoids GPU-specific float32 reduction order
-	 * divergence that compounds through 6 decoder layers,
-	 * causing scorer logits to deviate 10-15x from Python.
-	 */
-	struct sam3_backend *dec_be = cpu_be ? cpu_be : be;
-
-	/* Helper: reset dec_be arena to reclaim memory between evals.
-	 * Decoder cross-attention allocates ~33MB per layer, so without
-	 * reset the CPU arena would overflow after a few layers. */
-#define DEC_BE_ARENA_RESET() do { \
-	if (dec_be->ops->arena_reset) \
-		dec_be->ops->arena_reset(dec_be); \
-} while (0)
-
 	struct sam3_graph g;
 	struct sam3_tensor *img_2d;
 	struct sam3_tensor *geom_out = NULL;
 	struct sam3_tensor *context;
 	struct sam3_tensor *fused;
-	struct sam3_tensor *masks;
-	struct sam3_tensor *scores = NULL;
 	enum sam3_error err;
-	size_t persist_save;
-	int grid_h, grid_w;
 
-	if (!model->image_encoded)
-		return SAM3_EINVAL;
-
-	if (!prompt_tokens && !text_features)
-		return SAM3_EINVAL;
-
-	/* Save persist offset so inter-stage data can be freed later */
-	persist_save = persist->offset;
+	(void)cpu_be;
 
 	/*
 	 * Reshape 1× backbone features from NHWC [1, H, W, d_model]
@@ -999,7 +983,7 @@ enum sam3_error sam3_image_model_segment(
 		struct sam3_tensor *img_with_pos;
 		img_with_pos = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 						2, img_2d->dims);
-		if (!img_with_pos) { err = SAM3_ENOMEM; goto fail; }
+		if (!img_with_pos) { err = SAM3_ENOMEM; goto fail_helper; }
 		{
 			const float *id = (const float *)img_2d->data;
 			const float *pd = (const float *)pe_t->data;
@@ -1020,7 +1004,7 @@ enum sam3_error sam3_image_model_segment(
 					d};
 			x = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 					     2, xdims);
-			if (!x) { err = SAM3_ENOMEM; goto fail; }
+			if (!x) { err = SAM3_ENOMEM; goto fail_helper; }
 			size_t pt_bytes = (size_t)prompt_tokens->dims[0]
 				* (size_t)d * sizeof(float);
 			size_t cls_bytes = (size_t)enc->cls_token->dims[0]
@@ -1044,7 +1028,7 @@ enum sam3_error sam3_image_model_segment(
 			struct sam3_tensor *proj;
 			proj = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 						2, x->dims);
-			if (!proj) { err = SAM3_ENOMEM; goto fail; }
+			if (!proj) { err = SAM3_ENOMEM; goto fail_helper; }
 
 			const float *xd = (const float *)x->data;
 			const float *wd = (const float *)enc->post_proj_w->data;
@@ -1129,7 +1113,7 @@ enum sam3_error sam3_image_model_segment(
 		if (!buf_norm || !buf_qkv || !buf_attn || !buf_sa ||
 		    !buf_q || !buf_k || !buf_v || !buf_ca ||
 		    !buf_ff1 || !buf_ff2) {
-			err = SAM3_ENOMEM; goto fail;
+			err = SAM3_ENOMEM; goto fail_helper;
 		}
 
 		float *xd = (float *)x->data;
@@ -1391,7 +1375,7 @@ enum sam3_error sam3_image_model_segment(
 			struct sam3_tensor *xp;
 			xp = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 					      2, x->dims);
-			if (!xp) { err = SAM3_ENOMEM; goto fail; }
+			if (!xp) { err = SAM3_ENOMEM; goto fail_helper; }
 			memcpy(xp->data, x->data, x->nbytes);
 			x = xp;
 		}
@@ -1451,7 +1435,7 @@ enum sam3_error sam3_image_model_segment(
 		struct sam3_tensor *img_with_pos;
 		img_with_pos = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 						2, img_2d->dims);
-		if (!img_with_pos) { err = SAM3_ENOMEM; goto fail; }
+		if (!img_with_pos) { err = SAM3_ENOMEM; goto fail_helper; }
 		{
 			const float *id = (const float *)img_2d->data;
 			const float *pd = (const float *)pe_t->data;
@@ -1467,7 +1451,7 @@ enum sam3_error sam3_image_model_segment(
 			int xdims[2] = {enc->cls_token->dims[0], d};
 			x = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 					     2, xdims);
-			if (!x) { err = SAM3_ENOMEM; goto fail; }
+			if (!x) { err = SAM3_ENOMEM; goto fail_helper; }
 			memcpy(x->data, enc->cls_token->data,
 			       (size_t)enc->cls_token->dims[0]
 			       * (size_t)d * sizeof(float));
@@ -1479,7 +1463,7 @@ enum sam3_error sam3_image_model_segment(
 			struct sam3_tensor *proj;
 			proj = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 						2, x->dims);
-			if (!proj) { err = SAM3_ENOMEM; goto fail; }
+			if (!proj) { err = SAM3_ENOMEM; goto fail_helper; }
 
 			const float *xd = (const float *)x->data;
 			const float *wd = (const float *)enc->post_proj_w->data;
@@ -1550,7 +1534,7 @@ enum sam3_error sam3_image_model_segment(
 		if (!buf_norm || !buf_qkv || !buf_attn || !buf_sa ||
 		    !buf_q || !buf_k || !buf_v || !buf_ca ||
 		    !buf_ff1 || !buf_ff2) {
-			err = SAM3_ENOMEM; goto fail;
+			err = SAM3_ENOMEM; goto fail_helper;
 		}
 
 		float *xd = (float *)x->data;
@@ -1778,7 +1762,7 @@ enum sam3_error sam3_image_model_segment(
 			struct sam3_tensor *xp;
 			xp = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 					      2, x->dims);
-			if (!xp) { err = SAM3_ENOMEM; goto fail; }
+			if (!xp) { err = SAM3_ENOMEM; goto fail_helper; }
 			memcpy(xp->data, x->data, x->nbytes);
 			x = xp;
 		}
@@ -1831,7 +1815,7 @@ enum sam3_error sam3_image_model_segment(
 					    geom_out);
 		if (!context) {
 			err = SAM3_ENOMEM;
-			goto fail;
+			goto fail_helper;
 		}
 	} else if (text_features) {
 		context = text_features;
@@ -1875,7 +1859,7 @@ enum sam3_error sam3_image_model_segment(
 		size_t x_bytes = enc_x->dims[0] * enc_x->dims[1]
 				  * sizeof(float);
 		void *x_buf = sam3_arena_alloc(persist, x_bytes);
-		if (!x_buf) { err = SAM3_ENOMEM; goto fail; }
+		if (!x_buf) { err = SAM3_ENOMEM; goto fail_helper; }
 
 		/*
 		 * Copy encoder input into persist buffer for
@@ -1914,7 +1898,7 @@ enum sam3_error sam3_image_model_segment(
 					 img_2d->dims[1]};
 			enc_x = gh_tensor_wrap(scratch, SAM3_DTYPE_F32,
 						2, x_dims, x_buf);
-			if (!enc_x) { err = SAM3_ENOMEM; goto fail; }
+			if (!enc_x) { err = SAM3_ENOMEM; goto fail_helper; }
 
 			struct sam3_tensor *epos_wrap;
 			epos_wrap = gh_tensor_wrap(scratch,
@@ -1923,7 +1907,7 @@ enum sam3_error sam3_image_model_segment(
 						     enc_pe_t->data);
 			if (!epos_wrap) {
 				err = SAM3_ENOMEM;
-				goto fail;
+				goto fail_helper;
 			}
 
 			struct sam3_tensor *ctx_copy;
@@ -1931,18 +1915,18 @@ enum sam3_error sam3_image_model_segment(
 						   context->n_dims,
 						   context->dims,
 						   context->data);
-			if (!ctx_copy) { err = SAM3_ENOMEM; goto fail; }
+			if (!ctx_copy) { err = SAM3_ENOMEM; goto fail_helper; }
 
 			enc_x = sam3_encoder_fusion_build_layer(
 				&model->encoder, li, &g,
 				enc_x, epos_wrap, ctx_copy, scratch);
-			if (!enc_x) { err = SAM3_ENOMEM; goto fail; }
+			if (!enc_x) { err = SAM3_ENOMEM; goto fail_helper; }
 
 			err = be->ops->graph_eval(be, &g);
 			if (err != SAM3_OK) {
 				sam3_log_error("segment: enc layer %d "
 					       "eval failed: %d", li, err);
-				goto fail;
+				goto fail_helper;
 			}
 			memcpy(x_buf, enc_x->data, x_bytes);
 
@@ -1985,7 +1969,7 @@ enum sam3_error sam3_image_model_segment(
 					 img_2d->dims[1]};
 			fused = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
 						 2, x_dims);
-			if (!fused) { err = SAM3_ENOMEM; goto fail; }
+			if (!fused) { err = SAM3_ENOMEM; goto fail_helper; }
 			memcpy(fused->data, x_buf,
 			       (size_t)x_dims[0] * x_dims[1]
 			       * sizeof(float));
@@ -2014,6 +1998,74 @@ enum sam3_error sam3_image_model_segment(
 			       fused->dims[0], fused->dims[1],
 			       fmin, fmax, fsum / fn);
 	}
+
+	*out_fused = fused;
+	*out_context = context;
+	*out_img_2d = img_2d;
+	return SAM3_OK;
+
+fail_helper:
+	return err;
+}
+
+enum sam3_error sam3_image_model_segment(
+	struct sam3_image_model *model,
+	struct sam3_backend *be,
+	struct sam3_backend *cpu_be,
+	struct sam3_tensor *prompt_tokens,
+	struct sam3_tensor *text_features,
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_tensor **out_masks,
+	struct sam3_tensor **out_scores,
+	struct sam3_profiler *profiler)
+{
+	/*
+	 * dec_be: backend for decoder + scorer stages.
+	 * Using CPU avoids GPU-specific float32 reduction order
+	 * divergence that compounds through 6 decoder layers,
+	 * causing scorer logits to deviate 10-15x from Python.
+	 */
+	struct sam3_backend *dec_be = cpu_be ? cpu_be : be;
+
+	/* Helper: reset dec_be arena to reclaim memory between evals.
+	 * Decoder cross-attention allocates ~33MB per layer, so without
+	 * reset the CPU arena would overflow after a few layers. */
+#define DEC_BE_ARENA_RESET() do { \
+	if (dec_be->ops->arena_reset) \
+		dec_be->ops->arena_reset(dec_be); \
+} while (0)
+
+	struct sam3_graph g;
+	struct sam3_tensor *img_2d;
+	struct sam3_tensor *context;
+	struct sam3_tensor *fused;
+	struct sam3_tensor *masks;
+	struct sam3_tensor *scores = NULL;
+	enum sam3_error err;
+	size_t persist_save;
+	int grid_h, grid_w;
+
+	if (!model->image_encoded)
+		return SAM3_EINVAL;
+
+	if (!prompt_tokens && !text_features)
+		return SAM3_EINVAL;
+
+	/* Save persist offset so inter-stage data can be freed later */
+	persist_save = persist->offset;
+
+	/*
+	 * Stages 1+2: geometry encoder + DETR encoder fusion.
+	 * Produces (fused, context, img_2d) persist-allocated so they
+	 * survive the per-layer scratch resets done in Stage 3+.
+	 */
+	err = run_geom_and_fusion(model, be, cpu_be,
+				   prompt_tokens, text_features,
+				   scratch, persist, profiler,
+				   &fused, &context, &img_2d);
+	if (err != SAM3_OK)
+		goto fail;
 
 	/*
 	 * Stage 3: DETR decoder — per-layer evaluation to avoid MLX
