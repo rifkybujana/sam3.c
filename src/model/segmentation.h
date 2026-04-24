@@ -12,7 +12,7 @@
  *
  * Key types:  sam3_seg_head
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h, core/weight.h
- * Used by:    sam3_image.c
+ * Used by:    sam3_image.c, tests/test_batched_ops.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
@@ -189,6 +189,52 @@ struct sam3_tensor *sam3_seg_head_build_pixel_decoder(
  * Returns instance-projected pixel features [1, H4, W4, d].
  */
 struct sam3_tensor *sam3_seg_head_build_fpn(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_pixel_decoder_batched - Batched FPN pixel decoder.
+ *
+ * Same as sam3_seg_head_build_pixel_decoder but accepts [B, H, W, d]
+ * for every NHWC input. All ops in the FPN (gh_upsample, gh_add,
+ * gh_conv2d, gh_groupnorm, gh_relu) are N-aware, so this is a naming-
+ * consistency wrapper — the actual pipeline is the same.
+ *
+ * @head:     Loaded seg head
+ * @g:        Graph to add nodes to
+ * @enc_nhwc: Encoder states [B, enc_h, enc_w, d_model]
+ * @feat_2x:  Backbone feature at 2x, already broadcast to [B, H2, W2, d]
+ * @feat_4x:  Backbone feature at 4x, already broadcast to [B, H4, W4, d]
+ * @arena:    Arena for intermediate tensors
+ *
+ * Callers are responsible for tiling shared image features to [B, ...]
+ * before calling (use gh_broadcast_batch). Returns [B, H4, W4, d], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_pixel_decoder_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_fpn_batched - Batched FPN + 1×1 instance projection.
+ *
+ * Same as sam3_seg_head_build_fpn but accepts [B, H, W, d] inputs and
+ * returns [B, H, W, d]. Delegates to the N-aware build_pixel_decoder +
+ * gh_conv2d with N=B.
+ *
+ * @head, @g, @enc_nhwc, @feat_2x, @feat_4x, @arena — see
+ * sam3_seg_head_build_pixel_decoder_batched.
+ *
+ * Returns instance features [B, H4, W4, d], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_fpn_batched(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
 	struct sam3_tensor *enc_nhwc,

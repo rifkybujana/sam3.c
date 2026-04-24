@@ -423,10 +423,249 @@ static void test_cross_attn_batched_equals_per_slot(void)
 	run_both_backends(cross_attn_batched_case);
 }
 
+/*
+ * broadcast_batch_case - Verify gh_broadcast_batch tiles correctly.
+ *
+ * Pure CPU op (no graph node, just an arena memcpy loop), so the
+ * backend handle is unused — we run the case once standalone instead
+ * of through run_both_backends to keep the comment honest.
+ */
+static void broadcast_batch_case(struct sam3_backend *be, const char *name)
+{
+	(void)be; /* CPU-only op; backend irrelevant but symmetry with other cases */
+	(void)name;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 20);
+
+	/* Shape [1, 3, 4, 2] with a deterministic fill. */
+	int in_dims[] = {1, 3, 4, 2};
+	struct sam3_tensor *in = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, in_dims);
+	ASSERT_NOT_NULL(in);
+	int n_in = 1 * 3 * 4 * 2;
+	for (int i = 0; i < n_in; i++)
+		((float *)in->data)[i] = (float)(i * 3 + 1) * 0.25f;
+
+	struct sam3_tensor *out = gh_broadcast_batch(&ar, in, 3);
+	ASSERT_NOT_NULL(out);
+	ASSERT_EQ(out->n_dims, 4);
+	ASSERT_EQ(out->dims[0], 3);
+	ASSERT_EQ(out->dims[1], 3);
+	ASSERT_EQ(out->dims[2], 4);
+	ASSERT_EQ(out->dims[3], 2);
+
+	/* Each batch slot must contain the full input payload. */
+	for (int b = 0; b < 3; b++) {
+		const float *slot = (const float *)out->data +
+			(size_t)b * n_in;
+		const float *src  = (const float *)in->data;
+		ASSERT_EQ(memcmp(slot, src,
+				 (size_t)n_in * sizeof(float)), 0);
+	}
+
+	/* Also test rank without a leading-1 collapse:
+	 * [H, W, C] -> [B, H, W, C]. */
+	int raw_dims[] = {2, 3, 2};
+	struct sam3_tensor *raw = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						  raw_dims);
+	ASSERT_NOT_NULL(raw);
+	int n_raw = 2 * 3 * 2;
+	for (int i = 0; i < n_raw; i++)
+		((float *)raw->data)[i] = (float)i + 0.5f;
+
+	struct sam3_tensor *raw_out = gh_broadcast_batch(&ar, raw, 4);
+	ASSERT_NOT_NULL(raw_out);
+	ASSERT_EQ(raw_out->n_dims, 4);
+	ASSERT_EQ(raw_out->dims[0], 4);
+	ASSERT_EQ(raw_out->dims[1], 2);
+	ASSERT_EQ(raw_out->dims[2], 3);
+	ASSERT_EQ(raw_out->dims[3], 2);
+
+	for (int b = 0; b < 4; b++) {
+		const float *slot = (const float *)raw_out->data +
+			(size_t)b * n_raw;
+		const float *src  = (const float *)raw->data;
+		ASSERT_EQ(memcmp(slot, src,
+				 (size_t)n_raw * sizeof(float)), 0);
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_broadcast_batch(void)
+{
+	/* Pure CPU op — no backend needed, but call once just for count. */
+	broadcast_batch_case(NULL, "CPU-direct");
+}
+
+/*
+ * fpn_batched_case - Verify batched FPN+inst_proj matches per-slot.
+ *
+ * Builds a synthetic seg head with FPN + instance projection weights
+ * filled deterministically, then checks that
+ * sam3_seg_head_build_fpn_batched on B=2 inputs matches calling the
+ * 2D builder once per slot. Spatial dims are kept small because CPU
+ * conv2d is slow at 36×36×16 channels.
+ */
+static void fpn_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int d = 16;
+	const int eh = 9, ew = 9;
+	const int h2 = 18, w2 = 18;
+	const int h4 = 36, w4 = 36;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 25);  /* 32 MiB for 36x36 FPN scratch */
+
+	struct sam3_seg_head head = {0};
+	head.d_model = d;
+	head.n_attn_heads = 1;  /* unused in FPN path */
+
+	/*
+	 * FPN weights: 3 stages of 3x3 OHWI conv [d, 3, 3, d] + bias [d]
+	 * plus GroupNorm scale/shift [d]. Inst proj is a 1x1 OHWI conv
+	 * [d, 1, 1, d] + bias [d]. Use unique sin offsets per tensor so a
+	 * conv/norm mix-up would surface as a numeric difference.
+	 */
+	int conv_w_dims[] = {d, 3, 3, d};
+	int proj_w_dims[] = {d, 1, 1, d};
+	int d_dims[] = {d};
+	float off = 0.5f;
+	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++) {
+		head.fpn[i].conv_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4,
+						     conv_w_dims);
+		head.fpn[i].conv_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						     d_dims);
+		head.fpn[i].gn_w   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						     d_dims);
+		head.fpn[i].gn_b   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						     d_dims);
+		ASSERT_NOT_NULL(head.fpn[i].conv_w);
+		ASSERT_NOT_NULL(head.fpn[i].conv_b);
+		ASSERT_NOT_NULL(head.fpn[i].gn_w);
+		ASSERT_NOT_NULL(head.fpn[i].gn_b);
+		fill_sin_pattern(head.fpn[i].conv_w, off);    off += 1.0f;
+		fill_sin_pattern(head.fpn[i].conv_b, off);    off += 1.0f;
+		/*
+		 * GroupNorm scale near identity so the FPN output stays
+		 * numerically tame; bias small.
+		 */
+		float *gw = (float *)head.fpn[i].gn_w->data;
+		float *gb = (float *)head.fpn[i].gn_b->data;
+		for (int c = 0; c < d; c++) {
+			gw[c] = 1.0f + 0.01f * sinf(off + (float)c);
+			gb[c] = 0.01f * cosf(off + (float)c);
+		}
+		off += 1.0f;
+	}
+	head.inst_proj_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, proj_w_dims);
+	head.inst_proj_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	ASSERT_NOT_NULL(head.inst_proj_w);
+	ASSERT_NOT_NULL(head.inst_proj_b);
+	fill_sin_pattern(head.inst_proj_w, off);    off += 1.0f;
+	fill_sin_pattern(head.inst_proj_b, off);    off += 1.0f;
+
+	/* Batched inputs. Per-slot-different fill so slot aliasing surfaces. */
+	int eb_dims[] = {B, eh, ew, d};
+	int f2b_dims[] = {B, h2, w2, d};
+	int f4b_dims[] = {B, h4, w4, d};
+	struct sam3_tensor *eb  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, eb_dims);
+	struct sam3_tensor *f2b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f2b_dims);
+	struct sam3_tensor *f4b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f4b_dims);
+	ASSERT_NOT_NULL(eb);
+	ASSERT_NOT_NULL(f2b);
+	ASSERT_NOT_NULL(f4b);
+	for (int i = 0; i < B * eh * ew * d; i++)
+		((float *)eb->data)[i] = sinf(0.031f * (float)i + 0.1f);
+	for (int i = 0; i < B * h2 * w2 * d; i++)
+		((float *)f2b->data)[i] = sinf(0.017f * (float)i + 0.3f);
+	for (int i = 0; i < B * h4 * w4 * d; i++)
+		((float *)f4b->data)[i] = sinf(0.013f * (float)i + 0.5f);
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_seg_head_build_fpn_batched(
+		&head, &g, eb, f2b, f4b, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 4);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], h4);
+	ASSERT_EQ(outb->dims[2], w4);
+	ASSERT_EQ(outb->dims[3], d);
+
+	/* Per-slot reference: N=1 FPN on each batch slice. */
+	for (int b = 0; b < B; b++) {
+		int e1_dims[]  = {1, eh, ew, d};
+		int f2_1_dims[] = {1, h2, w2, d};
+		int f4_1_dims[] = {1, h4, w4, d};
+		struct sam3_tensor *e1   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, e1_dims);
+		struct sam3_tensor *f2_1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f2_1_dims);
+		struct sam3_tensor *f4_1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f4_1_dims);
+		ASSERT_NOT_NULL(e1);
+		ASSERT_NOT_NULL(f2_1);
+		ASSERT_NOT_NULL(f4_1);
+		memcpy(e1->data,
+		       (char *)eb->data +
+			       (size_t)b * eh * ew * d * sizeof(float),
+		       (size_t)eh * ew * d * sizeof(float));
+		memcpy(f2_1->data,
+		       (char *)f2b->data +
+			       (size_t)b * h2 * w2 * d * sizeof(float),
+		       (size_t)h2 * w2 * d * sizeof(float));
+		memcpy(f4_1->data,
+		       (char *)f4b->data +
+			       (size_t)b * h4 * w4 * d * sizeof(float),
+		       (size_t)h4 * w4 * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_seg_head_build_fpn(
+			&head, &g1, e1, f2_1, f4_1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * h4 * w4 * d;
+		const float *sptr = (const float *)out1->data;
+		int n = h4 * w4 * d;
+		int slot_fails = 0;
+		for (int i = 0; i < n; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				if (slot_fails < 10) {
+					fprintf(stderr,
+						"FAIL [%s fpn] b=%d i=%d: "
+						"batched=%.6f ref=%.6f tol=%g\n",
+						name, b, i, actual,
+						expected, tol);
+				}
+				tests_failed++;
+				slot_fails++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_fpn_batched_equals_per_slot(void)
+{
+	run_both_backends(fpn_batched_case);
+}
+
 int main(void)
 {
 	test_scorer_batched_equals_per_slot();
 	test_sdpa_4d_batch_equals_per_slot();
 	test_cross_attn_batched_equals_per_slot();
+	test_broadcast_batch();
+	test_fpn_batched_equals_per_slot();
 	TEST_REPORT();
 }

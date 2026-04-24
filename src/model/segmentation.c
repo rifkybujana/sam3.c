@@ -531,6 +531,43 @@ struct sam3_tensor *sam3_seg_head_build_fpn(
 	return inst;
 }
 
+struct sam3_tensor *sam3_seg_head_build_pixel_decoder_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena)
+{
+	/*
+	 * Underlying build_pixel_decoder is N-aware: gh_upsample, gh_add,
+	 * gh_conv2d, gh_groupnorm, gh_relu all thread a leading batch dim.
+	 * No structural change needed; this wrapper exists for naming
+	 * consistency with the rest of the batched builder family.
+	 */
+	return build_pixel_decoder(head, g, enc_nhwc, feat_2x, feat_4x, arena);
+}
+
+struct sam3_tensor *sam3_seg_head_build_fpn_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena)
+{
+	struct sam3_tensor *pixel_embed = build_pixel_decoder(
+		head, g, enc_nhwc, feat_2x, feat_4x, arena);
+	if (!pixel_embed)
+		return NULL;
+
+	head->_debug_pixel_embed = pixel_embed;
+
+	return gh_conv2d(g, arena, pixel_embed,
+			 head->inst_proj_w, head->inst_proj_b,
+			 1, 0, 1);
+}
+
 struct sam3_tensor *sam3_seg_head_build_mask_embed(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
