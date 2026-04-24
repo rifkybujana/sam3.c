@@ -234,6 +234,27 @@ struct sam3_tensor *sam3_decoder_build_sa(
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_tensor *query_pos, struct sam3_arena *arena);
 
+/*
+ * sam3_decoder_build_sa_batched - Batched decoder self-attention.
+ *
+ * Batched variant of sam3_decoder_build_sa. Accepts [B, nq, d] queries
+ * and query_pos, returns [B, nq, d]. Per-head SDPA uses the 4D reshape
+ * pattern derisked in commit f775e74.
+ *
+ * @dec:        Decoder
+ * @layer_idx:  Which layer's weights to use
+ * @g:          Graph
+ * @q:          [B, nq, d_model]
+ * @query_pos:  [B, nq, d_model]
+ * @arena:      Arena
+ *
+ * Returns [B, nq, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_decoder_build_sa_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos, struct sam3_arena *arena);
+
 struct sam3_tensor *sam3_decoder_build_tca(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,
