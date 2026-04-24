@@ -1202,7 +1202,23 @@ static enum sam3_error metal_dispatch_node(struct sam3_metal_backend *mtl,
 				int seq_kv = (ndims == 4)
 					? node->inputs[1]->dims[2]
 					: node->inputs[1]->dims[0];
+				/*
+				 * Mask shapes we accept:
+				 *   2D [seq_q, seq_kv]         (legacy, shared)
+				 *   3D [H, seq_q, seq_kv]      (per-head)
+				 *   4D [B, H, seq_q, seq_kv]   (per-batch-head)
+				 * MLX SDPA broadcasts missing leading dims so we
+				 * pass the 4D canonical shape with unit dims.
+				 */
+				int mndims = node->inputs[3]->n_dims;
 				int mshape[] = {1, 1, seq_q, seq_kv};
+				if (mndims == 3) {
+					mshape[0] = 1;
+					mshape[1] = node->inputs[3]->dims[0];
+				} else if (mndims == 4) {
+					mshape[0] = node->inputs[3]->dims[0];
+					mshape[1] = node->inputs[3]->dims[1];
+				}
 				rc = mlx_reshape(&mask4d, inputs[3],
 						  mshape, 4, stream);
 				if (rc) {
