@@ -261,7 +261,46 @@ struct sam3_tensor *sam3_decoder_build_tca(
 	struct sam3_tensor *query_pos,
 	struct sam3_tensor *text_features, struct sam3_arena *arena);
 
+/*
+ * sam3_decoder_build_tca_batched - Batched text cross-attention substep.
+ *
+ * Mirrors sam3_decoder_build_tca with batch dim leading. If
+ * @text_features is NULL the call is a no-op (returns q unchanged).
+ *
+ * @q:             [B, n_q, d_model]
+ * @query_pos:     [B, n_q, d_model]
+ * @text_features: [B, n_text, d_model] or NULL
+ * Returns [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_tca_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *text_features, struct sam3_arena *arena);
+
 struct sam3_tensor *sam3_decoder_build_ca(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features, struct sam3_tensor *enc_pos,
+	struct sam3_tensor *rpb_mask, struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_ca_batched - Batched vision cross-attention substep.
+ *
+ * Mirrors sam3_decoder_build_ca. When @enc_pos is non-NULL uses the
+ * with-pos variant (K = enc+pos, V = enc, RPB mask applied); else
+ * plain cross-attention. @rpb_mask when non-NULL must be shaped
+ * [B, n_heads, n_q, n_kv] and is passed as SDPA's additive mask.
+ *
+ * @q:             [B, n_q, d_model]
+ * @query_pos:     [B, n_q, d_model]
+ * @enc_features:  [B, n_kv, d_model]
+ * @enc_pos:       [n_kv, d_model] or [B, n_kv, d_model] or NULL
+ * @rpb_mask:      [B, n_heads, n_q, n_kv] or NULL
+ * Returns [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_ca_batched(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_tensor *query_pos,
