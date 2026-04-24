@@ -589,6 +589,90 @@ struct sam3_tensor *sam3_seg_head_build_mask_embed_batched(
 	return build_mask_embedder(head, g, queries, arena);
 }
 
+struct sam3_tensor *sam3_seg_head_build_mask_logits(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
+	struct sam3_arena *arena)
+{
+	if (!g || !mask_embed || !inst || !arena ||
+	    mask_embed->n_dims != 2 || inst->n_dims != 4 ||
+	    inst->dims[0] != 1) {
+		sam3_log_error("mask_logits: shape mismatch "
+			       "(mask_embed.n_dims=%d inst.n_dims=%d "
+			       "inst.N=%d)",
+			       mask_embed ? mask_embed->n_dims : -1,
+			       inst ? inst->n_dims : -1,
+			       (inst && inst->n_dims >= 1) ? inst->dims[0] : -1);
+		return NULL;
+	}
+
+	int H = inst->dims[1];
+	int W = inst->dims[2];
+	int d = inst->dims[3];
+	int nq = mask_embed->dims[0];
+
+	int flat_dims[] = {H * W, d};
+	struct sam3_tensor *inst_flat = gh_reshape(g, arena, inst, 2, flat_dims);
+	if (!inst_flat)
+		return NULL;
+
+	struct sam3_tensor *inst_flat_t = gh_transpose(g, arena, inst_flat);
+	if (!inst_flat_t)
+		return NULL;
+
+	struct sam3_tensor *logits = gh_matmul(g, arena, mask_embed, inst_flat_t);
+	if (!logits)
+		return NULL;
+
+	int out_dims[] = {nq, H, W};
+	return gh_reshape(g, arena, logits, 3, out_dims);
+}
+
+struct sam3_tensor *sam3_seg_head_build_mask_logits_batched(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
+	struct sam3_arena *arena)
+{
+	if (!g || !mask_embed || !inst || !arena ||
+	    mask_embed->n_dims != 3 || inst->n_dims != 4 ||
+	    mask_embed->dims[0] != inst->dims[0]) {
+		sam3_log_error("mask_logits_batched: shape mismatch "
+			       "(mask_embed.n_dims=%d inst.n_dims=%d "
+			       "mask_embed.B=%d inst.B=%d)",
+			       mask_embed ? mask_embed->n_dims : -1,
+			       inst ? inst->n_dims : -1,
+			       (mask_embed && mask_embed->n_dims >= 1) ?
+				       mask_embed->dims[0] : -1,
+			       (inst && inst->n_dims >= 1) ? inst->dims[0] : -1);
+		return NULL;
+	}
+
+	int B = mask_embed->dims[0];
+	int nq = mask_embed->dims[1];
+	int H = inst->dims[1];
+	int W = inst->dims[2];
+	int d = inst->dims[3];
+
+	int flat_dims[] = {B, H * W, d};
+	struct sam3_tensor *inst_flat = gh_reshape(g, arena, inst, 3, flat_dims);
+	if (!inst_flat)
+		return NULL;
+
+	/* gh_transpose swaps the last two dims: [B, H*W, d] -> [B, d, H*W]. */
+	struct sam3_tensor *inst_flat_t = gh_transpose(g, arena, inst_flat);
+	if (!inst_flat_t)
+		return NULL;
+
+	struct sam3_tensor *logits = gh_matmul(g, arena, mask_embed, inst_flat_t);
+	if (!logits)
+		return NULL;
+
+	int out_dims[] = {B, nq, H, W};
+	return gh_reshape(g, arena, logits, 4, out_dims);
+}
+
 struct sam3_tensor *sam3_seg_head_build(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,

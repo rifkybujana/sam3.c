@@ -279,4 +279,45 @@ struct sam3_tensor *sam3_seg_head_build_mask_embed_batched(
 	struct sam3_tensor *queries,
 	struct sam3_arena *arena);
 
+/*
+ * sam3_seg_head_build_mask_logits - Dot-product mask logits (2D path).
+ *
+ * Computes mask_embed @ inst_flat.T and reshapes back to a spatial
+ * map. Extracted from the inline Stage 4d code in sam3_image.c so both
+ * the 2D and batched (3D) variants can be unit-tested directly.
+ *
+ * @g:          Graph to add nodes to
+ * @mask_embed: [n_queries, d_model]
+ * @inst:       [1, H, W, d_model] instance features (NHWC)
+ * @arena:      Arena for intermediate tensors
+ *
+ * Returns mask logits [n_queries, H, W], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_mask_logits(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_mask_logits_batched - Batched dot-product mask logits.
+ *
+ * Batched mirror of sam3_seg_head_build_mask_logits. Every tensor
+ * gains a leading batch dim B. No weights involved; the operation is
+ * gh_reshape + gh_transpose (swap last two dims) + gh_matmul +
+ * gh_reshape, all batch-transparent.
+ *
+ * @g:          Graph to add nodes to
+ * @mask_embed: [B, n_queries, d_model]
+ * @inst:       [B, H, W, d_model] instance features (NHWC)
+ * @arena:      Arena for intermediate tensors
+ *
+ * Returns mask logits [B, n_queries, H, W], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_mask_logits_batched(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
+	struct sam3_arena *arena);
+
 #endif /* SAM3_MODEL_SEGMENTATION_H */

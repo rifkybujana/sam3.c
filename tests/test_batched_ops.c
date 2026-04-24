@@ -763,6 +763,112 @@ static void test_mask_mlp_batched_equals_per_slot(void)
 	run_both_backends(mask_mlp_batched_case);
 }
 
+/*
+ * mask_logits_batched_case - Verify batched dot-product mask logits
+ *                            matches the 2D path per-slot.
+ *
+ * Builds synthetic mask_embed [B, nq, d] and inst [B, H, W, d] with
+ * deterministic per-slot patterns, runs the batched builder, then
+ * compares against sam3_seg_head_build_mask_logits called once per
+ * batch slice. Takes no weights, so the only source of divergence
+ * would be gh_reshape/gh_transpose/gh_matmul failing to thread the
+ * leading batch dim.
+ */
+static void mask_logits_batched_case(struct sam3_backend *be,
+				     const char *name)
+{
+	const int B = 2;
+	const int nq = 8;
+	const int H = 18;
+	const int W = 18;
+	const int d = 16;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	int me_dims[] = {B, nq, d};
+	int inst_dims[] = {B, H, W, d};
+	struct sam3_tensor *me_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						   me_dims);
+	struct sam3_tensor *inst_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4,
+						     inst_dims);
+	ASSERT_NOT_NULL(me_b);
+	ASSERT_NOT_NULL(inst_b);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)me_b->data)[i] = (float)((i * 7 + 3) % 23) * 0.13f;
+	for (int i = 0; i < B * H * W * d; i++)
+		((float *)inst_b->data)[i] =
+			(float)((i * 11 + 5) % 19) * 0.09f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_seg_head_build_mask_logits_batched(
+		&g, me_b, inst_b, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 4);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], H);
+	ASSERT_EQ(outb->dims[3], W);
+
+	for (int b = 0; b < B; b++) {
+		int me1_dims[] = {nq, d};
+		int inst1_dims[] = {1, H, W, d};
+		struct sam3_tensor *me1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, me1_dims);
+		struct sam3_tensor *inst1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 4, inst1_dims);
+		ASSERT_NOT_NULL(me1);
+		ASSERT_NOT_NULL(inst1);
+		memcpy(me1->data,
+		       (char *)me_b->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(inst1->data,
+		       (char *)inst_b->data +
+			       (size_t)b * H * W * d * sizeof(float),
+		       (size_t)H * W * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_seg_head_build_mask_logits(
+			&g1, me1, inst1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 3);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], H);
+		ASSERT_EQ(out1->dims[2], W);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * H * W;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * H * W; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s mask_logits] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_mask_logits_batched_equals_per_slot(void)
+{
+	run_both_backends(mask_logits_batched_case);
+}
+
 int main(void)
 {
 	test_scorer_batched_equals_per_slot();
@@ -771,5 +877,6 @@ int main(void)
 	test_broadcast_batch();
 	test_fpn_batched_equals_per_slot();
 	test_mask_mlp_batched_equals_per_slot();
+	test_mask_logits_batched_equals_per_slot();
 	TEST_REPORT();
 }

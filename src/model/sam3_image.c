@@ -2816,6 +2816,10 @@ enum sam3_error sam3_image_model_segment(
 		 * inst is NHWC [1, H, W, d]. Reshape to [H*W, d],
 		 * transpose to [d, H*W], then matmul:
 		 * mask_embed [nq, d] @ inst_flat_t [d, H*W] → [nq, H*W]
+		 *
+		 * Rank-dispatches to the batched helper when mask_embed is
+		 * [B, nq, d]; the batched path threads a leading batch dim
+		 * through every op.
 		 */
 		{
 			sam3_arena_reset(scratch);
@@ -2823,7 +2827,6 @@ enum sam3_error sam3_image_model_segment(
 
 			int final_h = inst->dims[1];
 			int final_w = inst->dims[2];
-			int final_hw = final_h * final_w;
 			int n_q = queries->dims[0];
 
 			struct sam3_tensor *me_wrap, *inst_wrap;
@@ -2838,36 +2841,13 @@ enum sam3_error sam3_image_model_segment(
 				goto fail;
 			}
 
-			/* Reshape inst [1,H,W,d] → [H*W, d] */
-			int flat_dims[] = {final_hw, seg_d};
-			struct sam3_tensor *inst_flat;
-			inst_flat = gh_reshape(&g, scratch, inst_wrap,
-						2, flat_dims);
-			if (!inst_flat) {
-				err = SAM3_ENOMEM;
-				goto fail;
+			if (mask_embed->n_dims == 3) {
+				masks = sam3_seg_head_build_mask_logits_batched(
+					&g, me_wrap, inst_wrap, scratch);
+			} else {
+				masks = sam3_seg_head_build_mask_logits(
+					&g, me_wrap, inst_wrap, scratch);
 			}
-
-			/* Transpose [H*W, d] → [d, H*W] */
-			struct sam3_tensor *inst_flat_t;
-			inst_flat_t = gh_transpose(&g, scratch, inst_flat);
-			if (!inst_flat_t) {
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
-
-			/* masks = mask_embed @ inst_flat_t */
-			masks = gh_matmul(&g, scratch,
-					   me_wrap, inst_flat_t);
-			if (!masks) {
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
-
-			/* Reshape [nq, H*W] → [nq, H, W] */
-			int mask_dims[] = {n_q, final_h, final_w};
-			masks = gh_reshape(&g, scratch, masks,
-					    3, mask_dims);
 			if (!masks) {
 				err = SAM3_ENOMEM;
 				goto fail;
