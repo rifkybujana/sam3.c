@@ -3065,3 +3065,216 @@ fail:
 	persist->offset = persist_save;
 	return err;
 }
+
+/*
+ * sam3_image_model_segment_batched - Batched segmentation entry point.
+ *
+ * Current implementation serializes per-slot calls to
+ * sam3_image_model_segment and stacks the outputs along the leading
+ * batch dim. This preserves byte-for-byte parity with the existing 2D
+ * path while giving callers the batched API shape
+ * (sam3_processor_segment_batch in Task 15, future video paths). The
+ * already-landed _batched substep builders (decoder SA/TCA/CA/FFN,
+ * seg head cross-attn/FPN/mask MLP/mask logits, dot-scorer) are
+ * unchanged and remain available for a follow-up that lifts Stages
+ * 3+4 to run once on stacked [B, ...] tensors.
+ */
+enum sam3_error sam3_image_model_segment_batched(
+	struct sam3_image_model *model,
+	struct sam3_backend *be,
+	struct sam3_backend *cpu_be,
+	struct sam3_tensor *prompt_tokens,
+	struct sam3_tensor *text_features,
+	int B,
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_tensor **out_masks,
+	struct sam3_tensor **out_scores,
+	struct sam3_profiler *profiler)
+{
+	enum sam3_error err;
+	size_t outer_save;
+	struct sam3_tensor *batched_masks = NULL;
+	struct sam3_tensor *batched_scores = NULL;
+	int nq, mh, mw;
+	size_t dsz;
+
+	if (!model || !be || !scratch || !persist || !out_masks)
+		return SAM3_EINVAL;
+	if (B < 1)
+		return SAM3_EINVAL;
+	if (!model->image_encoded)
+		return SAM3_EINVAL;
+	if (!prompt_tokens && !text_features)
+		return SAM3_EINVAL;
+
+	/* Validate input ranks: batched inputs must be 3D [B, *, d]. */
+	if (prompt_tokens) {
+		if (prompt_tokens->n_dims != 3 ||
+		    prompt_tokens->dims[0] != B) {
+			sam3_log_error("segment_batched: prompt_tokens must "
+				       "be [B=%d, N+1, d], got rank %d",
+				       B, prompt_tokens->n_dims);
+			return SAM3_EINVAL;
+		}
+	}
+	if (text_features) {
+		if (text_features->n_dims != 3 ||
+		    text_features->dims[0] != B) {
+			sam3_log_error("segment_batched: text_features must "
+				       "be [B=%d, seq, d], got rank %d",
+				       B, text_features->n_dims);
+			return SAM3_EINVAL;
+		}
+	}
+
+	outer_save = persist->offset;
+
+	/*
+	 * Allocate batched output tensors up-front so they survive the
+	 * inner persist rollback that sam3_image_model_segment performs
+	 * on each slot.
+	 *
+	 * Mask spatial dims come from cached_feat_4x_nhwc (the FPN's
+	 * final upsampled scale), n_queries from the decoder config.
+	 */
+	nq = model->decoder.n_queries;
+	mh = model->cached_feat_4x_nhwc->dims[1];
+	mw = model->cached_feat_4x_nhwc->dims[2];
+	dsz = sizeof(float);
+
+	{
+		int m_dims[4] = {B, nq, mh, mw};
+		batched_masks = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						 4, m_dims);
+		if (!batched_masks) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+	}
+	if (out_scores) {
+		int s_dims[3] = {B, nq, 1};
+		batched_scores = gh_alloc_tensor(persist, SAM3_DTYPE_F32,
+						  3, s_dims);
+		if (!batched_scores) {
+			err = SAM3_ENOMEM;
+			goto fail;
+		}
+	}
+
+	/*
+	 * Per-slot loop. Wrap the b-th slice of the stacked inputs as a
+	 * 2D tensor and invoke the existing per-image pipeline. Copy the
+	 * returned masks/scores into the stacked outputs before moving on
+	 * — the inner function's persist rollback makes the returned
+	 * pointers live only until the next allocation on @persist.
+	 */
+	for (int b = 0; b < B; b++) {
+		struct sam3_tensor slot_pt;
+		struct sam3_tensor slot_tf;
+		struct sam3_tensor *slot_pt_p = NULL;
+		struct sam3_tensor *slot_tf_p = NULL;
+		struct sam3_tensor *slot_masks = NULL;
+		struct sam3_tensor *slot_scores = NULL;
+
+		if (prompt_tokens) {
+			int pt_n = prompt_tokens->dims[1];
+			int pt_d = prompt_tokens->dims[2];
+			size_t pt_stride = (size_t)pt_n * (size_t)pt_d *
+					    sam3_dtype_size(
+						prompt_tokens->dtype);
+			memset(&slot_pt, 0, sizeof(slot_pt));
+			slot_pt.dtype = prompt_tokens->dtype;
+			slot_pt.n_dims = 2;
+			slot_pt.dims[0] = pt_n;
+			slot_pt.dims[1] = pt_d;
+			slot_pt.data = (char *)prompt_tokens->data +
+					(size_t)b * pt_stride;
+			sam3_tensor_compute_strides(&slot_pt);
+			slot_pt.nbytes = (size_t)sam3_tensor_nelems(
+						&slot_pt) *
+					  sam3_dtype_size(slot_pt.dtype);
+			slot_pt_p = &slot_pt;
+		}
+		if (text_features) {
+			int tf_n = text_features->dims[1];
+			int tf_d = text_features->dims[2];
+			size_t tf_stride = (size_t)tf_n * (size_t)tf_d *
+					    sam3_dtype_size(
+						text_features->dtype);
+			memset(&slot_tf, 0, sizeof(slot_tf));
+			slot_tf.dtype = text_features->dtype;
+			slot_tf.n_dims = 2;
+			slot_tf.dims[0] = tf_n;
+			slot_tf.dims[1] = tf_d;
+			slot_tf.data = (char *)text_features->data +
+					(size_t)b * tf_stride;
+			sam3_tensor_compute_strides(&slot_tf);
+			slot_tf.nbytes = (size_t)sam3_tensor_nelems(
+						&slot_tf) *
+					  sam3_dtype_size(slot_tf.dtype);
+			slot_tf_p = &slot_tf;
+		}
+
+		err = sam3_image_model_segment(
+			model, be, cpu_be,
+			slot_pt_p, slot_tf_p,
+			scratch, persist,
+			&slot_masks,
+			batched_scores ? &slot_scores : NULL,
+			profiler);
+		if (err != SAM3_OK) {
+			sam3_log_error("segment_batched: slot %d failed: %d",
+				       b, err);
+			goto fail;
+		}
+
+		/* Validate shape consistency across slots. */
+		if (slot_masks->n_dims != 3 ||
+		    slot_masks->dims[0] != nq ||
+		    slot_masks->dims[1] != mh ||
+		    slot_masks->dims[2] != mw) {
+			sam3_log_error("segment_batched: slot %d mask shape "
+				       "mismatch", b);
+			err = SAM3_EINVAL;
+			goto fail;
+		}
+
+		{
+			size_t slot_bytes = (size_t)nq * (size_t)mh *
+					     (size_t)mw * dsz;
+			char *dst = (char *)batched_masks->data +
+				     (size_t)b * slot_bytes;
+			memcpy(dst, slot_masks->data, slot_bytes);
+		}
+
+		if (batched_scores) {
+			if (!slot_scores) {
+				sam3_log_error("segment_batched: slot %d "
+					       "missing scores", b);
+				err = SAM3_EINVAL;
+				goto fail;
+			}
+			if (slot_scores->n_dims != 2 ||
+			    slot_scores->dims[0] != nq) {
+				sam3_log_error("segment_batched: slot %d "
+					       "score shape mismatch", b);
+				err = SAM3_EINVAL;
+				goto fail;
+			}
+			size_t slot_bytes = (size_t)nq * dsz;
+			char *dst = (char *)batched_scores->data +
+				     (size_t)b * slot_bytes;
+			memcpy(dst, slot_scores->data, slot_bytes);
+		}
+	}
+
+	*out_masks = batched_masks;
+	if (out_scores)
+		*out_scores = batched_scores;
+	return SAM3_OK;
+
+fail:
+	persist->offset = outer_save;
+	return err;
+}

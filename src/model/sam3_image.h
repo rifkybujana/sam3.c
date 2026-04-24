@@ -189,4 +189,59 @@ enum sam3_error sam3_image_model_segment(
 	struct sam3_tensor **out_scores,
 	struct sam3_profiler *profiler);
 
+/*
+ * sam3_image_model_segment_batched - Batched segmentation pipeline.
+ *
+ * Runs the SAM3 segmentation pipeline with leading batch dim B.
+ * Callers are responsible for stacking per-set fusion inputs
+ * (prompt tokens, text features) along the leading dim.
+ *
+ * For single-image inference, the 2D sam3_image_model_segment remains
+ * the direct entry point. This batched helper gives
+ * sam3_processor_segment_batch (Task 15) and future callers a single
+ * API that accepts stacked [B, ...] inputs and produces stacked
+ * [B, ...] outputs.
+ *
+ * Current implementation serializes Stages 1-4 per batch slot under
+ * the hood (invoking sam3_image_model_segment once per b) and stacks
+ * the results along the leading batch dim. The internal graph-level
+ * batching of Stages 3 (DETR decoder) and 4 (seg head + scorer) via
+ * the already-landed _batched substep builders is a follow-up
+ * optimization; the public API and output layout match the final
+ * design so callers can adopt the entry point today.
+ *
+ * @model:          Loaded image model (must be image-encoded).
+ * @be, @cpu_be:    Main + CPU-side decoder backends (same roles as
+ *                  sam3_image_model_segment).
+ * @prompt_tokens:  [B, N+1, d_model] stacked prompt tokens, or NULL
+ *                  for text-only sets. N+1 must be identical across
+ *                  all B slots.
+ * @text_features:  [B, seq, d_model] stacked text features, or NULL
+ *                  for geometry-only sets. seq must be identical
+ *                  across all B slots — callers pad to a shared
+ *                  sequence length if required.
+ * @B:              Batch size (>= 1).
+ * @scratch:        Per-stage scratch arena (reset between stages).
+ * @persist:        Inter-stage persist arena.
+ * @out_masks:      Receives stacked mask tensor [B, n_queries, H, W].
+ * @out_scores:     Receives stacked score tensor [B, n_queries, 1]
+ *                  (non-NULL only when text_features is non-NULL).
+ *                  May be NULL if the caller does not need scores.
+ * @profiler:       Optional profiler pointer.
+ *
+ * Returns SAM3_OK on success, error code otherwise.
+ */
+enum sam3_error sam3_image_model_segment_batched(
+	struct sam3_image_model *model,
+	struct sam3_backend *be,
+	struct sam3_backend *cpu_be,
+	struct sam3_tensor *prompt_tokens,
+	struct sam3_tensor *text_features,
+	int B,
+	struct sam3_arena *scratch,
+	struct sam3_arena *persist,
+	struct sam3_tensor **out_masks,
+	struct sam3_tensor **out_scores,
+	struct sam3_profiler *profiler);
+
 #endif /* SAM3_MODEL_SAM3_IMAGE_H */
