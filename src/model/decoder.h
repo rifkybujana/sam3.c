@@ -239,6 +239,24 @@ void sam3_decoder_compute_rpb(const struct sam3_decoder *dec,
 			       const float *ref_boxes,
 			       int H, int W, float *out);
 
+/*
+ * sam3_decoder_compute_rpb_batched - Batched RPB mask computation.
+ *
+ * Batched wrapper around sam3_decoder_compute_rpb. Iterates the
+ * per-slot computation over B batch slots. Output is laid out so the
+ * batch dim is leading: [B, n_heads, nq, H*W].
+ *
+ * @dec:       Decoder with loaded RPB MLP weights
+ * @ref_boxes: [B, nq, 4] flat in cxcywh order (post-sigmoid)
+ * @B:         Batch size (>= 1)
+ * @H, @W:     Feature map spatial dims
+ * @out:       Output buffer, must hold B * n_heads * nq * H * W floats
+ */
+void sam3_decoder_compute_rpb_batched(const struct sam3_decoder *dec,
+				       const float *ref_boxes,
+				       int B, int H, int W,
+				       float *out);
+
 struct sam3_tensor *sam3_decoder_build_ffn(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,

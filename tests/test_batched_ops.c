@@ -1013,6 +1013,148 @@ static void test_box_refine_batched_equals_per_slot(void)
 	run_both_backends(box_refine_batched_case);
 }
 
+/*
+ * rpb_batched_case - Verify sam3_decoder_compute_rpb_batched matches
+ *                    calling sam3_decoder_compute_rpb once per batch slot.
+ *
+ * Pure CPU math on both paths (the batched wrapper is a thin loop over
+ * the per-slot helper), so the backend handle is unused — we still route
+ * through run_both_backends for interface symmetry and expect memcmp-exact
+ * equality since both paths execute the same float ops in the same order.
+ */
+static void rpb_batched_case(struct sam3_backend *be, const char *name)
+{
+	(void)be;
+	(void)name;
+
+	const int B = 2;
+	const int nq = 3;
+	const int d = 16;
+	const int n_heads = 2;
+	const int H = 4;
+	const int W = 5;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 20);
+
+	/*
+	 * Build a tiny decoder with only the RPB MLP weights populated.
+	 * Shapes per rpb_mlp_2layer's docstring:
+	 *   fc1_w: [hidden, 2]  fc1_b: [hidden]
+	 *   fc2_w: [n_heads, hidden]  fc2_b: [n_heads]
+	 */
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = n_heads;
+	dec.n_queries = nq;
+
+	int fc1_w_dims[] = {d, 2};
+	int fc1_b_dims[] = {d};
+	int fc2_w_dims[] = {n_heads, d};
+	int fc2_b_dims[] = {n_heads};
+
+	dec.rpb_y_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc1_w_dims);
+	dec.rpb_y_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc1_b_dims);
+	dec.rpb_y_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc2_w_dims);
+	dec.rpb_y_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc2_b_dims);
+	dec.rpb_x_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc1_w_dims);
+	dec.rpb_x_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc1_b_dims);
+	dec.rpb_x_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc2_w_dims);
+	dec.rpb_x_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc2_b_dims);
+	ASSERT_NOT_NULL(dec.rpb_y_fc1_w);
+	ASSERT_NOT_NULL(dec.rpb_y_fc1_b);
+	ASSERT_NOT_NULL(dec.rpb_y_fc2_w);
+	ASSERT_NOT_NULL(dec.rpb_y_fc2_b);
+	ASSERT_NOT_NULL(dec.rpb_x_fc1_w);
+	ASSERT_NOT_NULL(dec.rpb_x_fc1_b);
+	ASSERT_NOT_NULL(dec.rpb_x_fc2_w);
+	ASSERT_NOT_NULL(dec.rpb_x_fc2_b);
+
+	/* Unique sin offset per tensor surfaces weight/bias mix-ups. */
+	fill_sin_pattern(dec.rpb_y_fc1_w, 1.0f);
+	fill_sin_pattern(dec.rpb_y_fc1_b, 2.0f);
+	fill_sin_pattern(dec.rpb_y_fc2_w, 3.0f);
+	fill_sin_pattern(dec.rpb_y_fc2_b, 4.0f);
+	fill_sin_pattern(dec.rpb_x_fc1_w, 5.0f);
+	fill_sin_pattern(dec.rpb_x_fc1_b, 6.0f);
+	fill_sin_pattern(dec.rpb_x_fc2_w, 7.0f);
+	fill_sin_pattern(dec.rpb_x_fc2_b, 8.0f);
+
+	/*
+	 * Ref boxes in cxcywh with values strictly inside (0, 1) so the
+	 * cxcywh->xyxy conversion and log transform are well-defined. Keep
+	 * widths/heights modest so xyxy stays in range.
+	 */
+	float *ref_boxes_b = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * 4 * sizeof(float));
+	ASSERT_NOT_NULL(ref_boxes_b);
+	for (int b = 0; b < B; b++) {
+		for (int q = 0; q < nq; q++) {
+			float *rb = ref_boxes_b + (b * nq + q) * 4;
+			rb[0] = 0.4f + 0.05f * sinf(0.3f * (float)b +
+						   (float)q);
+			rb[1] = 0.5f + 0.05f * cosf(0.3f * (float)b +
+						   (float)q);
+			rb[2] = 0.2f + 0.02f * sinf(0.7f * (float)q +
+						   (float)b);
+			rb[3] = 0.2f + 0.02f * cosf(0.7f * (float)q +
+						   (float)b);
+		}
+	}
+
+	const size_t per_slot_n = (size_t)n_heads * nq * H * W;
+	float *out_batched = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * per_slot_n * sizeof(float));
+	float *out_ref = (float *)sam3_arena_alloc_raw(
+		&ar, per_slot_n * sizeof(float));
+	ASSERT_NOT_NULL(out_batched);
+	ASSERT_NOT_NULL(out_ref);
+
+	/* Batched call produces [B, n_heads, nq, H*W]. */
+	sam3_decoder_compute_rpb_batched(&dec, ref_boxes_b, B, H, W,
+					  out_batched);
+
+	/*
+	 * Per-slot reference: both paths call the same helper on the same
+	 * inputs in the same order, so memcmp-exact equality is expected.
+	 */
+	for (int b = 0; b < B; b++) {
+		sam3_decoder_compute_rpb(&dec,
+					  ref_boxes_b + (size_t)b * nq * 4,
+					  H, W, out_ref);
+		const float *bptr = out_batched + (size_t)b * per_slot_n;
+		tests_run++;
+		if (memcmp(bptr, out_ref,
+			   per_slot_n * sizeof(float)) != 0) {
+			fprintf(stderr,
+				"FAIL [%s rpb] b=%d: batched slice != "
+				"per-slot reference (memcmp)\n",
+				name, b);
+			tests_failed++;
+		}
+
+		/* Also do an element-wise compare so a failure pinpoints
+		 * the first diverging index. */
+		for (size_t i = 0; i < per_slot_n; i++) {
+			tests_run++;
+			if (bptr[i] != out_ref[i]) {
+				fprintf(stderr,
+					"FAIL [%s rpb] b=%d i=%zu: "
+					"batched=%.9g ref=%.9g\n",
+					name, b, i, bptr[i], out_ref[i]);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_rpb_batched_equals_per_slot(void)
+{
+	run_both_backends(rpb_batched_case);
+}
+
 int main(void)
 {
 	test_scorer_batched_equals_per_slot();
@@ -1023,5 +1165,6 @@ int main(void)
 	test_mask_mlp_batched_equals_per_slot();
 	test_mask_logits_batched_equals_per_slot();
 	test_box_refine_batched_equals_per_slot();
+	test_rpb_batched_equals_per_slot();
 	TEST_REPORT();
 }

@@ -937,6 +937,32 @@ void sam3_decoder_compute_rpb(const struct sam3_decoder *dec,
 	free(boxes);
 }
 
+/* --- sam3_decoder_compute_rpb_batched --- */
+
+void sam3_decoder_compute_rpb_batched(const struct sam3_decoder *dec,
+				       const float *ref_boxes,
+				       int B, int H, int W,
+				       float *out)
+{
+	if (!dec || !ref_boxes || !out || B < 1) {
+		sam3_log_error("rpb_batched: bad args (B=%d)", B);
+		return;
+	}
+
+	const int nq = dec->n_queries;
+	const int n_heads = dec->n_heads;
+	const size_t rb_stride  = (size_t)nq * 4u;
+	const size_t out_stride = (size_t)n_heads * (size_t)nq *
+				   (size_t)H * (size_t)W;
+
+	for (int b = 0; b < B; b++) {
+		sam3_decoder_compute_rpb(dec,
+					  ref_boxes + (size_t)b * rb_stride,
+					  H, W,
+					  out + (size_t)b * out_stride);
+	}
+}
+
 /*
  * decoder_self_attention_with_pos - Self-attention with position embedding.
  *
