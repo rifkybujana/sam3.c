@@ -69,6 +69,27 @@ struct sam3_tensor *gh_tensor_wrap(struct sam3_arena *arena,
 				   void *data);
 
 /*
+ * gh_broadcast_batch - Tile a tensor along a new leading batch dim.
+ *
+ * Allocates an output tensor with shape [B] + input's dims and copies
+ * input's payload into every batch slot via memcpy loop. Used when a
+ * shared image feature (typically [1, H, W, C] or a 3D equivalent) must
+ * be fed into a batched pipeline that expects [B, H, W, C].
+ *
+ * If @input already has a leading dim of 1, that dim is dropped first
+ * (so [1, H, W, C] becomes [B, H, W, C], not [B, 1, H, W, C]).
+ *
+ * @arena: Arena for the output tensor.
+ * @input: Tensor to broadcast.
+ * @B:     Batch size (>= 1).
+ *
+ * Returns the broadcasted tensor, or NULL on error.
+ */
+struct sam3_tensor *gh_broadcast_batch(struct sam3_arena *arena,
+				       struct sam3_tensor *input,
+				       int B);
+
+/*
  * gh_load_or_alloc - Load a weight tensor by name, or allocate zeroed.
  *
  * When wf is NULL or the tensor is not found, allocates a

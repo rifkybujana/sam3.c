@@ -1,0 +1,2344 @@
+/*
+ * tests/test_batched_ops.c - Unit tests for batched building blocks.
+ *
+ * Each batched op (scorer, seg head, decoder substeps, CPU helpers)
+ * is verified here with small synthetic tensors so the tests run
+ * without loading a model. Every test loops over both the CPU and
+ * Metal backends via run_both_backends(): CPU first (tight tolerance,
+ * easier failure localization), Metal second (loose tolerance, the
+ * deployment backend). A Metal-only failure indicates backend
+ * divergence worth escalating.
+ *
+ * Key types:  sam3_backend, sam3_arena, sam3_graph, sam3_tensor
+ * Depends on: test_helpers.h, backend/backend.h, core/alloc.h,
+ *             core/graph.h, model/graph_helpers.h
+ * Used by:    CTest
+ *
+ * Copyright (c) 2026 Rifky Bujana Bisri
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "test_helpers.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "backend/backend.h"
+#include "core/alloc.h"
+#include "core/graph.h"
+#include "model/graph_helpers.h"
+#include "model/model_misc.h"
+#include "model/sam3_image_internal.h"
+#include "model/segmentation.h"
+
+/*
+ * Helper: run a backend-parameterized test case on both CPU and Metal.
+ * The callback receives the backend handle and a short human name
+ * ("CPU" / "Metal") so failure messages can identify which backend
+ * diverged.
+ */
+typedef void (*backend_test_fn)(struct sam3_backend *be, const char *name);
+
+static void run_both_backends(backend_test_fn fn)
+{
+	{
+		struct sam3_backend *cpu = sam3_backend_init(SAM3_BACKEND_CPU);
+		ASSERT_NOT_NULL(cpu);
+		fn(cpu, "CPU");
+		sam3_backend_free(cpu);
+	}
+	{
+		struct sam3_backend *mtl = sam3_backend_init(SAM3_BACKEND_METAL);
+		if (!mtl) {
+			printf("  skip Metal: backend unavailable\n");
+			return;
+		}
+		fn(mtl, "Metal");
+		sam3_backend_free(mtl);
+	}
+}
+
+/*
+ * scorer_batched_case - Verify batched dot scorer matches per-slot 2D.
+ *
+ * Runs sam3_dot_scorer_build_batched on B=2 synthetic inputs, then
+ * rebuilds the 2D scorer per slot and compares element-wise with a
+ * backend-dependent tolerance.
+ */
+static void scorer_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int d = 16;
+	const int seq = 3;
+	const int nq = 8;
+	const int B = 2;
+	const int d_ffn = 32;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_dot_scorer sc = {0};
+	sc.d_model = d;
+	sc.d_proj = d;
+	sc.d_ffn = d_ffn;
+	ASSERT_EQ(sam3_dot_scorer_alloc_synthetic(&sc, &ar), 0);
+
+	int qb_dims[] = {B, nq, d};
+	int pb_dims[] = {B, seq, d};
+	struct sam3_tensor *qb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 qb_dims);
+	struct sam3_tensor *pb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 pb_dims);
+	ASSERT_NOT_NULL(qb);
+	ASSERT_NOT_NULL(pb);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)qb->data)[i] = (float)(i % 13) * 0.1f;
+	for (int i = 0; i < B * seq * d; i++)
+		((float *)pb->data)[i] = (float)(i % 17) * 0.2f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *sb = sam3_dot_scorer_build_batched(
+		&sc, &g, qb, pb, &ar);
+	ASSERT_NOT_NULL(sb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(sb->n_dims, 3);
+	ASSERT_EQ(sb->dims[0], B);
+	ASSERT_EQ(sb->dims[1], nq);
+	ASSERT_EQ(sb->dims[2], 1);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {nq, d};
+		int p1_dims[] = {seq, d};
+		struct sam3_tensor *q1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		struct sam3_tensor *p1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, p1_dims);
+		ASSERT_NOT_NULL(q1);
+		ASSERT_NOT_NULL(p1);
+		memcpy(q1->data,
+		       (char *)qb->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(p1->data,
+		       (char *)pb->data +
+			       (size_t)b * seq * d * sizeof(float),
+		       (size_t)seq * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *s1 = sam3_dot_scorer_build(
+			&sc, &g1, q1, p1, &ar);
+		ASSERT_NOT_NULL(s1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(s1->dims[0], nq);
+		ASSERT_EQ(s1->dims[1], 1);
+
+		const float *bptr = (const float *)sb->data +
+			(size_t)b * nq;
+		const float *sptr = (const float *)s1->data;
+		for (int i = 0; i < nq; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s] b=%d q=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected,
+					tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_scorer_batched_equals_per_slot(void)
+{
+	run_both_backends(scorer_batched_case);
+}
+
+/*
+ * sdpa_4d_batch_case - Derisk the Metal 4D SDPA batching path.
+ *
+ * The batched decoder (Tasks 11-13) reshapes each per-head attention
+ * slice from [nq, hd] to [B, 1, nq, hd] to reuse the existing 4D SDPA
+ * path. This smoke test validates that both CPU and Metal SDPA accept
+ * B > 1 with a leading-1 head dim and produce per-slot-equivalent
+ * output. A failure here would force a decoder-batching strategy pivot
+ * before sinking time into Tasks 11-13.
+ */
+static void sdpa_4d_batch_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int nkv = 5;
+	const int hd = 8;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	int q_dims[] = {B, 1, nq, hd};
+	int k_dims[] = {B, 1, nkv, hd};
+	struct sam3_tensor *Qb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, q_dims);
+	struct sam3_tensor *Kb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k_dims);
+	struct sam3_tensor *Vb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k_dims);
+	ASSERT_NOT_NULL(Qb);
+	ASSERT_NOT_NULL(Kb);
+	ASSERT_NOT_NULL(Vb);
+	for (int i = 0; i < B * nq * hd; i++)
+		((float *)Qb->data)[i] = (float)((i * 7 + 3) % 23) * 0.13f;
+	for (int i = 0; i < B * nkv * hd; i++) {
+		((float *)Kb->data)[i] = (float)((i * 11 + 5) % 19) * 0.09f;
+		((float *)Vb->data)[i] = (float)((i * 13 + 7) % 17) * 0.11f;
+	}
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = gh_sdpa(&g, &ar, Qb, Kb, Vb, NULL, hd);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 4);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], 1);
+	ASSERT_EQ(outb->dims[2], nq);
+	ASSERT_EQ(outb->dims[3], hd);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {1, 1, nq, hd};
+		int k1_dims[] = {1, 1, nkv, hd};
+		struct sam3_tensor *Q1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, q1_dims);
+		struct sam3_tensor *K1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k1_dims);
+		struct sam3_tensor *V1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, k1_dims);
+		ASSERT_NOT_NULL(Q1);
+		ASSERT_NOT_NULL(K1);
+		ASSERT_NOT_NULL(V1);
+		memcpy(Q1->data,
+		       (char *)Qb->data + (size_t)b * nq * hd * sizeof(float),
+		       (size_t)nq * hd * sizeof(float));
+		memcpy(K1->data,
+		       (char *)Kb->data + (size_t)b * nkv * hd * sizeof(float),
+		       (size_t)nkv * hd * sizeof(float));
+		memcpy(V1->data,
+		       (char *)Vb->data + (size_t)b * nkv * hd * sizeof(float),
+		       (size_t)nkv * hd * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = gh_sdpa(&g1, &ar, Q1, K1, V1, NULL, hd);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * hd;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * hd; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr, "FAIL [%s sdpa] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_sdpa_4d_batch_equals_per_slot(void)
+{
+	run_both_backends(sdpa_4d_batch_case);
+}
+
+/*
+ * fill_sin_pattern - Deterministic non-degenerate fill for test tensors.
+ *
+ * Each call uses a unique offset so swapping two tensors (e.g. a Q
+ * weight vs a K weight) would change the output and trip the parity
+ * check. sin/cos keep the magnitudes bounded.
+ */
+static void fill_sin_pattern(struct sam3_tensor *t, float offset)
+{
+	int n = 1;
+	for (int i = 0; i < t->n_dims; i++)
+		n *= t->dims[i];
+	float *data = (float *)t->data;
+	for (int i = 0; i < n; i++)
+		data[i] = 0.1f * sinf(offset + (float)i * 0.137f);
+}
+
+/*
+ * cross_attn_batched_case - Verify batched seg cross-attn matches per-slot 2D.
+ *
+ * Builds a synthetic seg head (only the prompt cross-attn weights are
+ * populated) and checks that the batched builder produces the same
+ * output as calling the 2D builder once per batch slot.
+ */
+static void cross_attn_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 9;
+	const int ntxt = 4;
+	const int d = 16;
+	const int n_heads = 2;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_seg_head head = {0};
+	head.d_model = d;
+	head.n_attn_heads = n_heads;
+
+	int d_dims[] = {d};
+	int dd_dims[] = {d, d};
+
+	head.pxattn_norm_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_norm_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_q_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_q_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_k_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_k_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_v_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_v_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	head.pxattn_o_w    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, dd_dims);
+	head.pxattn_o_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	ASSERT_NOT_NULL(head.pxattn_norm_w);
+	ASSERT_NOT_NULL(head.pxattn_norm_b);
+	ASSERT_NOT_NULL(head.pxattn_q_w);
+	ASSERT_NOT_NULL(head.pxattn_q_b);
+	ASSERT_NOT_NULL(head.pxattn_k_w);
+	ASSERT_NOT_NULL(head.pxattn_k_b);
+	ASSERT_NOT_NULL(head.pxattn_v_w);
+	ASSERT_NOT_NULL(head.pxattn_v_b);
+	ASSERT_NOT_NULL(head.pxattn_o_w);
+	ASSERT_NOT_NULL(head.pxattn_o_b);
+
+	/*
+	 * Norm weights kept near-identity so the LN step does something
+	 * sensible; biases small. Other tensors get unique sin offsets so
+	 * weight/bias mix-ups would surface as numeric differences.
+	 */
+	float *nw = (float *)head.pxattn_norm_w->data;
+	float *nb = (float *)head.pxattn_norm_b->data;
+	for (int i = 0; i < d; i++) {
+		nw[i] = 1.0f + 0.01f * sinf((float)i);
+		nb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(head.pxattn_q_w, 1.0f);
+	fill_sin_pattern(head.pxattn_q_b, 2.0f);
+	fill_sin_pattern(head.pxattn_k_w, 3.0f);
+	fill_sin_pattern(head.pxattn_k_b, 4.0f);
+	fill_sin_pattern(head.pxattn_v_w, 5.0f);
+	fill_sin_pattern(head.pxattn_v_b, 6.0f);
+	fill_sin_pattern(head.pxattn_o_w, 7.0f);
+	fill_sin_pattern(head.pxattn_o_b, 8.0f);
+
+	int x_dims[] = {B, nq, d};
+	int t_dims[] = {B, ntxt, d};
+	struct sam3_tensor *xb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 x_dims);
+	struct sam3_tensor *tb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 t_dims);
+	ASSERT_NOT_NULL(xb);
+	ASSERT_NOT_NULL(tb);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)xb->data)[i] = (float)((i * 7 + 3) % 23) * 0.13f;
+	for (int i = 0; i < B * ntxt * d; i++)
+		((float *)tb->data)[i] = (float)((i * 11 + 5) % 19) * 0.09f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_seg_head_build_cross_attn_batched(
+		&head, &g, xb, tb, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		int x1_dims[] = {nq, d};
+		int t1_dims[] = {ntxt, d};
+		struct sam3_tensor *x1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, x1_dims);
+		struct sam3_tensor *t1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, t1_dims);
+		ASSERT_NOT_NULL(x1);
+		ASSERT_NOT_NULL(t1);
+		memcpy(x1->data,
+		       (char *)xb->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(t1->data,
+		       (char *)tb->data +
+			       (size_t)b * ntxt * d * sizeof(float),
+		       (size_t)ntxt * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_seg_head_build_cross_attn(
+			&head, &g1, x1, t1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s xattn] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_cross_attn_batched_equals_per_slot(void)
+{
+	run_both_backends(cross_attn_batched_case);
+}
+
+/*
+ * broadcast_batch_case - Verify gh_broadcast_batch tiles correctly.
+ *
+ * Pure CPU op (no graph node, just an arena memcpy loop), so the
+ * backend handle is unused — we run the case once standalone instead
+ * of through run_both_backends to keep the comment honest.
+ */
+static void broadcast_batch_case(struct sam3_backend *be, const char *name)
+{
+	(void)be; /* CPU-only op; backend irrelevant but symmetry with other cases */
+	(void)name;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 20);
+
+	/* Shape [1, 3, 4, 2] with a deterministic fill. */
+	int in_dims[] = {1, 3, 4, 2};
+	struct sam3_tensor *in = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, in_dims);
+	ASSERT_NOT_NULL(in);
+	int n_in = 1 * 3 * 4 * 2;
+	for (int i = 0; i < n_in; i++)
+		((float *)in->data)[i] = (float)(i * 3 + 1) * 0.25f;
+
+	struct sam3_tensor *out = gh_broadcast_batch(&ar, in, 3);
+	ASSERT_NOT_NULL(out);
+	ASSERT_EQ(out->n_dims, 4);
+	ASSERT_EQ(out->dims[0], 3);
+	ASSERT_EQ(out->dims[1], 3);
+	ASSERT_EQ(out->dims[2], 4);
+	ASSERT_EQ(out->dims[3], 2);
+
+	/* Each batch slot must contain the full input payload. */
+	for (int b = 0; b < 3; b++) {
+		const float *slot = (const float *)out->data +
+			(size_t)b * n_in;
+		const float *src  = (const float *)in->data;
+		ASSERT_EQ(memcmp(slot, src,
+				 (size_t)n_in * sizeof(float)), 0);
+	}
+
+	/* Also test rank without a leading-1 collapse:
+	 * [H, W, C] -> [B, H, W, C]. */
+	int raw_dims[] = {2, 3, 2};
+	struct sam3_tensor *raw = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						  raw_dims);
+	ASSERT_NOT_NULL(raw);
+	int n_raw = 2 * 3 * 2;
+	for (int i = 0; i < n_raw; i++)
+		((float *)raw->data)[i] = (float)i + 0.5f;
+
+	struct sam3_tensor *raw_out = gh_broadcast_batch(&ar, raw, 4);
+	ASSERT_NOT_NULL(raw_out);
+	ASSERT_EQ(raw_out->n_dims, 4);
+	ASSERT_EQ(raw_out->dims[0], 4);
+	ASSERT_EQ(raw_out->dims[1], 2);
+	ASSERT_EQ(raw_out->dims[2], 3);
+	ASSERT_EQ(raw_out->dims[3], 2);
+
+	for (int b = 0; b < 4; b++) {
+		const float *slot = (const float *)raw_out->data +
+			(size_t)b * n_raw;
+		const float *src  = (const float *)raw->data;
+		ASSERT_EQ(memcmp(slot, src,
+				 (size_t)n_raw * sizeof(float)), 0);
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_broadcast_batch(void)
+{
+	/* Pure CPU op — no backend needed, but call once just for count. */
+	broadcast_batch_case(NULL, "CPU-direct");
+}
+
+/*
+ * fpn_batched_case - Verify batched FPN+inst_proj matches per-slot.
+ *
+ * Builds a synthetic seg head with FPN + instance projection weights
+ * filled deterministically, then checks that
+ * sam3_seg_head_build_fpn_batched on B=2 inputs matches calling the
+ * 2D builder once per slot. Spatial dims are kept small because CPU
+ * conv2d is slow at 36×36×16 channels.
+ */
+static void fpn_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int d = 16;
+	const int eh = 9, ew = 9;
+	const int h2 = 18, w2 = 18;
+	const int h4 = 36, w4 = 36;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 25);  /* 32 MiB for 36x36 FPN scratch */
+
+	struct sam3_seg_head head = {0};
+	head.d_model = d;
+	head.n_attn_heads = 1;  /* unused in FPN path */
+
+	/*
+	 * FPN weights: 3 stages of 3x3 OHWI conv [d, 3, 3, d] + bias [d]
+	 * plus GroupNorm scale/shift [d]. Inst proj is a 1x1 OHWI conv
+	 * [d, 1, 1, d] + bias [d]. Use unique sin offsets per tensor so a
+	 * conv/norm mix-up would surface as a numeric difference.
+	 */
+	int conv_w_dims[] = {d, 3, 3, d};
+	int proj_w_dims[] = {d, 1, 1, d};
+	int d_dims[] = {d};
+	float off = 0.5f;
+	for (int i = 0; i < SAM3_SEG_FPN_STAGES; i++) {
+		head.fpn[i].conv_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4,
+						     conv_w_dims);
+		head.fpn[i].conv_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						     d_dims);
+		head.fpn[i].gn_w   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						     d_dims);
+		head.fpn[i].gn_b   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						     d_dims);
+		ASSERT_NOT_NULL(head.fpn[i].conv_w);
+		ASSERT_NOT_NULL(head.fpn[i].conv_b);
+		ASSERT_NOT_NULL(head.fpn[i].gn_w);
+		ASSERT_NOT_NULL(head.fpn[i].gn_b);
+		fill_sin_pattern(head.fpn[i].conv_w, off);    off += 1.0f;
+		fill_sin_pattern(head.fpn[i].conv_b, off);    off += 1.0f;
+		/*
+		 * GroupNorm scale near identity so the FPN output stays
+		 * numerically tame; bias small.
+		 */
+		float *gw = (float *)head.fpn[i].gn_w->data;
+		float *gb = (float *)head.fpn[i].gn_b->data;
+		for (int c = 0; c < d; c++) {
+			gw[c] = 1.0f + 0.01f * sinf(off + (float)c);
+			gb[c] = 0.01f * cosf(off + (float)c);
+		}
+		off += 1.0f;
+	}
+	head.inst_proj_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, proj_w_dims);
+	head.inst_proj_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	ASSERT_NOT_NULL(head.inst_proj_w);
+	ASSERT_NOT_NULL(head.inst_proj_b);
+	fill_sin_pattern(head.inst_proj_w, off);    off += 1.0f;
+	fill_sin_pattern(head.inst_proj_b, off);    off += 1.0f;
+
+	/* Batched inputs. Per-slot-different fill so slot aliasing surfaces. */
+	int eb_dims[] = {B, eh, ew, d};
+	int f2b_dims[] = {B, h2, w2, d};
+	int f4b_dims[] = {B, h4, w4, d};
+	struct sam3_tensor *eb  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, eb_dims);
+	struct sam3_tensor *f2b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f2b_dims);
+	struct sam3_tensor *f4b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f4b_dims);
+	ASSERT_NOT_NULL(eb);
+	ASSERT_NOT_NULL(f2b);
+	ASSERT_NOT_NULL(f4b);
+	for (int i = 0; i < B * eh * ew * d; i++)
+		((float *)eb->data)[i] = sinf(0.031f * (float)i + 0.1f);
+	for (int i = 0; i < B * h2 * w2 * d; i++)
+		((float *)f2b->data)[i] = sinf(0.017f * (float)i + 0.3f);
+	for (int i = 0; i < B * h4 * w4 * d; i++)
+		((float *)f4b->data)[i] = sinf(0.013f * (float)i + 0.5f);
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_seg_head_build_fpn_batched(
+		&head, &g, eb, f2b, f4b, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 4);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], h4);
+	ASSERT_EQ(outb->dims[2], w4);
+	ASSERT_EQ(outb->dims[3], d);
+
+	/* Per-slot reference: N=1 FPN on each batch slice. */
+	for (int b = 0; b < B; b++) {
+		int e1_dims[]  = {1, eh, ew, d};
+		int f2_1_dims[] = {1, h2, w2, d};
+		int f4_1_dims[] = {1, h4, w4, d};
+		struct sam3_tensor *e1   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, e1_dims);
+		struct sam3_tensor *f2_1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f2_1_dims);
+		struct sam3_tensor *f4_1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4, f4_1_dims);
+		ASSERT_NOT_NULL(e1);
+		ASSERT_NOT_NULL(f2_1);
+		ASSERT_NOT_NULL(f4_1);
+		memcpy(e1->data,
+		       (char *)eb->data +
+			       (size_t)b * eh * ew * d * sizeof(float),
+		       (size_t)eh * ew * d * sizeof(float));
+		memcpy(f2_1->data,
+		       (char *)f2b->data +
+			       (size_t)b * h2 * w2 * d * sizeof(float),
+		       (size_t)h2 * w2 * d * sizeof(float));
+		memcpy(f4_1->data,
+		       (char *)f4b->data +
+			       (size_t)b * h4 * w4 * d * sizeof(float),
+		       (size_t)h4 * w4 * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_seg_head_build_fpn(
+			&head, &g1, e1, f2_1, f4_1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * h4 * w4 * d;
+		const float *sptr = (const float *)out1->data;
+		int n = h4 * w4 * d;
+		int slot_fails = 0;
+		for (int i = 0; i < n; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				if (slot_fails < 10) {
+					fprintf(stderr,
+						"FAIL [%s fpn] b=%d i=%d: "
+						"batched=%.6f ref=%.6f tol=%g\n",
+						name, b, i, actual,
+						expected, tol);
+				}
+				tests_failed++;
+				slot_fails++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_fpn_batched_equals_per_slot(void)
+{
+	run_both_backends(fpn_batched_case);
+}
+
+/*
+ * mask_mlp_batched_case - Verify batched mask embedder matches per-slot.
+ *
+ * Builds a synthetic seg head with only the mask_mlp[0..2] weights
+ * populated, then checks that sam3_seg_head_build_mask_embed_batched on
+ * B=2 synthetic queries matches calling the 2D builder once per batch
+ * slot. The underlying MLP uses gh_linear + gh_relu, both N-aware, so
+ * the batched wrapper is a naming-consistency no-op — this case guards
+ * against an accidental future regression.
+ */
+static void mask_mlp_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 9;
+	const int d = 16;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_seg_head head = {0};
+	head.d_model = d;
+	head.n_attn_heads = 1;  /* unused in MLP path */
+
+	int dd_dims[] = {d, d};
+	int d_dims[]  = {d};
+	float off = 0.5f;
+	for (int i = 0; i < SAM3_SEG_MASK_MLP_LAYERS; i++) {
+		head.mask_mlp[i].w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						     dd_dims);
+		head.mask_mlp[i].b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						     d_dims);
+		ASSERT_NOT_NULL(head.mask_mlp[i].w);
+		ASSERT_NOT_NULL(head.mask_mlp[i].b);
+		fill_sin_pattern(head.mask_mlp[i].w, off);    off += 1.0f;
+		fill_sin_pattern(head.mask_mlp[i].b, off);    off += 1.0f;
+	}
+
+	int qb_dims[] = {B, nq, d};
+	struct sam3_tensor *qb = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						 qb_dims);
+	ASSERT_NOT_NULL(qb);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)qb->data)[i] = (float)((i * 7 + 3) % 23) * 0.13f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_seg_head_build_mask_embed_batched(
+		&head, &g, qb, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {nq, d};
+		struct sam3_tensor *q1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		ASSERT_NOT_NULL(q1);
+		memcpy(q1->data,
+		       (char *)qb->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_seg_head_build_mask_embed(
+			&head, &g1, q1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s mask_mlp] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_mask_mlp_batched_equals_per_slot(void)
+{
+	run_both_backends(mask_mlp_batched_case);
+}
+
+/*
+ * mask_logits_batched_case - Verify batched dot-product mask logits
+ *                            matches the 2D path per-slot.
+ *
+ * Builds synthetic mask_embed [B, nq, d] and inst [B, H, W, d] with
+ * deterministic per-slot patterns, runs the batched builder, then
+ * compares against sam3_seg_head_build_mask_logits called once per
+ * batch slice. Takes no weights, so the only source of divergence
+ * would be gh_reshape/gh_transpose/gh_matmul failing to thread the
+ * leading batch dim.
+ */
+static void mask_logits_batched_case(struct sam3_backend *be,
+				     const char *name)
+{
+	const int B = 2;
+	const int nq = 8;
+	const int H = 18;
+	const int W = 18;
+	const int d = 16;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	int me_dims[] = {B, nq, d};
+	int inst_dims[] = {B, H, W, d};
+	struct sam3_tensor *me_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						   me_dims);
+	struct sam3_tensor *inst_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4,
+						     inst_dims);
+	ASSERT_NOT_NULL(me_b);
+	ASSERT_NOT_NULL(inst_b);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)me_b->data)[i] = (float)((i * 7 + 3) % 23) * 0.13f;
+	for (int i = 0; i < B * H * W * d; i++)
+		((float *)inst_b->data)[i] =
+			(float)((i * 11 + 5) % 19) * 0.09f;
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_seg_head_build_mask_logits_batched(
+		&g, me_b, inst_b, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 4);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], H);
+	ASSERT_EQ(outb->dims[3], W);
+
+	for (int b = 0; b < B; b++) {
+		int me1_dims[] = {nq, d};
+		int inst1_dims[] = {1, H, W, d};
+		struct sam3_tensor *me1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, me1_dims);
+		struct sam3_tensor *inst1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 4, inst1_dims);
+		ASSERT_NOT_NULL(me1);
+		ASSERT_NOT_NULL(inst1);
+		memcpy(me1->data,
+		       (char *)me_b->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(inst1->data,
+		       (char *)inst_b->data +
+			       (size_t)b * H * W * d * sizeof(float),
+		       (size_t)H * W * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_seg_head_build_mask_logits(
+			&g1, me1, inst1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 3);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], H);
+		ASSERT_EQ(out1->dims[2], W);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * H * W;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * H * W; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s mask_logits] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_mask_logits_batched_equals_per_slot(void)
+{
+	run_both_backends(mask_logits_batched_case);
+}
+
+/*
+ * box_refine_batched_case - Verify cpu_box_refine_batched matches
+ * calling cpu_box_refine once per batch slot.
+ *
+ * cpu_box_refine is pure CPU arithmetic (no graph nodes, no backend
+ * dispatch), so the backend handle is unused — we still route through
+ * run_both_backends for interface symmetry with the other cases.
+ */
+static void box_refine_batched_case(struct sam3_backend *be, const char *name)
+{
+	(void)be;
+	(void)name;
+
+	const int B = 2;
+	const int nq = 4;
+	const int d = 16;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	/*
+	 * Build a tiny decoder with only the weights cpu_box_refine touches:
+	 * output_ln_{w,b} and layers[0].box_fc{1,2,3}_{w,b}. Other fields
+	 * stay zero-initialized.
+	 */
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = 2;
+	dec.n_queries = 0;
+
+	int d_dims[] = {d};
+	int dd_dims[] = {d, d};
+	int d4_dims[] = {4, d};
+	int b4_dims[] = {4};
+
+	dec.output_ln_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	dec.output_ln_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	dec.layers[0].box_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  dd_dims);
+	dec.layers[0].box_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  d_dims);
+	dec.layers[0].box_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  dd_dims);
+	dec.layers[0].box_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  d_dims);
+	dec.layers[0].box_fc3_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  d4_dims);
+	dec.layers[0].box_fc3_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  b4_dims);
+	ASSERT_NOT_NULL(dec.output_ln_w);
+	ASSERT_NOT_NULL(dec.output_ln_b);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc1_w);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc1_b);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc2_w);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc2_b);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc3_w);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc3_b);
+
+	/*
+	 * Keep output_ln near identity so the LN output is well-scaled;
+	 * biases small. MLP weights get unique sin offsets.
+	 */
+	float *lnw = (float *)dec.output_ln_w->data;
+	float *lnb = (float *)dec.output_ln_b->data;
+	for (int i = 0; i < d; i++) {
+		lnw[i] = 1.0f + 0.01f * sinf((float)i);
+		lnb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(dec.layers[0].box_fc1_w, 1.0f);
+	fill_sin_pattern(dec.layers[0].box_fc1_b, 2.0f);
+	fill_sin_pattern(dec.layers[0].box_fc2_w, 3.0f);
+	fill_sin_pattern(dec.layers[0].box_fc2_b, 4.0f);
+	fill_sin_pattern(dec.layers[0].box_fc3_w, 5.0f);
+	fill_sin_pattern(dec.layers[0].box_fc3_b, 6.0f);
+
+	/* Raw float buffers for queries and ref boxes. */
+	float *q = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * d * sizeof(float));
+	float *rb_batched = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * 4 * sizeof(float));
+	float *rb_ref = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * 4 * sizeof(float));
+	ASSERT_NOT_NULL(q);
+	ASSERT_NOT_NULL(rb_batched);
+	ASSERT_NOT_NULL(rb_ref);
+
+	/* Per-slot-differing queries so slot aliasing would surface. */
+	for (int b = 0; b < B; b++) {
+		for (int i = 0; i < nq * d; i++) {
+			q[b * nq * d + i] = 0.1f * sinf(
+				0.3f * (float)b + (float)i * 0.137f);
+		}
+	}
+	/* Ref boxes in (0, 1) so inverse_sigmoid is well-defined. */
+	for (int i = 0; i < B * nq * 4; i++) {
+		rb_batched[i] = 0.3f + 0.1f * sinf((float)i);
+		rb_ref[i] = rb_batched[i];
+	}
+
+	/* Scratch buffers: tmp1 needs nq * max(d, 4) floats, tmp2 nq * d. */
+	int tmp1_stride = d > 4 ? d : 4;
+	float *tmp1 = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)nq * tmp1_stride * sizeof(float));
+	float *tmp2 = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)nq * d * sizeof(float));
+	ASSERT_NOT_NULL(tmp1);
+	ASSERT_NOT_NULL(tmp2);
+
+	/* Batched call: updates rb_batched in place. */
+	cpu_box_refine_batched(q, &dec, rb_batched, B, nq, d, tmp1, tmp2);
+
+	/* Per-slot reference. */
+	for (int b = 0; b < B; b++) {
+		cpu_box_refine(q + (size_t)b * nq * d, &dec,
+				rb_ref + (size_t)b * nq * 4,
+				nq, d, tmp1, tmp2);
+	}
+
+	/* Pure CPU math on both paths — tight tolerance. */
+	const float atol = 1e-6f;
+	const float rtol = 1e-6f;
+	for (int i = 0; i < B * nq * 4; i++) {
+		tests_run++;
+		float expected = rb_ref[i];
+		float actual = rb_batched[i];
+		float tol = atol + rtol * fabsf(expected);
+		if (fabsf(actual - expected) > tol) {
+			fprintf(stderr,
+				"FAIL [%s box_refine] i=%d: "
+				"batched=%.6f ref=%.6f tol=%g\n",
+				name, i, actual, expected, tol);
+			tests_failed++;
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_box_refine_batched_equals_per_slot(void)
+{
+	run_both_backends(box_refine_batched_case);
+}
+
+/*
+ * rpb_batched_case - Verify sam3_decoder_compute_rpb_batched matches
+ *                    calling sam3_decoder_compute_rpb once per batch slot.
+ *
+ * Pure CPU math on both paths (the batched wrapper is a thin loop over
+ * the per-slot helper), so the backend handle is unused — we still route
+ * through run_both_backends for interface symmetry and expect memcmp-exact
+ * equality since both paths execute the same float ops in the same order.
+ */
+static void rpb_batched_case(struct sam3_backend *be, const char *name)
+{
+	(void)be;
+	(void)name;
+
+	const int B = 2;
+	const int nq = 3;
+	const int d = 16;
+	const int n_heads = 2;
+	const int H = 4;
+	const int W = 5;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 20);
+
+	/*
+	 * Build a tiny decoder with only the RPB MLP weights populated.
+	 * Shapes per rpb_mlp_2layer's docstring:
+	 *   fc1_w: [hidden, 2]  fc1_b: [hidden]
+	 *   fc2_w: [n_heads, hidden]  fc2_b: [n_heads]
+	 */
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = n_heads;
+	dec.n_queries = nq;
+
+	int fc1_w_dims[] = {d, 2};
+	int fc1_b_dims[] = {d};
+	int fc2_w_dims[] = {n_heads, d};
+	int fc2_b_dims[] = {n_heads};
+
+	dec.rpb_y_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc1_w_dims);
+	dec.rpb_y_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc1_b_dims);
+	dec.rpb_y_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc2_w_dims);
+	dec.rpb_y_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc2_b_dims);
+	dec.rpb_x_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc1_w_dims);
+	dec.rpb_x_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc1_b_dims);
+	dec.rpb_x_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc2_w_dims);
+	dec.rpb_x_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc2_b_dims);
+	ASSERT_NOT_NULL(dec.rpb_y_fc1_w);
+	ASSERT_NOT_NULL(dec.rpb_y_fc1_b);
+	ASSERT_NOT_NULL(dec.rpb_y_fc2_w);
+	ASSERT_NOT_NULL(dec.rpb_y_fc2_b);
+	ASSERT_NOT_NULL(dec.rpb_x_fc1_w);
+	ASSERT_NOT_NULL(dec.rpb_x_fc1_b);
+	ASSERT_NOT_NULL(dec.rpb_x_fc2_w);
+	ASSERT_NOT_NULL(dec.rpb_x_fc2_b);
+
+	/* Unique sin offset per tensor surfaces weight/bias mix-ups. */
+	fill_sin_pattern(dec.rpb_y_fc1_w, 1.0f);
+	fill_sin_pattern(dec.rpb_y_fc1_b, 2.0f);
+	fill_sin_pattern(dec.rpb_y_fc2_w, 3.0f);
+	fill_sin_pattern(dec.rpb_y_fc2_b, 4.0f);
+	fill_sin_pattern(dec.rpb_x_fc1_w, 5.0f);
+	fill_sin_pattern(dec.rpb_x_fc1_b, 6.0f);
+	fill_sin_pattern(dec.rpb_x_fc2_w, 7.0f);
+	fill_sin_pattern(dec.rpb_x_fc2_b, 8.0f);
+
+	/*
+	 * Ref boxes in cxcywh with values strictly inside (0, 1) so the
+	 * cxcywh->xyxy conversion and log transform are well-defined. Keep
+	 * widths/heights modest so xyxy stays in range.
+	 */
+	float *ref_boxes_b = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * 4 * sizeof(float));
+	ASSERT_NOT_NULL(ref_boxes_b);
+	for (int b = 0; b < B; b++) {
+		for (int q = 0; q < nq; q++) {
+			float *rb = ref_boxes_b + (b * nq + q) * 4;
+			rb[0] = 0.4f + 0.05f * sinf(0.3f * (float)b +
+						   (float)q);
+			rb[1] = 0.5f + 0.05f * cosf(0.3f * (float)b +
+						   (float)q);
+			rb[2] = 0.2f + 0.02f * sinf(0.7f * (float)q +
+						   (float)b);
+			rb[3] = 0.2f + 0.02f * cosf(0.7f * (float)q +
+						   (float)b);
+		}
+	}
+
+	const size_t per_slot_n = (size_t)n_heads * nq * H * W;
+	float *out_batched = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * per_slot_n * sizeof(float));
+	float *out_ref = (float *)sam3_arena_alloc_raw(
+		&ar, per_slot_n * sizeof(float));
+	ASSERT_NOT_NULL(out_batched);
+	ASSERT_NOT_NULL(out_ref);
+
+	/* Batched call produces [B, n_heads, nq, H*W]. */
+	sam3_decoder_compute_rpb_batched(&dec, ref_boxes_b, B, H, W,
+					  out_batched);
+
+	/*
+	 * Per-slot reference: both paths call the same helper on the same
+	 * inputs in the same order, so memcmp-exact equality is expected.
+	 */
+	for (int b = 0; b < B; b++) {
+		sam3_decoder_compute_rpb(&dec,
+					  ref_boxes_b + (size_t)b * nq * 4,
+					  H, W, out_ref);
+		const float *bptr = out_batched + (size_t)b * per_slot_n;
+		tests_run++;
+		if (memcmp(bptr, out_ref,
+			   per_slot_n * sizeof(float)) != 0) {
+			fprintf(stderr,
+				"FAIL [%s rpb] b=%d: batched slice != "
+				"per-slot reference (memcmp)\n",
+				name, b);
+			tests_failed++;
+		}
+
+		/* Also do an element-wise compare so a failure pinpoints
+		 * the first diverging index. */
+		for (size_t i = 0; i < per_slot_n; i++) {
+			tests_run++;
+			if (bptr[i] != out_ref[i]) {
+				fprintf(stderr,
+					"FAIL [%s rpb] b=%d i=%zu: "
+					"batched=%.9g ref=%.9g\n",
+					name, b, i, bptr[i], out_ref[i]);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_rpb_batched_equals_per_slot(void)
+{
+	run_both_backends(rpb_batched_case);
+}
+
+/*
+ * query_pos_batched_case - Verify sam3_decoder_compute_query_pos_batched
+ *                          matches the 2D path per-slot.
+ *
+ * Builds a tiny decoder with only the ref_point_head MLP weights populated
+ * (rph_fc{1,2}_{w,b}). The ref_point_head is Linear(2*d -> d) + ReLU +
+ * Linear(d -> d); weight layout matches gh_linear (OUT x IN). Runs the
+ * batched builder on [B=2, nq=4, 4] ref_boxes and compares element-wise
+ * against calling the 2D builder once per batch slot on the same backend.
+ */
+static void query_pos_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int d = 16;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_queries = nq;
+
+	/*
+	 * ref_point_head: Linear(2*d -> d) + ReLU + Linear(d -> d).
+	 * gh_linear weight layout is OUT x IN (transposed at build time).
+	 */
+	int fc1_w_dims[] = {d, 2 * d};
+	int fc1_b_dims[] = {d};
+	int fc2_w_dims[] = {d, d};
+	int fc2_b_dims[] = {d};
+
+	dec.rph_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc1_w_dims);
+	dec.rph_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc1_b_dims);
+	dec.rph_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2, fc2_w_dims);
+	dec.rph_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, fc2_b_dims);
+	ASSERT_NOT_NULL(dec.rph_fc1_w);
+	ASSERT_NOT_NULL(dec.rph_fc1_b);
+	ASSERT_NOT_NULL(dec.rph_fc2_w);
+	ASSERT_NOT_NULL(dec.rph_fc2_b);
+
+	fill_sin_pattern(dec.rph_fc1_w, 1.0f);
+	fill_sin_pattern(dec.rph_fc1_b, 2.0f);
+	fill_sin_pattern(dec.rph_fc2_w, 3.0f);
+	fill_sin_pattern(dec.rph_fc2_b, 4.0f);
+
+	/*
+	 * Ref boxes in (0, 1). Per-slot-differing values surface any slot
+	 * aliasing in the sine embedding helper.
+	 */
+	int rb_dims[] = {B, nq, 4};
+	struct sam3_tensor *ref_boxes_b = gh_alloc_tensor(
+		&ar, SAM3_DTYPE_F32, 3, rb_dims);
+	ASSERT_NOT_NULL(ref_boxes_b);
+	float *rb = (float *)ref_boxes_b->data;
+	for (int b = 0; b < B; b++) {
+		for (int q = 0; q < nq; q++) {
+			float *row = rb + (b * nq + q) * 4;
+			row[0] = 0.4f + 0.05f * sinf(0.3f * (float)b +
+						     (float)q);
+			row[1] = 0.5f + 0.05f * cosf(0.3f * (float)b +
+						     (float)q);
+			row[2] = 0.2f + 0.02f * sinf(0.7f * (float)q +
+						     (float)b);
+			row[3] = 0.2f + 0.02f * cosf(0.7f * (float)q +
+						     (float)b);
+		}
+	}
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_decoder_compute_query_pos_batched(
+		&dec, &g, &ar, (const float *)ref_boxes_b->data, B);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		const float *rb_slot = (const float *)ref_boxes_b->data +
+			(size_t)b * nq * 4;
+		struct sam3_tensor *out1 = sam3_decoder_compute_query_pos(
+			&dec, &g1, &ar, rb_slot);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s query_pos] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_query_pos_batched_equals_per_slot(void)
+{
+	run_both_backends(query_pos_batched_case);
+}
+
+/*
+ * sa_batched_case - Verify batched decoder self-attention matches per-slot 2D.
+ *
+ * Builds a tiny decoder with only layer 0 self-attention weights populated
+ * and checks that sam3_decoder_build_sa_batched(B=2) produces the same
+ * output as calling sam3_decoder_build_sa once per batch slot. This is
+ * the first test that exercises the Metal 4D SDPA with B>1 inside the
+ * real decoder substep path.
+ */
+static void sa_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 8;
+	const int d = 16;
+	const int n_heads = 2;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = n_heads;
+	dec.n_queries = nq;
+
+	/* Layer-0 SA weights. gh_linear convention is [OUT, IN], so
+	 * qkv_w is [3*d, d], out_w is [d, d]. */
+	int qkv_w_dims[] = {3 * d, d};
+	int qkv_b_dims[] = {3 * d};
+	int out_w_dims[] = {d, d};
+	int out_b_dims[] = {d};
+	int ln_dims[] = {d};
+
+	dec.layers[0].sa_qkv_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						 qkv_w_dims);
+	dec.layers[0].sa_qkv_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 qkv_b_dims);
+	dec.layers[0].sa_out_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						 out_w_dims);
+	dec.layers[0].sa_out_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 out_b_dims);
+	dec.layers[0].sa_ln_w  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 ln_dims);
+	dec.layers[0].sa_ln_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 ln_dims);
+	ASSERT_NOT_NULL(dec.layers[0].sa_qkv_w);
+	ASSERT_NOT_NULL(dec.layers[0].sa_qkv_b);
+	ASSERT_NOT_NULL(dec.layers[0].sa_out_w);
+	ASSERT_NOT_NULL(dec.layers[0].sa_out_b);
+	ASSERT_NOT_NULL(dec.layers[0].sa_ln_w);
+	ASSERT_NOT_NULL(dec.layers[0].sa_ln_b);
+
+	/* LN gamma near identity, beta near zero so LN stays well-conditioned;
+	 * QKV/out weights get unique sin offsets so a tensor swap would trip
+	 * the parity check. */
+	float *lw = (float *)dec.layers[0].sa_ln_w->data;
+	float *lb = (float *)dec.layers[0].sa_ln_b->data;
+	for (int i = 0; i < d; i++) {
+		lw[i] = 1.0f + 0.01f * sinf((float)i);
+		lb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(dec.layers[0].sa_qkv_w, 1.0f);
+	fill_sin_pattern(dec.layers[0].sa_qkv_b, 2.0f);
+	fill_sin_pattern(dec.layers[0].sa_out_w, 3.0f);
+	fill_sin_pattern(dec.layers[0].sa_out_b, 4.0f);
+
+	/* Batched inputs: deterministic but distinct per slot so a
+	 * B-dim indexing bug would break equality. */
+	int qb_dims[] = {B, nq, d};
+	struct sam3_tensor *q_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						  qb_dims);
+	struct sam3_tensor *qpos_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     qb_dims);
+	ASSERT_NOT_NULL(q_b);
+	ASSERT_NOT_NULL(qpos_b);
+	for (int i = 0; i < B * nq * d; i++) {
+		((float *)q_b->data)[i]    = 0.1f * sinf(0.13f * (float)i +
+							 0.7f);
+		((float *)qpos_b->data)[i] = 0.1f * cosf(0.17f * (float)i +
+							 0.3f);
+	}
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_decoder_build_sa_batched(
+		&dec, 0, &g, q_b, qpos_b, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {nq, d};
+		struct sam3_tensor *q1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		struct sam3_tensor *qpos1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		ASSERT_NOT_NULL(q1);
+		ASSERT_NOT_NULL(qpos1);
+		memcpy(q1->data,
+		       (char *)q_b->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(qpos1->data,
+		       (char *)qpos_b->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_decoder_build_sa(
+			&dec, 0, &g1, q1, qpos1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s sa] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_sa_batched_equals_per_slot(void)
+{
+	run_both_backends(sa_batched_case);
+}
+
+/*
+ * tca_batched_case - Verify batched decoder TCA matches per-slot 2D.
+ *
+ * Exercises sam3_decoder_build_tca_batched on B=2 synthetic inputs
+ * and compares against the 2D sam3_decoder_build_tca path called
+ * once per slot. Text features are non-NULL (the NULL no-op path is
+ * trivial and covered by inspection).
+ */
+static void tca_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int ntxt = 3;
+	const int d = 16;
+	const int n_heads = 2;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = n_heads;
+	dec.n_queries = nq;
+
+	/* Layer-0 TCA weights. gh_linear convention is [OUT, IN]:
+	 * q_w [d, d], kv_w [2*d, d], out_w [d, d]. */
+	int qw_dims[] = {d, d};
+	int qb_dims[] = {d};
+	int kvw_dims[] = {2 * d, d};
+	int kvb_dims[] = {2 * d};
+	int ln_dims[] = {d};
+
+	dec.layers[0].tca_q_w   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  qw_dims);
+	dec.layers[0].tca_q_b   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  qb_dims);
+	dec.layers[0].tca_kv_w  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  kvw_dims);
+	dec.layers[0].tca_kv_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  kvb_dims);
+	dec.layers[0].tca_out_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  qw_dims);
+	dec.layers[0].tca_out_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  qb_dims);
+	dec.layers[0].tca_ln_w  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  ln_dims);
+	dec.layers[0].tca_ln_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  ln_dims);
+	ASSERT_NOT_NULL(dec.layers[0].tca_q_w);
+	ASSERT_NOT_NULL(dec.layers[0].tca_q_b);
+	ASSERT_NOT_NULL(dec.layers[0].tca_kv_w);
+	ASSERT_NOT_NULL(dec.layers[0].tca_kv_b);
+	ASSERT_NOT_NULL(dec.layers[0].tca_out_w);
+	ASSERT_NOT_NULL(dec.layers[0].tca_out_b);
+	ASSERT_NOT_NULL(dec.layers[0].tca_ln_w);
+	ASSERT_NOT_NULL(dec.layers[0].tca_ln_b);
+
+	float *lw = (float *)dec.layers[0].tca_ln_w->data;
+	float *lb = (float *)dec.layers[0].tca_ln_b->data;
+	for (int i = 0; i < d; i++) {
+		lw[i] = 1.0f + 0.01f * sinf((float)i);
+		lb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(dec.layers[0].tca_q_w,   1.0f);
+	fill_sin_pattern(dec.layers[0].tca_q_b,   2.0f);
+	fill_sin_pattern(dec.layers[0].tca_kv_w,  3.0f);
+	fill_sin_pattern(dec.layers[0].tca_kv_b,  4.0f);
+	fill_sin_pattern(dec.layers[0].tca_out_w, 5.0f);
+	fill_sin_pattern(dec.layers[0].tca_out_b, 6.0f);
+
+	int qb_tdims[] = {B, nq, d};
+	int tb_dims[]  = {B, ntxt, d};
+	struct sam3_tensor *q_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     qb_tdims);
+	struct sam3_tensor *qpos_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     qb_tdims);
+	struct sam3_tensor *tb     = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     tb_dims);
+	ASSERT_NOT_NULL(q_b);
+	ASSERT_NOT_NULL(qpos_b);
+	ASSERT_NOT_NULL(tb);
+	for (int i = 0; i < B * nq * d; i++) {
+		((float *)q_b->data)[i]    = 0.1f * sinf(0.13f * (float)i +
+							 0.7f);
+		((float *)qpos_b->data)[i] = 0.1f * cosf(0.17f * (float)i +
+							 0.3f);
+	}
+	for (int i = 0; i < B * ntxt * d; i++)
+		((float *)tb->data)[i] = 0.1f * sinf(0.11f * (float)i + 1.3f);
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_decoder_build_tca_batched(
+		&dec, 0, &g, q_b, qpos_b, tb, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {nq, d};
+		int t1_dims[] = {ntxt, d};
+		struct sam3_tensor *q1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		struct sam3_tensor *qpos1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		struct sam3_tensor *t1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, t1_dims);
+		ASSERT_NOT_NULL(q1);
+		ASSERT_NOT_NULL(qpos1);
+		ASSERT_NOT_NULL(t1);
+		memcpy(q1->data,
+		       (char *)q_b->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(qpos1->data,
+		       (char *)qpos_b->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+		memcpy(t1->data,
+		       (char *)tb->data +
+			       (size_t)b * ntxt * d * sizeof(float),
+		       (size_t)ntxt * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_decoder_build_tca(
+			&dec, 0, &g1, q1, qpos1, t1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s tca] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_tca_batched_equals_per_slot(void)
+{
+	run_both_backends(tca_batched_case);
+}
+
+/*
+ * ca_batched_case - Verify batched decoder CA matches per-slot 2D.
+ *
+ * Exercises BOTH branches of sam3_decoder_build_ca_batched:
+ *   (1) enc_pos=NULL, rpb_mask=NULL (plain cross-attn dispatch to
+ *       decoder_cross_attention_batched).
+ *   (2) enc_pos as 2D [n_kv, d] shared across batch + RPB mask
+ *       [B, n_heads, n_q, n_kv] (dispatch to
+ *       decoder_cross_attention_with_pos_batched, exercises the
+ *       gh_broadcast_batch path and mask-per-head slicing).
+ */
+static void ca_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int nkv = 5;
+	const int d = 16;
+	const int n_heads = 2;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = n_heads;
+	dec.n_queries = nq;
+
+	int qw_dims[] = {d, d};
+	int qb_dims[] = {d};
+	int kvw_dims[] = {2 * d, d};
+	int kvb_dims[] = {2 * d};
+	int ln_dims[] = {d};
+
+	dec.layers[0].ca_q_w   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						 qw_dims);
+	dec.layers[0].ca_q_b   = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 qb_dims);
+	dec.layers[0].ca_kv_w  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						 kvw_dims);
+	dec.layers[0].ca_kv_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 kvb_dims);
+	dec.layers[0].ca_out_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						 qw_dims);
+	dec.layers[0].ca_out_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 qb_dims);
+	dec.layers[0].ca_ln_w  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 ln_dims);
+	dec.layers[0].ca_ln_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						 ln_dims);
+	ASSERT_NOT_NULL(dec.layers[0].ca_q_w);
+	ASSERT_NOT_NULL(dec.layers[0].ca_q_b);
+	ASSERT_NOT_NULL(dec.layers[0].ca_kv_w);
+	ASSERT_NOT_NULL(dec.layers[0].ca_kv_b);
+	ASSERT_NOT_NULL(dec.layers[0].ca_out_w);
+	ASSERT_NOT_NULL(dec.layers[0].ca_out_b);
+	ASSERT_NOT_NULL(dec.layers[0].ca_ln_w);
+	ASSERT_NOT_NULL(dec.layers[0].ca_ln_b);
+
+	float *lw = (float *)dec.layers[0].ca_ln_w->data;
+	float *lb = (float *)dec.layers[0].ca_ln_b->data;
+	for (int i = 0; i < d; i++) {
+		lw[i] = 1.0f + 0.01f * sinf((float)i);
+		lb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(dec.layers[0].ca_q_w,   1.0f);
+	fill_sin_pattern(dec.layers[0].ca_q_b,   2.0f);
+	fill_sin_pattern(dec.layers[0].ca_kv_w,  3.0f);
+	fill_sin_pattern(dec.layers[0].ca_kv_b,  4.0f);
+	fill_sin_pattern(dec.layers[0].ca_out_w, 5.0f);
+	fill_sin_pattern(dec.layers[0].ca_out_b, 6.0f);
+
+	int qb_tdims[]  = {B, nq, d};
+	int kvb_tdims[] = {B, nkv, d};
+	int pos_dims[]  = {nkv, d};
+	int rpb_dims[]  = {B, n_heads, nq, nkv};
+
+	struct sam3_tensor *q_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     qb_tdims);
+	struct sam3_tensor *qpos_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     qb_tdims);
+	struct sam3_tensor *enc_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     kvb_tdims);
+	struct sam3_tensor *enc_pos_2d = gh_alloc_tensor(&ar, SAM3_DTYPE_F32,
+							 2, pos_dims);
+	struct sam3_tensor *rpb    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4,
+						     rpb_dims);
+	ASSERT_NOT_NULL(q_b);
+	ASSERT_NOT_NULL(qpos_b);
+	ASSERT_NOT_NULL(enc_b);
+	ASSERT_NOT_NULL(enc_pos_2d);
+	ASSERT_NOT_NULL(rpb);
+	for (int i = 0; i < B * nq * d; i++) {
+		((float *)q_b->data)[i]    = 0.1f * sinf(0.13f * (float)i +
+							 0.7f);
+		((float *)qpos_b->data)[i] = 0.1f * cosf(0.17f * (float)i +
+							 0.3f);
+	}
+	for (int i = 0; i < B * nkv * d; i++)
+		((float *)enc_b->data)[i] = 0.1f * sinf(0.09f * (float)i +
+							 1.7f);
+	for (int i = 0; i < nkv * d; i++)
+		((float *)enc_pos_2d->data)[i] = 0.05f * cosf(0.23f *
+							       (float)i);
+	for (int i = 0; i < B * n_heads * nq * nkv; i++)
+		((float *)rpb->data)[i] = 0.02f * sinf(0.31f * (float)i +
+						       2.1f);
+
+	/* --- Sub-case 1: enc_pos=NULL, rpb_mask=NULL. --- */
+	{
+		struct sam3_graph g;
+		sam3_graph_init(&g);
+		struct sam3_tensor *outb = sam3_decoder_build_ca_batched(
+			&dec, 0, &g, q_b, qpos_b, enc_b, NULL, NULL, &ar);
+		ASSERT_NOT_NULL(outb);
+		ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+		ASSERT_EQ(outb->n_dims, 3);
+		ASSERT_EQ(outb->dims[0], B);
+		ASSERT_EQ(outb->dims[1], nq);
+		ASSERT_EQ(outb->dims[2], d);
+
+		for (int b = 0; b < B; b++) {
+			int q1_dims[] = {nq, d};
+			int kv1_dims[] = {nkv, d};
+			struct sam3_tensor *q1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, q1_dims);
+			struct sam3_tensor *qpos1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, q1_dims);
+			struct sam3_tensor *enc1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, kv1_dims);
+			ASSERT_NOT_NULL(q1);
+			ASSERT_NOT_NULL(qpos1);
+			ASSERT_NOT_NULL(enc1);
+			memcpy(q1->data,
+			       (char *)q_b->data +
+				       (size_t)b * nq * d * sizeof(float),
+			       (size_t)nq * d * sizeof(float));
+			memcpy(qpos1->data,
+			       (char *)qpos_b->data +
+				       (size_t)b * nq * d * sizeof(float),
+			       (size_t)nq * d * sizeof(float));
+			memcpy(enc1->data,
+			       (char *)enc_b->data +
+				       (size_t)b * nkv * d * sizeof(float),
+			       (size_t)nkv * d * sizeof(float));
+
+			struct sam3_graph g1;
+			sam3_graph_init(&g1);
+			struct sam3_tensor *out1 = sam3_decoder_build_ca(
+				&dec, 0, &g1, q1, qpos1, enc1,
+				NULL, NULL, &ar);
+			ASSERT_NOT_NULL(out1);
+			ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+			ASSERT_EQ(out1->n_dims, 2);
+
+			const float *bptr = (const float *)outb->data +
+				(size_t)b * nq * d;
+			const float *sptr = (const float *)out1->data;
+			for (int i = 0; i < nq * d; i++) {
+				tests_run++;
+				float expected = sptr[i];
+				float actual = bptr[i];
+				float tol = atol + rtol * fabsf(expected);
+				if (fabsf(actual - expected) > tol) {
+					fprintf(stderr,
+						"FAIL [%s ca-nopos] "
+						"b=%d i=%d: batched=%.6f "
+						"ref=%.6f tol=%g\n",
+						name, b, i, actual,
+						expected, tol);
+					tests_failed++;
+				}
+			}
+		}
+	}
+
+	/* --- Sub-case 2: 2D enc_pos + RPB mask. --- */
+	{
+		struct sam3_graph g;
+		sam3_graph_init(&g);
+		struct sam3_tensor *outb = sam3_decoder_build_ca_batched(
+			&dec, 0, &g, q_b, qpos_b, enc_b,
+			enc_pos_2d, rpb, &ar);
+		ASSERT_NOT_NULL(outb);
+		ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+		ASSERT_EQ(outb->n_dims, 3);
+		ASSERT_EQ(outb->dims[0], B);
+		ASSERT_EQ(outb->dims[1], nq);
+		ASSERT_EQ(outb->dims[2], d);
+
+		for (int b = 0; b < B; b++) {
+			int q1_dims[] = {nq, d};
+			int kv1_dims[] = {nkv, d};
+			int rpb1_dims[] = {n_heads, nq, nkv};
+			struct sam3_tensor *q1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, q1_dims);
+			struct sam3_tensor *qpos1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, q1_dims);
+			struct sam3_tensor *enc1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, kv1_dims);
+			/* 2D enc_pos is shared across slots; reuse. */
+			struct sam3_tensor *rpb1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 3, rpb1_dims);
+			ASSERT_NOT_NULL(q1);
+			ASSERT_NOT_NULL(qpos1);
+			ASSERT_NOT_NULL(enc1);
+			ASSERT_NOT_NULL(rpb1);
+			memcpy(q1->data,
+			       (char *)q_b->data +
+				       (size_t)b * nq * d * sizeof(float),
+			       (size_t)nq * d * sizeof(float));
+			memcpy(qpos1->data,
+			       (char *)qpos_b->data +
+				       (size_t)b * nq * d * sizeof(float),
+			       (size_t)nq * d * sizeof(float));
+			memcpy(enc1->data,
+			       (char *)enc_b->data +
+				       (size_t)b * nkv * d * sizeof(float),
+			       (size_t)nkv * d * sizeof(float));
+			memcpy(rpb1->data,
+			       (char *)rpb->data +
+				       (size_t)b * n_heads * nq * nkv *
+					       sizeof(float),
+			       (size_t)n_heads * nq * nkv * sizeof(float));
+
+			struct sam3_graph g1;
+			sam3_graph_init(&g1);
+			struct sam3_tensor *out1 = sam3_decoder_build_ca(
+				&dec, 0, &g1, q1, qpos1, enc1,
+				enc_pos_2d, rpb1, &ar);
+			ASSERT_NOT_NULL(out1);
+			ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+			ASSERT_EQ(out1->n_dims, 2);
+
+			const float *bptr = (const float *)outb->data +
+				(size_t)b * nq * d;
+			const float *sptr = (const float *)out1->data;
+			for (int i = 0; i < nq * d; i++) {
+				tests_run++;
+				float expected = sptr[i];
+				float actual = bptr[i];
+				float tol = atol + rtol * fabsf(expected);
+				if (fabsf(actual - expected) > tol) {
+					fprintf(stderr,
+						"FAIL [%s ca-pos] "
+						"b=%d i=%d: batched=%.6f "
+						"ref=%.6f tol=%g\n",
+						name, b, i, actual,
+						expected, tol);
+					tests_failed++;
+				}
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_ca_batched_equals_per_slot(void)
+{
+	run_both_backends(ca_batched_case);
+}
+
+/*
+ * ffn_batched_case - Verify batched decoder FFN matches per-slot 2D.
+ *
+ * gh_mlp + gh_add + gh_layernorm are all batch-transparent, so this is
+ * a sanity check that the trivial rank-3 wrapper preserves per-slot
+ * semantics at B=2.
+ */
+static void ffn_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int d = 16;
+	const int d_ffn = 32;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_queries = nq;
+	dec.d_ffn = d_ffn;
+
+	int fc1_w_dims[] = {d_ffn, d};
+	int fc1_b_dims[] = {d_ffn};
+	int fc2_w_dims[] = {d, d_ffn};
+	int fc2_b_dims[] = {d};
+	int ln_dims[]    = {d};
+
+	dec.layers[0].ffn_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						   fc1_w_dims);
+	dec.layers[0].ffn_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						   fc1_b_dims);
+	dec.layers[0].ffn_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						   fc2_w_dims);
+	dec.layers[0].ffn_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						   fc2_b_dims);
+	dec.layers[0].ffn_ln_w  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						   ln_dims);
+	dec.layers[0].ffn_ln_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						   ln_dims);
+	ASSERT_NOT_NULL(dec.layers[0].ffn_fc1_w);
+	ASSERT_NOT_NULL(dec.layers[0].ffn_fc1_b);
+	ASSERT_NOT_NULL(dec.layers[0].ffn_fc2_w);
+	ASSERT_NOT_NULL(dec.layers[0].ffn_fc2_b);
+	ASSERT_NOT_NULL(dec.layers[0].ffn_ln_w);
+	ASSERT_NOT_NULL(dec.layers[0].ffn_ln_b);
+
+	float *lw = (float *)dec.layers[0].ffn_ln_w->data;
+	float *lb = (float *)dec.layers[0].ffn_ln_b->data;
+	for (int i = 0; i < d; i++) {
+		lw[i] = 1.0f + 0.01f * sinf((float)i);
+		lb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(dec.layers[0].ffn_fc1_w, 1.0f);
+	fill_sin_pattern(dec.layers[0].ffn_fc1_b, 2.0f);
+	fill_sin_pattern(dec.layers[0].ffn_fc2_w, 3.0f);
+	fill_sin_pattern(dec.layers[0].ffn_fc2_b, 4.0f);
+
+	int qb_dims[] = {B, nq, d};
+	struct sam3_tensor *q_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						  qb_dims);
+	ASSERT_NOT_NULL(q_b);
+	for (int i = 0; i < B * nq * d; i++)
+		((float *)q_b->data)[i] = 0.1f * sinf(0.13f * (float)i + 0.7f);
+
+	struct sam3_graph g;
+	sam3_graph_init(&g);
+	struct sam3_tensor *outb = sam3_decoder_build_ffn_batched(
+		&dec, 0, &g, q_b, &ar);
+	ASSERT_NOT_NULL(outb);
+	ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+	ASSERT_EQ(outb->n_dims, 3);
+	ASSERT_EQ(outb->dims[0], B);
+	ASSERT_EQ(outb->dims[1], nq);
+	ASSERT_EQ(outb->dims[2], d);
+
+	for (int b = 0; b < B; b++) {
+		int q1_dims[] = {nq, d};
+		struct sam3_tensor *q1 = gh_alloc_tensor(
+			&ar, SAM3_DTYPE_F32, 2, q1_dims);
+		ASSERT_NOT_NULL(q1);
+		memcpy(q1->data,
+		       (char *)q_b->data +
+			       (size_t)b * nq * d * sizeof(float),
+		       (size_t)nq * d * sizeof(float));
+
+		struct sam3_graph g1;
+		sam3_graph_init(&g1);
+		struct sam3_tensor *out1 = sam3_decoder_build_ffn(
+			&dec, 0, &g1, q1, &ar);
+		ASSERT_NOT_NULL(out1);
+		ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+		ASSERT_EQ(out1->n_dims, 2);
+		ASSERT_EQ(out1->dims[0], nq);
+		ASSERT_EQ(out1->dims[1], d);
+
+		const float *bptr = (const float *)outb->data +
+			(size_t)b * nq * d;
+		const float *sptr = (const float *)out1->data;
+		for (int i = 0; i < nq * d; i++) {
+			tests_run++;
+			float expected = sptr[i];
+			float actual = bptr[i];
+			float tol = atol + rtol * fabsf(expected);
+			if (fabsf(actual - expected) > tol) {
+				fprintf(stderr,
+					"FAIL [%s ffn] b=%d i=%d: "
+					"batched=%.6f ref=%.6f tol=%g\n",
+					name, b, i, actual, expected, tol);
+				tests_failed++;
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_ffn_batched_equals_per_slot(void)
+{
+	run_both_backends(ffn_batched_case);
+}
+
+/*
+ * seed_decoder_layer_weights - Allocate + fill every SA/TCA/CA/FFN
+ * weight for one decoder layer with deterministic fill_sin_pattern
+ * offsets. LN gammas are set near 1.0 and LN betas near 0.0 so the
+ * layernorms stay well-conditioned on synthetic inputs. @dec must
+ * already have d_model, n_heads, n_queries, d_ffn set.
+ */
+static void seed_decoder_layer_weights(struct sam3_decoder *dec,
+				       int layer_idx,
+				       struct sam3_arena *ar)
+{
+	int d = dec->d_model;
+	int d_ffn = dec->d_ffn;
+	int i = layer_idx;
+
+	int qkv_w_dims[] = {3 * d, d};
+	int qkv_b_dims[] = {3 * d};
+	int qw_dims[]    = {d, d};
+	int qb_dims[]    = {d};
+	int kvw_dims[]   = {2 * d, d};
+	int kvb_dims[]   = {2 * d};
+	int fc1_w_dims[] = {d_ffn, d};
+	int fc1_b_dims[] = {d_ffn};
+	int fc2_w_dims[] = {d, d_ffn};
+	int ln_dims[]    = {d};
+
+	/* SA */
+	dec->layers[i].sa_qkv_w = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						   qkv_w_dims);
+	dec->layers[i].sa_qkv_b = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   qkv_b_dims);
+	dec->layers[i].sa_out_w = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						   qw_dims);
+	dec->layers[i].sa_out_b = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   qb_dims);
+	dec->layers[i].sa_ln_w  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   ln_dims);
+	dec->layers[i].sa_ln_b  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   ln_dims);
+
+	/* TCA */
+	dec->layers[i].tca_q_w   = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						    qw_dims);
+	dec->layers[i].tca_q_b   = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    qb_dims);
+	dec->layers[i].tca_kv_w  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						    kvw_dims);
+	dec->layers[i].tca_kv_b  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    kvb_dims);
+	dec->layers[i].tca_out_w = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						    qw_dims);
+	dec->layers[i].tca_out_b = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    qb_dims);
+	dec->layers[i].tca_ln_w  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    ln_dims);
+	dec->layers[i].tca_ln_b  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    ln_dims);
+
+	/* CA */
+	dec->layers[i].ca_q_w   = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						   qw_dims);
+	dec->layers[i].ca_q_b   = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   qb_dims);
+	dec->layers[i].ca_kv_w  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						   kvw_dims);
+	dec->layers[i].ca_kv_b  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   kvb_dims);
+	dec->layers[i].ca_out_w = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						   qw_dims);
+	dec->layers[i].ca_out_b = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   qb_dims);
+	dec->layers[i].ca_ln_w  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   ln_dims);
+	dec->layers[i].ca_ln_b  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						   ln_dims);
+
+	/* FFN */
+	dec->layers[i].ffn_fc1_w = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						    fc1_w_dims);
+	dec->layers[i].ffn_fc1_b = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    fc1_b_dims);
+	dec->layers[i].ffn_fc2_w = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 2,
+						    fc2_w_dims);
+	dec->layers[i].ffn_fc2_b = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    qb_dims);
+	dec->layers[i].ffn_ln_w  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    ln_dims);
+	dec->layers[i].ffn_ln_b  = gh_alloc_tensor(ar, SAM3_DTYPE_F32, 1,
+						    ln_dims);
+
+	ASSERT_NOT_NULL(dec->layers[i].sa_qkv_w);
+	ASSERT_NOT_NULL(dec->layers[i].sa_qkv_b);
+	ASSERT_NOT_NULL(dec->layers[i].sa_out_w);
+	ASSERT_NOT_NULL(dec->layers[i].sa_out_b);
+	ASSERT_NOT_NULL(dec->layers[i].sa_ln_w);
+	ASSERT_NOT_NULL(dec->layers[i].sa_ln_b);
+	ASSERT_NOT_NULL(dec->layers[i].tca_q_w);
+	ASSERT_NOT_NULL(dec->layers[i].tca_q_b);
+	ASSERT_NOT_NULL(dec->layers[i].tca_kv_w);
+	ASSERT_NOT_NULL(dec->layers[i].tca_kv_b);
+	ASSERT_NOT_NULL(dec->layers[i].tca_out_w);
+	ASSERT_NOT_NULL(dec->layers[i].tca_out_b);
+	ASSERT_NOT_NULL(dec->layers[i].tca_ln_w);
+	ASSERT_NOT_NULL(dec->layers[i].tca_ln_b);
+	ASSERT_NOT_NULL(dec->layers[i].ca_q_w);
+	ASSERT_NOT_NULL(dec->layers[i].ca_q_b);
+	ASSERT_NOT_NULL(dec->layers[i].ca_kv_w);
+	ASSERT_NOT_NULL(dec->layers[i].ca_kv_b);
+	ASSERT_NOT_NULL(dec->layers[i].ca_out_w);
+	ASSERT_NOT_NULL(dec->layers[i].ca_out_b);
+	ASSERT_NOT_NULL(dec->layers[i].ca_ln_w);
+	ASSERT_NOT_NULL(dec->layers[i].ca_ln_b);
+	ASSERT_NOT_NULL(dec->layers[i].ffn_fc1_w);
+	ASSERT_NOT_NULL(dec->layers[i].ffn_fc1_b);
+	ASSERT_NOT_NULL(dec->layers[i].ffn_fc2_w);
+	ASSERT_NOT_NULL(dec->layers[i].ffn_fc2_b);
+	ASSERT_NOT_NULL(dec->layers[i].ffn_ln_w);
+	ASSERT_NOT_NULL(dec->layers[i].ffn_ln_b);
+
+	/* Fill LNs near identity, weights with distinct sin offsets. */
+	struct sam3_tensor *ln_tensors[] = {
+		dec->layers[i].sa_ln_w,  dec->layers[i].sa_ln_b,
+		dec->layers[i].tca_ln_w, dec->layers[i].tca_ln_b,
+		dec->layers[i].ca_ln_w,  dec->layers[i].ca_ln_b,
+		dec->layers[i].ffn_ln_w, dec->layers[i].ffn_ln_b,
+	};
+	for (int k = 0; k < (int)(sizeof(ln_tensors) / sizeof(ln_tensors[0]));
+	     k += 2) {
+		float *gw = (float *)ln_tensors[k]->data;
+		float *gb = (float *)ln_tensors[k + 1]->data;
+		for (int j = 0; j < d; j++) {
+			gw[j] = 1.0f + 0.01f * sinf((float)j + (float)k);
+			gb[j] = 0.01f * cosf((float)j + (float)k);
+		}
+	}
+
+	fill_sin_pattern(dec->layers[i].sa_qkv_w,  1.0f);
+	fill_sin_pattern(dec->layers[i].sa_qkv_b,  2.0f);
+	fill_sin_pattern(dec->layers[i].sa_out_w,  3.0f);
+	fill_sin_pattern(dec->layers[i].sa_out_b,  4.0f);
+	fill_sin_pattern(dec->layers[i].tca_q_w,   5.0f);
+	fill_sin_pattern(dec->layers[i].tca_q_b,   6.0f);
+	fill_sin_pattern(dec->layers[i].tca_kv_w,  7.0f);
+	fill_sin_pattern(dec->layers[i].tca_kv_b,  8.0f);
+	fill_sin_pattern(dec->layers[i].tca_out_w, 9.0f);
+	fill_sin_pattern(dec->layers[i].tca_out_b, 10.0f);
+	fill_sin_pattern(dec->layers[i].ca_q_w,    11.0f);
+	fill_sin_pattern(dec->layers[i].ca_q_b,    12.0f);
+	fill_sin_pattern(dec->layers[i].ca_kv_w,   13.0f);
+	fill_sin_pattern(dec->layers[i].ca_kv_b,   14.0f);
+	fill_sin_pattern(dec->layers[i].ca_out_w,  15.0f);
+	fill_sin_pattern(dec->layers[i].ca_out_b,  16.0f);
+	fill_sin_pattern(dec->layers[i].ffn_fc1_w, 17.0f);
+	fill_sin_pattern(dec->layers[i].ffn_fc1_b, 18.0f);
+	fill_sin_pattern(dec->layers[i].ffn_fc2_w, 19.0f);
+	fill_sin_pattern(dec->layers[i].ffn_fc2_b, 20.0f);
+}
+
+/*
+ * layer_batched_case - Full batched decoder layer end-to-end.
+ *
+ * Composes SA -> TCA -> CA -> FFN via sam3_decoder_build_layer_batched
+ * and compares against the same composition done by calling each 2D
+ * substep builder per slot. Exercises both CA branches:
+ *   (1) enc_pos=NULL, rpb_mask=NULL -> plain CA dispatch.
+ *   (2) enc_pos as 2D [n_kv, d] shared + RPB mask [B, n_heads, n_q, n_kv]
+ *       -> with-pos CA dispatch.
+ */
+static void layer_batched_case(struct sam3_backend *be, const char *name)
+{
+	const int B = 2;
+	const int nq = 4;
+	const int nkv = 5;
+	const int ntxt = 3;
+	const int d = 16;
+	const int n_heads = 2;
+	const int d_ffn = 32;
+	const float rtol = (be->type == SAM3_BACKEND_METAL) ? 1e-4f : 1e-6f;
+	const float atol = (be->type == SAM3_BACKEND_METAL) ? 1e-5f : 1e-6f;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 23);
+
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = n_heads;
+	dec.n_queries = nq;
+	dec.d_ffn = d_ffn;
+	seed_decoder_layer_weights(&dec, 0, &ar);
+
+	int qb_tdims[]  = {B, nq, d};
+	int kvb_tdims[] = {B, nkv, d};
+	int tb_dims[]   = {B, ntxt, d};
+	int pos_dims[]  = {nkv, d};
+	int rpb_dims[]  = {B, n_heads, nq, nkv};
+
+	struct sam3_tensor *q_b    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     qb_tdims);
+	struct sam3_tensor *qpos_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     qb_tdims);
+	struct sam3_tensor *enc_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     kvb_tdims);
+	struct sam3_tensor *txt_b  = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						     tb_dims);
+	struct sam3_tensor *enc_pos_2d = gh_alloc_tensor(&ar, SAM3_DTYPE_F32,
+							 2, pos_dims);
+	struct sam3_tensor *rpb    = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 4,
+						     rpb_dims);
+	ASSERT_NOT_NULL(q_b);
+	ASSERT_NOT_NULL(qpos_b);
+	ASSERT_NOT_NULL(enc_b);
+	ASSERT_NOT_NULL(txt_b);
+	ASSERT_NOT_NULL(enc_pos_2d);
+	ASSERT_NOT_NULL(rpb);
+
+	for (int i = 0; i < B * nq * d; i++) {
+		((float *)q_b->data)[i]    = 0.1f * sinf(0.13f * (float)i +
+							 0.7f);
+		((float *)qpos_b->data)[i] = 0.1f * cosf(0.17f * (float)i +
+							 0.3f);
+	}
+	for (int i = 0; i < B * nkv * d; i++)
+		((float *)enc_b->data)[i] = 0.1f * sinf(0.09f * (float)i + 1.7f);
+	for (int i = 0; i < B * ntxt * d; i++)
+		((float *)txt_b->data)[i] = 0.1f * sinf(0.11f * (float)i + 1.3f);
+	for (int i = 0; i < nkv * d; i++)
+		((float *)enc_pos_2d->data)[i] = 0.05f * cosf(0.23f * (float)i);
+	for (int i = 0; i < B * n_heads * nq * nkv; i++)
+		((float *)rpb->data)[i] = 0.02f * sinf(0.31f * (float)i + 2.1f);
+
+	/*
+	 * Two sub-cases: no-pos (CA branch 1) and pos + RPB (CA branch 2).
+	 * Each runs the batched layer once and the 2D composition per slot.
+	 */
+	for (int sub = 0; sub < 2; sub++) {
+		struct sam3_tensor *enc_pos_in = (sub == 1) ? enc_pos_2d : NULL;
+		struct sam3_tensor *rpb_in     = (sub == 1) ? rpb : NULL;
+		const char *sub_label = (sub == 1) ? "layer-pos" : "layer-nopos";
+
+		struct sam3_graph g;
+		sam3_graph_init(&g);
+		struct sam3_tensor *outb = sam3_decoder_build_layer_batched(
+			&dec, 0, &g, q_b, qpos_b, enc_b, enc_pos_in, txt_b,
+			rpb_in, &ar);
+		ASSERT_NOT_NULL(outb);
+		ASSERT_EQ(be->ops->graph_eval(be, &g), SAM3_OK);
+		ASSERT_EQ(outb->n_dims, 3);
+		ASSERT_EQ(outb->dims[0], B);
+		ASSERT_EQ(outb->dims[1], nq);
+		ASSERT_EQ(outb->dims[2], d);
+
+		for (int b = 0; b < B; b++) {
+			int q1_dims[]   = {nq, d};
+			int kv1_dims[]  = {nkv, d};
+			int t1_dims[]   = {ntxt, d};
+			int rpb1_dims[] = {n_heads, nq, nkv};
+			struct sam3_tensor *q1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, q1_dims);
+			struct sam3_tensor *qpos1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, q1_dims);
+			struct sam3_tensor *enc1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, kv1_dims);
+			struct sam3_tensor *txt1 = gh_alloc_tensor(
+				&ar, SAM3_DTYPE_F32, 2, t1_dims);
+			struct sam3_tensor *rpb1 = NULL;
+			if (sub == 1) {
+				rpb1 = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 3,
+						       rpb1_dims);
+				ASSERT_NOT_NULL(rpb1);
+				memcpy(rpb1->data,
+				       (char *)rpb->data +
+					       (size_t)b * n_heads * nq * nkv *
+						       sizeof(float),
+				       (size_t)n_heads * nq * nkv *
+					       sizeof(float));
+			}
+			ASSERT_NOT_NULL(q1);
+			ASSERT_NOT_NULL(qpos1);
+			ASSERT_NOT_NULL(enc1);
+			ASSERT_NOT_NULL(txt1);
+			memcpy(q1->data,
+			       (char *)q_b->data +
+				       (size_t)b * nq * d * sizeof(float),
+			       (size_t)nq * d * sizeof(float));
+			memcpy(qpos1->data,
+			       (char *)qpos_b->data +
+				       (size_t)b * nq * d * sizeof(float),
+			       (size_t)nq * d * sizeof(float));
+			memcpy(enc1->data,
+			       (char *)enc_b->data +
+				       (size_t)b * nkv * d * sizeof(float),
+			       (size_t)nkv * d * sizeof(float));
+			memcpy(txt1->data,
+			       (char *)txt_b->data +
+				       (size_t)b * ntxt * d * sizeof(float),
+			       (size_t)ntxt * d * sizeof(float));
+
+			/* Manual 2D composition: SA -> TCA -> CA -> FFN,
+			 * matching sam3_decoder_build_layer_batched order. */
+			struct sam3_graph g1;
+			sam3_graph_init(&g1);
+			struct sam3_tensor *qc;
+			qc = sam3_decoder_build_sa(&dec, 0, &g1, q1, qpos1,
+						    &ar);
+			ASSERT_NOT_NULL(qc);
+			qc = sam3_decoder_build_tca(&dec, 0, &g1, qc, qpos1,
+						     txt1, &ar);
+			ASSERT_NOT_NULL(qc);
+			qc = sam3_decoder_build_ca(&dec, 0, &g1, qc, qpos1,
+						    enc1, enc_pos_in, rpb1,
+						    &ar);
+			ASSERT_NOT_NULL(qc);
+			qc = sam3_decoder_build_ffn(&dec, 0, &g1, qc, &ar);
+			ASSERT_NOT_NULL(qc);
+			ASSERT_EQ(be->ops->graph_eval(be, &g1), SAM3_OK);
+			ASSERT_EQ(qc->n_dims, 2);
+			ASSERT_EQ(qc->dims[0], nq);
+			ASSERT_EQ(qc->dims[1], d);
+
+			const float *bptr = (const float *)outb->data +
+				(size_t)b * nq * d;
+			const float *sptr = (const float *)qc->data;
+			for (int i = 0; i < nq * d; i++) {
+				tests_run++;
+				float expected = sptr[i];
+				float actual = bptr[i];
+				float tol = atol + rtol * fabsf(expected);
+				if (fabsf(actual - expected) > tol) {
+					fprintf(stderr,
+						"FAIL [%s %s] b=%d i=%d: "
+						"batched=%.6f ref=%.6f "
+						"tol=%g\n",
+						name, sub_label, b, i,
+						actual, expected, tol);
+					tests_failed++;
+				}
+			}
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_layer_batched_equals_per_slot(void)
+{
+	run_both_backends(layer_batched_case);
+}
+
+int main(void)
+{
+	test_scorer_batched_equals_per_slot();
+	test_sdpa_4d_batch_equals_per_slot();
+	test_cross_attn_batched_equals_per_slot();
+	test_broadcast_batch();
+	test_fpn_batched_equals_per_slot();
+	test_mask_mlp_batched_equals_per_slot();
+	test_mask_logits_batched_equals_per_slot();
+	test_box_refine_batched_equals_per_slot();
+	test_rpb_batched_equals_per_slot();
+	test_query_pos_batched_equals_per_slot();
+	test_sa_batched_equals_per_slot();
+	test_tca_batched_equals_per_slot();
+	test_ca_batched_equals_per_slot();
+	test_ffn_batched_equals_per_slot();
+	test_layer_batched_equals_per_slot();
+	TEST_REPORT();
+}

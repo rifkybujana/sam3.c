@@ -1125,10 +1125,25 @@ enum sam3_error sam3_processor_precache_text(struct sam3_processor *proc,
 	return err;
 }
 
-enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
-				       const struct sam3_prompt *prompts,
-				       int n_prompts,
-				       struct sam3_result *result)
+/*
+ * segment_one - Shared body for sam3_processor_segment and
+ * sam3_processor_segment_batch. Runs text encode + geometry project +
+ * full mask pipeline for a single prompt set, writing mask/score/box
+ * data into @result.
+ *
+ * @use_async_text: 1 to let the async text paths (hit on
+ *                  proc->text_cached_bundle, or join of an in-flight
+ *                  worker that set_text spawned) participate. 0 to
+ *                  always take the inline text encode path for this
+ *                  call — used by the batch entry point, which drops
+ *                  pending async state up front so each set's text is
+ *                  encoded synchronously.
+ */
+static enum sam3_error segment_one(struct sam3_processor *proc,
+				   const struct sam3_prompt *prompts,
+				   int n_prompts,
+				   struct sam3_result *result,
+				   int use_async_text)
 {
 	struct sam3_tensor *prompt_tokens = NULL;
 	struct sam3_tensor *text_features = NULL;
@@ -1180,7 +1195,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 	if (text) {
 		SAM3_PROF_BEGIN(proc->profiler, "text_encode");
 
-		if (proc->text_cached_bundle) {
+		if (use_async_text && proc->text_cached_bundle) {
 			/*
 			 * Hit path: set_text found the bundle already in
 			 * txt_cache. Read features directly from the cache
@@ -1189,7 +1204,7 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 			text_features = proc->text_cached_bundle->features;
 			proc->text_cached_bundle = NULL;
 			SAM3_PROF_END(proc->profiler, "text_encode");
-		} else if (proc->text_thread_active) {
+		} else if (use_async_text && proc->text_thread_active) {
 			/*
 			 * Miss path: set_text spawned a worker. Join it,
 			 * then pick up the features from the slot it wrote
@@ -1499,6 +1514,62 @@ fail:
 		}
 	}
 	return err;
+}
+
+enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
+				       const struct sam3_prompt *prompts,
+				       int n_prompts,
+				       struct sam3_result *result)
+{
+	return segment_one(proc, prompts, n_prompts, result,
+			   /* use_async_text= */ 1);
+}
+
+enum sam3_error sam3_processor_segment_batch(
+	struct sam3_processor *proc,
+	const struct sam3_prompt_set *sets,
+	int n_sets,
+	struct sam3_result *results)
+{
+	int i;
+	enum sam3_error err;
+
+	if (!proc || !sets || n_sets <= 0 || !results)
+		return SAM3_EINVAL;
+
+	if (!proc->image_loaded)
+		return SAM3_EINVAL;
+
+	/* Zero results up front + validate all sets */
+	memset(results, 0, (size_t)n_sets * sizeof(results[0]));
+	for (i = 0; i < n_sets; i++) {
+		if (!sets[i].prompts || sets[i].n_prompts <= 0)
+			return SAM3_EINVAL;
+	}
+
+	/* Drop any pending async text state */
+	if (proc->text_thread_active)
+		join_text_worker(proc);
+	proc->text_cached_bundle = NULL;
+	proc->text_worker_slot = -1;
+
+	for (i = 0; i < n_sets; i++) {
+		err = segment_one(proc, sets[i].prompts, sets[i].n_prompts,
+				  &results[i], /* use_async_text= */ 0);
+		if (err != SAM3_OK) {
+			int j;
+			sam3_log_error("segment_batch: set %d/%d failed: %d",
+				       i + 1, n_sets, err);
+			for (j = 0; j < i; j++)
+				sam3_result_free(&results[j]);
+			memset(results, 0,
+			       (size_t)n_sets * sizeof(results[0]));
+			return err;
+		}
+	}
+
+	sam3_log_info("segment_batch: %d sets completed", n_sets);
+	return SAM3_OK;
 }
 
 void sam3_processor_cache_clear(struct sam3_processor *proc, unsigned which)

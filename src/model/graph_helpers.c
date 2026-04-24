@@ -84,6 +84,61 @@ struct sam3_tensor *gh_tensor_wrap(struct sam3_arena *arena,
 	return t;
 }
 
+struct sam3_tensor *gh_broadcast_batch(struct sam3_arena *arena,
+				       struct sam3_tensor *input,
+				       int B)
+{
+	if (!arena || !input || B < 1)
+		return NULL;
+
+	/*
+	 * Drop a leading dim of 1 if present. [1, H, W, C] should become
+	 * [B, H, W, C], not [B, 1, H, W, C]. Skip for already-unsqueezed
+	 * shapes.
+	 */
+	int skip_leading = (input->n_dims >= 2 && input->dims[0] == 1) ? 1 : 0;
+	int src_nd = input->n_dims - skip_leading;
+	const int *src_dims = input->dims + skip_leading;
+
+	if (src_nd + 1 > SAM3_MAX_DIMS) {
+		sam3_log_error("broadcast_batch: output rank exceeds "
+			       "SAM3_MAX_DIMS (%d > %d)",
+			       src_nd + 1, SAM3_MAX_DIMS);
+		return NULL;
+	}
+
+	int out_dims[SAM3_MAX_DIMS];
+	out_dims[0] = B;
+	for (int i = 0; i < src_nd; i++)
+		out_dims[i + 1] = src_dims[i];
+
+	struct sam3_tensor *out = gh_alloc_tensor(arena, input->dtype,
+						  src_nd + 1, out_dims);
+	if (!out)
+		return NULL;
+
+	/*
+	 * Planning-pass arena: gh_alloc_tensor returns data=NULL when
+	 * arena->skip_data is set. Shape is still computed correctly; skip
+	 * the memcpy. Real data is filled later when the arena is switched
+	 * to allocation mode.
+	 */
+	if (!out->data || !input->data)
+		return out;
+
+	/*
+	 * Per-slot byte count: input->nbytes already excludes any leading-1
+	 * dim's contribution (since 1 * X == X), so it equals the payload
+	 * size of one batch slot regardless of whether we dropped a dim.
+	 */
+	size_t per_slot_bytes = input->nbytes;
+	for (int b = 0; b < B; b++)
+		memcpy((char *)out->data + (size_t)b * per_slot_bytes,
+		       input->data, per_slot_bytes);
+
+	return out;
+}
+
 struct sam3_tensor *gh_load_or_alloc(const struct sam3_weight_file *wf,
 				      const char *name,
 				      struct sam3_arena *arena,

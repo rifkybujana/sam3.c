@@ -235,6 +235,110 @@ static struct sam3_tensor *build_prompt_cross_attn(
 }
 
 /*
+ * build_prompt_cross_attn_batched - Batched prompt cross-attention.
+ *
+ * Batched mirror of build_prompt_cross_attn. Every tensor carries a
+ * leading batch dim B. Per-head SDPA uses the [B, 1, head_len, hd]
+ * 4D reshape so the Metal SDPA kernel's 4D path handles both axes.
+ */
+static struct sam3_tensor *build_prompt_cross_attn_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *x,      /* [B, n_pixels, d] */
+	struct sam3_tensor *text,   /* [B, seq, d]     */
+	struct sam3_arena *a)
+{
+	int d = head->d_model;
+	int n_heads = head->n_attn_heads;
+	int head_dim = d / n_heads;
+
+	if (x->n_dims != 3 || text->n_dims != 3 ||
+	    x->dims[0] != text->dims[0]) {
+		sam3_log_error("seg_cross_attn_batched: shape mismatch "
+			       "x.n_dims=%d text.n_dims=%d "
+			       "x.B=%d text.B=%d",
+			       x->n_dims, text->n_dims,
+			       x->n_dims >= 1 ? x->dims[0] : -1,
+			       text->n_dims >= 1 ? text->dims[0] : -1);
+		return NULL;
+	}
+
+	int B = x->dims[0];
+	int nq = x->dims[1];
+
+	/* LayerNorm on encoder states ([B, nq, d] -> [B, nq, d]). */
+	struct sam3_tensor *normed = gh_layernorm(g, a, x,
+		head->pxattn_norm_w, head->pxattn_norm_b);
+	if (!normed)
+		return NULL;
+
+	/* Q from normed; K, V from text. */
+	struct sam3_tensor *q = gh_linear(g, a, normed,
+		head->pxattn_q_w, head->pxattn_q_b);
+	struct sam3_tensor *k = gh_linear(g, a, text,
+		head->pxattn_k_w, head->pxattn_k_b);
+	struct sam3_tensor *v = gh_linear(g, a, text,
+		head->pxattn_v_w, head->pxattn_v_b);
+	if (!q || !k || !v)
+		return NULL;
+
+	int nkv = text->dims[1];
+
+	/*
+	 * Per-head SDPA: slice on the d axis (dim 2 now that B is leading),
+	 * reshape to [B, 1, head_len, hd] for SDPA, reshape back to 3D.
+	 */
+	struct sam3_tensor *head_outs[64];
+	for (int h = 0; h < n_heads; h++) {
+		int hstart = h * head_dim;
+		int hend = hstart + head_dim;
+
+		struct sam3_tensor *hq = gh_slice(g, a, q, 2, hstart, hend);
+		struct sam3_tensor *hk = gh_slice(g, a, k, 2, hstart, hend);
+		struct sam3_tensor *hv = gh_slice(g, a, v, 2, hstart, hend);
+		if (!hq || !hk || !hv)
+			return NULL;
+
+		int q4_dims[] = {B, 1, nq, head_dim};
+		int k4_dims[] = {B, 1, nkv, head_dim};
+		struct sam3_tensor *hq4 = gh_reshape(g, a, hq, 4, q4_dims);
+		struct sam3_tensor *hk4 = gh_reshape(g, a, hk, 4, k4_dims);
+		struct sam3_tensor *hv4 = gh_reshape(g, a, hv, 4, k4_dims);
+		if (!hq4 || !hk4 || !hv4)
+			return NULL;
+
+		struct sam3_tensor *ho4 = gh_sdpa(g, a, hq4, hk4, hv4,
+						  NULL, head_dim);
+		if (!ho4)
+			return NULL;
+
+		int ho_dims[] = {B, nq, head_dim};
+		struct sam3_tensor *ho = gh_reshape(g, a, ho4, 3, ho_dims);
+		if (!ho)
+			return NULL;
+		head_outs[h] = ho;
+	}
+
+	/* Concatenate heads along the d axis (axis 2). */
+	struct sam3_tensor *merged;
+	if (n_heads == 1) {
+		merged = head_outs[0];
+	} else {
+		merged = gh_concat(g, a, head_outs, n_heads, 2);
+		if (!merged)
+			return NULL;
+	}
+
+	/* Output projection + residual. */
+	struct sam3_tensor *attn_out = gh_linear(g, a, merged,
+		head->pxattn_o_w, head->pxattn_o_b);
+	if (!attn_out)
+		return NULL;
+
+	return gh_add(g, a, x, attn_out);
+}
+
+/*
  * build_pixel_decoder - FPN pixel decoder (NHWC).
  *
  * Takes 3 NHWC features (encoder at 72×72, feat_2x, feat_4x) and
@@ -299,8 +403,21 @@ static struct sam3_tensor *build_pixel_decoder(
 				       i, ph, pw, ch, cw);
 		}
 
-		/* Skip connection: curr + upsampled prev */
-		prev = gh_add(g, a, curr, prev);
+		/*
+		 * Skip connection: upsampled prev + curr.
+		 *
+		 * prev is first so gh_add allocates the output at
+		 * prev's shape. In the 2D path and pre-batched unit
+		 * tests both tensors share the same batch dim so the
+		 * order is semantically neutral (add is commutative).
+		 *
+		 * In the batched driver prev is [B, H, W, d] while
+		 * curr is the shared image feature [1, H, W, d].
+		 * Putting prev first keeps the output at [B, H, W, d]
+		 * and lets Metal MLX broadcast curr across the batch
+		 * dim on-device, avoiding a large host-side tile.
+		 */
+		prev = gh_add(g, a, prev, curr);
 		if (!prev) {
 			sam3_log_error("seg: FPN stage %d add fail", i);
 			return NULL;
@@ -382,6 +499,17 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
 				        text_features, arena);
 }
 
+struct sam3_tensor *sam3_seg_head_build_cross_attn_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *encoder_states,
+	struct sam3_tensor *text_features,
+	struct sam3_arena *arena)
+{
+	return build_prompt_cross_attn_batched(head, g, encoder_states,
+					       text_features, arena);
+}
+
 struct sam3_tensor *sam3_seg_head_build_pixel_decoder(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
@@ -416,6 +544,43 @@ struct sam3_tensor *sam3_seg_head_build_fpn(
 	return inst;
 }
 
+struct sam3_tensor *sam3_seg_head_build_pixel_decoder_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena)
+{
+	/*
+	 * Underlying build_pixel_decoder is N-aware: gh_upsample, gh_add,
+	 * gh_conv2d, gh_groupnorm, gh_relu all thread a leading batch dim.
+	 * No structural change needed; this wrapper exists for naming
+	 * consistency with the rest of the batched builder family.
+	 */
+	return build_pixel_decoder(head, g, enc_nhwc, feat_2x, feat_4x, arena);
+}
+
+struct sam3_tensor *sam3_seg_head_build_fpn_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena)
+{
+	struct sam3_tensor *pixel_embed = build_pixel_decoder(
+		head, g, enc_nhwc, feat_2x, feat_4x, arena);
+	if (!pixel_embed)
+		return NULL;
+
+	head->_debug_pixel_embed = pixel_embed;
+
+	return gh_conv2d(g, arena, pixel_embed,
+			 head->inst_proj_w, head->inst_proj_b,
+			 1, 0, 1);
+}
+
 struct sam3_tensor *sam3_seg_head_build_mask_embed(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
@@ -423,6 +588,102 @@ struct sam3_tensor *sam3_seg_head_build_mask_embed(
 	struct sam3_arena *arena)
 {
 	return build_mask_embedder(head, g, queries, arena);
+}
+
+struct sam3_tensor *sam3_seg_head_build_mask_embed_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *queries,
+	struct sam3_arena *arena)
+{
+	/* gh_linear and gh_relu both thread a leading batch dim, so
+	 * build_mask_embedder works directly on [B, nq, d]. Wrapper
+	 * for naming consistency with other _batched entry points. */
+	return build_mask_embedder(head, g, queries, arena);
+}
+
+struct sam3_tensor *sam3_seg_head_build_mask_logits(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
+	struct sam3_arena *arena)
+{
+	if (!g || !mask_embed || !inst || !arena ||
+	    mask_embed->n_dims != 2 || inst->n_dims != 4 ||
+	    inst->dims[0] != 1) {
+		sam3_log_error("mask_logits: shape mismatch "
+			       "(mask_embed.n_dims=%d inst.n_dims=%d "
+			       "inst.N=%d)",
+			       mask_embed ? mask_embed->n_dims : -1,
+			       inst ? inst->n_dims : -1,
+			       (inst && inst->n_dims >= 1) ? inst->dims[0] : -1);
+		return NULL;
+	}
+
+	int H = inst->dims[1];
+	int W = inst->dims[2];
+	int d = inst->dims[3];
+	int nq = mask_embed->dims[0];
+
+	int flat_dims[] = {H * W, d};
+	struct sam3_tensor *inst_flat = gh_reshape(g, arena, inst, 2, flat_dims);
+	if (!inst_flat)
+		return NULL;
+
+	struct sam3_tensor *inst_flat_t = gh_transpose(g, arena, inst_flat);
+	if (!inst_flat_t)
+		return NULL;
+
+	struct sam3_tensor *logits = gh_matmul(g, arena, mask_embed, inst_flat_t);
+	if (!logits)
+		return NULL;
+
+	int out_dims[] = {nq, H, W};
+	return gh_reshape(g, arena, logits, 3, out_dims);
+}
+
+struct sam3_tensor *sam3_seg_head_build_mask_logits_batched(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
+	struct sam3_arena *arena)
+{
+	if (!g || !mask_embed || !inst || !arena ||
+	    mask_embed->n_dims != 3 || inst->n_dims != 4 ||
+	    mask_embed->dims[0] != inst->dims[0]) {
+		sam3_log_error("mask_logits_batched: shape mismatch "
+			       "(mask_embed.n_dims=%d inst.n_dims=%d "
+			       "mask_embed.B=%d inst.B=%d)",
+			       mask_embed ? mask_embed->n_dims : -1,
+			       inst ? inst->n_dims : -1,
+			       (mask_embed && mask_embed->n_dims >= 1) ?
+				       mask_embed->dims[0] : -1,
+			       (inst && inst->n_dims >= 1) ? inst->dims[0] : -1);
+		return NULL;
+	}
+
+	int B = mask_embed->dims[0];
+	int nq = mask_embed->dims[1];
+	int H = inst->dims[1];
+	int W = inst->dims[2];
+	int d = inst->dims[3];
+
+	int flat_dims[] = {B, H * W, d};
+	struct sam3_tensor *inst_flat = gh_reshape(g, arena, inst, 3, flat_dims);
+	if (!inst_flat)
+		return NULL;
+
+	/* gh_transpose swaps the last two dims: [B, H*W, d] -> [B, d, H*W]. */
+	struct sam3_tensor *inst_flat_t = gh_transpose(g, arena, inst_flat);
+	if (!inst_flat_t)
+		return NULL;
+
+	struct sam3_tensor *logits = gh_matmul(g, arena, mask_embed, inst_flat_t);
+	if (!logits)
+		return NULL;
+
+	int out_dims[] = {B, nq, H, W};
+	return gh_reshape(g, arena, logits, 4, out_dims);
 }
 
 struct sam3_tensor *sam3_seg_head_build(

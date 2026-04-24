@@ -575,6 +575,19 @@ enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
 	return sam3_processor_segment(&ctx->proc, prompts, n_prompts, result);
 }
 
+enum sam3_error sam3_segment_batch(sam3_ctx *ctx,
+				   const struct sam3_prompt_set *sets,
+				   int n_sets,
+				   struct sam3_result *results)
+{
+	if (!ctx || !results)
+		return SAM3_EINVAL;
+	if (!ctx->proc_ready)
+		return SAM3_EINVAL;
+
+	return sam3_processor_segment_batch(&ctx->proc, sets, n_sets, results);
+}
+
 void sam3_result_free(struct sam3_result *result)
 {
 	if (!result)

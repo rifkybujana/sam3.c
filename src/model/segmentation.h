@@ -12,7 +12,7 @@
  *
  * Key types:  sam3_seg_head
  * Depends on: core/tensor.h, core/graph.h, core/alloc.h, core/weight.h
- * Used by:    sam3_image.c
+ * Used by:    sam3_image.c, tests/test_batched_ops.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
  * SPDX-License-Identifier: MIT
@@ -140,6 +140,28 @@ struct sam3_tensor *sam3_seg_head_build_cross_attn(
 	struct sam3_arena *arena);
 
 /*
+ * sam3_seg_head_build_cross_attn_batched - Batched prompt cross-attention.
+ *
+ * Batched variant of sam3_seg_head_build_cross_attn. Every tensor gains
+ * a leading batch dim B. Per-head SDPA uses the [B, 1, head_len, hd]
+ * 4D reshape so the existing Metal 4D SDPA path handles B > 1.
+ *
+ * @head:           Loaded seg head
+ * @g:              Graph to add nodes to
+ * @encoder_states: [B, n_pixels, d_model]
+ * @text_features:  [B, n_text, d_model]
+ * @arena:          Arena for intermediate tensors
+ *
+ * Returns cross-attended encoder states [B, n_pixels, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_cross_attn_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *encoder_states,
+	struct sam3_tensor *text_features,
+	struct sam3_arena *arena);
+
+/*
  * Build FPN pixel decoder only (no instance projection). Operates on
  * NHWC tensors [1, H, W, d].
  */
@@ -175,6 +197,52 @@ struct sam3_tensor *sam3_seg_head_build_fpn(
 	struct sam3_arena *arena);
 
 /*
+ * sam3_seg_head_build_pixel_decoder_batched - Batched FPN pixel decoder.
+ *
+ * Same as sam3_seg_head_build_pixel_decoder but accepts [B, H, W, d]
+ * for every NHWC input. All ops in the FPN (gh_upsample, gh_add,
+ * gh_conv2d, gh_groupnorm, gh_relu) are N-aware, so this is a naming-
+ * consistency wrapper — the actual pipeline is the same.
+ *
+ * @head:     Loaded seg head
+ * @g:        Graph to add nodes to
+ * @enc_nhwc: Encoder states [B, enc_h, enc_w, d_model]
+ * @feat_2x:  Backbone feature at 2x, already broadcast to [B, H2, W2, d]
+ * @feat_4x:  Backbone feature at 4x, already broadcast to [B, H4, W4, d]
+ * @arena:    Arena for intermediate tensors
+ *
+ * Callers are responsible for tiling shared image features to [B, ...]
+ * before calling (use gh_broadcast_batch). Returns [B, H4, W4, d], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_pixel_decoder_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_fpn_batched - Batched FPN + 1×1 instance projection.
+ *
+ * Same as sam3_seg_head_build_fpn but accepts [B, H, W, d] inputs and
+ * returns [B, H, W, d]. Delegates to the N-aware build_pixel_decoder +
+ * gh_conv2d with N=B.
+ *
+ * @head, @g, @enc_nhwc, @feat_2x, @feat_4x, @arena — see
+ * sam3_seg_head_build_pixel_decoder_batched.
+ *
+ * Returns instance features [B, H4, W4, d], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_fpn_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *enc_nhwc,
+	struct sam3_tensor *feat_2x,
+	struct sam3_tensor *feat_4x,
+	struct sam3_arena *arena);
+
+/*
  * sam3_seg_head_build_mask_embed - Build mask embedder MLP on queries.
  *
  * @head:    Loaded seg head
@@ -188,6 +256,68 @@ struct sam3_tensor *sam3_seg_head_build_mask_embed(
 	struct sam3_seg_head *head,
 	struct sam3_graph *g,
 	struct sam3_tensor *queries,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_mask_embed_batched - Batched mask embedder MLP.
+ *
+ * Same as sam3_seg_head_build_mask_embed but accepts [B, n_queries, d]
+ * and returns [B, n_queries, d]. Underlying 3-layer MLP uses only
+ * gh_linear / gh_relu (batch-transparent), so this wrapper is naming-
+ * consistency only.
+ *
+ * @head:    Loaded seg head with mask_mlp[0..2] weights
+ * @g:       Graph to add nodes to
+ * @queries: [B, n_queries, d_model]
+ * @arena:   Arena for intermediate tensors
+ *
+ * Returns mask embeddings [B, n_queries, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_mask_embed_batched(
+	struct sam3_seg_head *head,
+	struct sam3_graph *g,
+	struct sam3_tensor *queries,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_mask_logits - Dot-product mask logits (2D path).
+ *
+ * Computes mask_embed @ inst_flat.T and reshapes back to a spatial
+ * map. Extracted from the inline Stage 4d code in sam3_image.c so both
+ * the 2D and batched (3D) variants can be unit-tested directly.
+ *
+ * @g:          Graph to add nodes to
+ * @mask_embed: [n_queries, d_model]
+ * @inst:       [1, H, W, d_model] instance features (NHWC)
+ * @arena:      Arena for intermediate tensors
+ *
+ * Returns mask logits [n_queries, H, W], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_mask_logits(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_seg_head_build_mask_logits_batched - Batched dot-product mask logits.
+ *
+ * Batched mirror of sam3_seg_head_build_mask_logits. Every tensor
+ * gains a leading batch dim B. No weights involved; the operation is
+ * gh_reshape + gh_transpose (swap last two dims) + gh_matmul +
+ * gh_reshape, all batch-transparent.
+ *
+ * @g:          Graph to add nodes to
+ * @mask_embed: [B, n_queries, d_model]
+ * @inst:       [B, H, W, d_model] instance features (NHWC)
+ * @arena:      Arena for intermediate tensors
+ *
+ * Returns mask logits [B, n_queries, H, W], or NULL.
+ */
+struct sam3_tensor *sam3_seg_head_build_mask_logits_batched(
+	struct sam3_graph *g,
+	struct sam3_tensor *mask_embed,
+	struct sam3_tensor *inst,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_SEGMENTATION_H */

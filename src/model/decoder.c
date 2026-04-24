@@ -686,6 +686,67 @@ static struct sam3_tensor *gen_sine_position_embed(
 }
 
 /*
+ * gen_sine_position_embed_batched - Batched sine position embeddings.
+ *
+ * Allocates [B, nq, 2*d_model] tensor and fills each batch slot by
+ * invoking the same math as gen_sine_position_embed on its [nq, 4]
+ * coordinate slice. Honors arena->skip_data so planning-pass arenas
+ * compute shape without touching data.
+ */
+static struct sam3_tensor *gen_sine_position_embed_batched(
+	struct sam3_arena *arena,
+	const float *coords, int B, int nq, int d_model)
+{
+	int num_feats = d_model / 2;
+	int out_dim = d_model * 2;
+	int out_dims[] = {B, nq, out_dim};
+
+	struct sam3_tensor *out = gh_alloc_tensor(arena, SAM3_DTYPE_F32,
+						  3, out_dims);
+	if (!out)
+		return NULL;
+
+	if (arena->skip_data)
+		return out;
+
+	float *dst_base = (float *)out->data;
+	float scale = 2.0f * (float)M_PI;
+
+	/* Same dim_t precompute as the 2D path. */
+	float dim_t[256]; /* num_feats <= 256 */
+	for (int j = 0; j < num_feats; j++) {
+		float exp = 2.0f * (float)(j / 2) / (float)num_feats;
+		dim_t[j] = powf(10000.0f, exp);
+	}
+
+	int coord_order[] = {1, 0, 2, 3}; /* y, x, w, h */
+
+	const size_t coords_stride = (size_t)nq * 4u;
+	const size_t dst_stride    = (size_t)nq * (size_t)out_dim;
+
+	for (int b = 0; b < B; b++) {
+		const float *c_slot = coords + (size_t)b * coords_stride;
+		float *dst_slot = dst_base + (size_t)b * dst_stride;
+
+		for (int q = 0; q < nq; q++) {
+			float *row = dst_slot + q * out_dim;
+			for (int c = 0; c < 4; c++) {
+				int ci = coord_order[c];
+				float val = c_slot[q * 4 + ci] * scale;
+				float *block = row + c * num_feats;
+				for (int j = 0; j < num_feats; j += 2) {
+					float v = val / dim_t[j];
+					block[j]     = sinf(v);
+					block[j + 1] = cosf(v);
+				}
+			}
+		}
+	}
+
+	return out;
+}
+
+/*
  * sam3_decoder_compute_query_pos - Compute DAB-DETR query_pos.
  *
  * Computes query_pos from reference_points by:
@@ -721,6 +782,37 @@ struct sam3_tensor *sam3_decoder_compute_query_pos(
 	if (!qpos)
 		sam3_log_error("decoder: ref_point_head mlp failed");
 
+	return qpos;
+}
+
+struct sam3_tensor *sam3_decoder_compute_query_pos_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_arena *arena,
+	const float *ref_boxes,
+	int B)
+{
+	if (!dec || !g || !arena || !ref_boxes || B < 1) {
+		sam3_log_error("query_pos_batched: bad args (B=%d)", B);
+		return NULL;
+	}
+
+	int nq = dec->n_queries;
+	int d = dec->d_model;
+
+	struct sam3_tensor *sine_embed =
+		gen_sine_position_embed_batched(arena, ref_boxes, B, nq, d);
+	if (!sine_embed) {
+		sam3_log_error("query_pos_batched: sine embed alloc failed");
+		return NULL;
+	}
+
+	struct sam3_tensor *qpos = gh_mlp(g, arena, sine_embed,
+					   dec->rph_fc1_w, dec->rph_fc1_b,
+					   dec->rph_fc2_w, dec->rph_fc2_b,
+					   SAM3_OP_RELU);
+	if (!qpos)
+		sam3_log_error("query_pos_batched: ref_point_head mlp failed");
 	return qpos;
 }
 
@@ -937,6 +1029,32 @@ void sam3_decoder_compute_rpb(const struct sam3_decoder *dec,
 	free(boxes);
 }
 
+/* --- sam3_decoder_compute_rpb_batched --- */
+
+void sam3_decoder_compute_rpb_batched(const struct sam3_decoder *dec,
+				       const float *ref_boxes,
+				       int B, int H, int W,
+				       float *out)
+{
+	if (!dec || !ref_boxes || !out || B < 1) {
+		sam3_log_error("rpb_batched: bad args (B=%d)", B);
+		return;
+	}
+
+	const int nq = dec->n_queries;
+	const int n_heads = dec->n_heads;
+	const size_t rb_stride  = (size_t)nq * 4u;
+	const size_t out_stride = (size_t)n_heads * (size_t)nq *
+				   (size_t)H * (size_t)W;
+
+	for (int b = 0; b < B; b++) {
+		sam3_decoder_compute_rpb(dec,
+					  ref_boxes + (size_t)b * rb_stride,
+					  H, W,
+					  out + (size_t)b * out_stride);
+	}
+}
+
 /*
  * decoder_self_attention_with_pos - Self-attention with position embedding.
  *
@@ -1015,6 +1133,116 @@ static struct sam3_tensor *decoder_self_attention_with_pos(
 	}
 
 	/* Output projection */
+	return gh_linear(g, arena, merged, out_w, out_b);
+}
+
+/*
+ * decoder_self_attention_with_pos_batched - Batched mirror of
+ * decoder_self_attention_with_pos.
+ *
+ * Input/output gains a leading batch dim B. Per-head SDPA uses the
+ * [B, 1, head_len, hd] reshape so the existing 4D SDPA path handles
+ * B > 1 on both CPU and Metal (derisked in f775e74).
+ */
+static struct sam3_tensor *decoder_self_attention_with_pos_batched(
+	struct sam3_graph *g, struct sam3_arena *arena,
+	struct sam3_tensor *tgt,       /* [B, nq, d] */
+	struct sam3_tensor *query_pos, /* [B, nq, d] */
+	struct sam3_tensor *qkv_w, struct sam3_tensor *qkv_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int d_model, int n_heads)
+{
+	if (tgt->n_dims != 3 || query_pos->n_dims != 3 ||
+	    tgt->dims[0] != query_pos->dims[0] ||
+	    tgt->dims[1] != query_pos->dims[1]) {
+		sam3_log_error("dec_sa_batched: shape mismatch "
+			       "tgt.n_dims=%d qpos.n_dims=%d "
+			       "tgt.B=%d qpos.B=%d",
+			       tgt->n_dims, query_pos->n_dims,
+			       tgt->n_dims >= 1 ? tgt->dims[0] : -1,
+			       query_pos->n_dims >= 1 ? query_pos->dims[0] : -1);
+		return NULL;
+	}
+
+	int head_dim = d_model / n_heads;
+	int B = tgt->dims[0];
+	int nq = tgt->dims[1];
+
+	/* tgt + query_pos for Q and K projections. */
+	struct sam3_tensor *tgt_pos = gh_add(g, arena, tgt, query_pos);
+	if (!tgt_pos)
+		return NULL;
+
+	/* Slice QKV weights on axis 0 (packed dim is outer for these
+	 * weights; layout unchanged from the 2D path). */
+	struct sam3_tensor *q_w = gh_slice(g, arena, qkv_w, 0, 0, d_model);
+	struct sam3_tensor *k_w = gh_slice(g, arena, qkv_w, 0, d_model,
+					   2 * d_model);
+	struct sam3_tensor *v_w = gh_slice(g, arena, qkv_w, 0, 2 * d_model,
+					   3 * d_model);
+	if (!q_w || !k_w || !v_w)
+		return NULL;
+
+	struct sam3_tensor *q_b = gh_slice(g, arena, qkv_b, 0, 0, d_model);
+	struct sam3_tensor *k_b = gh_slice(g, arena, qkv_b, 0, d_model,
+					   2 * d_model);
+	struct sam3_tensor *v_b = gh_slice(g, arena, qkv_b, 0, 2 * d_model,
+					   3 * d_model);
+	if (!q_b || !k_b || !v_b)
+		return NULL;
+
+	/* Project: Q and K from tgt+pos, V from raw tgt. gh_linear is
+	 * batch-transparent. */
+	struct sam3_tensor *sq = gh_linear(g, arena, tgt_pos, q_w, q_b);
+	struct sam3_tensor *sk = gh_linear(g, arena, tgt_pos, k_w, k_b);
+	struct sam3_tensor *sv = gh_linear(g, arena, tgt, v_w, v_b);
+	if (!sq || !sk || !sv)
+		return NULL;
+
+	/* Per-head SDPA: slice on axis 2 (the d axis, since B is leading).
+	 * Each head slice is [B, nq, head_dim]; wrap as 4D
+	 * [B, 1, nq, head_dim] for SDPA, unwrap back to 3D afterward. */
+	struct sam3_tensor *head_outs[64];
+	for (int h = 0; h < n_heads; h++) {
+		int hs = h * head_dim;
+		int he = hs + head_dim;
+
+		struct sam3_tensor *hq = gh_slice(g, arena, sq, 2, hs, he);
+		struct sam3_tensor *hk = gh_slice(g, arena, sk, 2, hs, he);
+		struct sam3_tensor *hv = gh_slice(g, arena, sv, 2, hs, he);
+		if (!hq || !hk || !hv)
+			return NULL;
+
+		int q4_dims[] = {B, 1, nq, head_dim};
+		struct sam3_tensor *hq4 = gh_reshape(g, arena, hq, 4, q4_dims);
+		struct sam3_tensor *hk4 = gh_reshape(g, arena, hk, 4, q4_dims);
+		struct sam3_tensor *hv4 = gh_reshape(g, arena, hv, 4, q4_dims);
+		if (!hq4 || !hk4 || !hv4)
+			return NULL;
+
+		struct sam3_tensor *ho4 = gh_sdpa(g, arena, hq4, hk4, hv4,
+						  NULL, head_dim);
+		if (!ho4)
+			return NULL;
+
+		int ho3_dims[] = {B, nq, head_dim};
+		struct sam3_tensor *ho = gh_reshape(g, arena, ho4, 3, ho3_dims);
+		if (!ho)
+			return NULL;
+		head_outs[h] = ho;
+	}
+
+	/* Concat heads along the d axis (axis 2). */
+	struct sam3_tensor *merged;
+	if (n_heads == 1) {
+		merged = head_outs[0];
+	} else {
+		merged = gh_concat(g, arena, head_outs, n_heads, 2);
+		if (!merged)
+			return NULL;
+	}
+
+	/* Output projection. */
 	return gh_linear(g, arena, merged, out_w, out_b);
 }
 
@@ -1113,6 +1341,217 @@ static struct sam3_tensor *decoder_cross_attention_with_pos(
 	}
 
 	/* Output projection */
+	return gh_linear(g, arena, merged, out_w, out_b);
+}
+
+/*
+ * decoder_cross_attention_batched - Batched packed-KV cross-attention.
+ *
+ * Batched mirror of gh_cross_attention. Q from [B, n_q, d] source, K
+ * and V are sliced from a packed kv projection of [B, n_kv, d] source.
+ * Per-head SDPA uses the [B, 1, head_len, hd] reshape.
+ */
+static struct sam3_tensor *decoder_cross_attention_batched(
+	struct sam3_graph *g, struct sam3_arena *arena,
+	struct sam3_tensor *q_src,   /* [B, n_q, d] */
+	struct sam3_tensor *kv_src,  /* [B, n_kv, d] */
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *kv_w, struct sam3_tensor *kv_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int d_model, int n_heads)
+{
+	if (q_src->n_dims != 3 || kv_src->n_dims != 3 ||
+	    q_src->dims[0] != kv_src->dims[0]) {
+		sam3_log_error("dec_ca_batched: shape mismatch "
+			       "q.n_dims=%d kv.n_dims=%d q.B=%d kv.B=%d",
+			       q_src->n_dims, kv_src->n_dims,
+			       q_src->n_dims >= 1 ? q_src->dims[0] : -1,
+			       kv_src->n_dims >= 1 ? kv_src->dims[0] : -1);
+		return NULL;
+	}
+
+	int head_dim = d_model / n_heads;
+	int B = q_src->dims[0];
+	int n_q = q_src->dims[1];
+	int n_kv = kv_src->dims[1];
+
+	/* Project Q [B, n_q, d] and packed KV [B, n_kv, 2*d]. */
+	struct sam3_tensor *sq = gh_linear(g, arena, q_src, q_w, q_b);
+	struct sam3_tensor *kv = gh_linear(g, arena, kv_src, kv_w, kv_b);
+	if (!sq || !kv)
+		return NULL;
+
+	/* Slice K and V from packed KV on axis 2 (d axis). */
+	struct sam3_tensor *sk = gh_slice(g, arena, kv, 2, 0, d_model);
+	struct sam3_tensor *sv = gh_slice(g, arena, kv, 2, d_model,
+					   2 * d_model);
+	if (!sk || !sv)
+		return NULL;
+
+	/* Per-head SDPA with 4D reshape pattern. */
+	struct sam3_tensor *head_outs[64];
+	for (int h = 0; h < n_heads; h++) {
+		int hs = h * head_dim;
+		int he = hs + head_dim;
+
+		struct sam3_tensor *hq = gh_slice(g, arena, sq, 2, hs, he);
+		struct sam3_tensor *hk = gh_slice(g, arena, sk, 2, hs, he);
+		struct sam3_tensor *hv = gh_slice(g, arena, sv, 2, hs, he);
+		if (!hq || !hk || !hv)
+			return NULL;
+
+		int q4_dims[] = {B, 1, n_q, head_dim};
+		int k4_dims[] = {B, 1, n_kv, head_dim};
+		struct sam3_tensor *hq4 = gh_reshape(g, arena, hq, 4, q4_dims);
+		struct sam3_tensor *hk4 = gh_reshape(g, arena, hk, 4, k4_dims);
+		struct sam3_tensor *hv4 = gh_reshape(g, arena, hv, 4, k4_dims);
+		if (!hq4 || !hk4 || !hv4)
+			return NULL;
+
+		struct sam3_tensor *ho4 = gh_sdpa(g, arena, hq4, hk4, hv4,
+						  NULL, head_dim);
+		if (!ho4)
+			return NULL;
+
+		int ho3_dims[] = {B, n_q, head_dim};
+		struct sam3_tensor *ho = gh_reshape(g, arena, ho4, 3, ho3_dims);
+		if (!ho)
+			return NULL;
+		head_outs[h] = ho;
+	}
+
+	struct sam3_tensor *merged = (n_heads == 1)
+		? head_outs[0]
+		: gh_concat(g, arena, head_outs, n_heads, 2);
+	if (!merged)
+		return NULL;
+
+	return gh_linear(g, arena, merged, out_w, out_b);
+}
+
+/*
+ * decoder_cross_attention_with_pos_batched - Batched mirror of
+ * decoder_cross_attention_with_pos.
+ *
+ * Q from [B, n_q, d] q_src (no pos add inside; caller pre-adds).
+ * K projected from (kv_src + kv_pos), V from raw kv_src. kv_pos may
+ * arrive as 2D [n_kv, d] (shared across batch) or 3D [B, n_kv, d];
+ * 2D inputs are tiled up-front via gh_broadcast_batch. Optional RPB
+ * mask is [B, n_heads, n_q, n_kv] and is sliced per-head on axis 1
+ * into [B, 1, n_q, n_kv] before SDPA.
+ */
+static struct sam3_tensor *decoder_cross_attention_with_pos_batched(
+	struct sam3_graph *g, struct sam3_arena *arena,
+	struct sam3_tensor *q_src,   /* [B, n_q, d] */
+	struct sam3_tensor *kv_src,  /* [B, n_kv, d] */
+	struct sam3_tensor *kv_pos,  /* [n_kv, d] or [B, n_kv, d] */
+	struct sam3_tensor *q_w, struct sam3_tensor *q_b,
+	struct sam3_tensor *kv_w, struct sam3_tensor *kv_b,
+	struct sam3_tensor *out_w, struct sam3_tensor *out_b,
+	int d_model, int n_heads,
+	struct sam3_tensor *rpb_mask)
+{
+	if (q_src->n_dims != 3 || kv_src->n_dims != 3 ||
+	    q_src->dims[0] != kv_src->dims[0]) {
+		sam3_log_error("dec_ca_pos_batched: shape mismatch "
+			       "q.n_dims=%d kv.n_dims=%d q.B=%d kv.B=%d",
+			       q_src->n_dims, kv_src->n_dims,
+			       q_src->n_dims >= 1 ? q_src->dims[0] : -1,
+			       kv_src->n_dims >= 1 ? kv_src->dims[0] : -1);
+		return NULL;
+	}
+
+	int head_dim = d_model / n_heads;
+	int B = q_src->dims[0];
+	int n_q = q_src->dims[1];
+	int n_kv = kv_src->dims[1];
+
+	/* Project Q. */
+	struct sam3_tensor *sq = gh_linear(g, arena, q_src, q_w, q_b);
+	if (!sq)
+		return NULL;
+
+	/* Tile kv_pos to [B, n_kv, d] if it arrived as shared 2D. */
+	struct sam3_tensor *kv_pos_b = kv_pos;
+	if (kv_pos->n_dims == 2) {
+		kv_pos_b = gh_broadcast_batch(arena, kv_pos, B);
+		if (!kv_pos_b)
+			return NULL;
+	}
+
+	/* kv_src + kv_pos for K projection. */
+	struct sam3_tensor *kv_with_pos = gh_add(g, arena, kv_src, kv_pos_b);
+	if (!kv_with_pos)
+		return NULL;
+
+	/* Slice packed KV weights: [2*d, d] → K_w [d,d], V_w [d,d]. */
+	struct sam3_tensor *k_w = gh_slice(g, arena, kv_w, 0, 0, d_model);
+	struct sam3_tensor *v_w = gh_slice(g, arena, kv_w, 0, d_model,
+					    2 * d_model);
+	if (!k_w || !v_w)
+		return NULL;
+
+	/* Slice packed KV bias: [2*d] → K_b [d], V_b [d]. */
+	struct sam3_tensor *k_b = gh_slice(g, arena, kv_b, 0, 0, d_model);
+	struct sam3_tensor *v_b = gh_slice(g, arena, kv_b, 0, d_model,
+					    2 * d_model);
+	if (!k_b || !v_b)
+		return NULL;
+
+	/* K from (kv_src + pos), V from raw kv_src. */
+	struct sam3_tensor *sk = gh_linear(g, arena, kv_with_pos, k_w, k_b);
+	struct sam3_tensor *sv = gh_linear(g, arena, kv_src, v_w, v_b);
+	if (!sk || !sv)
+		return NULL;
+
+	/* Per-head SDPA with optional RPB mask. */
+	struct sam3_tensor *head_outs[64];
+	for (int h = 0; h < n_heads; h++) {
+		int hs = h * head_dim;
+		int he = hs + head_dim;
+
+		struct sam3_tensor *hq = gh_slice(g, arena, sq, 2, hs, he);
+		struct sam3_tensor *hk = gh_slice(g, arena, sk, 2, hs, he);
+		struct sam3_tensor *hv = gh_slice(g, arena, sv, 2, hs, he);
+		if (!hq || !hk || !hv)
+			return NULL;
+
+		int q4_dims[] = {B, 1, n_q, head_dim};
+		int k4_dims[] = {B, 1, n_kv, head_dim};
+		struct sam3_tensor *hq4 = gh_reshape(g, arena, hq, 4, q4_dims);
+		struct sam3_tensor *hk4 = gh_reshape(g, arena, hk, 4, k4_dims);
+		struct sam3_tensor *hv4 = gh_reshape(g, arena, hv, 4, k4_dims);
+		if (!hq4 || !hk4 || !hv4)
+			return NULL;
+
+		/* rpb_mask: [B, n_heads, n_q, n_kv] -> slice axis 1 for
+		 * head h to [B, 1, n_q, n_kv], already the 4D shape SDPA
+		 * expects. */
+		struct sam3_tensor *hmask = NULL;
+		if (rpb_mask) {
+			hmask = gh_slice(g, arena, rpb_mask, 1, h, h + 1);
+			if (!hmask)
+				return NULL;
+		}
+
+		struct sam3_tensor *ho4 = gh_sdpa(g, arena, hq4, hk4, hv4,
+						  hmask, head_dim);
+		if (!ho4)
+			return NULL;
+
+		int ho3_dims[] = {B, n_q, head_dim};
+		struct sam3_tensor *ho = gh_reshape(g, arena, ho4, 3, ho3_dims);
+		if (!ho)
+			return NULL;
+		head_outs[h] = ho;
+	}
+
+	struct sam3_tensor *merged = (n_heads == 1)
+		? head_outs[0]
+		: gh_concat(g, arena, head_outs, n_heads, 2);
+	if (!merged)
+		return NULL;
+
 	return gh_linear(g, arena, merged, out_w, out_b);
 }
 
@@ -1338,6 +1777,30 @@ struct sam3_tensor *sam3_decoder_build_sa(
 	return q;
 }
 
+struct sam3_tensor *sam3_decoder_build_sa_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos, struct sam3_arena *arena)
+{
+	int i = layer_idx;
+
+	struct sam3_tensor *sa_out = decoder_self_attention_with_pos_batched(
+		g, arena, q, query_pos,
+		dec->layers[i].sa_qkv_w, dec->layers[i].sa_qkv_b,
+		dec->layers[i].sa_out_w, dec->layers[i].sa_out_b,
+		dec->d_model, dec->n_heads);
+	if (!sa_out)
+		return NULL;
+
+	/* Residual + post-norm, matching the 2D wrapper. */
+	q = gh_add(g, arena, q, sa_out);
+	if (!q)
+		return NULL;
+	return gh_layernorm(g, arena, q,
+			    dec->layers[i].sa_ln_w,
+			    dec->layers[i].sa_ln_b);
+}
+
 struct sam3_tensor *sam3_decoder_build_tca(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,
@@ -1428,6 +1891,81 @@ struct sam3_tensor *sam3_decoder_build_ca(
 	return q;
 }
 
+struct sam3_tensor *sam3_decoder_build_tca_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *text_features, struct sam3_arena *arena)
+{
+	int i = layer_idx;
+
+	if (!text_features)
+		return q;
+
+	struct sam3_tensor *q_with_pos = gh_add(g, arena, q, query_pos);
+	if (!q_with_pos)
+		return NULL;
+
+	struct sam3_tensor *tca_out = decoder_cross_attention_batched(
+		g, arena, q_with_pos, text_features,
+		dec->layers[i].tca_q_w, dec->layers[i].tca_q_b,
+		dec->layers[i].tca_kv_w, dec->layers[i].tca_kv_b,
+		dec->layers[i].tca_out_w, dec->layers[i].tca_out_b,
+		dec->d_model, dec->n_heads);
+	if (!tca_out)
+		return NULL;
+
+	q = gh_add(g, arena, q, tca_out);
+	if (!q)
+		return NULL;
+	return gh_layernorm(g, arena, q,
+			    dec->layers[i].tca_ln_w,
+			    dec->layers[i].tca_ln_b);
+}
+
+struct sam3_tensor *sam3_decoder_build_ca_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features, struct sam3_tensor *enc_pos,
+	struct sam3_tensor *rpb_mask, struct sam3_arena *arena)
+{
+	int i = layer_idx;
+	int d = dec->d_model;
+
+	struct sam3_tensor *q_with_pos = gh_add(g, arena, q, query_pos);
+	if (!q_with_pos)
+		return NULL;
+
+	struct sam3_tensor *ca_out;
+	if (enc_pos) {
+		ca_out = decoder_cross_attention_with_pos_batched(
+			g, arena,
+			q_with_pos, enc_features, enc_pos,
+			dec->layers[i].ca_q_w, dec->layers[i].ca_q_b,
+			dec->layers[i].ca_kv_w, dec->layers[i].ca_kv_b,
+			dec->layers[i].ca_out_w, dec->layers[i].ca_out_b,
+			d, dec->n_heads, rpb_mask);
+	} else {
+		ca_out = decoder_cross_attention_batched(
+			g, arena,
+			q_with_pos, enc_features,
+			dec->layers[i].ca_q_w, dec->layers[i].ca_q_b,
+			dec->layers[i].ca_kv_w, dec->layers[i].ca_kv_b,
+			dec->layers[i].ca_out_w, dec->layers[i].ca_out_b,
+			d, dec->n_heads);
+	}
+	if (!ca_out)
+		return NULL;
+
+	q = gh_add(g, arena, q, ca_out);
+	if (!q)
+		return NULL;
+	return gh_layernorm(g, arena, q,
+			    dec->layers[i].ca_ln_w,
+			    dec->layers[i].ca_ln_b);
+}
+
 struct sam3_tensor *sam3_decoder_build_ffn(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,
@@ -1452,6 +1990,71 @@ struct sam3_tensor *sam3_decoder_build_ffn(
 			  dec->layers[i].ffn_ln_w,
 			  dec->layers[i].ffn_ln_b);
 	return q;
+}
+
+struct sam3_tensor *sam3_decoder_build_ffn_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_arena *arena)
+{
+	int i = layer_idx;
+
+	struct sam3_tensor *ff = gh_mlp(g, arena, q,
+					 dec->layers[i].ffn_fc1_w,
+					 dec->layers[i].ffn_fc1_b,
+					 dec->layers[i].ffn_fc2_w,
+					 dec->layers[i].ffn_fc2_b,
+					 SAM3_OP_RELU);
+	if (!ff)
+		return NULL;
+
+	q = gh_add(g, arena, q, ff);
+	if (!q)
+		return NULL;
+	return gh_layernorm(g, arena, q,
+			    dec->layers[i].ffn_ln_w,
+			    dec->layers[i].ffn_ln_b);
+}
+
+struct sam3_tensor *sam3_decoder_build_final_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_arena *arena)
+{
+	return gh_layernorm(g, arena, q,
+			    dec->output_ln_w, dec->output_ln_b);
+}
+
+struct sam3_tensor *sam3_decoder_build_layer_batched(
+	struct sam3_decoder *dec,
+	int layer_idx,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features,
+	struct sam3_tensor *enc_pos,
+	struct sam3_tensor *text_features,
+	struct sam3_tensor *rpb_mask,
+	struct sam3_arena *arena)
+{
+	q = sam3_decoder_build_sa_batched(dec, layer_idx, g, q, query_pos,
+					   arena);
+	if (!q)
+		return NULL;
+
+	q = sam3_decoder_build_tca_batched(dec, layer_idx, g, q, query_pos,
+					    text_features, arena);
+	if (!q)
+		return NULL;
+
+	q = sam3_decoder_build_ca_batched(dec, layer_idx, g, q, query_pos,
+					   enc_features, enc_pos, rpb_mask,
+					   arena);
+	if (!q)
+		return NULL;
+
+	return sam3_decoder_build_ffn_batched(dec, layer_idx, g, q, arena);
 }
 
 struct sam3_tensor *sam3_decoder_build(

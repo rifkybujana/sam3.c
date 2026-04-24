@@ -185,6 +185,30 @@ struct sam3_tensor *sam3_decoder_compute_query_pos(
 	const float *ref_boxes);
 
 /*
+ * sam3_decoder_compute_query_pos_batched - Batched query_pos.
+ *
+ * Same as sam3_decoder_compute_query_pos but accepts [B, nq, 4]
+ * ref_boxes flat and returns [B, nq, d_model]. Sine embedding runs
+ * CPU-side for all slots into a [B, nq, 2*d] tensor, then the
+ * ref_point_head MLP (gh_linear + ReLU + gh_linear) runs on the
+ * batched tensor (batch-transparent).
+ *
+ * @dec:       Initialized and loaded decoder
+ * @g:         Graph to add ref_point_head nodes to
+ * @arena:     Arena for intermediate tensors
+ * @ref_boxes: [B * nq * 4] flat, sigmoid-ed cxcywh
+ * @B:         Batch size (>= 1)
+ *
+ * Returns [B, nq, d_model] query_pos, or NULL.
+ */
+struct sam3_tensor *sam3_decoder_compute_query_pos_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_arena *arena,
+	const float *ref_boxes,
+	int B);
+
+/*
  * sam3_decoder_build_final - Apply output layer norm after all layers.
  *
  * @dec:   Initialized and loaded decoder
@@ -210,13 +234,73 @@ struct sam3_tensor *sam3_decoder_build_sa(
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_tensor *query_pos, struct sam3_arena *arena);
 
+/*
+ * sam3_decoder_build_sa_batched - Batched decoder self-attention.
+ *
+ * Batched variant of sam3_decoder_build_sa. Accepts [B, nq, d] queries
+ * and query_pos, returns [B, nq, d]. Per-head SDPA uses the 4D reshape
+ * pattern derisked in commit f775e74.
+ *
+ * @dec:        Decoder
+ * @layer_idx:  Which layer's weights to use
+ * @g:          Graph
+ * @q:          [B, nq, d_model]
+ * @query_pos:  [B, nq, d_model]
+ * @arena:      Arena
+ *
+ * Returns [B, nq, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_decoder_build_sa_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos, struct sam3_arena *arena);
+
 struct sam3_tensor *sam3_decoder_build_tca(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_tensor *query_pos,
 	struct sam3_tensor *text_features, struct sam3_arena *arena);
 
+/*
+ * sam3_decoder_build_tca_batched - Batched text cross-attention substep.
+ *
+ * Mirrors sam3_decoder_build_tca with batch dim leading. If
+ * @text_features is NULL the call is a no-op (returns q unchanged).
+ *
+ * @q:             [B, n_q, d_model]
+ * @query_pos:     [B, n_q, d_model]
+ * @text_features: [B, n_text, d_model] or NULL
+ * Returns [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_tca_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *text_features, struct sam3_arena *arena);
+
 struct sam3_tensor *sam3_decoder_build_ca(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features, struct sam3_tensor *enc_pos,
+	struct sam3_tensor *rpb_mask, struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_ca_batched - Batched vision cross-attention substep.
+ *
+ * Mirrors sam3_decoder_build_ca. When @enc_pos is non-NULL uses the
+ * with-pos variant (K = enc+pos, V = enc, RPB mask applied); else
+ * plain cross-attention. @rpb_mask when non-NULL must be shaped
+ * [B, n_heads, n_q, n_kv] and is passed as SDPA's additive mask.
+ *
+ * @q:             [B, n_q, d_model]
+ * @query_pos:     [B, n_q, d_model]
+ * @enc_features:  [B, n_kv, d_model]
+ * @enc_pos:       [n_kv, d_model] or [B, n_kv, d_model] or NULL
+ * @rpb_mask:      [B, n_heads, n_q, n_kv] or NULL
+ * Returns [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_ca_batched(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,
 	struct sam3_tensor *query_pos,
@@ -239,9 +323,86 @@ void sam3_decoder_compute_rpb(const struct sam3_decoder *dec,
 			       const float *ref_boxes,
 			       int H, int W, float *out);
 
+/*
+ * sam3_decoder_compute_rpb_batched - Batched RPB mask computation.
+ *
+ * Batched wrapper around sam3_decoder_compute_rpb. Iterates the
+ * per-slot computation over B batch slots. Output is laid out so the
+ * batch dim is leading: [B, n_heads, nq, H*W].
+ *
+ * @dec:       Decoder with loaded RPB MLP weights
+ * @ref_boxes: [B, nq, 4] flat in cxcywh order (post-sigmoid)
+ * @B:         Batch size (>= 1)
+ * @H, @W:     Feature map spatial dims
+ * @out:       Output buffer, must hold B * n_heads * nq * H * W floats
+ */
+void sam3_decoder_compute_rpb_batched(const struct sam3_decoder *dec,
+				       const float *ref_boxes,
+				       int B, int H, int W,
+				       float *out);
+
 struct sam3_tensor *sam3_decoder_build_ffn(
 	struct sam3_decoder *dec, int layer_idx,
 	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_ffn_batched - Batched decoder FFN substep.
+ *
+ * gh_mlp + gh_add + gh_layernorm; all batch-transparent. Input/output
+ * is [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_ffn_batched(
+	struct sam3_decoder *dec, int layer_idx,
+	struct sam3_graph *g, struct sam3_tensor *q,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_final_batched - Batched output layernorm.
+ *
+ * Trivial rank-3 wrapper around gh_layernorm using output_ln weights.
+ * Input/output is [B, n_q, d_model].
+ */
+struct sam3_tensor *sam3_decoder_build_final_batched(
+	struct sam3_decoder *dec,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_arena *arena);
+
+/*
+ * sam3_decoder_build_layer_batched - Compose one batched decoder layer.
+ *
+ * Runs SA -> TCA -> CA -> FFN using the _batched substep builders.
+ * Same param semantics as sam3_decoder_build_layer but every tensor
+ * carries a leading batch dim B. Takes @rpb_mask directly instead of
+ * the 2D version's boxes pointer-to-pointer; the caller (Task 14's
+ * decoder loop) is responsible for running cpu_box_refine_batched +
+ * sam3_decoder_compute_query_pos_batched + sam3_decoder_compute_rpb_batched
+ * between layers — this builder does not update box state.
+ *
+ * @dec:           Decoder
+ * @layer_idx:     Which layer's weights to use
+ * @g:             Graph
+ * @q:             [B, n_q, d_model]
+ * @query_pos:     [B, n_q, d_model]
+ * @enc_features:  [B, n_kv, d_model]
+ * @enc_pos:       [n_kv, d_model] or [B, n_kv, d_model] or NULL
+ * @text_features: [B, n_text, d_model] or NULL
+ * @rpb_mask:      [B, n_heads, n_q, n_kv] or NULL
+ * @arena:         Arena
+ *
+ * Returns updated queries [B, n_queries, d_model], or NULL.
+ */
+struct sam3_tensor *sam3_decoder_build_layer_batched(
+	struct sam3_decoder *dec,
+	int layer_idx,
+	struct sam3_graph *g,
+	struct sam3_tensor *q,
+	struct sam3_tensor *query_pos,
+	struct sam3_tensor *enc_features,
+	struct sam3_tensor *enc_pos,
+	struct sam3_tensor *text_features,
+	struct sam3_tensor *rpb_mask,
 	struct sam3_arena *arena);
 
 #endif /* SAM3_MODEL_DECODER_H */
