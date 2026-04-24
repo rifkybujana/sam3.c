@@ -29,6 +29,7 @@
 #include "core/graph.h"
 #include "model/graph_helpers.h"
 #include "model/model_misc.h"
+#include "model/sam3_image_internal.h"
 #include "model/segmentation.h"
 
 /*
@@ -869,6 +870,149 @@ static void test_mask_logits_batched_equals_per_slot(void)
 	run_both_backends(mask_logits_batched_case);
 }
 
+/*
+ * box_refine_batched_case - Verify cpu_box_refine_batched matches
+ * calling cpu_box_refine once per batch slot.
+ *
+ * cpu_box_refine is pure CPU arithmetic (no graph nodes, no backend
+ * dispatch), so the backend handle is unused — we still route through
+ * run_both_backends for interface symmetry with the other cases.
+ */
+static void box_refine_batched_case(struct sam3_backend *be, const char *name)
+{
+	(void)be;
+	(void)name;
+
+	const int B = 2;
+	const int nq = 4;
+	const int d = 16;
+
+	struct sam3_arena ar;
+	sam3_arena_init(&ar, 1 << 22);
+
+	/*
+	 * Build a tiny decoder with only the weights cpu_box_refine touches:
+	 * output_ln_{w,b} and layers[0].box_fc{1,2,3}_{w,b}. Other fields
+	 * stay zero-initialized.
+	 */
+	struct sam3_decoder dec = {0};
+	dec.d_model = d;
+	dec.n_heads = 2;
+	dec.n_queries = 0;
+
+	int d_dims[] = {d};
+	int dd_dims[] = {d, d};
+	int d4_dims[] = {4, d};
+	int b4_dims[] = {4};
+
+	dec.output_ln_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	dec.output_ln_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1, d_dims);
+	dec.layers[0].box_fc1_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  dd_dims);
+	dec.layers[0].box_fc1_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  d_dims);
+	dec.layers[0].box_fc2_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  dd_dims);
+	dec.layers[0].box_fc2_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  d_dims);
+	dec.layers[0].box_fc3_w = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 2,
+						  d4_dims);
+	dec.layers[0].box_fc3_b = gh_alloc_tensor(&ar, SAM3_DTYPE_F32, 1,
+						  b4_dims);
+	ASSERT_NOT_NULL(dec.output_ln_w);
+	ASSERT_NOT_NULL(dec.output_ln_b);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc1_w);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc1_b);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc2_w);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc2_b);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc3_w);
+	ASSERT_NOT_NULL(dec.layers[0].box_fc3_b);
+
+	/*
+	 * Keep output_ln near identity so the LN output is well-scaled;
+	 * biases small. MLP weights get unique sin offsets.
+	 */
+	float *lnw = (float *)dec.output_ln_w->data;
+	float *lnb = (float *)dec.output_ln_b->data;
+	for (int i = 0; i < d; i++) {
+		lnw[i] = 1.0f + 0.01f * sinf((float)i);
+		lnb[i] = 0.01f * cosf((float)i);
+	}
+	fill_sin_pattern(dec.layers[0].box_fc1_w, 1.0f);
+	fill_sin_pattern(dec.layers[0].box_fc1_b, 2.0f);
+	fill_sin_pattern(dec.layers[0].box_fc2_w, 3.0f);
+	fill_sin_pattern(dec.layers[0].box_fc2_b, 4.0f);
+	fill_sin_pattern(dec.layers[0].box_fc3_w, 5.0f);
+	fill_sin_pattern(dec.layers[0].box_fc3_b, 6.0f);
+
+	/* Raw float buffers for queries and ref boxes. */
+	float *q = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * d * sizeof(float));
+	float *rb_batched = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * 4 * sizeof(float));
+	float *rb_ref = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)B * nq * 4 * sizeof(float));
+	ASSERT_NOT_NULL(q);
+	ASSERT_NOT_NULL(rb_batched);
+	ASSERT_NOT_NULL(rb_ref);
+
+	/* Per-slot-differing queries so slot aliasing would surface. */
+	for (int b = 0; b < B; b++) {
+		for (int i = 0; i < nq * d; i++) {
+			q[b * nq * d + i] = 0.1f * sinf(
+				0.3f * (float)b + (float)i * 0.137f);
+		}
+	}
+	/* Ref boxes in (0, 1) so inverse_sigmoid is well-defined. */
+	for (int i = 0; i < B * nq * 4; i++) {
+		rb_batched[i] = 0.3f + 0.1f * sinf((float)i);
+		rb_ref[i] = rb_batched[i];
+	}
+
+	/* Scratch buffers: tmp1 needs nq * max(d, 4) floats, tmp2 nq * d. */
+	int tmp1_stride = d > 4 ? d : 4;
+	float *tmp1 = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)nq * tmp1_stride * sizeof(float));
+	float *tmp2 = (float *)sam3_arena_alloc_raw(
+		&ar, (size_t)nq * d * sizeof(float));
+	ASSERT_NOT_NULL(tmp1);
+	ASSERT_NOT_NULL(tmp2);
+
+	/* Batched call: updates rb_batched in place. */
+	cpu_box_refine_batched(q, &dec, rb_batched, B, nq, d, tmp1, tmp2);
+
+	/* Per-slot reference. */
+	for (int b = 0; b < B; b++) {
+		cpu_box_refine(q + (size_t)b * nq * d, &dec,
+				rb_ref + (size_t)b * nq * 4,
+				nq, d, tmp1, tmp2);
+	}
+
+	/* Pure CPU math on both paths — tight tolerance. */
+	const float atol = 1e-6f;
+	const float rtol = 1e-6f;
+	for (int i = 0; i < B * nq * 4; i++) {
+		tests_run++;
+		float expected = rb_ref[i];
+		float actual = rb_batched[i];
+		float tol = atol + rtol * fabsf(expected);
+		if (fabsf(actual - expected) > tol) {
+			fprintf(stderr,
+				"FAIL [%s box_refine] i=%d: "
+				"batched=%.6f ref=%.6f tol=%g\n",
+				name, i, actual, expected, tol);
+			tests_failed++;
+		}
+	}
+
+	sam3_arena_free(&ar);
+}
+
+static void test_box_refine_batched_equals_per_slot(void)
+{
+	run_both_backends(box_refine_batched_case);
+}
+
 int main(void)
 {
 	test_scorer_batched_equals_per_slot();
@@ -878,5 +1022,6 @@ int main(void)
 	test_fpn_batched_equals_per_slot();
 	test_mask_mlp_batched_equals_per_slot();
 	test_mask_logits_batched_equals_per_slot();
+	test_box_refine_batched_equals_per_slot();
 	TEST_REPORT();
 }

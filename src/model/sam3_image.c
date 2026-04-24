@@ -20,6 +20,7 @@
 #include <math.h>
 
 #include "sam3_image.h"
+#include "sam3_image_internal.h"
 #include "graph_helpers.h"
 #include "util/log.h"
 #include "util/profile.h"
@@ -118,10 +119,10 @@ static inline float cpu_inverse_sigmoid(float x)
  * @tmp1:      Scratch buffer [nq * max(d, 4)]
  * @tmp2:      Scratch buffer [nq * d]
  */
-static void cpu_box_refine(const float *q,
-			    const struct sam3_decoder *dec,
-			    float *ref_boxes, int nq, int d,
-			    float *tmp1, float *tmp2)
+void cpu_box_refine(const float *q,
+		     const struct sam3_decoder *dec,
+		     float *ref_boxes, int nq, int d,
+		     float *tmp1, float *tmp2)
 {
 	/* Step 1: LayerNorm(q) using output_ln weights */
 	cpu_layernorm_f32(q,
@@ -147,6 +148,27 @@ static void cpu_box_refine(const float *q,
 	for (int j = 0; j < nq * 4; j++) {
 		float logit = cpu_inverse_sigmoid(ref_boxes[j]);
 		ref_boxes[j] = 1.0f / (1.0f + expf(-(logit + tmp2[j])));
+	}
+}
+
+/*
+ * cpu_box_refine_batched - Iterate cpu_box_refine over B batch slots.
+ *
+ * Pointers advance by nq*d (q) and nq*4 (ref_boxes) per slot; the
+ * scratch buffers tmp1/tmp2 are reused across slots.
+ */
+void cpu_box_refine_batched(const float *q,
+			     const struct sam3_decoder *dec,
+			     float *ref_boxes, int B, int nq, int d,
+			     float *tmp1, float *tmp2)
+{
+	const size_t q_stride  = (size_t)nq * (size_t)d;
+	const size_t rb_stride = (size_t)nq * 4u;
+
+	for (int b = 0; b < B; b++) {
+		cpu_box_refine(q + (size_t)b * q_stride, dec,
+				ref_boxes + (size_t)b * rb_stride,
+				nq, d, tmp1, tmp2);
 	}
 }
 
