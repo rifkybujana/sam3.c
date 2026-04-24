@@ -287,6 +287,39 @@ enum sam3_error sam3_segment(sam3_ctx *ctx, const struct sam3_prompt *prompts,
 			     int n_prompts, struct sam3_result *result);
 
 /*
+ * sam3_segment_batch - Run N independent segmentation queries against
+ * the same cached image in a single call.
+ *
+ * @ctx:     Context with image already set
+ * @sets:    Array of @n_sets prompt sets. Each set describes one logical
+ *           query (points/boxes/text that together pick out one object
+ *           or concept) and produces its own result. Each set may have
+ *           its own text prompt; caches already populated via
+ *           sam3_precache_text() or previous calls amortize repeated
+ *           text encoding.
+ * @n_sets:  Number of prompt sets (must be > 0).
+ * @results: Caller-provided array of @n_sets result structs. The callee
+ *           overwrites each element; on success all results are filled
+ *           and the caller is responsible for calling sam3_result_free()
+ *           on each. On failure, results for sets that had already been
+ *           processed are freed internally and the array is zeroed.
+ *
+ * Any pending asynchronous text encode from a prior sam3_set_text() is
+ * joined and dropped before the first set is processed — within a batch,
+ * each set's text is encoded inline (with text-cache reuse) rather than
+ * through the async worker. Image features are shared across all sets.
+ *
+ * This call is equivalent to invoking sam3_segment() once per set with
+ * the same cached image, but in a single API call with a single failure
+ * path. Returns SAM3_OK on success. Returns SAM3_EINVAL if any set is
+ * empty or no image is set.
+ */
+enum sam3_error sam3_segment_batch(sam3_ctx *ctx,
+				   const struct sam3_prompt_set *sets,
+				   int n_sets,
+				   struct sam3_result *results);
+
+/*
  * sam3_result_free - Free memory allocated in a sam3_result.
  *
  * @result: Result struct to free (fields set to NULL/0 after).

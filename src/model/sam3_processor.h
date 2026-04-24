@@ -288,6 +288,32 @@ enum sam3_error sam3_processor_segment(struct sam3_processor *proc,
 				       struct sam3_result *result);
 
 /*
+ * sam3_processor_segment_batch - Run N independent segmentations against
+ * the same cached image in a single call.
+ *
+ * @proc:    Processor with image already set
+ * @sets:    Array of prompt sets; each set describes one logical query
+ * @n_sets:  Number of prompt sets (> 0)
+ * @results: Caller-provided array of @n_sets result structs. On success
+ *           every result is filled; caller frees each with
+ *           sam3_result_free(). On failure, results filled so far are
+ *           freed and the whole array is zeroed.
+ *
+ * Drops any pending async text state before processing the first set;
+ * each set's text prompt is encoded inline (with text-cache reuse).
+ * Image features are shared across all sets. Segment calls are currently
+ * serialized through the main backend — this API is primarily about
+ * convenience and single-failure-path semantics, not backend parallelism.
+ *
+ * Returns SAM3_OK on success.
+ */
+enum sam3_error sam3_processor_segment_batch(
+	struct sam3_processor *proc,
+	const struct sam3_prompt_set *sets,
+	int n_sets,
+	struct sam3_result *results);
+
+/*
  * sam3_project_prompts - CPU-side prompt coordinate projection.
  *
  * @model:        Loaded image model (for geometry encoder weights)

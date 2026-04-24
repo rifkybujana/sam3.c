@@ -292,6 +292,12 @@ if(SAM3_TESTS)
 			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 	endif()
 
+	# test_segment_batch opens models/sam3.sam3
+	if(TARGET test_segment_batch)
+		target_compile_definitions(test_segment_batch PRIVATE
+			SAM3_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	endif()
+
 	# test_persist_bus_smoke opens models/sam3.sam3 and assets/bus.jpg
 	if(TARGET test_persist_bus_smoke)
 		target_compile_definitions(test_persist_bus_smoke PRIVATE
