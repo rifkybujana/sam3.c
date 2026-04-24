@@ -39,6 +39,21 @@ struct sam3_geometry_encoder {
 	/* Pos enc projection: sinusoidal pos encoding + Linear(d, d) */
 	struct sam3_tensor *posenc_proj_w, *posenc_proj_b;  /* [d_model, d_model] */
 
+	/*
+	 * Box pool projection: Conv2d(d, d, kernel=7) applied to RoI-aligned
+	 * image features. Weight layout is PyTorch OIHW [d_out, d_in, kh, kw].
+	 */
+	struct sam3_tensor *box_pool_proj_w;             /* [d, d, 7, 7] */
+	struct sam3_tensor *box_pool_proj_b;             /* [d] */
+
+	/*
+	 * Box pos enc projection: Linear(d+2, d) applied to the output of
+	 * PositionEmbeddingSine.encode_boxes(cx, cy, w, h) — concat of
+	 * (pos_y, pos_x, h, w), total d_model + 2 features.
+	 */
+	struct sam3_tensor *box_posenc_proj_w;           /* [d, d+2] */
+	struct sam3_tensor *box_posenc_proj_b;           /* [d] */
+
 	/* Image pre-norm for pool projection (LayerNorm) */
 	struct sam3_tensor *img_pre_norm_w, *img_pre_norm_b;  /* [d_model] */
 

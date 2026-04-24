@@ -548,6 +548,156 @@ static void cpu_bilinear_sample_nhwc(float *out, const float *data,
 }
 
 /*
+ * cpu_bilinear_interp_nhwc_pix - Bilinear interp at feature-space pixel
+ * coords (x, y). Matches torchvision roi_align's bilinear_interpolate:
+ * fully out-of-bounds (y < -1, y > H, etc.) returns 0; otherwise clamp
+ * each axis separately. Used by cpu_roi_align_nhwc.
+ */
+static void cpu_bilinear_interp_nhwc_pix(float *out, const float *data,
+					 int C, int H, int W,
+					 float x, float y)
+{
+	if (y < -1.0f || y > (float)H ||
+	    x < -1.0f || x > (float)W) {
+		for (int c = 0; c < C; c++)
+			out[c] = 0.0f;
+		return;
+	}
+	if (y <= 0.0f) y = 0.0f;
+	if (x <= 0.0f) x = 0.0f;
+
+	int y_low = (int)y;
+	int x_low = (int)x;
+	int y_high, x_high;
+
+	if (y_low >= H - 1) {
+		y_high = H - 1;
+		y_low  = H - 1;
+		y      = (float)y_low;
+	} else {
+		y_high = y_low + 1;
+	}
+	if (x_low >= W - 1) {
+		x_high = W - 1;
+		x_low  = W - 1;
+		x      = (float)x_low;
+	} else {
+		x_high = x_low + 1;
+	}
+
+	float ly = y - (float)y_low;
+	float lx = x - (float)x_low;
+	float hy = 1.0f - ly;
+	float hx = 1.0f - lx;
+
+	const float *v1 = data + (y_low  * W + x_low ) * C;
+	const float *v2 = data + (y_low  * W + x_high) * C;
+	const float *v3 = data + (y_high * W + x_low ) * C;
+	const float *v4 = data + (y_high * W + x_high) * C;
+
+	float w1 = hy * hx;
+	float w2 = hy * lx;
+	float w3 = ly * hx;
+	float w4 = ly * lx;
+	for (int c = 0; c < C; c++)
+		out[c] = w1 * v1[c] + w2 * v2[c] +
+			 w3 * v3[c] + w4 * v4[c];
+}
+
+/*
+ * cpu_roi_align_nhwc - RoI align a single box to pool_h × pool_w × C.
+ *
+ * Matches torchvision.ops.roi_align with spatial_scale=1.0,
+ * sampling_ratio=0 (auto), aligned=False. Each of pool_h × pool_w output
+ * bins averages (grid_h × grid_w) bilinearly-sampled points spread evenly
+ * within the bin, where grid_h = ceil(roi_h / pool_h) and similarly for
+ * the width.
+ *
+ * @out:                Output buffer [pool_h * pool_w * C]
+ * @data:               NHWC feature data [H, W, C]
+ * @C, H, W:            Feature map dims
+ * @x1, y1, x2, y2:     Box in feature-space pixel coords (xyxy)
+ * @pool_h, pool_w:     Output spatial dims
+ */
+static void cpu_roi_align_nhwc(float *out, const float *data,
+			       int C, int H, int W,
+			       float x1, float y1,
+			       float x2, float y2,
+			       int pool_h, int pool_w)
+{
+	float roi_w = x2 - x1;
+	float roi_h = y2 - y1;
+	if (roi_w < 1.0f) roi_w = 1.0f;
+	if (roi_h < 1.0f) roi_h = 1.0f;
+
+	float bin_h = roi_h / (float)pool_h;
+	float bin_w = roi_w / (float)pool_w;
+	int   grid_h = (int)ceilf(bin_h);
+	int   grid_w = (int)ceilf(bin_w);
+	if (grid_h < 1) grid_h = 1;
+	if (grid_w < 1) grid_w = 1;
+
+	float inv_count = 1.0f / (float)(grid_h * grid_w);
+	float tmp[512];  /* d_model <= 512 */
+
+	for (int ph = 0; ph < pool_h; ph++) {
+		for (int pw = 0; pw < pool_w; pw++) {
+			float *o = out +
+				((size_t)ph * pool_w + pw) * C;
+			for (int c = 0; c < C; c++)
+				o[c] = 0.0f;
+
+			for (int iy = 0; iy < grid_h; iy++) {
+				float y = y1 + (float)ph * bin_h +
+					  ((float)iy + 0.5f) *
+					  (bin_h / (float)grid_h);
+				for (int ix = 0; ix < grid_w; ix++) {
+					float x = x1 + (float)pw * bin_w +
+						  ((float)ix + 0.5f) *
+						  (bin_w / (float)grid_w);
+					cpu_bilinear_interp_nhwc_pix(
+						tmp, data, C, H, W, x, y);
+					for (int c = 0; c < C; c++)
+						o[c] += tmp[c];
+				}
+			}
+			for (int c = 0; c < C; c++)
+				o[c] *= inv_count;
+		}
+	}
+}
+
+/*
+ * cpu_conv2d_collapse - Apply a Conv2d(C_in, C_out, kernel=pool_h×pool_w)
+ * whose kernel covers the entire input spatial extent, producing a single
+ * C_out vector (stride 1, no padding, bias add).
+ *
+ * Input layout:  data[ph * pool_w + pw, ci] — HWC with channels innermost.
+ * Weight layout: PyTorch OIHW, i.e. w[((co * C_in + ci) * pool_h + kh) *
+ *                pool_w + kw].
+ */
+static void cpu_conv2d_collapse(float *out, const float *data,
+				const float *w, const float *b,
+				int C_in, int C_out,
+				int pool_h, int pool_w)
+{
+	int spatial = pool_h * pool_w;
+	for (int co = 0; co < C_out; co++) {
+		float sum = b[co];
+		const float *w_co = w + (size_t)co * C_in * spatial;
+		for (int ci = 0; ci < C_in; ci++) {
+			const float *w_coci = w_co + (size_t)ci * spatial;
+			const float *data_ci = data + ci;
+			for (int k = 0; k < spatial; k++) {
+				sum += data_ci[(size_t)k * C_in] *
+				       w_coci[k];
+			}
+		}
+		out[co] = sum;
+	}
+}
+
+/*
  * sam3_project_prompts - Project point/box coordinates to d_model
  * embeddings.
  *
@@ -609,7 +759,10 @@ struct sam3_tensor *sam3_project_prompts(
 	const float *img_normed = NULL;
 	float *img_norm_buf = NULL;
 	int feat_H = 0, feat_W = 0;
-	if (n_points > 0 && enc->pool_proj_w && feat_s1_nhwc) {
+	int need_img_norm =
+		(n_points > 0 && enc->pool_proj_w) ||
+		(n_boxes  > 0 && enc->box_pool_proj_w);
+	if (need_img_norm && feat_s1_nhwc) {
 		const struct sam3_tensor *feat = feat_s1_nhwc;
 		/* NHWC: dims = [1, H, W, C] */
 		feat_H = feat->dims[1];
@@ -720,7 +873,13 @@ struct sam3_tensor *sam3_project_prompts(
 		}
 	}
 
-	/* Project boxes: normalize to [0,1], linear, add label embed */
+	/*
+	 * Project boxes: direct + pos-enc + pool + label embed.
+	 *
+	 * Python (SequenceGeometryEncoder._encode_boxes) expects boxes in
+	 * normalized cxcywh [0,1] with default label=1 (positive). We
+	 * accept the public sam3_box (xyxy absolute) and convert here.
+	 */
 	if (n_boxes > 0) {
 		const float *bw = (const float *)enc->box_proj_w->data;
 		const float *bb = (const float *)enc->box_proj_b->data;
@@ -730,19 +889,97 @@ struct sam3_tensor *sam3_project_prompts(
 			if (prompts[i].type != SAM3_PROMPT_BOX)
 				continue;
 
-			float coords[4] = {
-				prompts[i].box.x1 / norm_w,
-				prompts[i].box.y1 / norm_h,
-				prompts[i].box.x2 / norm_w,
-				prompts[i].box.y2 / norm_h
-			};
+			/* Normalize xyxy to [0,1] then convert to cxcywh. */
+			float x1n = prompts[i].box.x1 / norm_w;
+			float y1n = prompts[i].box.y1 / norm_h;
+			float x2n = prompts[i].box.x2 / norm_w;
+			float y2n = prompts[i].box.y2 / norm_h;
+			float cx = 0.5f * (x1n + x2n);
+			float cy = 0.5f * (y1n + y2n);
+			float bw_norm = x2n - x1n;
+			float bh_norm = y2n - y1n;
+			float coords[4] = {cx, cy, bw_norm, bh_norm};
 
-			/* Linear: out = coords @ W^T + b */
+			/* 1. Direct: out = cxcywh @ W^T + b */
 			cpu_linear(od + row * d, coords, bw, bb,
 				   1, 4, d);
 
-			/* Box label: default to 0 (positive) */
-			const float *lv = le;  /* label_embed[0] */
+			/*
+			 * 2. Box pos-enc projection. Python reference:
+			 *   pos_x, pos_y = _encode_xy(cx, cy)  # each [half_d]
+			 *   enc = cat([pos_y, pos_x, h, w])    # [d_model + 2]
+			 *   proj = Linear(d+2, d) @ enc
+			 * Note the order: pos_y FIRST, then pos_x, then h, w.
+			 */
+			if (enc->box_posenc_proj_w) {
+				int half_d = d / 2;
+				float pe_buf[514];  /* d_model + 2 <= 514 */
+				float proj_tmp[512];
+				cpu_sinusoidal_posenc(pe_buf,
+						      cy, half_d);
+				cpu_sinusoidal_posenc(pe_buf + half_d,
+						      cx, half_d);
+				pe_buf[d    ] = bh_norm;
+				pe_buf[d + 1] = bw_norm;
+				cpu_linear(proj_tmp, pe_buf,
+					(const float *)
+					 enc->box_posenc_proj_w->data,
+					(const float *)
+					 enc->box_posenc_proj_b->data,
+					1, d + 2, d);
+				for (int c = 0; c < d; c++)
+					od[row * d + c] += proj_tmp[c];
+			}
+
+			/*
+			 * 3. Box pool projection. RoI align (7x7) on the
+			 * LayerNormed image features, then Conv2d(d, d, k=7)
+			 * collapses to a single d-vector.
+			 */
+			if (img_normed && enc->box_pool_proj_w) {
+				const int roi_size = 7;
+				/* Box in feature-space pixel coords. */
+				float fx1 = x1n * (float)feat_W;
+				float fy1 = y1n * (float)feat_H;
+				float fx2 = x2n * (float)feat_W;
+				float fy2 = y2n * (float)feat_H;
+
+				/*
+				 * 7*7*d = 7*7*256 = 12544 floats.
+				 * Allocate scratch from the prompt arena.
+				 */
+				int roi_dims[] = {roi_size, roi_size, d};
+				struct sam3_tensor *roi_t =
+					gh_alloc_tensor(arena,
+						SAM3_DTYPE_F32,
+						3, roi_dims);
+				if (!roi_t)
+					return NULL;
+				float *roi = (float *)roi_t->data;
+				cpu_roi_align_nhwc(roi, img_normed,
+					d, feat_H, feat_W,
+					fx1, fy1, fx2, fy2,
+					roi_size, roi_size);
+
+				float proj_tmp[512];
+				cpu_conv2d_collapse(proj_tmp, roi,
+					(const float *)
+					 enc->box_pool_proj_w->data,
+					(const float *)
+					 enc->box_pool_proj_b->data,
+					d, d, roi_size, roi_size);
+				for (int c = 0; c < d; c++)
+					od[row * d + c] += proj_tmp[c];
+			}
+
+			/*
+			 * 4. Label embedding. Python's Prompt._init_box
+			 * defaults box_labels to 1 (positive); the public
+			 * processor API accepts label=True which also maps
+			 * to 1. We mirror that default here (public sam3_box
+			 * has no label field).
+			 */
+			const float *lv = le + 1 * d;  /* label_embed[1] */
 			for (int c = 0; c < d; c++)
 				od[row * d + c] += lv[c];
 

@@ -51,6 +51,8 @@ enum sam3_error sam3_geometry_encoder_load(
 	int point_b_dims[] = {d};
 	int box_w_dims[] = {d, 4};
 	int box_b_dims[] = {d};
+	int box_pool_w_dims[] = {d, d, 7, 7};
+	int box_posenc_w_dims[] = {d, d + 2};
 	int cls_dims[] = {1, d};
 	int proj_w_dims[] = {d, d};
 	int ca_kv_w_dims[] = {d2, d};
@@ -118,6 +120,32 @@ enum sam3_error sam3_geometry_encoder_load(
 		"geom_enc.points_pos_enc_project.bias", arena,
 		SAM3_DTYPE_F32, 1, d_dims);
 	if (!enc->posenc_proj_b)
+		return SAM3_ENOMEM;
+
+	/* Box pool projection: Conv2d(d, d, k=7) over RoI-aligned features */
+	enc->box_pool_proj_w = gh_load_mmap(wf,
+		"geom_enc.boxes_pool_project.weight", arena,
+		SAM3_DTYPE_F32, 4, box_pool_w_dims);
+	if (!enc->box_pool_proj_w)
+		return SAM3_ENOMEM;
+
+	enc->box_pool_proj_b = gh_load_mmap(wf,
+		"geom_enc.boxes_pool_project.bias", arena,
+		SAM3_DTYPE_F32, 1, d_dims);
+	if (!enc->box_pool_proj_b)
+		return SAM3_ENOMEM;
+
+	/* Box pos-enc projection: Linear(d+2, d) over encode_boxes output */
+	enc->box_posenc_proj_w = gh_load_mmap(wf,
+		"geom_enc.boxes_pos_enc_project.weight", arena,
+		SAM3_DTYPE_F32, 2, box_posenc_w_dims);
+	if (!enc->box_posenc_proj_w)
+		return SAM3_ENOMEM;
+
+	enc->box_posenc_proj_b = gh_load_mmap(wf,
+		"geom_enc.boxes_pos_enc_project.bias", arena,
+		SAM3_DTYPE_F32, 1, d_dims);
+	if (!enc->box_posenc_proj_b)
 		return SAM3_ENOMEM;
 
 	/* Image pre-norm: LayerNorm(d_model) for pool projection */
