@@ -23,6 +23,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/sam3_platform.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

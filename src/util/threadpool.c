@@ -21,7 +21,7 @@
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
-#include <unistd.h>
+#include "util/sam3_platform.h"
 #endif
 
 #include "util/threadpool.h"
@@ -63,7 +63,7 @@ static int detect_n_threads(void)
 		}
 	}
 #else
-	long val = sysconf(_SC_NPROCESSORS_ONLN);
+	long val = sam3_get_nprocessors_onln();
 	if (val > 0)
 		n = (int)val;
 #endif

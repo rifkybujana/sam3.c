@@ -18,9 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include "util/sam3_platform.h"
 
 #include "weight.h"
 #include "json/cJSON.h"
@@ -75,14 +73,14 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 		return SAM3_EINVAL;
 	}
 
-	fd = open(path, O_RDONLY);
+	fd = sam3_open_rdonly(path);
 	if (fd < 0) {
 		sam3_log_error("st_open: cannot open %s", path);
 		return SAM3_EIO;
 	}
 
-	struct stat st;
-	if (fstat(fd, &st) < 0) {
+	sam3_stat_t st;
+	if (sam3_fstat(fd, &st) < 0) {
 		sam3_log_error("st_open: fstat failed for %s", path);
 		close(fd);
 		return SAM3_EIO;

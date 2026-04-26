@@ -13,6 +13,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/sam3_platform.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +22,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
 
 #include "weight.h"
 #include "util/log.h"
@@ -312,14 +313,14 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 		return SAM3_EINVAL;
 	}
 
-	fd = open(path, O_RDONLY);
+	fd = sam3_open_rdonly(path);
 	if (fd < 0) {
 		sam3_log_error("weight_open: cannot open %s", path);
 		return SAM3_EIO;
 	}
 
-	struct stat st;
-	if (fstat(fd, &st) < 0) {
+	sam3_stat_t st;
+	if (sam3_fstat(fd, &st) < 0) {
 		sam3_log_error("weight_open: fstat failed for %s", path);
 		close(fd);
 		return SAM3_EIO;

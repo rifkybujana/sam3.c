@@ -23,6 +23,8 @@ fn main() {
     } else if cfg!(target_os = "linux") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
     }
+    // Windows has no rpath — `libsam3.dll` must sit next to the .exe.
+    // The Tauri host crate's build.rs copies it into the target dir.
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
 
@@ -73,7 +75,7 @@ fn resolve_paths() -> (PathBuf, PathBuf) {
             .unwrap_or_else(|| PathBuf::from("include"));
         if !has_lib(&build) {
             panic!(
-                "sam3-sys: SAM3_BUILD_DIR={} has no libsam3.{{dylib,so}}",
+                "sam3-sys: SAM3_BUILD_DIR={} has no libsam3.{{dylib,so,dll.a}}",
                 build.display()
             );
         }
@@ -104,11 +106,15 @@ fn resolve_paths() -> (PathBuf, PathBuf) {
 
     panic!(
         "sam3-sys: unable to locate libsam3. Set SAM3_LIB_DIR and SAM3_INCLUDE_DIR, \
-         or SAM3_BUILD_DIR, or ensure `build/libsam3.{{dylib,so}}` exists under the \
-         repository root (run `cmake -S . -B build -DSAM3_SHARED=ON && cmake --build build`)."
+         or SAM3_BUILD_DIR, or ensure `build/libsam3.{{dylib,so,dll.a}}` exists under \
+         the repository root (run `cmake -S . -B build -DSAM3_SHARED=ON && cmake --build build`)."
     );
 }
 
 fn has_lib(dir: &Path) -> bool {
-    dir.join("libsam3.dylib").is_file() || dir.join("libsam3.so").is_file()
+    dir.join("libsam3.dylib").is_file()
+        || dir.join("libsam3.so").is_file()
+        // MinGW-w64 import library — the .dll itself sits next to it
+        // and is loaded at runtime from the same directory or PATH.
+        || dir.join("libsam3.dll.a").is_file()
 }

@@ -17,11 +17,12 @@
 
 #include "feature_cache.h"
 
+#include "util/sam3_platform.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include "util/log.h"
 #include "feature_cache_persist.h"

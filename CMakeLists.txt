@@ -16,6 +16,7 @@ option(SAM3_DEBUG_DUMP "Enable debug tensor dumps to /tmp" OFF)
 option(SAM3_BLAS    "Use BLAS for CPU matmul (Accelerate/OpenBLAS/MKL)" ON)
 option(SAM3_BENCH   "Build benchmarking harness" OFF)
 option(SAM3_SHARED  "Build shared library" OFF)
+option(SAM3_VIDEO   "Build video subsystem (requires FFmpeg)" ON)
 option(SAM3_FIXTURE_TESTS
 	"Register tests that require Python-generated fixtures" OFF)
 option(SAM3_E2E_TESTS
@@ -108,6 +109,20 @@ set(SAM3_SOURCES
 	${SAM3_UTIL_SOURCES}
 )
 
+# Strip the FFmpeg-dependent TUs when video is disabled and replace
+# them with stub implementations of the public sam3_video_* API. The
+# Rust bindings reference these symbols unconditionally; without
+# stubs they fail to link.
+if(NOT SAM3_VIDEO)
+	list(REMOVE_ITEM SAM3_SOURCES
+		${CMAKE_SOURCE_DIR}/src/util/video.c
+		${CMAKE_SOURCE_DIR}/src/util/video_encode.c
+		${CMAKE_SOURCE_DIR}/src/model/sam3_video.c
+		${CMAKE_SOURCE_DIR}/src/model/video_session.c)
+	list(APPEND SAM3_SOURCES
+		${CMAKE_SOURCE_DIR}/src/util/video_stubs.c)
+endif()
+
 # Backend factory (always needed)
 list(APPEND SAM3_SOURCES src/backend/backend.c)
 
@@ -143,6 +158,27 @@ if(SAM3_SHARED)
 			LINK_FLAGS "-exported_symbols_list ${CMAKE_SOURCE_DIR}/bindings/python/exports.txt"
 		)
 	endif()
+	# On Windows, MinGW only exports __declspec(dllexport) symbols by
+	# default. The codebase uses GCC visibility implicitly (no explicit
+	# attributes), so internal symbols like sam3_log_write are hidden
+	# and tools like sam3_cli fail to link. Enable CMake's auto-export
+	# so every defined symbol becomes visible — same effective surface
+	# as the macOS/Linux build.
+	if(WIN32)
+		# CMake's WINDOWS_EXPORT_ALL_SYMBOLS auto-generates a .def
+		# file from sam3's own object files. In practice (CMake
+		# 3.x + ld 2.40+) it sometimes only catches __declspec
+		# symbols (cJSON), missing the sam3_* API. Adding
+		# --export-all-symbols forces ld to export every defined
+		# global as a fallback. The 65535-ordinal overflow we
+		# previously saw came from the downstream Rust cdylib
+		# re-exporting the entire rlib graph; libsam3 itself only
+		# has ~255 exports, well under the limit.
+		set_target_properties(sam3 PROPERTIES
+			WINDOWS_EXPORT_ALL_SYMBOLS ON
+		)
+		target_link_options(sam3 PRIVATE -Wl,--export-all-symbols)
+	endif()
 else()
 	add_library(sam3 STATIC ${SAM3_SOURCES})
 endif()
@@ -161,11 +197,36 @@ target_link_libraries(sam3 Threads::Threads)
 find_package(ZLIB REQUIRED)
 target_link_libraries(sam3 ZLIB::ZLIB)
 
+# Windows-specific link deps. winpthreads is pulled in by Threads above;
+# mman-win32 provides <sys/mman.h>; bcrypt for entropy; ws2_32 for any
+# FFmpeg networking stubs we still link; winmm for high-resolution time.
+if(WIN32)
+	find_library(MMAN_WIN32_LIB NAMES mman libmman
+		HINTS ENV PATH
+		PATH_SUFFIXES lib ../lib)
+	if(NOT MMAN_WIN32_LIB)
+		message(FATAL_ERROR
+			"mman-win32 not found. Install via "
+			"`pacman -S mingw-w64-ucrt-x86_64-mman-win32` "
+			"in the MSYS2 UCRT64 shell.")
+	endif()
+	target_link_libraries(sam3 ${MMAN_WIN32_LIB} bcrypt ws2_32 winmm)
+	target_compile_definitions(sam3 PRIVATE
+		_WIN32_WINNT=0x0A00
+		WIN32_LEAN_AND_MEAN)
+endif()
+
 # Video I/O via statically-built FFmpeg (+ openh264 + libvpx). Binary
 # ships self-contained — no runtime dependency on system ffmpeg. First
-# build takes ~10-15 min to compile ffmpeg from source.
-include(${CMAKE_SOURCE_DIR}/cmake/StaticFfmpeg.cmake)
-target_link_libraries(sam3 ffmpeg_static)
+# build takes ~10-15 min to compile ffmpeg from source. Disable with
+# -DSAM3_VIDEO=OFF when FFmpeg's Unix build flow can't be used (e.g.
+# Windows MSVC) or when only the image-segmentation path is needed.
+if(SAM3_VIDEO)
+	include(${CMAKE_SOURCE_DIR}/cmake/StaticFfmpeg.cmake)
+	target_link_libraries(sam3 ffmpeg_static)
+else()
+	target_compile_definitions(sam3 PUBLIC SAM3_NO_VIDEO)
+endif()
 
 if(SAM3_BLAS)
 	if(APPLE)
@@ -199,6 +260,17 @@ add_executable(sam3_cli
 	tools/weight_conv_perm.c)
 target_include_directories(sam3_cli PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_cli sam3)
+if(NOT SAM3_VIDEO)
+	# cli_track.c calls into the (excluded) video frame iterator and
+	# encoder; the public sam3_video_* stubs alone don't satisfy its
+	# link surface. Drop the source and replace cli_track() with a
+	# stub at the top of sam3_cli.c via a macro guard.
+	target_compile_definitions(sam3_cli PRIVATE SAM3_NO_VIDEO)
+	get_target_property(_sam3_cli_srcs sam3_cli SOURCES)
+	list(REMOVE_ITEM _sam3_cli_srcs tools/cli_track.c)
+	list(APPEND _sam3_cli_srcs tools/cli_track_stub.c)
+	set_target_properties(sam3_cli PROPERTIES SOURCES "${_sam3_cli_srcs}")
+endif()
 if(SAM3_BENCH)
 	target_sources(sam3_cli PRIVATE tools/cli_bench.c)
 	target_link_libraries(sam3_cli sam3_bench)
