@@ -478,13 +478,24 @@ enum sam3_error sam3_cache_load_image(sam3_ctx *ctx, const char *path)
 	if (slot < 0)
 		return SAM3_ENOMEM;
 
+	/* The slot was just reclaimed (arena reset/reinit). The backend's
+	 * tensor map may still hold mlx_array entries keyed on tensor
+	 * pointers inside this arena from the slot's previous occupant.
+	 * Reused pointers (same address + same shape + same dtype) would
+	 * otherwise return stale GPU data. Evict the slot's range now. */
+	struct sam3_arena *slot_arena = &ctx->proc.img_cache->slots[slot].arena;
+	if (ctx->proc.backend && ctx->proc.backend->ops->cache_invalidate &&
+	    slot_arena->base)
+		ctx->proc.backend->ops->cache_invalidate(
+			ctx->proc.backend, slot_arena->base, slot_arena->size);
+
 	uint64_t hash = 0;
 	uint8_t prefix[SAM3_CACHE_PREFIX_BYTES];
 	size_t prefix_len = 0;
 	struct sam3_image_bundle bundle = {0};
 
 	enum sam3_error err = sam3_image_bundle_load(path, &sig,
-		&ctx->proc.img_cache->slots[slot].arena,
+		slot_arena,
 		&hash, prefix, &prefix_len, &bundle);
 	if (err != SAM3_OK)
 		return err;

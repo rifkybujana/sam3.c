@@ -80,6 +80,33 @@ impl Ctx {
             .ok_or(Error::NoMemory)
     }
 
+    /// Create a new SAM3 context with non-default cache slot counts.
+    ///
+    /// `n_image_slots` is the upper bound on cached images (default is 8).
+    /// `image_mem_budget_bytes = 0` keeps all slots resident in RAM (no
+    /// spill-to-disk), trading memory for predictability — useful when the
+    /// process tolerates the working set and disk-spill failures (e.g. EIO,
+    /// permission errors) would silently drop encoded image features and
+    /// force re-encoding on the next visit.
+    pub fn new_with_cache(n_image_slots: i32, n_text_slots: i32) -> Result<Self> {
+        let opts = sys::sam3_cache_opts {
+            n_image_slots,
+            n_text_slots,
+            image_mem_budget_bytes: 0,
+            image_spill_dir: std::ptr::null(),
+        };
+        // SAFETY: sam3_init_ex reads the opts struct synchronously and copies
+        // out any retained fields; the local goes out of scope safely after
+        // the call returns. NULL on failure.
+        let raw = unsafe { sys::sam3_init_ex(&opts as *const _) };
+        NonNull::new(raw)
+            .map(|raw| Ctx {
+                raw,
+                _not_send_sync: PhantomData,
+            })
+            .ok_or(Error::NoMemory)
+    }
+
     /// Raw pointer for intra-crate FFI (e.g. video session construction).
     ///
     /// Not part of the public API. Returned pointer is live for the lifetime
@@ -198,6 +225,112 @@ impl Ctx {
         unsafe { crate::error::check(sys::sam3_set_text(self.raw.as_ptr(), c.as_ptr())) }
     }
 
+    /// Populate the image feature cache for `(pixels, width, height)` without
+    /// changing the current-image state.
+    ///
+    /// Runs the image encoder (blocking) and stores the resulting features
+    /// in the in-memory cache keyed by pixel content. A later
+    /// [`set_image_rgb`](Self::set_image_rgb) with the same buffer returns
+    /// in microseconds. No-op if the same pixels are already cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] if `pixels.len() < width * height * 3` or
+    /// if `width * height * 3` overflows `usize`. Requires a model loaded
+    /// via [`load_model`](Self::load_model).
+    pub fn precache_image(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
+        let need = crate::ImageData {
+            pixels,
+            width,
+            height,
+        }
+        .required_len()
+        .ok_or(Error::Invalid)?;
+        if pixels.len() < need {
+            return Err(Error::Invalid);
+        }
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. pixels has at least width*height*3
+        // bytes (verified above) and is not retained past the call.
+        unsafe {
+            crate::error::check(sys::sam3_precache_image(
+                self.raw.as_ptr(),
+                pixels.as_ptr(),
+                width as i32,
+                height as i32,
+            ))
+        }
+    }
+
+    /// Serialize a cached image entry to disk.
+    ///
+    /// Looks up the in-memory cache entry keyed by `(pixels, width, height)`
+    /// and writes it to `path`. Call [`precache_image`](Self::precache_image)
+    /// first with the same buffer. The saved file includes a model signature,
+    /// so loading into a different model will be rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] if the buffer is too small, no matching
+    /// cache entry exists, or the path cannot be converted to a C string.
+    pub fn cache_save_image<P: AsRef<Path>>(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        path: P,
+    ) -> Result<()> {
+        let need = crate::ImageData {
+            pixels,
+            width,
+            height,
+        }
+        .required_len()
+        .ok_or(Error::Invalid)?;
+        if pixels.len() < need {
+            return Err(Error::Invalid);
+        }
+        let c = path_to_cstring(path.as_ref())?;
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. pixels has at least width*height*3
+        // bytes (verified above) and neither the buffer nor the path string
+        // are retained past the call.
+        unsafe {
+            crate::error::check(sys::sam3_cache_save_image(
+                self.raw.as_ptr(),
+                pixels.as_ptr(),
+                width as i32,
+                height as i32,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    /// Restore a previously-saved image cache entry from disk.
+    ///
+    /// After this call, a [`set_image_rgb`](Self::set_image_rgb) or
+    /// [`precache_image`](Self::precache_image) with the pixels used at save
+    /// time will hit the cache. Returns [`Error::Model`] if the file's model
+    /// signature does not match the currently loaded model.
+    pub fn cache_load_image<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let c = path_to_cstring(path.as_ref())?;
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. c is a NUL-terminated path string
+        // not retained past the call.
+        unsafe { crate::error::check(sys::sam3_cache_load_image(self.raw.as_ptr(), c.as_ptr())) }
+    }
+
+    /// Flush in-memory image and/or text feature caches.
+    ///
+    /// `which` is a bitmask: `1` = image, `2` = text, `0` = both. After this
+    /// call the next `set_image_rgb` / `set_text` will re-encode from scratch.
+    pub fn cache_clear(&mut self, which: u32) {
+        // SAFETY: self.raw is a non-null sam3_ctx from sam3_init(); &mut self
+        // guarantees no concurrent use. sam3_cache_clear has no return value
+        // and tolerates any `which` value.
+        unsafe { sys::sam3_cache_clear(self.raw.as_ptr(), which) }
+    }
+
     /// Run segmentation with the given prompts against the current image.
     ///
     /// `prompts` may mix points, boxes, masks, and (if a BPE vocab is
@@ -306,5 +439,37 @@ mod tests {
     fn set_prompt_space_is_infallible() {
         let mut ctx = Ctx::new().unwrap();
         ctx.set_prompt_space(1024, 1024);
+    }
+
+    #[test]
+    fn precache_image_rejects_short_buffer() {
+        let mut ctx = Ctx::new().unwrap();
+        let err = ctx.precache_image(&[0; 10], 10, 10).unwrap_err();
+        assert!(matches!(err, Error::Invalid));
+    }
+
+    #[test]
+    fn precache_image_rejects_dimension_overflow() {
+        let mut ctx = Ctx::new().unwrap();
+        let err = ctx.precache_image(&[0; 10], u32::MAX, u32::MAX).unwrap_err();
+        assert!(matches!(err, Error::Invalid));
+    }
+
+    #[test]
+    fn cache_save_image_rejects_short_buffer() {
+        let mut ctx = Ctx::new().unwrap();
+        let err = ctx
+            .cache_save_image(&[0; 10], 10, 10, "/tmp/unused.sam3cache")
+            .unwrap_err();
+        assert!(matches!(err, Error::Invalid));
+    }
+
+    #[test]
+    fn cache_load_image_missing_file_errors() {
+        let mut ctx = Ctx::new().unwrap();
+        // No model loaded, so proc is not ready — libsam3 returns SAM3_EINVAL
+        // before touching the filesystem. Either Invalid or Io is acceptable.
+        let err = ctx.cache_load_image("/nonexistent/path.sam3cache").unwrap_err();
+        assert!(matches!(err, Error::Invalid | Error::Io));
     }
 }

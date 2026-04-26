@@ -370,6 +370,22 @@ enum sam3_error sam3_processor_set_image(struct sam3_processor *proc,
 	struct sam3_arena *persist = &proc->img_cache->slots[slot].arena;
 
 	sam3_arena_reset(&proc->scratch_arena);
+	/*
+	 * The backend tensor-map keys on sam3_tensor pointers. After arena
+	 * reset, fresh allocations land at the same pointer addresses, so
+	 * a stale cache entry (same pointer + same shape + same dtype)
+	 * silently returns the previous call's mlx_array — and its stale
+	 * GPU data. Evict the whole scratch range so the next wrap_tensor
+	 * uploads the new host bytes. The slot's persist arena was just
+	 * reset by claim_slot, so it needs the same treatment.
+	 */
+	if (proc->backend->ops->cache_invalidate && proc->scratch_arena.base)
+		proc->backend->ops->cache_invalidate(
+			proc->backend, proc->scratch_arena.base,
+			proc->scratch_arena.size);
+	if (proc->backend->ops->cache_invalidate && persist->base)
+		proc->backend->ops->cache_invalidate(
+			proc->backend, persist->base, persist->size);
 
 	dims[0] = 3;
 	dims[1] = height;
@@ -1220,6 +1236,17 @@ enum sam3_error sam3_processor_precache_image(struct sam3_processor *proc,
 	struct sam3_arena *persist = &proc->img_cache->slots[slot].arena;
 
 	sam3_arena_reset(&proc->scratch_arena);
+	/* See note at sam3_processor_set_image: invalidate the backend
+	 * tensor cache for the just-reset scratch range AND the just-
+	 * reclaimed persist (slot) arena so reused pointers don't return
+	 * stale mlx_arrays. */
+	if (proc->backend->ops->cache_invalidate && proc->scratch_arena.base)
+		proc->backend->ops->cache_invalidate(
+			proc->backend, proc->scratch_arena.base,
+			proc->scratch_arena.size);
+	if (proc->backend->ops->cache_invalidate && persist->base)
+		proc->backend->ops->cache_invalidate(
+			proc->backend, persist->base, persist->size);
 
 	dims[0] = 3;
 	dims[1] = height;
@@ -1494,6 +1521,14 @@ static enum sam3_error segment_one(struct sam3_processor *proc,
 
 			tok_dims[0] = ctx;
 			sam3_arena_reset(&proc->scratch_arena);
+			/* See note at sam3_processor_set_image: invalidate
+			 * the backend tensor cache for the reset range. */
+			if (proc->backend->ops->cache_invalidate &&
+			    proc->scratch_arena.base)
+				proc->backend->ops->cache_invalidate(
+					proc->backend,
+					proc->scratch_arena.base,
+					proc->scratch_arena.size);
 			tok_tensor = gh_alloc_tensor(&proc->model_arena,
 						      SAM3_DTYPE_I32, 1,
 						      tok_dims);
