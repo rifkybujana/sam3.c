@@ -15,23 +15,23 @@
 
 #include "cpu_kernels.h"
 #include "cpu_simd.h"
+#include "backend/cpu/cpu_blas.h"
 #include "core/tensor.h"
 #include "util/log.h"
 #include "util/threadpool.h"
 
 #include <string.h>
 
-#ifdef SAM3_HAS_BLAS
-#ifdef __APPLE__
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-#endif
-
 #define TILE_M 8
 #define TILE_N 8
 #define TILE_K 64
+
+/* The hand-rolled SIMD/scalar paths below are only used when no
+ * external BLAS is linked. With SAM3_HAS_BLAS the dispatch routes
+ * straight through sam3_blas_sgemm() and these helpers would be
+ * dead code (and -Werror=unused-function tripping). */
+
+#ifndef SAM3_HAS_BLAS
 
 /* --- Scalar path (when no SIMD available) --- */
 
@@ -142,7 +142,10 @@ static void matmul_f32_avx2(const float *a, const float *b, float *c,
 
 #endif /* SAM3_HAS_AVX2 */
 
-/* --- Parallel dispatch context --- */
+/* --- Fallback parallel dispatch (no BLAS).
+ *
+ * When SAM3_HAS_BLAS is defined, sam3_blas_sgemm() handles both
+ * single and batched GEMMs and we drop this bespoke path entirely. */
 
 struct matmul_par_ctx {
 	const float *a;
@@ -175,6 +178,37 @@ static void matmul_parallel_fn(void *arg, int task_id, int n_tasks)
 #endif
 }
 
+static void cpu_matmul_f32_fallback(const float *A, const float *B, float *C,
+				    int M, int K, int N,
+				    struct sam3_threadpool *pool)
+{
+	struct matmul_par_ctx ctx = {
+		.a = A, .b = B, .c = C,
+		.M = M, .K = K, .N = N,
+	};
+
+	int n_tasks = sam3_threadpool_n_threads(pool);
+	if (n_tasks < 1)
+		n_tasks = 1;
+
+	sam3_threadpool_parallel_for(pool, matmul_parallel_fn, &ctx,
+				     n_tasks);
+}
+
+#endif /* !SAM3_HAS_BLAS */
+
+/* Compute the leading "batch" of a matmul tensor (everything except
+ * the trailing 2 dims). Returns 1 for <=2D tensors. */
+static size_t matmul_batch(const struct sam3_tensor *t)
+{
+	if (t->n_dims <= 2)
+		return 1;
+	size_t b = 1;
+	for (int i = 0; i < t->n_dims - 2; ++i)
+		b *= (size_t)t->dims[i];
+	return b;
+}
+
 enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 				  struct sam3_threadpool *pool)
 {
@@ -193,7 +227,6 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	/* A: [M, K], B: [K, N], C: [M, N] */
 	if (a->n_dims < 1 || b->n_dims < 1) {
 		sam3_log_error("matmul: need at least 1D tensors");
 		return SAM3_EINVAL;
@@ -222,35 +255,57 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 		return SAM3_EINVAL;
 	}
 
-	if (sam3_tensor_nelems(c) != M * N) {
-		sam3_log_error("matmul: output size mismatch %d != %d",
-			       sam3_tensor_nelems(c), M * N);
+	/* Resolve batch. If both A and B carry a batch dim it must
+	 * match; if only one does, the other is broadcast (stride=0). */
+	size_t batch_a = matmul_batch(a);
+	size_t batch_b = matmul_batch(b);
+	size_t batch = batch_a > batch_b ? batch_a : batch_b;
+
+	if (batch_a != 1 && batch_b != 1 && batch_a != batch_b) {
+		sam3_log_error("matmul: batch mismatch %zu vs %zu",
+			       batch_a, batch_b);
 		return SAM3_EINVAL;
 	}
 
+	if (sam3_tensor_nelems(c) != (int)(batch * M * N)) {
+		sam3_log_error("matmul: output size mismatch %d != %zu",
+			       sam3_tensor_nelems(c),
+			       batch * (size_t)M * (size_t)N);
+		return SAM3_EINVAL;
+	}
+
+	const float *A = (const float *)a->data;
+	const float *B = (const float *)b->data;
+	float       *C = (float *)c->data;
+
 #ifdef SAM3_HAS_BLAS
-	(void)pool;
-	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-		    M, N, K_a,
-		    1.0f,
-		    (const float *)a->data, K_a,
-		    (const float *)b->data, N,
-		    0.0f,
-		    (float *)c->data, N);
+	if (batch == 1) {
+		sam3_blas_sgemm(false, false, M, N, K_a, 1.0f,
+				A, K_a, B, N, 0.0f, C, N);
+	} else {
+		ptrdiff_t sa = batch_a == 1 ? 0 : (ptrdiff_t)M * K_a;
+		ptrdiff_t sb = batch_b == 1 ? 0 : (ptrdiff_t)K_a * N;
+		ptrdiff_t sc = (ptrdiff_t)M * N;
+		sam3_blas_sgemm_batched(pool, batch, false, false,
+					M, N, K_a, 1.0f,
+					A, K_a, sa,
+					B, N, sb,
+					0.0f,
+					C, N, sc);
+	}
 #else
-	struct matmul_par_ctx ctx = {
-		.a = (const float *)a->data,
-		.b = (const float *)b->data,
-		.c = (float *)c->data,
-		.M = M, .K = K_a, .N = N,
-	};
-
-	int n_tasks = sam3_threadpool_n_threads(pool);
-	if (n_tasks < 1)
-		n_tasks = 1;
-
-	sam3_threadpool_parallel_for(pool, matmul_parallel_fn, &ctx,
-				     n_tasks);
+	if (batch == 1) {
+		cpu_matmul_f32_fallback(A, B, C, M, K_a, N, pool);
+	} else {
+		ptrdiff_t sa = batch_a == 1 ? 0 : (ptrdiff_t)M * K_a;
+		ptrdiff_t sb = batch_b == 1 ? 0 : (ptrdiff_t)K_a * N;
+		ptrdiff_t sc = (ptrdiff_t)M * N;
+		for (size_t i = 0; i < batch; ++i) {
+			cpu_matmul_f32_fallback(A + i * sa, B + i * sb,
+						C + i * sc,
+						M, K_a, N, pool);
+		}
+	}
 #endif
 
 	return SAM3_OK;

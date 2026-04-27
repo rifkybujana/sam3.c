@@ -16,6 +16,7 @@
 
 #include "cpu_kernels.h"
 #include "cpu_simd.h"
+#include "backend/cpu/cpu_blas.h"
 #include "core/half.h"
 #include "core/tensor.h"
 #include "util/log.h"
@@ -232,6 +233,16 @@ enum sam3_error cpu_kernel_matmul_bf16(const struct sam3_node *node,
 			       sam3_tensor_nelems(c), M * N);
 		return SAM3_EINVAL;
 	}
+
+#ifdef SAM3_HAS_BLAS
+	if ((size_t)M * (size_t)N * (size_t)K_a >= SAM3_BLAS_F16_GEMM_THRESHOLD) {
+		if (sam3_blas_gemm_bf16(pool, false, false, M, N, K_a,
+					(const uint16_t *)a->data,
+					(const uint16_t *)b->data,
+					(uint16_t *)c->data) == 0)
+			return SAM3_OK;
+	}
+#endif
 
 	struct matmul_par_ctx_bf16 ctx = {
 		.a = (const uint16_t *)a->data,

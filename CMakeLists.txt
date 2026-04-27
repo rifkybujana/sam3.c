@@ -66,25 +66,67 @@ if(SAM3_DEBUG_DUMP)
 	add_definitions(-DSAM3_DEBUG_DUMP)
 endif()
 
+set(SAM3_BLAS_VENDOR "auto" CACHE STRING
+	"BLAS vendor: auto|openblas|accelerate|mkl|none")
+set_property(CACHE SAM3_BLAS_VENDOR PROPERTY STRINGS
+	auto openblas accelerate mkl none)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+
+set(SAM3_BLAS_TARGET "")
 if(SAM3_BLAS)
-	if(APPLE)
+	set(_sam3_blas_v ${SAM3_BLAS_VENDOR})
+	if(_sam3_blas_v STREQUAL "auto")
+		if(APPLE)
+			set(_sam3_blas_v "accelerate")
+		else()
+			set(_sam3_blas_v "openblas")
+		endif()
+	endif()
+
+	if(_sam3_blas_v STREQUAL "accelerate")
 		find_library(ACCELERATE_LIB Accelerate)
 		if(ACCELERATE_LIB)
 			add_definitions(-DSAM3_HAS_BLAS)
-			message(STATUS "BLAS: using Accelerate framework")
-		else()
-			message(WARNING "BLAS: Accelerate not found, disabling")
-			set(SAM3_BLAS OFF)
+			set(SAM3_BLAS_TARGET "${ACCELERATE_LIB}")
+			message(STATUS "BLAS: Accelerate framework")
 		endif()
-	else()
-		find_package(BLAS QUIET)
-		if(BLAS_FOUND)
+	elseif(_sam3_blas_v STREQUAL "openblas")
+		# Try our module-mode FindOpenBLAS first (header + .lib).
+		# Some distros' OpenBLASConfig.cmake (e.g. MSYS2) require
+		# Fortran/OpenMP which we don't enable, so module mode is
+		# the more robust default. Fall back to CONFIG (vcpkg) and
+		# generic FindBLAS as last resorts.
+		find_package(OpenBLAS QUIET MODULE)
+		if(NOT OpenBLAS_FOUND)
+			find_package(OpenBLAS CONFIG QUIET)
+		endif()
+		if(OpenBLAS_FOUND OR TARGET OpenBLAS::OpenBLAS)
 			add_definitions(-DSAM3_HAS_BLAS)
-			message(STATUS "BLAS: found ${BLAS_LIBRARIES}")
+			set(SAM3_BLAS_TARGET OpenBLAS::OpenBLAS)
+			message(STATUS "BLAS: OpenBLAS")
 		else()
-			message(WARNING "BLAS: not found, falling back to SIMD kernels")
-			set(SAM3_BLAS OFF)
+			find_package(BLAS QUIET)
+			if(BLAS_FOUND)
+				add_definitions(-DSAM3_HAS_BLAS)
+				set(SAM3_BLAS_TARGET ${BLAS_LIBRARIES})
+				message(STATUS "BLAS: generic (${BLAS_LIBRARIES})")
+			endif()
 		endif()
+	elseif(_sam3_blas_v STREQUAL "mkl")
+		find_package(MKL CONFIG QUIET)
+		if(MKL_FOUND)
+			add_definitions(-DSAM3_HAS_BLAS)
+			set(SAM3_BLAS_TARGET MKL::MKL)
+			message(STATUS "BLAS: Intel MKL")
+		endif()
+	endif()
+
+	if(NOT SAM3_BLAS_TARGET)
+		message(WARNING
+			"BLAS: vendor='${_sam3_blas_v}' not found; "
+			"falling back to SIMD kernels")
+		set(SAM3_BLAS OFF)
 	endif()
 endif()
 
@@ -113,12 +155,13 @@ set(SAM3_SOURCES
 # them with stub implementations of the public sam3_video_* API. The
 # Rust bindings reference these symbols unconditionally; without
 # stubs they fail to link.
+# NOTE: video_session.c has no FFmpeg deps and is needed by tests
+# (test_video_session, test_video_persistence, etc.) — keep it.
 if(NOT SAM3_VIDEO)
 	list(REMOVE_ITEM SAM3_SOURCES
 		${CMAKE_SOURCE_DIR}/src/util/video.c
 		${CMAKE_SOURCE_DIR}/src/util/video_encode.c
-		${CMAKE_SOURCE_DIR}/src/model/sam3_video.c
-		${CMAKE_SOURCE_DIR}/src/model/video_session.c)
+		${CMAKE_SOURCE_DIR}/src/model/sam3_video.c)
 	list(APPEND SAM3_SOURCES
 		${CMAKE_SOURCE_DIR}/src/util/video_stubs.c)
 endif()
@@ -228,12 +271,8 @@ else()
 	target_compile_definitions(sam3 PUBLIC SAM3_NO_VIDEO)
 endif()
 
-if(SAM3_BLAS)
-	if(APPLE)
-		target_link_libraries(sam3 ${ACCELERATE_LIB})
-	else()
-		target_link_libraries(sam3 ${BLAS_LIBRARIES})
-	endif()
+if(SAM3_BLAS AND SAM3_BLAS_TARGET)
+	target_link_libraries(sam3 ${SAM3_BLAS_TARGET})
 endif()
 
 if(SAM3_METAL)
@@ -274,6 +313,16 @@ endif()
 if(SAM3_BENCH)
 	target_sources(sam3_cli PRIVATE tools/cli_bench.c)
 	target_link_libraries(sam3_cli sam3_bench)
+endif()
+
+# On Windows, copy the OpenBLAS DLL next to sam3_cli.exe so it
+# can be launched directly from the build dir without setting PATH.
+if(WIN32 AND SAM3_BLAS AND TARGET OpenBLAS::OpenBLAS)
+	add_custom_command(TARGET sam3_cli POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			$<TARGET_FILE:OpenBLAS::OpenBLAS>
+			$<TARGET_FILE_DIR:sam3_cli>
+		COMMENT "Copying OpenBLAS DLL next to sam3_cli")
 endif()
 
 add_executable(gen_nhwc_fixtures tools/gen_nhwc_fixtures.c)
@@ -492,4 +541,10 @@ foreach(BENCH_SRC ${BENCH_SOURCES})
 	get_filename_component(BENCH_NAME ${BENCH_SRC} NAME_WE)
 	add_executable(${BENCH_NAME} ${BENCH_SRC})
 	target_link_libraries(${BENCH_NAME} sam3)
+	if(WIN32)
+		# Bigger stack: BLAS-tiled SDPA + threadpool workers can
+		# transitively use >1 MB through OpenBLAS internals.
+		target_link_options(${BENCH_NAME} PRIVATE
+			"LINKER:--stack,67108864")
+	endif()
 endforeach()

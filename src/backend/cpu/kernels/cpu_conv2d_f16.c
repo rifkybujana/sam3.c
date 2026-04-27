@@ -21,6 +21,7 @@
 
 #include "cpu_kernels.h"
 #include "cpu_simd_f16.h"
+#include "backend/cpu/cpu_blas.h"
 #include "core/half.h"
 #include "core/tensor.h"
 #include "core/alloc.h"
@@ -84,7 +85,9 @@ static void im2col_nhwc_f16(const uint16_t *in, uint16_t *col,
  *
  * Used to convert weight [N, K] → weight_T [K, N] so the matmul
  * inner loop accesses weight_T[k][j:j+8] contiguously for NEON.
+ * Only used by the bespoke (non-BLAS) matmul path below.
  */
+#ifndef SAM3_HAS_BLAS
 static void transpose_u16(const uint16_t *src, uint16_t *dst,
 			   int rows, int cols)
 {
@@ -250,6 +253,7 @@ static void conv2d_nhwc_matmul_f16_fn(void *arg, int task_id,
 }
 
 #endif /* SAM3_HAS_NEON_FP16 */
+#endif /* !SAM3_HAS_BLAS */
 
 enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 				      struct sam3_arena *scratch,
@@ -336,6 +340,71 @@ enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 		return SAM3_ENOMEM;
 	}
 
+#ifdef SAM3_HAS_BLAS
+	{
+		size_t M = (size_t)OH * OW;
+		float *col_f = (float *)sam3_arena_alloc(scratch,
+				M * K * sizeof(float));
+		float *w_f   = (float *)sam3_arena_alloc(scratch,
+				(size_t)cpg_out * K * sizeof(float));
+		float *out_f = (float *)sam3_arena_alloc(scratch,
+				M * (size_t)cpg_out * sizeof(float));
+		if (!col_f || !w_f || !out_f) {
+			sam3_log_error("conv2d_f16: scratch OOM (BLAS)");
+			scratch->offset = saved_offset;
+			return SAM3_ENOMEM;
+		}
+
+		const uint16_t *w_data = (const uint16_t *)weight->data;
+
+		for (int n = 0; n < N_batch; n++) {
+			const uint16_t *in_n =
+				(const uint16_t *)input->data +
+				(size_t)n * H * W * C_in;
+			uint16_t *out_n = (uint16_t *)output->data +
+				(size_t)n * OH * OW * C_out;
+
+			for (int g = 0; g < groups; g++) {
+				im2col_nhwc_f16(in_n, col,
+						C_in, H, W, KH, KW,
+						stride, pad, OH, OW,
+						g * cpg_in, cpg_in);
+
+				const uint16_t *w_g = w_data +
+					(size_t)g * cpg_out * KH * KW * KIC;
+
+				size_t nC = M * K;
+				size_t nW = (size_t)cpg_out * K;
+				for (size_t i = 0; i < nC; ++i)
+					col_f[i] = fp16_to_f32(col[i]);
+				for (size_t i = 0; i < nW; ++i)
+					w_f[i] = fp16_to_f32(w_g[i]);
+
+				sam3_blas_sgemm(false, true,
+						(int)M, cpg_out, (int)K,
+						1.0f,
+						col_f, (int)K,
+						w_f, (int)K,
+						0.0f,
+						out_f, cpg_out);
+
+				uint16_t *out_g = out_n + g * cpg_out;
+				for (size_t i = 0; i < M; ++i) {
+					for (int j = 0; j < cpg_out; ++j)
+						out_g[i * C_out + j] =
+							f32_to_fp16(
+							  out_f[i * cpg_out + j]);
+				}
+			}
+		}
+
+		scratch->offset = saved_offset;
+		(void)pool;
+		return SAM3_OK;
+	}
+#endif
+
+#ifndef SAM3_HAS_BLAS
 	/* Weight transpose buffer: [K, cpg_out] in fp16 */
 	size_t wt_size = K * (size_t)cpg_out * sizeof(uint16_t);
 	uint16_t *wt_buf = (uint16_t *)sam3_arena_alloc_raw(scratch,
@@ -412,4 +481,5 @@ enum sam3_error cpu_kernel_conv2d_f16(const struct sam3_node *node,
 
 	scratch->offset = saved_offset;
 	return SAM3_OK;
+#endif /* !SAM3_HAS_BLAS */
 }
