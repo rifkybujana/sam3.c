@@ -23,13 +23,12 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include <ctype.h>
 
 #include "util/video.h"
 #include "util/video_internal.h"
 #include "util/log.h"
+#include "util/platform.h"
 
 #include "vendor/stb_image.h"
 #include "vendor/stb_image_resize2.h"
@@ -115,68 +114,39 @@ static int cmp_filenames(const void *a, const void *b)
 enum sam3_error sam3_frame_dir_list_open(const char *dir_path,
 					 struct sam3_frame_dir_list *out)
 {
+	struct sam3_dir_list entries;
+	enum sam3_error err;
+
 	if (!dir_path || !out)
 		return SAM3_EINVAL;
 
 	memset(out, 0, sizeof(*out));
 	out->dir_path = dir_path;
 
-	DIR *dir = opendir(dir_path);
-	if (!dir) {
+	err = sam3_dir_list_open(dir_path, is_image_file, &entries);
+	if (err != SAM3_OK) {
 		sam3_log_error("cannot open frame directory '%s'", dir_path);
+		return err;
+	}
+
+	if (entries.n == 0) {
+		sam3_log_error("no image files in '%s'", dir_path);
+		sam3_dir_list_free(&entries);
 		return SAM3_EIO;
 	}
 
-	char **names = NULL;
-	int n = 0, cap = 0;
-	struct dirent *ent;
-	enum sam3_error err = SAM3_OK;
-
-	while ((ent = readdir(dir)) != NULL) {
-		if (!is_image_file(ent->d_name))
-			continue;
-		if (n >= MAX_DIR_FRAMES) {
-			sam3_log_warn("frame directory capped at %d files",
-				      MAX_DIR_FRAMES);
-			break;
-		}
-		if (n >= cap) {
-			cap = cap ? cap * 2 : 64;
-			char **tmp = realloc(names,
-					     (size_t)cap * sizeof(char *));
-			if (!tmp) {
-				err = SAM3_ENOMEM;
-				goto fail;
-			}
-			names = tmp;
-		}
-		names[n] = strdup(ent->d_name);
-		if (!names[n]) {
-			err = SAM3_ENOMEM;
-			goto fail;
-		}
-		n++;
-	}
-	closedir(dir);
-
-	if (n == 0) {
-		sam3_log_error("no image files in '%s'", dir_path);
-		err = SAM3_EIO;
-		goto fail;
+	if (entries.n > MAX_DIR_FRAMES) {
+		sam3_log_warn("frame directory capped at %d files",
+			      MAX_DIR_FRAMES);
+		for (int i = MAX_DIR_FRAMES; i < entries.n; i++)
+			free(entries.names[i]);
+		entries.n = MAX_DIR_FRAMES;
 	}
 
-	qsort(names, (size_t)n, sizeof(char *), cmp_filenames);
-	out->names = names;
-	out->n = n;
+	qsort(entries.names, (size_t)entries.n, sizeof(char *), cmp_filenames);
+	out->names = entries.names;
+	out->n = entries.n;
 	return SAM3_OK;
-
-fail:
-	closedir(dir);
-	for (int i = 0; i < n; i++)
-		free(names[i]);
-	free(names);
-	memset(out, 0, sizeof(*out));
-	return err;
 }
 
 void sam3_frame_dir_list_free(struct sam3_frame_dir_list *list)
@@ -589,12 +559,9 @@ enum sam3_video_type sam3_video_detect_type(const char *path)
 	if (!path)
 		return SAM3_VIDEO_UNKNOWN;
 
-	struct stat st;
-	if (stat(path, &st) != 0)
-		return SAM3_VIDEO_UNKNOWN;
-	if (S_ISDIR(st.st_mode))
+	if (sam3_path_is_dir(path))
 		return SAM3_VIDEO_FRAME_DIR;
-	if (S_ISREG(st.st_mode))
+	if (sam3_path_is_regular(path))
 		return SAM3_VIDEO_FILE;
 	return SAM3_VIDEO_UNKNOWN;
 }

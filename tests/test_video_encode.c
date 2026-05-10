@@ -17,10 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include "test_helpers.h"
+#include "util/platform.h"
 #include "util/video_encode.h"
 
 #pragma clang diagnostic push
@@ -117,10 +116,35 @@ static void test_overlay_half_alpha_blends(void)
 	ASSERT(changed);
 }
 
-static const char *tmp_mp4_path(char buf[static 256])
+struct temp_video_path {
+	char dir[512];
+	char mp4[1024];
+};
+
+static int temp_video_path_init(struct temp_video_path *tmp)
 {
-	snprintf(buf, 256, "/tmp/sam3_test_video_%d.mp4", (int)getpid());
-	return buf;
+	char *dir = sam3_platform_temp_dir("sam3-test-video");
+	int n;
+
+	if (!dir)
+		return -1;
+	n = snprintf(tmp->dir, sizeof(tmp->dir), "%s", dir);
+	free(dir);
+	if (n < 0 || (size_t)n >= sizeof(tmp->dir))
+		return -1;
+	n = snprintf(tmp->mp4, sizeof(tmp->mp4), "%s/%s", tmp->dir,
+		     "out.mp4");
+	if (n < 0 || (size_t)n >= sizeof(tmp->mp4)) {
+		sam3_platform_rmdir(tmp->dir);
+		return -1;
+	}
+	return 0;
+}
+
+static void temp_video_path_cleanup(struct temp_video_path *tmp)
+{
+	remove(tmp->mp4);
+	sam3_platform_rmdir(tmp->dir);
 }
 
 static void test_encoder_close_null_is_ok(void)
@@ -132,39 +156,46 @@ static void test_encoder_rejects_unknown_extension(void)
 {
 	struct sam3_video_encoder *enc = NULL;
 	enum sam3_error err = sam3_video_encoder_open(
-		"/tmp/sam3_test_bad.xyz", 16, 16, 10, 1, &enc);
+		"sam3_test_bad.xyz", 16, 16, 10, 1, &enc);
 	ASSERT_EQ(err, SAM3_EIO);
 	ASSERT(enc == NULL);
 }
 
 static void test_encoder_open_close_idempotent(void)
 {
-	char path[256];
-	tmp_mp4_path(path);
-	remove(path);
+	struct temp_video_path tmp;
+	ASSERT_EQ(temp_video_path_init(&tmp), 0);
 
 	struct sam3_video_encoder *enc = NULL;
-	enum sam3_error err = sam3_video_encoder_open(path, 16, 16, 10, 1,
+	enum sam3_error err = sam3_video_encoder_open(tmp.mp4, 16, 16, 10, 1,
 						      &enc);
 	ASSERT_EQ(err, SAM3_OK);
 	ASSERT(enc != NULL);
+	if (err != SAM3_OK || !enc) {
+		temp_video_path_cleanup(&tmp);
+		return;
+	}
 
 	/* Close once. */
 	ASSERT_EQ(sam3_video_encoder_close(enc), SAM3_OK);
 
-	remove(path);
+	temp_video_path_cleanup(&tmp);
 }
 
 static void test_encoder_roundtrip_mp4(void)
 {
-	char path[256];
-	tmp_mp4_path(path);
-	remove(path);
+	struct temp_video_path tmp;
+	ASSERT_EQ(temp_video_path_init(&tmp), 0);
 
 	struct sam3_video_encoder *enc = NULL;
-	ASSERT_EQ(sam3_video_encoder_open(path, 16, 16, 10, 1, &enc),
-		  SAM3_OK);
+	enum sam3_error err = sam3_video_encoder_open(tmp.mp4, 16, 16, 10, 1,
+						      &enc);
+	ASSERT_EQ(err, SAM3_OK);
 	ASSERT(enc != NULL);
+	if (err != SAM3_OK || !enc) {
+		temp_video_path_cleanup(&tmp);
+		return;
+	}
 
 	uint8_t frame[16 * 16 * 3];
 	for (int i = 0; i < 24; i++) {
@@ -181,19 +212,33 @@ static void test_encoder_roundtrip_mp4(void)
 
 	/* Reopen via libav to verify file is valid. */
 	AVFormatContext *fmt = NULL;
-	int rc = avformat_open_input(&fmt, path, NULL, NULL);
+	int rc = avformat_open_input(&fmt, tmp.mp4, NULL, NULL);
 	ASSERT_EQ(rc, 0);
+	if (rc != 0) {
+		temp_video_path_cleanup(&tmp);
+		return;
+	}
 	rc = avformat_find_stream_info(fmt, NULL);
 	ASSERT(rc >= 0);
+	if (rc < 0) {
+		avformat_close_input(&fmt);
+		temp_video_path_cleanup(&tmp);
+		return;
+	}
 
 	int vstream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1,
 					  NULL, 0);
 	ASSERT(vstream >= 0);
+	if (vstream < 0) {
+		avformat_close_input(&fmt);
+		temp_video_path_cleanup(&tmp);
+		return;
+	}
 	ASSERT_EQ(fmt->streams[vstream]->codecpar->width, 16);
 	ASSERT_EQ(fmt->streams[vstream]->codecpar->height, 16);
 
 	avformat_close_input(&fmt);
-	remove(path);
+	temp_video_path_cleanup(&tmp);
 }
 
 int main(void)

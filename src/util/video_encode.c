@@ -15,6 +15,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "util/video_encode.h"
 #include "util/log.h"
@@ -36,6 +37,19 @@ static const uint8_t palette[10][3] = {
 	{  38,  70,  83 }, /* navy */
 	{ 244, 162,  97 }, /* tan */
 };
+
+static int sam3_ascii_strcasecmp(const char *a, const char *b)
+{
+	while (*a && *b) {
+		int ca = tolower((unsigned char)*a);
+		int cb = tolower((unsigned char)*b);
+		if (ca != cb)
+			return ca - cb;
+		a++;
+		b++;
+	}
+	return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
 
 void sam3_overlay_composite(uint8_t *rgb, int w, int h,
 			    const uint8_t *mask, int mw, int mh,
@@ -122,13 +136,69 @@ static enum AVCodecID codec_for_path(const char *path)
 		if (path[i - 1] == '.') { ext = path + i; break; }
 	}
 	if (!ext) return AV_CODEC_ID_NONE;
-	if (strcasecmp(ext, "mp4") == 0 ||
-	    strcasecmp(ext, "mov") == 0 ||
-	    strcasecmp(ext, "mkv") == 0)
+	if (sam3_ascii_strcasecmp(ext, "mp4") == 0 ||
+	    sam3_ascii_strcasecmp(ext, "mov") == 0 ||
+	    sam3_ascii_strcasecmp(ext, "mkv") == 0)
 		return AV_CODEC_ID_H264;
-	if (strcasecmp(ext, "webm") == 0)
+	if (sam3_ascii_strcasecmp(ext, "webm") == 0)
 		return AV_CODEC_ID_VP9;
 	return AV_CODEC_ID_NONE;
+}
+
+static int encoder_supports_pix_fmt(const AVCodec *codec,
+					    enum AVPixelFormat pix_fmt)
+{
+	const enum AVPixelFormat *fmt;
+
+	if (!codec->pix_fmts)
+		return 1;
+	for (fmt = codec->pix_fmts; *fmt != AV_PIX_FMT_NONE; fmt++) {
+		if (*fmt == pix_fmt)
+			return 1;
+	}
+	return 0;
+}
+
+static int encoder_is_hardware_backed(const AVCodec *codec)
+{
+	const char *name;
+
+	if (!codec || !codec->name)
+		return 0;
+	name = codec->name;
+	return strstr(name, "_mf") != NULL ||
+	       strstr(name, "_d3d12va") != NULL ||
+	       strstr(name, "_qsv") != NULL ||
+	       strstr(name, "_nvenc") != NULL ||
+	       strstr(name, "_amf") != NULL ||
+	       strstr(name, "_vaapi") != NULL ||
+	       strstr(name, "_videotoolbox") != NULL ||
+	       strstr(name, "_v4l2m2m") != NULL ||
+	       strstr(name, "_mediacodec") != NULL;
+}
+
+static const AVCodec *find_compatible_encoder(enum AVCodecID codec_id,
+					      enum AVPixelFormat pix_fmt)
+{
+	void *iter = NULL;
+	const AVCodec *codec;
+
+	while ((codec = av_codec_iterate(&iter)) != NULL) {
+		if (!av_codec_is_encoder(codec))
+			continue;
+		if (codec->id != codec_id)
+			continue;
+		if (encoder_is_hardware_backed(codec))
+			continue;
+		if (encoder_supports_pix_fmt(codec, pix_fmt))
+			return codec;
+	}
+
+	codec = avcodec_find_encoder(codec_id);
+	if (codec && !encoder_is_hardware_backed(codec) &&
+	    encoder_supports_pix_fmt(codec, pix_fmt))
+		return codec;
+	return NULL;
 }
 
 enum sam3_error sam3_video_encoder_close(struct sam3_video_encoder *enc)
@@ -222,10 +292,16 @@ enum sam3_error sam3_video_encoder_open(const char *path,
 		return SAM3_EIO;
 	}
 
-	const AVCodec *codec = avcodec_find_encoder(codec_id);
+	const AVCodec *codec = find_compatible_encoder(codec_id,
+						      AV_PIX_FMT_YUV420P);
+	if (!codec && codec_id == AV_CODEC_ID_H264) {
+		codec_id = AV_CODEC_ID_MPEG4;
+		codec = find_compatible_encoder(codec_id, AV_PIX_FMT_YUV420P);
+	}
 	if (!codec) {
 		sam3_log_error("encoder not compiled into libav for codec %d "
-			       "(rebuild ffmpeg with libx264/libvpx)",
+			       "with yuv420p support (rebuild ffmpeg with "
+			       "libx264/libvpx or enable mpeg4)",
 			       (int)codec_id);
 		sam3_video_encoder_close(enc);
 		return SAM3_EIO;
@@ -242,7 +318,7 @@ enum sam3_error sam3_video_encoder_open(const char *path,
 		sam3_video_encoder_close(enc);
 		return SAM3_ENOMEM;
 	}
-	enc->codec->codec_id   = codec_id;
+	enc->codec->codec_id   = codec->id;
 	enc->codec->width      = width;
 	enc->codec->height     = height;
 	enc->codec->pix_fmt    = AV_PIX_FMT_YUV420P;
