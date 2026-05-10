@@ -93,8 +93,18 @@ Recent commit map:
 - Added `SAM3_REQUIRE_BLAS` failure behavior for explicit BLAS-required builds.
 - Installed local vcpkg dependencies for the Windows build:
   - `ffmpeg:x64-windows`
-  - `openblas:x64-windows`
+  - `openblas[core,threads,dynamic-arch]:x64-windows`
   - `zlib:x64-windows`
+- The `[threads,dynamic-arch]` features on OpenBLAS are mandatory: the default
+  `openblas:x64-windows` triplet ships a `SINGLE_THREADED generic` DLL, which
+  pins `cblas_sgemm` to one core and disables AVX2/AVX-512 kernels. Because the
+  CPU `matmul` and `conv2d` kernels intentionally bypass the SAM3 thread pool
+  when `SAM3_HAS_BLAS` is defined (and let BLAS do its own parallelism), the
+  default DLL leaves the image encoder running single-threaded on a generic
+  scalar kernel. With these features the DLL self-identifies as
+  `OpenBLAS … DYNAMIC_ARCH NO_AFFINITY Haswell USE_OPENMP` (or USE_THREAD)
+  with `MAX_THREADS` ≥ host core count, and the encoder saturates available
+  cores via `OPENBLAS_NUM_THREADS` (auto-detected by default).
 
 ### Phase 4: Video Directory And Encoding Portability
 
