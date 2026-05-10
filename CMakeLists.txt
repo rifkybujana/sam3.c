@@ -63,14 +63,16 @@ endif()
 if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 	add_compile_options(/arch:AVX2)
 	add_compile_definitions(SAM3_HAS_AVX2=1 __AVX2__=1)
+	# NOTE: deliberately NOT enabling /GL + /LTCG.
+	# When SAM3_SHARED=ON, CMake's auto-export step (`cmake -E __create_def`)
+	# crashes (0xC0000005) reading LTCG-format .obj files, breaking sam3.dll.
+	# AVX2 alone gives the dominant speedup; LTCG is only ~5-10% on top.
 	add_compile_options(
 		$<$<CONFIG:Release>:/O2>
 		$<$<CONFIG:Release>:/Oi>
 		$<$<CONFIG:Release>:/Ot>
-		$<$<CONFIG:Release>:/GL>
 		$<$<CONFIG:Release>:/fp:fast>
 	)
-	add_link_options($<$<CONFIG:Release>:/LTCG>)
 endif()
 
 if(NOT MSVC AND NOT APPLE)
