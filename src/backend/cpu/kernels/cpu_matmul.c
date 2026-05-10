@@ -175,6 +175,44 @@ static void matmul_parallel_fn(void *arg, int task_id, int n_tasks)
 #endif
 }
 
+#ifdef SAM3_HAS_BLAS
+/*
+ * Row-batched parallel sgemm. OpenBLAS is pinned to 1 thread in
+ * cpu_init() to avoid N x N oversubscription with sam3_threadpool, so we
+ * drive parallelism here by splitting the M dimension across worker
+ * threads and issuing one cblas_sgemm per row band. Output bands are
+ * disjoint so there are no data races.
+ */
+struct blas_sgemm_par_ctx {
+	const float *a;
+	const float *b;
+	float       *c;
+	int          M;
+	int          K;
+	int          N;
+};
+
+static void blas_sgemm_rows_fn(void *arg, int task_id, int n_tasks)
+{
+	struct blas_sgemm_par_ctx *ctx = (struct blas_sgemm_par_ctx *)arg;
+	int chunk = ctx->M / n_tasks;
+	int m_start = task_id * chunk;
+	int m_end = (task_id == n_tasks - 1) ? ctx->M : m_start + chunk;
+	int m_rows = m_end - m_start;
+
+	if (m_rows <= 0)
+		return;
+
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+		    m_rows, ctx->N, ctx->K,
+		    1.0f,
+		    ctx->a + (size_t)m_start * ctx->K, ctx->K,
+		    ctx->b, ctx->N,
+		    0.0f,
+		    ctx->c + (size_t)m_start * ctx->N, ctx->N);
+}
+#endif
+
 enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 				  struct sam3_threadpool *pool)
 {
@@ -229,14 +267,39 @@ enum sam3_error cpu_kernel_matmul(const struct sam3_node *node,
 	}
 
 #ifdef SAM3_HAS_BLAS
-	(void)pool;
-	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-		    M, N, K_a,
-		    1.0f,
-		    (const float *)a->data, K_a,
-		    (const float *)b->data, N,
-		    0.0f,
-		    (float *)c->data, N);
+	{
+		int n_threads = sam3_threadpool_n_threads(pool);
+		if (n_threads < 1)
+			n_threads = 1;
+
+		/*
+		 * Small M: single sgemm. Pool dispatch overhead would
+		 * outweigh parallel speedup at this size.
+		 */
+		if (n_threads == 1 || M < 64) {
+			cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+				    M, N, K_a,
+				    1.0f,
+				    (const float *)a->data, K_a,
+				    (const float *)b->data, N,
+				    0.0f,
+				    (float *)c->data, N);
+		} else {
+			int n_tasks = n_threads;
+			if (n_tasks > M)
+				n_tasks = M;
+
+			struct blas_sgemm_par_ctx ctx = {
+				.a = (const float *)a->data,
+				.b = (const float *)b->data,
+				.c = (float *)c->data,
+				.M = M, .K = K_a, .N = N,
+			};
+			sam3_threadpool_parallel_for(pool,
+						     blas_sgemm_rows_fn,
+						     &ctx, n_tasks);
+		}
+	}
 #else
 	struct matmul_par_ctx ctx = {
 		.a = (const float *)a->data,

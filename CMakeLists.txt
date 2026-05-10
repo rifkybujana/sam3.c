@@ -56,6 +56,33 @@ else()
 	)
 endif()
 
+# ---- SIMD / Release optimizations ----
+# Without /arch:AVX2 on MSVC x64, MSVC doesn't define __AVX2__ and our
+# SAM3_HAS_AVX2 paths (cpu_matmul, cpu_transpose, half.h, ...) all fall
+# through to scalar, leaving the CPU backend ~3-4x slower than necessary.
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+	add_compile_options(/arch:AVX2)
+	add_compile_definitions(SAM3_HAS_AVX2=1 __AVX2__=1)
+	add_compile_options(
+		$<$<CONFIG:Release>:/O2>
+		$<$<CONFIG:Release>:/Oi>
+		$<$<CONFIG:Release>:/Ot>
+		$<$<CONFIG:Release>:/GL>
+		$<$<CONFIG:Release>:/fp:fast>
+	)
+	add_link_options($<$<CONFIG:Release>:/LTCG>)
+endif()
+
+if(NOT MSVC AND NOT APPLE)
+	include(CheckCCompilerFlag)
+	check_c_compiler_flag("-mavx2" SAM3_HAS_MAVX2)
+	check_c_compiler_flag("-mfma"  SAM3_HAS_MFMA)
+	if(SAM3_HAS_MAVX2 AND SAM3_HAS_MFMA)
+		add_compile_options(-mavx2 -mfma)
+		add_compile_definitions(SAM3_HAS_AVX2=1)
+	endif()
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 	set(SAM3_SANITIZE_FLAGS "-fsanitize=address,undefined")
 endif()

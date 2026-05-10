@@ -23,6 +23,18 @@
 #include "util/profile.h"
 #include "util/threadpool.h"
 
+#if defined(SAM3_HAS_BLAS) && !defined(__APPLE__)
+/*
+ * Pin OpenBLAS to 1 thread per call. Our sam3_threadpool already
+ * parallelizes over rows in cpu_kernel_matmul, so letting OpenBLAS spawn
+ * its own N threads causes N x N oversubscription -- visible as low
+ * total CPU utilization and high lock contention. Forward-declared to
+ * avoid a hard dependency on openblas headers in this TU; link will fail
+ * loudly if the linked BLAS impl lacks this symbol.
+ */
+extern void openblas_set_num_threads(int n);
+#endif
+
 static enum sam3_error cpu_init(struct sam3_backend *be)
 {
 	struct sam3_cpu_backend *cpu = (struct sam3_cpu_backend *)be;
@@ -57,6 +69,12 @@ static enum sam3_error cpu_init(struct sam3_backend *be)
 		sam3_log_error("CPU backend: thread pool init failed");
 		return SAM3_ENOMEM;
 	}
+
+#if defined(SAM3_HAS_BLAS) && !defined(__APPLE__)
+	openblas_set_num_threads(1);
+	sam3_log_info("CPU backend: OpenBLAS pinned to 1 thread "
+		      "(threadpool drives parallelism)");
+#endif
 
 	sam3_log_info("CPU backend initialized (arena: %zu, scratch: %zu)",
 		      capacity, scratch_cap);
