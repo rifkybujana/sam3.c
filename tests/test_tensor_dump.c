@@ -30,7 +30,7 @@ static void test_dump_2d_tensor(void)
 	t.data = data;
 	t.nbytes = sizeof(data);
 
-	const char *path = "/tmp/test_tensor_dump_2d.bin";
+	const char *path = "test_tensor_dump_2d.bin";
 	ASSERT_EQ(sam3_tensor_dump(path, &t), 0);
 
 	FILE *f = fopen(path, "rb");
@@ -61,7 +61,7 @@ static void test_dump_rejects_null(void)
 	t.data = &v;
 
 	ASSERT_EQ(sam3_tensor_dump(NULL, &t), -1);
-	ASSERT_EQ(sam3_tensor_dump("/tmp/x.bin", NULL), -1);
+	ASSERT_EQ(sam3_tensor_dump("x.bin", NULL), -1);
 }
 
 static void test_dump_rejects_non_f32(void)
@@ -73,7 +73,7 @@ static void test_dump_rejects_non_f32(void)
 	t.dims[0] = 1;
 	t.data = data;
 
-	ASSERT_EQ(sam3_tensor_dump("/tmp/x.bin", &t), -1);
+	ASSERT_EQ(sam3_tensor_dump("x.bin", &t), -1);
 }
 
 int main(void)

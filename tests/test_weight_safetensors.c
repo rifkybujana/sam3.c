@@ -18,8 +18,8 @@
 #include "test_helpers.h"
 #include "core/weight.h"
 
-#define TEST_ST_FILE  "/tmp/test_sam3.safetensors"
-#define TEST_SAM3_FILE "/tmp/test_sam3_from_st.sam3"
+#define TEST_ST_FILE  "test_sam3.safetensors"
+#define TEST_SAM3_FILE "test_sam3_from_st.sam3"
 
 /* --- Helper: write a raw SafeTensors file --- */
 
@@ -160,7 +160,7 @@ static void test_safetensors_bad_file(void)
 	weight_reader_safetensors_init(&reader);
 
 	enum sam3_error err = reader.ops->open(
-		&reader, "/tmp/nonexistent_safetensors_file.safetensors");
+		&reader, "nonexistent_safetensors_file.safetensors");
 	ASSERT_EQ(err, SAM3_EIO);
 }
 

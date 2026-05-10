@@ -152,6 +152,9 @@ endif()
 # Include paths
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+	include_directories(BEFORE ${CMAKE_SOURCE_DIR}/compat/msvc)
+endif()
 
 # Library sources
 file(GLOB_RECURSE SAM3_CORE_SOURCES   "src/core/*.c")
@@ -437,6 +440,14 @@ if(SAM3_TESTS)
 			tools/cli_track.c)
 		target_include_directories(test_cli_track PRIVATE
 			${CMAKE_SOURCE_DIR}/tools)
+	endif()
+
+	# test_sam3_main shells out to the built CLI executable.
+	if(TARGET test_sam3_main)
+		target_compile_definitions(test_sam3_main PRIVATE
+			"SAM3_CLI_PATH=\"$<TARGET_FILE_NAME:sam3_cli>\"")
+		set_tests_properties(test_sam3_main PROPERTIES
+			WORKING_DIRECTORY "$<TARGET_FILE_DIR:sam3_cli>")
 	endif()
 
 	# test_video_encode needs libav headers directly for the roundtrip test

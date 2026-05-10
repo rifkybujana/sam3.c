@@ -331,7 +331,7 @@ static void test_cache_persist_image_roundtrip(void)
 		return;
 	}
 
-	const char *tmpfile = "/tmp/sam3_test_image.sam3cache";
+	const char *tmpfile = "sam3_test_image.sam3cache";
 	int sz;
 	uint8_t *pix;
 
@@ -367,7 +367,7 @@ static void test_cache_persist_image_roundtrip(void)
 	}
 
 	free(pix);
-	unlink(tmpfile);
+	remove(tmpfile);
 }
 
 /*
@@ -380,7 +380,7 @@ static void test_cache_persist_text_roundtrip(void)
 		return;
 	}
 
-	const char *tmpfile = "/tmp/sam3_test_text.sam3cache";
+	const char *tmpfile = "sam3_test_text.sam3cache";
 	const char *text = "cat";
 
 	{
@@ -407,7 +407,7 @@ static void test_cache_persist_text_roundtrip(void)
 		sam3_free(ctx);
 	}
 
-	unlink(tmpfile);
+	remove(tmpfile);
 }
 
 int main(void)

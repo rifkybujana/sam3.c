@@ -20,6 +20,7 @@
 #include <time.h>
 
 #include "model/tokenizer.h"
+#include "util/time.h"
 
 /* --- Configuration ─ --- */
 
@@ -51,9 +52,7 @@ static const struct {
 
 static double get_time_ms(void)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+	return (double)sam3_time_ns() / 1e6;
 }
 
 /* --- Benchmark runner ─ --- */

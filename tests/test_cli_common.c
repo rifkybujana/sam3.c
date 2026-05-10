@@ -85,10 +85,19 @@ static void test_json_result(void)
 	r.boxes = boxes;
 
 	char *buf = NULL;
-	size_t len = 0;
-	FILE *fp = open_memstream(&buf, &len);
+	long len;
+	FILE *fp = tmpfile();
 	ASSERT(fp != NULL);
 	cli_json_result(fp, &r);
+	fflush(fp);
+	ASSERT_EQ(fseek(fp, 0, SEEK_END), 0);
+	len = ftell(fp);
+	ASSERT(len >= 0);
+	ASSERT_EQ(fseek(fp, 0, SEEK_SET), 0);
+	buf = malloc((size_t)len + 1);
+	ASSERT(buf != NULL);
+	ASSERT_EQ(fread(buf, 1, (size_t)len, fp), (size_t)len);
+	buf[len] = '\0';
 	fclose(fp);
 
 	ASSERT(strstr(buf, "\"n_masks\": 2") != NULL);

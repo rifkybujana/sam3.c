@@ -74,7 +74,7 @@ static void write_test_bmp(const char *path, int w, int h,
 
 static void test_image_load_basic(void)
 {
-	const char *path = "/tmp/sam3_test_load.bmp";
+	const char *path = "sam3_test_load.bmp";
 	write_test_bmp(path, 8, 6, 255, 0, 0);
 
 	struct sam3_image img = {0};
@@ -98,18 +98,18 @@ static void test_image_load_null_args(void)
 {
 	struct sam3_image img = {0};
 	ASSERT_EQ(sam3_image_load(NULL, &img), SAM3_EINVAL);
-	ASSERT_EQ(sam3_image_load("/tmp/sam3_test.bmp", NULL), SAM3_EINVAL);
+	ASSERT_EQ(sam3_image_load("sam3_test.bmp", NULL), SAM3_EINVAL);
 }
 
 static void test_image_load_nonexistent(void)
 {
 	struct sam3_image img = {0};
-	ASSERT_EQ(sam3_image_load("/tmp/sam3_no_such_file.bmp", &img), SAM3_EIO);
+	ASSERT_EQ(sam3_image_load("sam3_no_such_file.bmp", &img), SAM3_EIO);
 }
 
 static void test_image_resize(void)
 {
-	const char *path = "/tmp/sam3_test_resize.bmp";
+	const char *path = "sam3_test_resize.bmp";
 	write_test_bmp(path, 16, 8, 0, 255, 0);
 
 	struct sam3_image src = {0};
@@ -135,7 +135,7 @@ static void test_image_resize(void)
 static void test_image_letterbox_landscape(void)
 {
 	/* 200x100 landscape -> letterbox to 100x100 */
-	const char *path = "/tmp/sam3_test_letterbox.bmp";
+	const char *path = "sam3_test_letterbox.bmp";
 	write_test_bmp(path, 200, 100, 0, 0, 255);
 
 	struct sam3_image src = {0};
@@ -168,7 +168,7 @@ static void test_image_letterbox_landscape(void)
 static void test_image_letterbox_portrait(void)
 {
 	/* 100x200 portrait -> letterbox to 100x100 */
-	const char *path = "/tmp/sam3_test_letterbox_p.bmp";
+	const char *path = "sam3_test_letterbox_p.bmp";
 	write_test_bmp(path, 100, 200, 128, 64, 32);
 
 	struct sam3_image src = {0};

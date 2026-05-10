@@ -19,8 +19,10 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#ifdef __APPLE__
 #include <pthread.h>
 #include <sys/qos.h>
+#endif
 
 #include "cli_common.h"
 #include "cli_segment.h"
@@ -936,7 +938,9 @@ int cli_segment(int argc, char **argv)
 	 * P-core/E-core migration jitter on Apple Silicon. Best-effort:
 	 * a failure here is not fatal.
 	 */
+#ifdef __APPLE__
 	(void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
 	/* Set log level */
 	if (args.quiet)

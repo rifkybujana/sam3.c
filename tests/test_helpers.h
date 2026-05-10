@@ -37,6 +37,24 @@
 static int tests_run = 0;
 static int tests_failed = 0;
 
+static inline float sam3_test_pos_inf(void)
+{
+	volatile float zero = 0.0f;
+	return 1.0f / zero;
+}
+
+static inline float sam3_test_neg_inf(void)
+{
+	volatile float zero = 0.0f;
+	return -1.0f / zero;
+}
+
+static inline float sam3_test_nan(void)
+{
+	volatile float zero = 0.0f;
+	return zero / zero;
+}
+
 #define ASSERT(cond) do {                                           \
 	tests_run++;                                                    \
 	if (!(cond)) {                                                  \

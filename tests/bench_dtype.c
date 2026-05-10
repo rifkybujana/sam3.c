@@ -24,6 +24,7 @@
 #include "core/graph.h"
 #include "backend/cpu/kernels/cpu_kernels.h"
 #include "util/threadpool.h"
+#include "util/time.h"
 
 /* --- Configuration ─ --- */
 
@@ -48,9 +49,7 @@ static const int add_sizes[] = {
 
 static double get_time_ms(void)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+	return (double)sam3_time_ns() / 1e6;
 }
 
 /* --- Random fill helpers  --- */

@@ -68,9 +68,9 @@ test_numeric_stats_nan_inf(void)
 	struct sam3_numeric_stats stats;
 
 	data[0] = 1.0f;
-	data[1] = 0.0f / 0.0f;   /* NaN */
-	data[2] = 1.0f / 0.0f;   /* +Inf */
-	data[3] = -1.0f / 0.0f;  /* -Inf */
+	data[1] = sam3_test_nan();      /* NaN */
+	data[2] = sam3_test_pos_inf();  /* +Inf */
+	data[3] = sam3_test_neg_inf();  /* -Inf */
 
 	make_f32_tensor(&t, data, 4);
 	sam3_trace_compute_stats(&t, &stats);

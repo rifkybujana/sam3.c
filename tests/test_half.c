@@ -67,19 +67,19 @@ test_fp16_special_values(void)
 	ASSERT_EQ(fp16_is_inf(neg_zero), 0);
 
 	/* +inf */
-	uint16_t pos_inf = f32_to_fp16(1.0f / 0.0f);
+	uint16_t pos_inf = f32_to_fp16(sam3_test_pos_inf());
 	ASSERT_EQ(fp16_is_inf(pos_inf), 1);
 	ASSERT_EQ(fp16_is_nan(pos_inf), 0);
 	ASSERT_EQ(pos_inf, (uint16_t)0x7C00u);
 
 	/* -inf */
-	uint16_t neg_inf = f32_to_fp16(-1.0f / 0.0f);
+	uint16_t neg_inf = f32_to_fp16(sam3_test_neg_inf());
 	ASSERT_EQ(fp16_is_inf(neg_inf), 1);
 	ASSERT_EQ(fp16_is_nan(neg_inf), 0);
 	ASSERT_EQ(neg_inf, (uint16_t)0xFC00u);
 
 	/* NaN round-trip: the result must still be NaN */
-	float    nan_f   = 0.0f / 0.0f;
+	float    nan_f   = sam3_test_nan();
 	uint16_t nan_h   = f32_to_fp16(nan_f);
 	ASSERT_EQ(fp16_is_nan(nan_h), 1);
 	ASSERT_EQ(fp16_is_inf(nan_h), 0);
@@ -134,19 +134,19 @@ static void
 test_bf16_special_values(void)
 {
 	/* +inf */
-	uint16_t pos_inf = f32_to_bf16(1.0f / 0.0f);
+	uint16_t pos_inf = f32_to_bf16(sam3_test_pos_inf());
 	ASSERT_EQ(bf16_is_inf(pos_inf), 1);
 	ASSERT_EQ(bf16_is_nan(pos_inf), 0);
 	ASSERT_EQ(pos_inf, (uint16_t)0x7F80u);
 
 	/* -inf */
-	uint16_t neg_inf = f32_to_bf16(-1.0f / 0.0f);
+	uint16_t neg_inf = f32_to_bf16(sam3_test_neg_inf());
 	ASSERT_EQ(bf16_is_inf(neg_inf), 1);
 	ASSERT_EQ(bf16_is_nan(neg_inf), 0);
 	ASSERT_EQ(neg_inf, (uint16_t)0xFF80u);
 
 	/* NaN: conversion must produce a NaN bit pattern */
-	float    nan_f  = 0.0f / 0.0f;
+	float    nan_f  = sam3_test_nan();
 	uint16_t nan_b  = f32_to_bf16(nan_f);
 	ASSERT_EQ(bf16_is_nan(nan_b), 1);
 	ASSERT_EQ(bf16_is_inf(nan_b), 0);

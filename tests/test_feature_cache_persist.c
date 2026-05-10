@@ -89,7 +89,7 @@ static void test_persist_image_roundtrip(void)
 
 	struct sam3_cache_persist_sig sig = make_sig();
 	uint8_t prefix[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x01 };
-	const char *path = "/tmp/sam3_persist_image_roundtrip.sam3cache";
+	const char *path = "sam3_persist_image_roundtrip.sam3cache";
 
 	ASSERT_EQ(sam3_image_bundle_save(path, &sig, 0xFEEDFACECAFEBEEFULL,
 					 prefix, sizeof(prefix), &b),
@@ -143,7 +143,7 @@ static void test_persist_text_roundtrip(void)
 
 	struct sam3_cache_persist_sig sig = make_sig();
 	int32_t toks[4] = { 101, 202, 303, 404 };
-	const char *path = "/tmp/sam3_persist_text_roundtrip.sam3cache";
+	const char *path = "sam3_persist_text_roundtrip.sam3cache";
 
 	ASSERT_EQ(sam3_text_bundle_save(path, &sig, 0x1122334455667788ULL,
 					toks, 4, &b),
@@ -191,7 +191,7 @@ static void test_bundle_uncompressed_roundtrip(void)
 	b.width    = 1920;
 	b.height   = 1080;
 
-	const char *path = "/tmp/sam3_bundle_raw_rt.bin";
+	const char *path = "sam3_bundle_raw_rt.bin";
 	ASSERT_EQ(sam3_image_bundle_write_uncompressed(path, &b), SAM3_OK);
 
 	struct sam3_arena ra;

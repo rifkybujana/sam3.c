@@ -68,7 +68,7 @@ static const struct weight_reader_ops tr_ops = {
 
 static void test_sam3_1_roundtrip(void)
 {
-	const char *path = "/tmp/sam3_test_variant.sam3";
+	const char *path = "sam3_test_variant.sam3";
 	struct sam3_model_config cfg = {
 		.image_size       = 1008,
 		.encoder_dim      = 1024,
@@ -91,12 +91,12 @@ static void test_sam3_1_roundtrip(void)
 	ASSERT_EQ(wf.header->reserved[2], 3);
 	sam3_weight_close(&wf);
 
-	unlink(path);
+	remove(path);
 }
 
 static void test_sam3_legacy_defaults(void)
 {
-	const char *path = "/tmp/sam3_test_legacy.sam3";
+	const char *path = "sam3_test_legacy.sam3";
 	struct sam3_model_config cfg = {
 		.image_size       = 1008,
 		.encoder_dim      = 1024,
@@ -118,7 +118,7 @@ static void test_sam3_legacy_defaults(void)
 	ASSERT_EQ(wf.header->reserved[2], 0);
 	sam3_weight_close(&wf);
 
-	unlink(path);
+	remove(path);
 }
 
 int main(void)

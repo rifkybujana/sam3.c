@@ -148,6 +148,49 @@ Recent commit map:
 
 ## Validation Completed
 
+## Phase 6 Progress
+
+- Started Phase 6 upstream verification on Windows.
+- Current planned gate: configure and build `build-win` as a Release shared
+  MSVC build with `SAM3_VIDEO=ON` and `SAM3_BLAS=ON`, then run full Release
+  CTest.
+- Configure completed for `build-win` with the Visual Studio 17 2022 x64
+  generator. CMake found FFmpeg through the vcpkg `FFMPEG` module and found
+  OpenBLAS for BLAS support.
+- Release shared build produced `build-win/Release/sam3.dll` and
+  `build-win/Release/sam3.lib`, but the full build did not complete because
+  several test/tool targets still contain MSVC portability issues.
+- Build blockers found from the log:
+  - POSIX-only headers remain in tests/tools: `unistd.h`, `sys/wait.h`,
+    `getopt.h`, and `libgen.h`.
+  - Several tests use compile-time floating-point divide-by-zero expressions
+    that MSVC rejects as errors.
+  - Benchmark timing helpers still call `clock_gettime(CLOCK_MONOTONIC)`.
+  - `tools/gen_nhwc_fixtures.c` still depends on POSIX `S_ISDIR`/`mkdir`
+    behavior.
+- Applied a corrective portability pass after the failed build: added MSVC
+  compatibility headers for lightweight POSIX test/CLI conveniences, moved
+  benchmark timing to `sam3_time_ns`, made CLI subprocess tests resolve the
+  built `sam3_cli` target, replaced MSVC-rejected float constants with runtime
+  helper values, and moved `gen_nhwc_fixtures` directory handling onto the
+  platform layer.
+- Second build attempt cleared those blocker classes and reduced the hard
+  failure to `test_cli_common` using POSIX `open_memstream`; the test capture
+  path was changed to use a portable temporary file.
+- Release shared build now completes successfully. Confirmed key artifacts:
+  `build-win/Release/sam3.dll`, `build-win/Release/sam3.lib`,
+  `build-win/Release/sam3_cli.exe`, and
+  `build-win/Release/test_cli_common.exe`.
+- First full Release CTest run executed 82 tests: 76 passed and 6 failed. The
+  failing tests all used hard-coded POSIX `/tmp/...` paths on Windows:
+  `test_feature_cache_persist`, `test_image`, `test_sam3_1_header`,
+  `test_tensor_dump`, `test_weight_q8`, and `test_weight_safetensors`.
+- Replaced those active test paths, plus skipped cache persistence smoke paths,
+  with local relative test artifacts so they work under Windows CTest without a
+  POSIX `/tmp` directory.
+- Full Release CTest now passes: 82 tests passed, 0 failed.
+- Upstream SAM3 Phase 6 commit step completed on `feature/windows-blas`.
+
 ### Platform And Weight Tests
 
 Static MSVC validation was used because Windows Defender blocks the Debug shared
@@ -244,10 +287,10 @@ sam3-sys: using checked-in fallback bindings because bindgen panicked
   can fail with process/load errors because Defender flags the generated DLL.
   No exclusions or bypasses were added. Current reliable validation uses
   `build-win-static` or Release shared builds.
-- **Full Phase 6 shared Release verification is still pending.** Phases 0-5 are
-  targeted-green, but the full `cmake --build build-win --config Release
-  --parallel` plus full `ctest -C Release` gate has not been completed in this
-  report.
+- **Full Phase 6 shared Release verification is complete.** The full
+  `cmake --build build-win --config Release --parallel` plus
+  `ctest --test-dir build-win -C Release --output-on-failure` gate passed after
+  the remaining Windows test/tool portability fixes.
 - **Rust fallback bindings can drift.** `sam3-sys/src/fallback_bindings.rs` is
   a checked-in manual fallback used when `libclang.dll` is absent. It must be
   kept in sync with `include/sam3/sam3.h` and `include/sam3/sam3_types.h` when

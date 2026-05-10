@@ -32,6 +32,7 @@
 #include "model/necks.h"
 #include "model/segmentation.h"
 #include "util/log.h"
+#include "util/platform.h"
 
 /* Fixed PRNG seed for byte-identical fixture regeneration. */
 #define GEN_NHWC_SEED 0x5A3ABCDEu
@@ -655,18 +656,14 @@ static enum sam3_error dump_mask_dec_fixture(const char *out_dir,
  */
 static enum sam3_error ensure_dir(const char *path)
 {
-	struct stat st;
-
-	if (stat(path, &st) == 0) {
-		if (!S_ISDIR(st.st_mode)) {
-			sam3_log_error("%s exists but is not a directory",
-				       path);
-			return SAM3_EIO;
-		}
+	if (sam3_path_is_dir(path))
 		return SAM3_OK;
+	if (sam3_path_is_regular(path)) {
+		sam3_log_error("%s exists but is not a directory", path);
+		return SAM3_EIO;
 	}
 
-	if (mkdir(path, 0775) != 0) {
+	if (sam3_platform_mkdir(path) != 0) {
 		sam3_log_error("mkdir %s failed: %s",
 			       path, strerror(errno));
 		return SAM3_EIO;

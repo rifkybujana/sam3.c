@@ -21,6 +21,7 @@
 #include "core/graph.h"
 #include "core/tensor.h"
 
+#include <math.h>
 #include <string.h>
 
 #define EPS 1e-4f
@@ -233,8 +234,7 @@ static void test_gh_multihead_attention(void)
 	/* Output should be finite */
 	float *o = (float *)out->data;
 	for (int i = 0; i < 8; i++) {
-		ASSERT(o[i] == o[i]);         /* Not NaN */
-		ASSERT(o[i] < 1.0f / 0.0f);  /* Not +Inf */
+		ASSERT(isfinite(o[i]));
 	}
 }
 
@@ -300,9 +300,7 @@ static void test_gh_mlp(void)
 	/* Output should be finite (not NaN or Inf) */
 	float *o = (float *)out->data;
 	for (int i = 0; i < 8; i++) {
-		ASSERT(o[i] == o[i]);           /* Not NaN */
-		ASSERT(o[i] < 1.0f / 0.0f);    /* Not +Inf */
-		ASSERT(o[i] > -1.0f / 0.0f);   /* Not -Inf */
+		ASSERT(isfinite(o[i]));
 	}
 }
 

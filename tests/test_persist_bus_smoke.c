@@ -35,6 +35,7 @@
 #include "model/feature_cache.h"
 #include "model/sam3_processor.h"
 #include "model/sam3_internal.h"
+#include "util/time.h"
 
 #ifndef SAM3_SOURCE_DIR
 #define SAM3_SOURCE_DIR "."
@@ -43,9 +44,9 @@
 #define MODEL_PATH SAM3_SOURCE_DIR "/models/sam3.sam3"
 #define IMAGE_PATH SAM3_SOURCE_DIR "/assets/bus.jpg"
 #define IMAGE_PATH2 SAM3_SOURCE_DIR "/assets/cat_2.png"
-#define IMG_CACHE  "/tmp/sam3_bus_image.sam3cache"
-#define TXT_PERSON "/tmp/sam3_bus_text_person.sam3cache"
-#define TXT_BUS    "/tmp/sam3_bus_text_bus.sam3cache"
+#define IMG_CACHE  "sam3_bus_image.sam3cache"
+#define TXT_PERSON "sam3_bus_text_person.sam3cache"
+#define TXT_BUS    "sam3_bus_text_bus.sam3cache"
 
 static long file_size_bytes(const char *path)
 {
@@ -55,9 +56,7 @@ static long file_size_bytes(const char *path)
 
 static double now_ms(void)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+	return (double)sam3_time_ns() / 1e6;
 }
 
 #define TIME_START(t) double t = now_ms()

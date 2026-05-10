@@ -26,6 +26,7 @@
 
 #include "sam3/sam3.h"
 #include "sam3/sam3_types.h"
+#include "util/time.h"
 
 /* --- Defaults --- */
 
@@ -37,9 +38,7 @@
 
 static double now_ms(void)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+	return (double)sam3_time_ns() / 1e6;
 }
 
 /* --- Stats --- */

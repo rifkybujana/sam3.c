@@ -94,7 +94,7 @@ static const struct weight_reader_ops q8_reader_ops = {
 
 static void test_weight_q8_round_trip(void)
 {
-	const char *path = "/tmp/test_q8_weight.sam3";
+	const char *path = "test_q8_weight.sam3";
 	struct q8_test_state state;
 	struct weight_reader reader = {
 		.ops  = &q8_reader_ops,
@@ -144,7 +144,7 @@ static void test_weight_q8_round_trip(void)
 	}
 
 	sam3_weight_close(&wf);
-	unlink(path);
+	remove(path);
 }
 
 int main(void)
