@@ -6,6 +6,10 @@ mod error;
 
 pub use error::{Error, Result};
 
+mod cache;
+
+pub use cache::{CacheKind, CacheOpts, CacheStats};
+
 mod log;
 
 pub use log::{set_log_level, version, LogLevel};

@@ -10,6 +10,7 @@ description  = "Safe Rust bindings to the SAM3 inference engine"
 
 [dependencies]
 sam3-sys  = { version = "0.1.0", path = "../sam3-sys" }
+bitflags  = "2"
 thiserror = "1"
 
 [lints]

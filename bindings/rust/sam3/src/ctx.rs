@@ -80,6 +80,34 @@ impl Ctx {
             .ok_or(Error::NoMemory)
     }
 
+    /// Create a new SAM3 context with explicit image and text cache slots.
+    pub fn new_with_cache(image_slots: u32, text_slots: u32) -> Result<Self> {
+        Self::new_with_cache_opts(&crate::CacheOpts {
+            image_slots: Some(image_slots),
+            text_slots: Some(text_slots),
+            image_mem_budget_bytes: None,
+        })
+    }
+
+    /// Create a new SAM3 context with cache options.
+    pub fn new_with_cache_opts(opts: &crate::CacheOpts) -> Result<Self> {
+        let raw_opts = sys::sam3_cache_opts {
+            n_image_slots: opts.image_slots.unwrap_or(0) as i32,
+            n_text_slots: opts.text_slots.unwrap_or(0) as i32,
+            image_mem_budget_bytes: opts.image_mem_budget_bytes.unwrap_or(0),
+            image_spill_dir: std::ptr::null(),
+        };
+        // SAFETY: raw_opts points to a valid stack value for the duration of
+        // the call. sam3_init_ex copies the tunables and returns NULL on failure.
+        let raw = unsafe { sys::sam3_init_ex(&raw_opts) };
+        NonNull::new(raw)
+            .map(|raw| Ctx {
+                raw,
+                _not_send_sync: PhantomData,
+            })
+            .ok_or(Error::NoMemory)
+    }
+
     /// Raw pointer for intra-crate FFI (e.g. video session construction).
     ///
     /// Not part of the public API. Returned pointer is live for the lifetime
@@ -157,6 +185,70 @@ impl Ctx {
         self.set_image_rgb(img.pixels, img.width, img.height)
     }
 
+    /// Populate the image feature cache without changing the current image.
+    pub fn precache_image(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
+        let need = crate::ImageData {
+            pixels,
+            width,
+            height,
+        }
+        .required_len()
+        .ok_or(Error::Invalid)?;
+        if pixels.len() < need {
+            return Err(Error::Invalid);
+        }
+        // SAFETY: self.raw is valid, pixels has at least width*height*3 bytes,
+        // and libsam3 does not retain the pointer beyond the call.
+        unsafe {
+            crate::error::check(sys::sam3_precache_image(
+                self.raw.as_ptr(),
+                pixels.as_ptr(),
+                width as i32,
+                height as i32,
+            ))
+        }
+    }
+
+    /// Save a cached image entry to disk.
+    pub fn cache_save_image<P: AsRef<Path>>(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        out_path: P,
+    ) -> Result<()> {
+        let need = crate::ImageData {
+            pixels,
+            width,
+            height,
+        }
+        .required_len()
+        .ok_or(Error::Invalid)?;
+        if pixels.len() < need {
+            return Err(Error::Invalid);
+        }
+        let c = path_to_cstring(out_path.as_ref())?;
+        // SAFETY: self.raw is valid, c is a NUL-terminated path, and pixels has
+        // the required length. libsam3 does not retain these pointers.
+        unsafe {
+            crate::error::check(sys::sam3_cache_save_image(
+                self.raw.as_ptr(),
+                pixels.as_ptr(),
+                width as i32,
+                height as i32,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    /// Load a cached image entry from disk.
+    pub fn cache_load_image<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let c = path_to_cstring(path.as_ref())?;
+        // SAFETY: self.raw is valid and c is a NUL-terminated path not retained
+        // beyond the call.
+        unsafe { crate::error::check(sys::sam3_cache_load_image(self.raw.as_ptr(), c.as_ptr())) }
+    }
+
     /// Set the input image by loading a PNG/JPEG/BMP file from disk.
     ///
     /// # Errors
@@ -181,6 +273,29 @@ impl Ctx {
         // guarantees no concurrent use. sam3_set_prompt_space has no error
         // path.
         unsafe { sys::sam3_set_prompt_space(self.raw.as_ptr(), width as i32, height as i32) }
+    }
+
+    /// Clear image and/or text feature caches. An empty mask clears both.
+    pub fn cache_clear(&mut self, which: crate::CacheKind) {
+        // SAFETY: self.raw is valid and sam3_cache_clear accepts any bitmask;
+        // unknown bits are ignored by the C layer.
+        unsafe { sys::sam3_cache_clear(self.raw.as_ptr(), which.bits()) }
+    }
+
+    /// Return cache hit/miss/eviction counters.
+    pub fn cache_stats(&self) -> crate::CacheStats {
+        // SAFETY: zeroed sam3_cache_stats is valid output storage.
+        let mut raw = unsafe { std::mem::zeroed::<sys::sam3_cache_stats>() };
+        // SAFETY: self.raw is valid and raw points to writable output storage.
+        unsafe { sys::sam3_cache_stats(self.raw.as_ptr(), &mut raw) };
+        crate::CacheStats {
+            image_hits: raw.image_hits,
+            image_misses: raw.image_misses,
+            image_evictions: raw.image_evictions,
+            text_hits: raw.text_hits,
+            text_misses: raw.text_misses,
+            text_evictions: raw.text_evictions,
+        }
     }
 
     /// Pre-tokenize and asynchronously encode a text prompt.
