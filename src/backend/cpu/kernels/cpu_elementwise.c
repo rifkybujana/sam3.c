@@ -73,8 +73,11 @@ static void add_f32_scalar(const float *a, const float *b, float *out,
 		for (int i = start; i < end; i++)
 			out[i] = a[i] + b[i];
 	} else {
-		for (int i = start; i < end; i++)
-			out[i] = a[i] + b[i % broadcast_n];
+		for (int r = start; r < end; r++) {
+			int base = r * broadcast_n;
+			for (int j = 0; j < broadcast_n; j++)
+				out[base + j] = a[base + j] + b[j];
+		}
 	}
 }
 
@@ -85,8 +88,11 @@ static void mul_f32_scalar(const float *a, const float *b, float *out,
 		for (int i = start; i < end; i++)
 			out[i] = a[i] * b[i];
 	} else {
-		for (int i = start; i < end; i++)
-			out[i] = a[i] * b[i % broadcast_n];
+		for (int r = start; r < end; r++) {
+			int base = r * broadcast_n;
+			for (int j = 0; j < broadcast_n; j++)
+				out[base + j] = a[base + j] * b[j];
+		}
 	}
 }
 
@@ -97,8 +103,11 @@ static void div_f32_scalar(const float *a, const float *b, float *out,
 		for (int i = start; i < end; i++)
 			out[i] = a[i] / b[i];
 	} else {
-		for (int i = start; i < end; i++)
-			out[i] = a[i] / b[i % broadcast_n];
+		for (int r = start; r < end; r++) {
+			int base = r * broadcast_n;
+			for (int j = 0; j < broadcast_n; j++)
+				out[base + j] = a[base + j] / b[j];
+		}
 	}
 }
 

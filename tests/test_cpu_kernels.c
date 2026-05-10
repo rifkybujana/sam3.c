@@ -23,6 +23,7 @@
 #endif
 
 #include <string.h>
+#include <float.h>
 
 #define EPS 1e-4f
 
@@ -988,7 +989,7 @@ static void test_softmax_large_logits(void)
 	/* No NaN or Inf */
 	for (int i = 0; i < 3; i++) {
 		ASSERT(out[i] == out[i]); /* NaN check */
-		ASSERT(out[i] < 1.0f / 0.0f); /* Inf check */
+		ASSERT(out[i] < FLT_MAX); /* Inf check */
 	}
 }
 

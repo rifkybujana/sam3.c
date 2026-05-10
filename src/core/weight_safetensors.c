@@ -17,10 +17,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include "weight.h"
 #include "json/cJSON.h"
@@ -41,6 +37,7 @@ struct st_tensor_entry {
 struct st_reader_state {
 	void                   *mapped;
 	size_t                  mapped_size;
+	struct sam3_file_map    map;
 	const void             *data_section;
 	struct st_tensor_entry *entries;
 	int                     n_entries;
@@ -62,8 +59,8 @@ static enum sam3_dtype parse_dtype(const char *s)
 
 static enum sam3_error st_open(struct weight_reader *r, const char *path)
 {
-	int fd = -1;
-	void *mapped = MAP_FAILED;
+	struct sam3_file_map file_map;
+	void *mapped = NULL;
 	cJSON *root = NULL;
 	struct st_reader_state *s = NULL;
 	struct st_tensor_entry *entries = NULL;
@@ -75,31 +72,18 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 		return SAM3_EINVAL;
 	}
 
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
+	memset(&file_map, 0, sizeof(file_map));
+	err = sam3_file_map_read(path, &file_map);
+	if (err != SAM3_OK) {
 		sam3_log_error("st_open: cannot open %s", path);
-		return SAM3_EIO;
+		return err;
 	}
 
-	struct stat st;
-	if (fstat(fd, &st) < 0) {
-		sam3_log_error("st_open: fstat failed for %s", path);
-		close(fd);
-		return SAM3_EIO;
-	}
-
-	file_size = (size_t)st.st_size;
+	file_size = file_map.size;
+	mapped = file_map.data;
 	if (file_size < 8) {
 		sam3_log_error("st_open: file too small: %s", path);
-		close(fd);
-		return SAM3_EIO;
-	}
-
-	mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-
-	if (mapped == MAP_FAILED) {
-		sam3_log_error("st_open: mmap failed for %s", path);
+		sam3_file_unmap(&file_map);
 		return SAM3_EIO;
 	}
 
@@ -262,6 +246,7 @@ static enum sam3_error st_open(struct weight_reader *r, const char *path)
 
 	s->mapped       = mapped;
 	s->mapped_size  = file_size;
+	s->map          = file_map;
 	s->data_section = (const char *)mapped + 8 + (size_t)header_size;
 	s->entries      = entries;
 	s->n_entries    = idx;
@@ -277,8 +262,7 @@ fail:
 	if (root)
 		cJSON_Delete(root);
 	free(entries);
-	if (mapped != MAP_FAILED)
-		munmap(mapped, file_size);
+	sam3_file_unmap(&file_map);
 	return err;
 }
 
@@ -336,8 +320,7 @@ static void st_close(struct weight_reader *r)
 	if (!s)
 		return;
 
-	if (s->mapped && s->mapped_size > 0)
-		munmap(s->mapped, s->mapped_size);
+	sam3_file_unmap(&s->map);
 
 	free(s->entries);
 	free(s);

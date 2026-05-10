@@ -1013,18 +1013,18 @@ static const char *find_text_prompt(const struct sam3_prompt *prompts,
 static void join_text_worker(struct sam3_processor *proc)
 {
 	if (proc->text_thread_active) {
-		pthread_join(proc->text_thread, NULL);
+		sam3_thread_join(&proc->text_thread);
 		proc->text_thread_active = 0;
 	}
 }
 
 /*
- * text_worker_main - pthread entry point for async text encoding.
+ * text_worker_main - Thread entry point for async text encoding.
  *
  * Reads pre-tokenized state from proc, runs the text encoder, writes
  * the result tensor into the pre-claimed text cache slot's arena, and
  * registers the bundle with the cache. The main thread must not touch
- * the slot arena or the cache's mutable tables until pthread_join
+ * the slot arena or the cache's mutable tables until thread join
  * returns.
  */
 static void *text_worker_main(void *arg)
@@ -1139,21 +1139,14 @@ enum sam3_error sam3_processor_set_text(struct sam3_processor *proc,
 
 	/*
 	 * Spawn the worker. Request an 8 MiB stack — MLX-C plus ASan
-	 * blows the default 512 KiB pthread stack on macOS, and the
+	 * blows the default 512 KiB thread stack on macOS, and the
 	 * matching size is validated by test_metal_cpu_concurrent.
 	 */
-	pthread_attr_t attr;
-	if (pthread_attr_init(&attr) != 0)
-		return SAM3_EBACKEND;
-	if (pthread_attr_setstacksize(&attr, 8UL * 1024 * 1024) != 0) {
-		pthread_attr_destroy(&attr);
-		return SAM3_EBACKEND;
-	}
-	rc = pthread_create(&proc->text_thread, &attr, text_worker_main,
-			    proc);
-	pthread_attr_destroy(&attr);
+	rc = sam3_thread_create_with_stack(&proc->text_thread,
+					    8UL * 1024 * 1024,
+					    text_worker_main, proc);
 	if (rc != 0) {
-		sam3_log_error("set_text: pthread_create failed (%d)", rc);
+		sam3_log_error("set_text: thread_create failed (%d)", rc);
 		return SAM3_EBACKEND;
 	}
 	proc->text_thread_active = 1;

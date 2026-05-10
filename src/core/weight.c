@@ -16,11 +16,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include "weight.h"
 #include "util/log.h"
@@ -28,15 +23,14 @@
 /* ── Async prefetch ────────────────────────────────────────────────── */
 
 struct prefetch_args {
-	void   *addr;
-	size_t  len;
+	const struct sam3_file_map *map;
 };
 
 static void *prefetch_worker(void *arg)
 {
 	struct prefetch_args *a = arg;
 
-	madvise(a->addr, a->len, MADV_WILLNEED);
+	sam3_file_prefetch(a->map, SAM3_PREFETCH_WILLNEED);
 	free(a);
 	return NULL;
 }
@@ -303,45 +297,33 @@ static int build_hash_table(struct sam3_weight_file *wf)
 enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 				 const char *path)
 {
-	int fd = -1;
-	void *mapped = MAP_FAILED;
+	struct sam3_file_map file_map;
+	void *mapped = NULL;
 	size_t file_size = 0;
+	enum sam3_error err;
 
 	if (!wf || !path) {
 		sam3_log_error("weight_open: NULL argument");
 		return SAM3_EINVAL;
 	}
 
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
+	memset(&file_map, 0, sizeof(file_map));
+	err = sam3_file_map_read(path, &file_map);
+	if (err != SAM3_OK) {
 		sam3_log_error("weight_open: cannot open %s", path);
-		return SAM3_EIO;
+		return err;
 	}
 
-	struct stat st;
-	if (fstat(fd, &st) < 0) {
-		sam3_log_error("weight_open: fstat failed for %s", path);
-		close(fd);
-		return SAM3_EIO;
-	}
-
-	file_size = (size_t)st.st_size;
+	file_size = file_map.size;
+	mapped = file_map.data;
 	if (file_size < sizeof(struct sam3_weight_header)) {
 		sam3_log_error("weight_open: file too small: %s", path);
-		close(fd);
+		sam3_file_unmap(&file_map);
 		return SAM3_EMODEL;
 	}
 
-	mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-
-	if (mapped == MAP_FAILED) {
-		sam3_log_error("weight_open: mmap failed for %s", path);
-		return SAM3_EIO;
-	}
-
 	/* Hint sequential access for initial weight loading pass */
-	madvise(mapped, file_size, MADV_SEQUENTIAL);
+	sam3_file_prefetch(&file_map, SAM3_PREFETCH_SEQUENTIAL);
 
 	/* Validate header */
 	const struct sam3_weight_header *hdr = mapped;
@@ -349,7 +331,7 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 	if (hdr->magic != SAM3_WEIGHT_MAGIC) {
 		sam3_log_error("weight_open: bad magic 0x%08x in %s",
 			       hdr->magic, path);
-		munmap(mapped, file_size);
+		sam3_file_unmap(&file_map);
 		memset(wf, 0, sizeof(*wf));
 		return SAM3_EMODEL;
 	}
@@ -373,7 +355,7 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 		sam3_log_error("weight_open: unsupported version %u in %s "
 			       "(expected 3 or 4; regenerate via sam3_convert)",
 			       hdr->version, path);
-		munmap(mapped, file_size);
+		sam3_file_unmap(&file_map);
 		memset(wf, 0, sizeof(*wf));
 		return SAM3_EMODEL;
 	}
@@ -387,13 +369,19 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 	if (table_end > file_size) {
 		sam3_log_error("weight_open: tensor table exceeds file: %s",
 			       path);
-		munmap(mapped, file_size);
+		sam3_file_unmap(&file_map);
 		memset(wf, 0, sizeof(*wf));
 		return SAM3_EMODEL;
 	}
 
 	/* Populate the handle */
-	enum sam3_error err;
+	wf->mapped      = mapped;
+	wf->mapped_size = file_size;
+	wf->map         = file_map;
+	wf->header      = hdr;
+	wf->tensors     = (const struct sam3_weight_tensor_desc *)
+			  ((const char *)mapped + header_size);
+
 	size_t data_start = align_up(table_end, SAM3_WEIGHT_PAGE_ALIGN);
 
 	if (data_start > file_size) {
@@ -403,11 +391,6 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 		goto fail;
 	}
 
-	wf->mapped      = mapped;
-	wf->mapped_size = file_size;
-	wf->header      = hdr;
-	wf->tensors     = (const struct sam3_weight_tensor_desc *)
-			  ((const char *)mapped + header_size);
 	wf->data_base   = (const char *)mapped + data_start;
 
 	/* Validate all tensor data ranges fit in file */
@@ -432,43 +415,33 @@ enum sam3_error sam3_weight_open(struct sam3_weight_file *wf,
 	}
 
 	/*
-	 * The initial scan above touches the header, the tensor table,
-	 * and (via build_hash_table) every tensor name — strictly
-	 * sequential, so MADV_SEQUENTIAL was the right hint. Inference,
-	 * however, accesses the data blob in a random-but-repeated
-	 * pattern (the same ~50 tensors per ViT block, per inference).
-	 * MADV_SEQUENTIAL would let the kernel drop those pages after
-	 * the first read, forcing re-faults on every subsequent block.
-	 *
-	 * Switch to MADV_RANDOM to discourage pre-eviction, then spawn
-	 * a background thread to issue MADV_WILLNEED so the caller can
-	 * overlap processor/module init with the prefetch I/O.
+	 * The initial scan is sequential. Inference then revisits tensor pages
+	 * in a random-but-repeated pattern, so switch hints and prefetch in the
+	 * background while the caller initializes processor modules.
 	 */
-	madvise(mapped, file_size, MADV_RANDOM);
+	sam3_file_prefetch(&wf->map, SAM3_PREFETCH_RANDOM);
 
 	struct prefetch_args *pa = malloc(sizeof(*pa));
 	if (pa) {
-		pa->addr = (void *)wf->data_base;
-		pa->len  = file_size - data_start;
-		if (pthread_create(&wf->prefetch_thread, NULL,
-				   prefetch_worker, pa) == 0) {
+		pa->map = &wf->map;
+		if (sam3_thread_create(&wf->prefetch_thread,
+				       prefetch_worker, pa) == 0) {
 			wf->prefetch_active = 1;
 		} else {
 			/* Thread creation failed — prefetch synchronously */
-			madvise(pa->addr, pa->len, MADV_WILLNEED);
+			sam3_file_prefetch(&wf->map, SAM3_PREFETCH_WILLNEED);
 			free(pa);
 		}
 	} else {
 		/* Alloc failed — prefetch synchronously */
-		madvise((void *)wf->data_base, file_size - data_start,
-			MADV_WILLNEED);
+		sam3_file_prefetch(&wf->map, SAM3_PREFETCH_WILLNEED);
 	}
 
 	sam3_log_info("opened %s: %u tensors", path, hdr->n_tensors);
 	return SAM3_OK;
 
 fail:
-	munmap(mapped, file_size);
+	sam3_file_unmap(&wf->map);
 	memset(wf, 0, sizeof(*wf));
 	return err;
 }
@@ -478,7 +451,7 @@ void sam3_weight_prefetch_wait(struct sam3_weight_file *wf)
 	if (!wf || !wf->prefetch_active)
 		return;
 
-	pthread_join(wf->prefetch_thread, NULL);
+	sam3_thread_join(&wf->prefetch_thread);
 	wf->prefetch_active = 0;
 }
 
@@ -489,17 +462,17 @@ void sam3_weight_close(struct sam3_weight_file *wf)
 
 	sam3_weight_prefetch_wait(wf);
 
-	if (wf->mapped && wf->mapped_size > 0)
-		munmap(wf->mapped, wf->mapped_size);
+	sam3_file_unmap(&wf->map);
 
 	free(wf->hash_table);
 	memset(wf, 0, sizeof(*wf));
 }
 
-void sam3_weight_madvise(struct sam3_weight_file *wf, int advice)
+void sam3_weight_prefetch_hint(struct sam3_weight_file *wf,
+				       enum sam3_prefetch_hint hint)
 {
-	if (wf && wf->mapped && wf->mapped_size > 0)
-		madvise(wf->mapped, wf->mapped_size, advice);
+	if (wf)
+		sam3_file_prefetch(&wf->map, hint);
 }
 
 const struct sam3_weight_tensor_desc *sam3_weight_find(

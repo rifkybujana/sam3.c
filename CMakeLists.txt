@@ -14,6 +14,9 @@ option(SAM3_PROFILE "Enable profiler"     OFF)
 option(SAM3_TRACE   "Enable dtype tracing" OFF)
 option(SAM3_DEBUG_DUMP "Enable debug tensor dumps to /tmp" OFF)
 option(SAM3_BLAS    "Use BLAS for CPU matmul (Accelerate/OpenBLAS/MKL)" ON)
+option(SAM3_VIDEO "Enable FFmpeg-backed video I/O" ON)
+option(SAM3_REQUIRE_VIDEO "Fail configure if video dependencies are unavailable" OFF)
+option(SAM3_REQUIRE_BLAS "Fail configure if BLAS is unavailable" OFF)
 option(SAM3_BENCH   "Build benchmarking harness" OFF)
 option(SAM3_SHARED  "Build shared library" OFF)
 option(SAM3_FIXTURE_TESTS
@@ -42,16 +45,26 @@ elseif(APPLE)
 endif()
 
 # Compiler warnings
-add_compile_options(
-	-Wall -Wextra -Wpedantic
-	-Wno-unused-parameter
-	-Wstrict-prototypes
-	-Wmissing-prototypes
-)
+if(MSVC)
+	add_compile_options(/W4 /wd4100 /wd4244 /wd4267)
+else()
+	add_compile_options(
+		-Wall -Wextra -Wpedantic
+		-Wno-unused-parameter
+		-Wstrict-prototypes
+		-Wmissing-prototypes
+	)
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 	set(SAM3_SANITIZE_FLAGS "-fsanitize=address,undefined")
 endif()
+
+function(sam3_configure_executable target)
+	if(MSVC)
+		target_link_options(${target} PRIVATE /STACK:8388608)
+	endif()
+endfunction()
 
 if(SAM3_PROFILE)
 	add_definitions(-DSAM3_HAS_PROFILE)
@@ -96,10 +109,24 @@ file(GLOB_RECURSE SAM3_CORE_SOURCES   "src/core/*.c")
 file(GLOB_RECURSE SAM3_MODEL_SOURCES  "src/model/*.c")
 file(GLOB_RECURSE SAM3_UTIL_SOURCES   "src/util/*.c")
 
+if(NOT SAM3_VIDEO)
+	list(REMOVE_ITEM SAM3_MODEL_SOURCES
+		${CMAKE_SOURCE_DIR}/src/model/sam3_video.c
+		${CMAKE_SOURCE_DIR}/src/model/video_session.c)
+	list(REMOVE_ITEM SAM3_UTIL_SOURCES
+		${CMAKE_SOURCE_DIR}/src/util/video.c
+		${CMAKE_SOURCE_DIR}/src/util/video_encode.c)
+endif()
+
 # Suppress warnings for vendored code
 file(GLOB_RECURSE SAM3_VENDORED_SOURCES "src/core/json/*.c")
-set_source_files_properties(${SAM3_VENDORED_SOURCES} PROPERTIES
-    COMPILE_FLAGS "-Wno-strict-prototypes -Wno-missing-prototypes -Wno-unused-function -Wno-deprecated-declarations")
+if(MSVC)
+	set_source_files_properties(${SAM3_VENDORED_SOURCES} PROPERTIES
+		COMPILE_FLAGS "/wd4100 /wd4244 /wd4267")
+else()
+	set_source_files_properties(${SAM3_VENDORED_SOURCES} PROPERTIES
+		COMPILE_FLAGS "-Wno-strict-prototypes -Wno-missing-prototypes -Wno-unused-function -Wno-deprecated-declarations")
+endif()
 
 set(SAM3_SOURCES
 	src/sam3.c
@@ -138,6 +165,11 @@ if(SAM3_SHARED)
 	set_target_properties(sam3 PROPERTIES
 		POSITION_INDEPENDENT_CODE ON
 	)
+	if(WIN32)
+		set_target_properties(sam3 PROPERTIES
+			WINDOWS_EXPORT_ALL_SYMBOLS ON
+		)
+	endif()
 	if(APPLE)
 		set_target_properties(sam3 PROPERTIES
 			LINK_FLAGS "-exported_symbols_list ${CMAKE_SOURCE_DIR}/bindings/python/exports.txt"
@@ -161,11 +193,15 @@ target_link_libraries(sam3 Threads::Threads)
 find_package(ZLIB REQUIRED)
 target_link_libraries(sam3 ZLIB::ZLIB)
 
-# Video I/O via statically-built FFmpeg (+ openh264 + libvpx). Binary
-# ships self-contained — no runtime dependency on system ffmpeg. First
-# build takes ~10-15 min to compile ffmpeg from source.
-include(${CMAKE_SOURCE_DIR}/cmake/StaticFfmpeg.cmake)
-target_link_libraries(sam3 ffmpeg_static)
+if(SAM3_VIDEO)
+	# Video I/O via statically-built FFmpeg (+ openh264 + libvpx). Binary
+	# ships self-contained — no runtime dependency on system ffmpeg. First
+	# build takes ~10-15 min to compile ffmpeg from source.
+	include(${CMAKE_SOURCE_DIR}/cmake/StaticFfmpeg.cmake)
+	target_link_libraries(sam3 ffmpeg_static)
+elseif(SAM3_REQUIRE_VIDEO)
+	message(FATAL_ERROR "SAM3_REQUIRE_VIDEO=ON requires SAM3_VIDEO=ON")
+endif()
 
 if(SAM3_BLAS)
 	if(APPLE)
@@ -197,6 +233,7 @@ add_executable(sam3_cli
 	tools/cli_info.c
 	tools/weight_rename.c
 	tools/weight_conv_perm.c)
+sam3_configure_executable(sam3_cli)
 target_include_directories(sam3_cli PRIVATE ${CMAKE_SOURCE_DIR}/tools)
 target_link_libraries(sam3_cli sam3)
 if(SAM3_BENCH)
@@ -205,10 +242,12 @@ if(SAM3_BENCH)
 endif()
 
 add_executable(gen_nhwc_fixtures tools/gen_nhwc_fixtures.c)
+sam3_configure_executable(gen_nhwc_fixtures)
 target_link_libraries(gen_nhwc_fixtures sam3)
 
 # SAM 3.1 parity fixture seed dumper (manual regen tool, not CI).
 add_executable(sam3_1_dump_seed tools/sam3_1_dump_seed.c)
+sam3_configure_executable(sam3_1_dump_seed)
 target_link_libraries(sam3_1_dump_seed sam3)
 target_include_directories(sam3_1_dump_seed PRIVATE
 	${CMAKE_SOURCE_DIR}/src)
@@ -220,6 +259,10 @@ if(SAM3_TESTS)
 	# test_helpers_png.c is a helper TU, not a standalone test.
 	list(REMOVE_ITEM TEST_SOURCES
 		${CMAKE_SOURCE_DIR}/tests/test_helpers_png.c)
+	if(NOT SAM3_VIDEO)
+		file(GLOB VIDEO_TEST_SOURCES "tests/test_video*.c")
+		list(REMOVE_ITEM TEST_SOURCES ${VIDEO_TEST_SOURCES})
+	endif()
 	if(NOT SAM3_FIXTURE_TESTS)
 		list(REMOVE_ITEM TEST_SOURCES
 			${CMAKE_SOURCE_DIR}/tests/test_tracker_fixtures.c)
@@ -240,6 +283,7 @@ if(SAM3_TESTS)
 	foreach(test_src ${TEST_SOURCES})
 		get_filename_component(test_name ${test_src} NAME_WE)
 		add_executable(${test_name} ${test_src})
+		sam3_configure_executable(${test_name})
 		target_link_libraries(${test_name} sam3)
 		add_test(NAME ${test_name} COMMAND ${test_name})
 	endforeach()
@@ -350,7 +394,7 @@ if(SAM3_TESTS)
 	endif()
 
 	# test_video_encode needs libav headers directly for the roundtrip test
-	if(TARGET test_video_encode)
+	if(SAM3_VIDEO AND TARGET test_video_encode)
 		target_link_libraries(test_video_encode ffmpeg_static)
 	endif()
 
@@ -419,5 +463,6 @@ set(BENCH_SOURCES
 foreach(BENCH_SRC ${BENCH_SOURCES})
 	get_filename_component(BENCH_NAME ${BENCH_SRC} NAME_WE)
 	add_executable(${BENCH_NAME} ${BENCH_SRC})
+	sam3_configure_executable(${BENCH_NAME})
 	target_link_libraries(${BENCH_NAME} sam3)
 endforeach()

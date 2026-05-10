@@ -20,10 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "util/log.h"
+#include "util/platform.h"
 #include "feature_cache_persist.h"
 
 /* --- disk-tier helpers --- */
@@ -237,17 +236,14 @@ sam3_image_cache_create_ex(int n_slots, size_t slot_arena_bytes,
 			if (!c->spill_dir)
 				goto fail_slots;
 			/* mkdir best-effort; existing dir is fine. */
-			mkdir(c->spill_dir, 0700);
+			sam3_platform_mkdir(c->spill_dir);
 		} else {
-			char tmpl[] = "/tmp/sam3-imgcache-XXXXXX";
-			char *d = mkdtemp(tmpl);
+			char *d = sam3_platform_temp_dir("sam3-imgcache");
 			if (!d) {
-				sam3_log_error("image_cache: mkdtemp failed");
+				sam3_log_error("image_cache: temp dir failed");
 				goto fail_slots;
 			}
-			c->spill_dir = strdup(d);
-			if (!c->spill_dir)
-				goto fail_slots;
+			c->spill_dir = d;
 			c->owns_spill_dir = 1;
 		}
 	}
@@ -265,7 +261,7 @@ sam3_image_cache_create_ex(int n_slots, size_t slot_arena_bytes,
 
 fail_spill_dir:
 	if (c->owns_spill_dir && c->spill_dir)
-		rmdir(c->spill_dir);
+		sam3_platform_rmdir(c->spill_dir);
 	free(c->spill_dir);
 fail_slots:
 	free(c->slots);
@@ -286,7 +282,7 @@ void sam3_image_cache_destroy(struct sam3_image_feature_cache *c)
 		sam3_arena_free(&s->arena);
 	}
 	if (c->owns_spill_dir && c->spill_dir)
-		rmdir(c->spill_dir);
+		sam3_platform_rmdir(c->spill_dir);
 	free(c->spill_dir);
 	free(c->slots);
 	free(c);

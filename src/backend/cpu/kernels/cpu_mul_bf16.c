@@ -92,10 +92,13 @@ static void mul_bf16_scalar(const uint16_t *a, const uint16_t *b,
 				bf16_to_f32(a[i]) * bf16_to_f32(b[i]));
 		}
 	} else {
-		for (int i = start; i < end; i++) {
-			out[i] = f32_to_bf16(
-				bf16_to_f32(a[i]) *
-				bf16_to_f32(b[i % broadcast_n]));
+		for (int r = start; r < end; r++) {
+			int base = r * broadcast_n;
+			for (int j = 0; j < broadcast_n; j++) {
+				out[base + j] = f32_to_bf16(
+					bf16_to_f32(a[base + j]) *
+					bf16_to_f32(b[j]));
+			}
 		}
 	}
 }

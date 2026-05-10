@@ -19,9 +19,9 @@
 #define SAM3_CORE_WEIGHT_H
 
 #include <stdint.h>
-#include <pthread.h>
 #include "sam3/sam3_types.h"
 #include "core/tensor.h"
+#include "util/platform.h"
 
 /* .sam3 file magic: ASCII "SAM3" = 0x53414D33 (little-endian: 0x334D4153) */
 #define SAM3_WEIGHT_MAGIC   0x334D4153
@@ -83,12 +83,13 @@ _Static_assert(sizeof(struct sam3_weight_tensor_desc) == 176,
 struct sam3_weight_file {
 	void                                 *mapped;
 	size_t                                mapped_size;
+	struct sam3_file_map                  map;
 	const struct sam3_weight_header      *header;
 	const struct sam3_weight_tensor_desc *tensors;
 	const void                           *data_base;
 	uint32_t                             *hash_table;
 	uint32_t                              hash_capacity;
-	pthread_t                             prefetch_thread;
+	sam3_thread                           prefetch_thread;
 	int                                   prefetch_active;
 	uint32_t                              text_backbone; /* derived from header */
 };
@@ -154,14 +155,15 @@ enum sam3_error sam3_weight_to_tensor(
 	struct sam3_tensor *out);
 
 /*
- * sam3_weight_madvise - Set mmap access pattern hint.
+ * sam3_weight_prefetch_hint - Set file-map access pattern hint.
  *
  * @wf:     Open weight file
- * @advice: POSIX madvise advice (e.g. MADV_SEQUENTIAL, MADV_RANDOM)
+ * @hint:   Portable prefetch hint.
  *
- * Calls madvise() on the mapped region. No-op if wf is not mapped.
+ * Applies an OS-specific file mapping hint. No-op if wf is not mapped.
  */
-void sam3_weight_madvise(struct sam3_weight_file *wf, int advice);
+void sam3_weight_prefetch_hint(struct sam3_weight_file *wf,
+				       enum sam3_prefetch_hint hint);
 
 /*
  * sam3_weight_prefetch_wait - Wait for background prefetch to complete.

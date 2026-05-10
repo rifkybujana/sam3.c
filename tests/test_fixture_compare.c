@@ -23,7 +23,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "sam3/sam3.h"
 #include "sam3/internal/processor_normalize.h"
@@ -31,6 +30,7 @@
 #include "model/sam3_internal.h"
 #include "model/sam3_processor.h"
 #include "model/graph_helpers.h"
+#include "util/platform.h"
 
 #ifndef SAM3_SOURCE_DIR
 #error "SAM3_SOURCE_DIR must be defined by CMake"
@@ -41,14 +41,23 @@
 
 /* --- Helpers  --- */
 
+static int set_env_var(const char *name, const char *value)
+{
+#ifdef _WIN32
+	return _putenv_s(name, value);
+#else
+	return setenv(name, value, 1);
+#endif
+}
+
 static int fixtures_available(void)
 {
-	return access(FIXTURE_DIR "/metadata.json", F_OK) == 0;
+	return sam3_path_is_regular(FIXTURE_DIR "/metadata.json");
 }
 
 static int model_available(void)
 {
-	return access(MODEL_PATH, F_OK) == 0;
+	return sam3_path_is_regular(MODEL_PATH);
 }
 
 /*
@@ -629,7 +638,7 @@ cleanup:
 
 static int bus_fixtures_available(void)
 {
-	return access(BUS_FIXTURE_DIR "/metadata.json", F_OK) == 0;
+	return sam3_path_is_regular(BUS_FIXTURE_DIR "/metadata.json");
 }
 
 static void test_bus_person_text_only(void)
@@ -859,8 +868,8 @@ cleanup:
 
 static int sam3_1_fixtures_available(void)
 {
-	return access(SAM3_1_BUS_FIXTURE_DIR "/metadata.json", F_OK) == 0
-	    && access(SAM3_1_MODEL_PATH, F_OK) == 0;
+	return sam3_path_is_regular(SAM3_1_BUS_FIXTURE_DIR "/metadata.json")
+	    && sam3_path_is_regular(SAM3_1_MODEL_PATH);
 }
 
 static void test_bus_person_sam3_1(void)
@@ -1009,7 +1018,7 @@ cleanup:
 int main(void)
 {
 	/* Force full F32 precision on Metal for fixture comparison */
-	setenv("SAM3_METAL_F32", "1", 1);
+	(void)set_env_var("SAM3_METAL_F32", "1");
 
 	if (!fixtures_available()) {
 		printf("SKIP: fixtures not found at %s\n", FIXTURE_DIR);

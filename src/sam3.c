@@ -17,7 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <sys/mman.h>
 
 #include "sam3/sam3.h"
 #include "sam3/internal/tensor_dump.h"

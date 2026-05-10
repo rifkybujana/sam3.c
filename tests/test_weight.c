@@ -18,7 +18,7 @@
 #include "test_helpers.h"
 #include "core/weight.h"
 
-#define TEST_FILE "/tmp/test_sam3_weights.sam3"
+#define TEST_FILE "test_sam3_weights.sam3"
 
 /* --- Minimal in-memory reader for testing --- */
 
@@ -261,7 +261,7 @@ static void test_weight_file_not_found(void)
 	struct sam3_weight_file wf;
 
 	memset(&wf, 0, sizeof(wf));
-	err = sam3_weight_open(&wf, "/tmp/nonexistent_sam3_file.sam3");
+	err = sam3_weight_open(&wf, "nonexistent_sam3_file.sam3");
 	ASSERT_EQ(err, SAM3_EIO);
 }
 

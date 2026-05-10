@@ -8,7 +8,7 @@
  * executes task 0 to avoid unnecessary context switches.
  *
  * Key types:  sam3_threadpool
- * Depends on: util/threadpool.h, util/log.h, <pthread.h>
+ * Depends on: util/threadpool.h, util/log.h, util/platform.h
  * Used by:    cpu_backend.c, cpu_matmul.c, cpu_conv2d.c
  *
  * Copyright (c) 2026 Rifky Bujana Bisri
@@ -16,25 +16,19 @@
  */
 
 #include <stdlib.h>
-#include <pthread.h>
-
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#else
-#include <unistd.h>
-#endif
 
 #include "util/threadpool.h"
 #include "util/log.h"
+#include "util/platform.h"
 
 struct sam3_threadpool {
 	int              n_threads;     /* total threads including caller */
-	pthread_t       *workers;       /* n_threads - 1 worker threads */
+	sam3_thread     *workers;       /* n_threads - 1 worker threads */
 	int              n_workers;     /* n_threads - 1 */
 
-	pthread_mutex_t  mutex;
-	pthread_cond_t   cond_work;     /* workers wait on this */
-	pthread_cond_t   cond_done;     /* caller waits on this */
+	sam3_mutex       mutex;
+	sam3_cond        cond_work;     /* workers wait on this */
+	sam3_cond        cond_done;     /* caller waits on this */
 
 	/* Work descriptor (protected by mutex) */
 	sam3_parallel_fn work_fn;
@@ -51,23 +45,7 @@ struct sam3_threadpool {
 
 static int detect_n_threads(void)
 {
-	int n = 1;
-
-#ifdef __APPLE__
-	size_t len = sizeof(n);
-	/* Prefer performance cores on Apple Silicon */
-	if (sysctlbyname("hw.perflevel0.logicalcpu", &n, &len, NULL, 0) != 0) {
-		len = sizeof(n);
-		if (sysctlbyname("hw.logicalcpu", &n, &len, NULL, 0) != 0) {
-			n = 1;
-		}
-	}
-#else
-	long val = sysconf(_SC_NPROCESSORS_ONLN);
-	if (val > 0)
-		n = (int)val;
-#endif
-
+	int n = sam3_platform_cpu_count();
 	if (n < 1)
 		n = 1;
 	return n;
@@ -84,14 +62,14 @@ static void *worker_main(void *arg)
 		int task_id = -1;
 		int n_tasks = 0;
 
-		pthread_mutex_lock(&pool->mutex);
+		sam3_mutex_lock(&pool->mutex);
 
 		/* Wait until new work arrives or shutdown */
 		while (pool->generation == my_gen && !pool->shutdown)
-			pthread_cond_wait(&pool->cond_work, &pool->mutex);
+			sam3_cond_wait(&pool->cond_work, &pool->mutex);
 
 		if (pool->shutdown) {
-			pthread_mutex_unlock(&pool->mutex);
+			sam3_mutex_unlock(&pool->mutex);
 			break;
 		}
 
@@ -103,23 +81,23 @@ static void *worker_main(void *arg)
 		fn = pool->work_fn;
 		ctx = pool->work_ctx;
 
-		pthread_mutex_unlock(&pool->mutex);
+		sam3_mutex_unlock(&pool->mutex);
 
 		/* Execute tasks while work remains */
 		while (task_id < n_tasks) {
 			fn(ctx, task_id, n_tasks);
 
-			pthread_mutex_lock(&pool->mutex);
+			sam3_mutex_lock(&pool->mutex);
 			task_id = pool->task_counter++;
-			pthread_mutex_unlock(&pool->mutex);
+			sam3_mutex_unlock(&pool->mutex);
 		}
 
 		/* Signal completion */
-		pthread_mutex_lock(&pool->mutex);
+		sam3_mutex_lock(&pool->mutex);
 		pool->done_counter++;
 		if (pool->done_counter >= pool->n_active - 1)
-			pthread_cond_signal(&pool->cond_done);
-		pthread_mutex_unlock(&pool->mutex);
+			sam3_cond_signal(&pool->cond_done);
+		sam3_mutex_unlock(&pool->mutex);
 	}
 
 	return NULL;
@@ -146,58 +124,58 @@ struct sam3_threadpool *sam3_threadpool_create(int n_threads)
 	pool->generation = 0;
 	pool->shutdown = 0;
 
-	if (pthread_mutex_init(&pool->mutex, NULL) != 0) {
+	if (sam3_mutex_init(&pool->mutex) != 0) {
 		sam3_log_error("threadpool: mutex init failed");
 		free(pool);
 		return NULL;
 	}
 
-	if (pthread_cond_init(&pool->cond_work, NULL) != 0) {
+	if (sam3_cond_init(&pool->cond_work) != 0) {
 		sam3_log_error("threadpool: cond_work init failed");
-		pthread_mutex_destroy(&pool->mutex);
+		sam3_mutex_destroy(&pool->mutex);
 		free(pool);
 		return NULL;
 	}
 
-	if (pthread_cond_init(&pool->cond_done, NULL) != 0) {
+	if (sam3_cond_init(&pool->cond_done) != 0) {
 		sam3_log_error("threadpool: cond_done init failed");
-		pthread_cond_destroy(&pool->cond_work);
-		pthread_mutex_destroy(&pool->mutex);
+		sam3_cond_destroy(&pool->cond_work);
+		sam3_mutex_destroy(&pool->mutex);
 		free(pool);
 		return NULL;
 	}
 
 	if (pool->n_workers > 0) {
-		pool->workers = calloc(pool->n_workers, sizeof(pthread_t));
+		pool->workers = calloc(pool->n_workers, sizeof(*pool->workers));
 		if (!pool->workers) {
 			sam3_log_error("threadpool: failed to allocate workers");
-			pthread_cond_destroy(&pool->cond_done);
-			pthread_cond_destroy(&pool->cond_work);
-			pthread_mutex_destroy(&pool->mutex);
+			sam3_cond_destroy(&pool->cond_done);
+			sam3_cond_destroy(&pool->cond_work);
+			sam3_mutex_destroy(&pool->mutex);
 			free(pool);
 			return NULL;
 		}
 
 		for (i = 0; i < pool->n_workers; i++) {
-			int rc = pthread_create(&pool->workers[i], NULL,
-						worker_main, pool);
+			int rc = sam3_thread_create(&pool->workers[i],
+						     worker_main, pool);
 			if (rc != 0) {
-				sam3_log_error("threadpool: pthread_create "
+				sam3_log_error("threadpool: thread_create "
 					       "failed for worker %d", i);
 				/* Shut down already-created workers */
-				pthread_mutex_lock(&pool->mutex);
+				sam3_mutex_lock(&pool->mutex);
 				pool->shutdown = 1;
 				pool->n_workers = i;
-				pthread_cond_broadcast(&pool->cond_work);
-				pthread_mutex_unlock(&pool->mutex);
+				sam3_cond_broadcast(&pool->cond_work);
+				sam3_mutex_unlock(&pool->mutex);
 
 				for (int j = 0; j < i; j++)
-					pthread_join(pool->workers[j], NULL);
+					sam3_thread_join(&pool->workers[j]);
 
 				free(pool->workers);
-				pthread_cond_destroy(&pool->cond_done);
-				pthread_cond_destroy(&pool->cond_work);
-				pthread_mutex_destroy(&pool->mutex);
+				sam3_cond_destroy(&pool->cond_done);
+				sam3_cond_destroy(&pool->cond_work);
+				sam3_mutex_destroy(&pool->mutex);
 				free(pool);
 				return NULL;
 			}
@@ -217,19 +195,19 @@ void sam3_threadpool_free(struct sam3_threadpool *pool)
 		return;
 
 	/* Signal shutdown to all workers */
-	pthread_mutex_lock(&pool->mutex);
+	sam3_mutex_lock(&pool->mutex);
 	pool->shutdown = 1;
-	pthread_cond_broadcast(&pool->cond_work);
-	pthread_mutex_unlock(&pool->mutex);
+	sam3_cond_broadcast(&pool->cond_work);
+	sam3_mutex_unlock(&pool->mutex);
 
 	/* Join all workers */
 	for (i = 0; i < pool->n_workers; i++)
-		pthread_join(pool->workers[i], NULL);
+		sam3_thread_join(&pool->workers[i]);
 
 	free(pool->workers);
-	pthread_cond_destroy(&pool->cond_done);
-	pthread_cond_destroy(&pool->cond_work);
-	pthread_mutex_destroy(&pool->mutex);
+	sam3_cond_destroy(&pool->cond_done);
+	sam3_cond_destroy(&pool->cond_work);
+	sam3_mutex_destroy(&pool->mutex);
 	free(pool);
 }
 
@@ -257,7 +235,7 @@ void sam3_threadpool_parallel_for(struct sam3_threadpool *pool,
 
 	n_active = n_tasks < pool->n_threads ? n_tasks : pool->n_threads;
 
-	pthread_mutex_lock(&pool->mutex);
+	sam3_mutex_lock(&pool->mutex);
 
 	pool->work_fn = fn;
 	pool->work_ctx = ctx;
@@ -267,17 +245,17 @@ void sam3_threadpool_parallel_for(struct sam3_threadpool *pool,
 	pool->done_counter = 0;
 	pool->generation++;
 
-	pthread_cond_broadcast(&pool->cond_work);
-	pthread_mutex_unlock(&pool->mutex);
+	sam3_cond_broadcast(&pool->cond_work);
+	sam3_mutex_unlock(&pool->mutex);
 
 	/* Caller executes task 0 */
 	fn(ctx, 0, n_tasks);
 
 	/* Wait for workers to finish */
-	pthread_mutex_lock(&pool->mutex);
+	sam3_mutex_lock(&pool->mutex);
 	while (pool->done_counter < n_active - 1)
-		pthread_cond_wait(&pool->cond_done, &pool->mutex);
-	pthread_mutex_unlock(&pool->mutex);
+		sam3_cond_wait(&pool->cond_done, &pool->mutex);
+	sam3_mutex_unlock(&pool->mutex);
 }
 
 int sam3_threadpool_n_threads(const struct sam3_threadpool *pool)

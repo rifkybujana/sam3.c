@@ -638,7 +638,7 @@ static struct sam3_tensor *gen_sine_position_embed(
 		return NULL;
 
 	float *dst = (float *)out->data;
-	float scale = 2.0f * (float)M_PI;
+	float scale = 2.0f * 3.14159265358979323846f;
 
 	/*
 	 * Precompute dim_t[j] = 10000^(2*floor(j/2) / num_feats).

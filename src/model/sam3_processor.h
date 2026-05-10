@@ -18,13 +18,13 @@
 #ifndef SAM3_MODEL_SAM3_PROCESSOR_H
 #define SAM3_MODEL_SAM3_PROCESSOR_H
 
-#include <pthread.h>
 #include <stdint.h>
 
 #include "sam3_image.h"
 #include "backend/backend.h"
 #include "sam3/sam3_types.h"
 #include "feature_cache.h"
+#include "util/platform.h"
 
 /* Forward declaration — only used as an opaque pointer here. */
 struct sam3_profiler;
@@ -64,8 +64,8 @@ struct sam3_processor {
 	 * - txt_cache:           LRU text feature cache
 	 * - text_cached_bundle:  hit path; cleared by segment
 	 * - text_worker_slot:    -1 or txt_cache slot the worker writes
-	 * - text_thread:         pthread handle (valid iff active=1)
-	 * - text_thread_active:  1 between pthread_create and join
+	 * - text_thread:         worker thread handle (valid iff active=1)
+	 * - text_thread_active:  1 between thread create and join
 	 * - text_thread_err:     last worker exit code
 	 * - text_tokens:         raw token IDs the worker reads
 	 * - text_n_tokens:       number of real (non-padding) tokens
@@ -75,7 +75,7 @@ struct sam3_processor {
 	struct sam3_text_feature_cache *txt_cache;
 	struct sam3_text_bundle *text_cached_bundle; /* hit path; cleared by segment */
 	int                      text_worker_slot;   /* -1 or txt_cache slot */
-	pthread_t            text_thread;
+	sam3_thread          text_thread;
 	int                  text_thread_active;
 	enum sam3_error      text_thread_err;
 	int32_t              text_tokens[SAM3_PROCESSOR_MAX_TOKENS];
